@@ -528,6 +528,33 @@ static void loraTaskMain(void*) {
     }
 }
 
+#if CONFIG_DIPTYCH_LCD
+#include "lcd.h"
+/* Settings → Reticulum → Transports → LoRa. Mirrors the web LoraPanel. Selects
+ * store the raw wire values (the device atoi's them), same as the browser. */
+static void loraSettingsPane(void* arg) {
+    lv_obj_t* p = static_cast<lv_obj_t*>(arg);
+    lcdSettingSection (p, "LoRa");
+    lcdSettingSwitch  (p, "Enable", "s.lora.enable");
+    lcdSettingSection (p, "Radio");
+    lcdSettingDropdown(p, "Frequency", "s.lora.frequency",
+                       "433000000,868100000,869525000,915000000,923000000");
+    lcdSettingDropdown(p, "Bandwidth", "s.lora.bandwidth", "125000,250000,500000");
+    lcdSettingDropdown(p, "Spreading", "s.lora.spreading_factor", "7,8,9,10,11,12");
+    lcdSettingDropdown(p, "Coding rate", "s.lora.coding_rate", "5,6,7,8");
+    lcdSettingSlider  (p, "TX power", "s.lora.tx_power", -9, 22);
+    lcdSettingSlider  (p, "Preamble", "s.lora.preamble", 6, 32);
+    lcdSettingText    (p, "Sync word", "s.lora.sync_word");
+    lcdSettingDropdown(p, "Mode", "s.lora.mode",
+                       "full,gateway,access_point,roaming,boundary");
+    lcdSettingSection (p, "Status");
+    lcdSettingValue   (p, "State", "lora.state");
+    lcdSettingValue   (p, "Chip", "lora.chip");
+    lcdSettingValue   (p, "Bitrate", "lora.bitrate_eff");
+    lcdSettingValue   (p, "RSSI", "lora.stats.rssi_last");
+}
+#endif
+
 void loraInit(void) {
     if (storageGetInt("s.lora.version", 0) < LORA_VERSION) {
         /* Frequency + TX power are user-must-pick (region / antenna).
@@ -542,6 +569,10 @@ void loraInit(void) {
         storageDefault("s.lora.sync_word", "0x42");
         storageSet("s.lora.version", LORA_VERSION);
     }
+
+#if CONFIG_DIPTYCH_LCD
+    lcdRegisterSettings("Reticulum/Transports/LoRa", "LoRa", loraSettingsPane);
+#endif
 
     cliRegisterCmd("lora", cliLora);
 

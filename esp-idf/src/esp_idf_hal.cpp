@@ -180,6 +180,10 @@ void EspIdfHal::spiBegin()
 
 void EspIdfHal::spiBeginTransaction()
 {
+    /* Serialize with the LCD's async-DMA flush on the shared SPI2 bus (the
+     * SPI driver's own bus lock isn't enough — esp_lcd drops it before its DMA
+     * finishes). Outer lock first, then the driver bus, released in reverse. */
+    spiHelperBusLock();
     if (_spiDev) spi_device_acquire_bus(_spiDev, portMAX_DELAY);
 }
 
@@ -203,6 +207,7 @@ void EspIdfHal::spiTransfer(uint8_t* out, size_t len, uint8_t* in)
 void EspIdfHal::spiEndTransaction()
 {
     if (_spiDev) spi_device_release_bus(_spiDev);
+    spiHelperBusUnlock();
 }
 
 void EspIdfHal::spiEnd()
