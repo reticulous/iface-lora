@@ -23,7 +23,7 @@
  * See docs/component-plan.md §7 / §12.
  */
 #include "lora.h"
-#include "board.h"
+#include "tdeck.h"
 #include "esp_idf_hal.h"
 #include "diptych.h"
 #include "ports.h"
