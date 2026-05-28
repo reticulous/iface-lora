@@ -31,7 +31,7 @@ loraInit();    // after rnsdInit, after the board has powered the LoRa rail
 
 The **board pin map** (`BOARD_LORA_CS`, `BOARD_LORA_DIO1`,
 `BOARD_LORA_RST`, `BOARD_LORA_BUSY`, `BOARD_LORA_SPI_*`) comes from the
-consuming app-straddle's `main/` (e.g. reticulous-tdeck's
+consuming buildable straddle's `main/` (e.g. reticulous-tdeck's
 `tdeck.h`). The component's PRIVATE include path includes
 `${CMAKE_SOURCE_DIR}/main` so consumers don't have to thread the pin
 defs through Kconfig or a function-pointer table.

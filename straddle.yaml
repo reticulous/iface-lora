@@ -3,7 +3,7 @@
 # Carries the RadioLib ESP-IDF HAL (esp_idf_hal.cpp/h). Owns DIO1 ISR;
 # implements RNode on-air framing for ecosystem interop.
 #
-# Board pin map (BOARD_LORA_*) comes from the consuming app-straddle's
+# Board pin map (BOARD_LORA_*) comes from the consuming buildable straddle's
 # main/ dir (e.g., reticulous-tdeck's tdeck.h). The component's PRIVATE
 # include path includes ${CMAKE_SOURCE_DIR}/main so consumers don't have
 # to thread the pin defs through Kconfig or a function pointer table.
