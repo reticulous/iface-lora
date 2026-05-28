@@ -1,0 +1,11 @@
+description: "reticulous-lora: SX1262 LoRa transport for reticulous (RadioLib + custom ESP-IDF HAL, RNode on-air framing)."
+url: https://github.com/reticulous/reticulous-lora
+version: "0.1.0"
+license: "Apache-2.0"
+targets:
+  - esp32s3
+dependencies:
+  idf:
+    version: ">=5.5"
+  jgromes/radiolib:
+    version: "^7.0.0"

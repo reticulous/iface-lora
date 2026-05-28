@@ -57,7 +57,7 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
-import { useDeviceStore } from 'diptych-browser/stores/device'
+import { useDeviceStore } from 'spangap-browser/stores/device'
 
 const device = useDeviceStore()
 
@@ -72,7 +72,7 @@ const txFrames  = computed(() => Number(device.get('lora.stats.tx_frames') ?? 0)
 /* No preselected defaults (plan §12.4). All values stored as ints
  * (frequency in Hz, bandwidth in Hz) so storage stays type-clean. */
 
-/* Storage values are stored as strings here (matching diptych's
+/* Storage values are stored as strings here (matching spangap's
  * SettingSelect type); storageGetInt on the device side atoi's them. */
 const freqOptions = [
   { label: '433.000 MHz (ISM EU/AS)', value: '433000000' },

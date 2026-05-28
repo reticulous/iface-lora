@@ -17,8 +17,8 @@
  */
 #include "esp_idf_hal.h"
 
-#include "diptych.h"     /* info()/warn()/err() macros, safeStrncpy, etc. */
-#include "spi_helper.h"  /* spiHelperInitBus — diptych-core shared SPI bus owner */
+#include "spangap.h"     /* info()/warn()/err() macros, safeStrncpy, etc. */
+#include "spi_helper.h"  /* spiHelperInitBus — spangap-core shared SPI bus owner */
 
 #include "esp_timer.h"
 #include "freertos/task.h"
@@ -42,7 +42,7 @@ void EspIdfHal::init()
      * service + device handle are one-shot. */
     if (_inited) return;
 
-    /* SPI bus init via diptych-core's spi_helper — idempotent, safe to
+    /* SPI bus init via spangap-core's spi_helper — idempotent, safe to
      * call alongside future LCD/SD drivers that share this bus. */
     spi_bus_config_t bus = {};
     bus.mosi_io_num   = _mosiPin;

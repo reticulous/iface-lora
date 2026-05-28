@@ -14,7 +14,7 @@
  * RX wake mechanism: setDio1Action → HAL attachInterrupt → IRAM_ATTR
  * trampoline → vTaskNotifyGiveFromISR. itsPoll() unblocks on the same
  * task notification, so a single wait point handles ITS, ISR, and
- * deadlines (the diptych canonical loop pattern).
+ * deadlines (the spangap canonical loop pattern).
  *
  * TX: synchronous radio.transmit() in the task. SX126x is half-duplex
  * so we cannot transmit while a split RX is pending — guarded by
@@ -25,7 +25,7 @@
 #include "lora.h"
 #include "tdeck.h"
 #include "esp_idf_hal.h"
-#include "diptych.h"
+#include "spangap.h"
 #include "ports.h"
 
 #include <RadioLib.h>
@@ -528,7 +528,7 @@ static void loraTaskMain(void*) {
     }
 }
 
-#if CONFIG_DIPTYCH_LCD
+#if CONFIG_SPANGAP_LCD
 #include "lcd.h"
 /* Settings → Reticulum → Transports → LoRa. Mirrors the web LoraPanel. Selects
  * store the raw wire values (the device atoi's them), same as the browser. */
@@ -570,7 +570,7 @@ void loraInit(void) {
         storageSet("s.lora.version", LORA_VERSION);
     }
 
-#if CONFIG_DIPTYCH_LCD
+#if CONFIG_SPANGAP_LCD
     lcdRegisterSettings("Reticulum/Transports/LoRa", "LoRa", loraSettingsPane);
 #endif
 
