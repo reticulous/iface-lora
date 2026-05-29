@@ -3,13 +3,12 @@ set(LORA_SRCS
     "src/esp_idf_hal.cpp"
 )
 
+include(${CMAKE_CURRENT_LIST_DIR}/spangap_requires.cmake)
 idf_component_register(
     SRCS ${LORA_SRCS}
     INCLUDE_DIRS "include"
     REQUIRES
-        spangap-core
-        spangap-lcd
-        reticulous-core
+        ${SPANGAP_REQUIRES}
         driver
         esp_timer
         esp_event

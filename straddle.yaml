@@ -16,3 +16,7 @@ browser: browser
 platforms: [idf]
 requires:
   - reticulous/reticulous-core
+optional_requires:
+  # lora.cpp registers a Settings pane via lcdSetting* helpers,
+  # gated on CONFIG_SPANGAP_LCD.
+  - spangap/spangap-lcd
