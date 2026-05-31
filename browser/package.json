@@ -1,5 +1,5 @@
 {
-  "name": "reticulous-lora",
+  "name": "tr-lora",
   "version": "0.1.0",
   "type": "module",
   "description": "Browser-side LoRa transport settings panel for reticulous.",

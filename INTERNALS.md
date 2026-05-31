@@ -1,4 +1,4 @@
-# reticulous-lora — internals
+# tr-lora — internals
 
 ## Task
 

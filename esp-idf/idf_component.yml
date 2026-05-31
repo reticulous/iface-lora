@@ -1,5 +1,5 @@
-description: "reticulous-lora: SX1262 LoRa transport for reticulous (RadioLib + custom ESP-IDF HAL, RNode on-air framing)."
-url: https://github.com/reticulous/reticulous-lora
+description: "tr-lora: SX1262 LoRa transport for reticulous (RadioLib + custom ESP-IDF HAL, RNode on-air framing)."
+url: https://github.com/reticulous/tr-lora
 version: "0.1.0"
 license: "Apache-2.0"
 targets:

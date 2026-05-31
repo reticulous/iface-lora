@@ -1,6 +1,6 @@
 # License
 
-This repository, **reticulous-lora** (SX1262 LoRa transport for reticulous;
+This repository, **tr-lora** (SX1262 LoRa transport for reticulous;
 RadioLib + custom ESP-IDF HAL, RNode on-air framing), is released under the
 **Apache License, Version 2.0**.
 

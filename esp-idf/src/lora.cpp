@@ -412,9 +412,10 @@ static void onCfgChange(const char* /*key*/, const char* /*val*/) {
 /* ─────────────── CLI ─────────────── */
 
 static void cliLora(const char* args) {
-    if (args && strcmp(args, "help") == 0) {
-        cliPrintf("  %-*s LoRa transport status\n",   CLI_HELP_COL, "lora");
-        cliPrintf("  %-*s enable/disable LoRa\n",     CLI_HELP_COL, "lora up|down");
+    if (args && strcmp(args, "help") == 0) { cliPrintf("%-*s LoRa transport status; up/down\n", CLI_HELP_COL, "lora [up|down]"); return; }
+    if (args && cliWantsHelp(args)) {
+        cliPrintf("%-*s LoRa transport status\n",   CLI_HELP_COL, "lora");
+        cliPrintf("%-*s enable/disable LoRa\n",     CLI_HELP_COL, "lora up|down");
         return;
     }
     if (args && strcmp(args, "up") == 0)   { storageSet("s.lora.enable", 1); cliPrintf("enabled\n"); return; }
