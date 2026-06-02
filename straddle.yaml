@@ -20,3 +20,9 @@ optional_requires:
   # lora.cpp registers a Settings pane via lcdSetting* helpers,
   # gated on CONFIG_SPANGAP_LCD.
   - spangap/spangap-lcd
+# Auto-init: folded into the generated spangapInitStraddles() dispatcher.
+# loraInit() self-registers with rnsd via ITS, so it sorts after rnsd (order
+# 160) in the transport band.
+init:
+  - call: loraInit
+    order: 170
