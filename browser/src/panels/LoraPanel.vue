@@ -7,21 +7,21 @@
       coding rate; the radio stays disabled until you enable it.
     </div>
 
-    <SettingToggle label="Enabled" k="s.lora.enable" />
+    <SettingToggle label="Enabled" k="s.lora.0.enable" />
 
     <div class="section-heading">Radio</div>
 
-    <SettingSelect label="Frequency" k="s.lora.frequency" :options="freqOptions" />
-    <SettingSelect label="Bandwidth" k="s.lora.bandwidth" :options="bwOptions" />
-    <SettingSelect label="Spreading factor" k="s.lora.spreading_factor" :options="sfOptions" />
-    <SettingSelect label="Coding rate" k="s.lora.coding_rate" :options="crOptions" />
-    <SettingSlider label="TX power (dBm)" k="s.lora.tx_power" :min="-9" :max="22" />
-    <SettingSlider label="Preamble (sym)"  k="s.lora.preamble"  :min="6"  :max="32" />
-    <SettingText   label="Sync word"       k="s.lora.sync_word" />
+    <SettingSelect label="Frequency" k="s.lora.0.frequency" :options="freqOptions" />
+    <SettingSelect label="Bandwidth" k="s.lora.0.bandwidth" :options="bwOptions" />
+    <SettingSelect label="Spreading factor" k="s.lora.0.spreading_factor" :options="sfOptions" />
+    <SettingSelect label="Coding rate" k="s.lora.0.coding_rate" :options="crOptions" />
+    <SettingSlider label="TX power (dBm)" k="s.lora.0.tx_power" :min="-9" :max="22" />
+    <SettingSlider label="Preamble (sym)"  k="s.lora.0.preamble"  :min="6"  :max="32" />
+    <SettingText   label="Sync word"       k="s.lora.0.sync_word" />
 
     <div class="section-heading">RNS interface</div>
 
-    <SettingSelect label="Mode" k="s.lora.mode" :options="modeOptions" />
+    <SettingSelect label="Mode" k="s.lora.0.mode" :options="modeOptions" />
 
     <q-separator dark class="q-mt-md" />
 
@@ -61,13 +61,13 @@ import { useDeviceStore } from 'spangap-browser/stores/device'
 
 const device = useDeviceStore()
 
-const state     = computed(() => String(device.get('lora.state') ?? ''))
-const chip      = computed(() => String(device.get('lora.chip') ?? ''))
-const bitrate   = computed(() => Number(device.get('lora.bitrate_eff') ?? 0))
-const rssi      = computed(() => Number(device.get('lora.stats.rssi_last') ?? 0))
-const snr       = computed(() => Number(device.get('lora.stats.snr_last')  ?? 0))
-const rxFrames  = computed(() => Number(device.get('lora.stats.rx_frames') ?? 0))
-const txFrames  = computed(() => Number(device.get('lora.stats.tx_frames') ?? 0))
+const state     = computed(() => String(device.get('lora.0.state') ?? ''))
+const chip      = computed(() => String(device.get('lora.0.chip') ?? ''))
+const bitrate   = computed(() => Number(device.get('lora.0.bitrate_eff') ?? 0))
+const rssi      = computed(() => Number(device.get('lora.0.stats.rssi_last') ?? 0))
+const snr       = computed(() => Number(device.get('lora.0.stats.snr_last')  ?? 0))
+const rxFrames  = computed(() => Number(device.get('lora.0.stats.rx_frames') ?? 0))
+const txFrames  = computed(() => Number(device.get('lora.0.stats.tx_frames') ?? 0))
 
 /* No preselected defaults (plan §12.4). All values stored as ints
  * (frequency in Hz, bandwidth in Hz) so storage stays type-clean. */
@@ -80,11 +80,20 @@ const freqOptions = [
   { label: '869.525 MHz (EU868 RNS)', value: '869525000' },
   { label: '915.000 MHz (US915)',     value: '915000000' },
   { label: '923.000 MHz (AS923)',     value: '923000000' },
+  /* 2.4 GHz — SX128x only */
+  { label: '2400.000 MHz (2.4 GHz)',  value: '2400000000' },
+  { label: '2450.000 MHz (2.4 GHz)',  value: '2450000000' },
+  { label: '2480.000 MHz (2.4 GHz)',  value: '2480000000' },
 ]
 const bwOptions = [
   { label: '125 kHz', value: '125000' },
   { label: '250 kHz', value: '250000' },
   { label: '500 kHz', value: '500000' },
+  /* SX128x (2.4 GHz) bandwidths */
+  { label: '203 kHz (SX128x)',  value: '203125' },
+  { label: '406 kHz (SX128x)',  value: '406250' },
+  { label: '812 kHz (SX128x)',  value: '812500' },
+  { label: '1625 kHz (SX128x)', value: '1625000' },
 ]
 const sfOptions = [
   { label: 'SF7 (fast, short range)',  value: '7' },

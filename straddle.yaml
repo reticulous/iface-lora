@@ -1,12 +1,13 @@
-# tr-lora — SX1262 LoRa transport for reticulous.
+# tr-lora — SX126x LoRa transport for reticulous.
 #
 # Carries the RadioLib ESP-IDF HAL (esp_idf_hal.cpp/h). Owns DIO1 ISR;
-# implements RNode on-air framing for ecosystem interop.
+# implements RNode on-air framing for ecosystem interop. Drives up to
+# CONFIG_LORA_COUNT radios on one shared SPI bus, each registering with
+# rnsd as lora/<slot>.
 #
-# Board pin map (BOARD_LORA_*) comes from the consuming buildable straddle's
-# main/ dir (e.g., hw-tdeck's tdeck.h). The component's PRIVATE
-# include path includes ${CMAKE_SOURCE_DIR}/main so consumers don't have
-# to thread the pin defs through Kconfig or a function pointer table.
+# Pins + per-radio type come from this component's own Kconfig (LORA_* /
+# LORAn_*), resolved from the buildable's sdkconfig. The board sets them in
+# its sdkconfig.defaults; staged-but-inert when CONFIG_LORA_COUNT=0.
 schema_version: 1
 name: reticulous/tr-lora
 prefix: rns_lora
@@ -21,8 +22,7 @@ optional_requires:
   # gated on CONFIG_SPANGAP_LCD.
   - spangap/spangap-lcd
 # Auto-init: folded into the generated spangapInitStraddles() dispatcher.
-# loraInit() self-registers with rnsd via ITS, so it sorts after rnsd (order
-# 160) in the transport band.
+# loraInit() self-registers with rnsd via ITS; `requires: reticulous/rns` puts
+# rnsd ahead of it in dependency-topo order, so its port surface is up first.
 init:
   - call: loraInit
-    order: 170

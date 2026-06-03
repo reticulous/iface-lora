@@ -16,8 +16,6 @@ idf_component_register(
         radiolib
 )
 
-# Board pin-map bridge: lora.cpp uses BOARD_LORA_* macros (CS, DIO1, RST,
-# BUSY, TCXO voltage, etc.) defined in the consumer's main/tdeck.h (or
-# the equivalent board header). Adding main/ to the PRIVATE include path
-# lets `#include "tdeck.h"` resolve directly, no Kconfig plumbing.
-target_include_directories(${COMPONENT_LIB} PRIVATE "${CMAKE_SOURCE_DIR}/main")
+# Pins + per-radio type come from this component's own Kconfig (LORA_* /
+# LORAn_*), resolved from the buildable's sdkconfig — no reach into the
+# board's main/ header, no function-pointer table.
