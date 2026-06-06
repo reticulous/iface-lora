@@ -1,4 +1,4 @@
-# tr-lora — internals
+# iface-lora — internals
 
 ## Task
 

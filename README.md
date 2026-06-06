@@ -1,8 +1,8 @@
-# tr-lora
+# iface-lora
 
 ## What is this?
 
-**tr-lora** is the LoRa transport for [rns](../rns), driving **any RadioLib LoRa
+**iface-lora** is the LoRa transport for [rns](../rns), driving **any RadioLib LoRa
 chip** — SX126x (SX1261/2/8, LLCC68), SX127x / RFM9x (SX1272/6/7/8), SX128x
 (2.4 GHz), LR11x0 (LR1110/20/21) and LR2021. It carries the RadioLib ESP-IDF
 HAL, owns the radio's IRQ line, and implements **RNode on-air framing** so the
@@ -13,7 +13,7 @@ family.
 ## What this straddle owns
 
 ```
-tr-lora/
+iface-lora/
 ├── esp-idf/
 │   ├── include/lora.h
 │   └── src/
@@ -41,7 +41,7 @@ antenna RF switch, any chip) and a `chip` (any of the parts above). Boards
 set these in their `sdkconfig.defaults`; a build can override with
 `spangap build --lora-count N --loraN-cs … --loraN-radio sx1262
 --loraN-rfsw-rx … --loraN-rfsw-tx …` or interactively via
-`spangap menuconfig`. `CONFIG_LORA_COUNT=0` (the default) leaves tr-lora
+`spangap menuconfig`. `CONFIG_LORA_COUNT=0` (the default) leaves iface-lora
 staged but inert.
 
 The antenna RF switch is configured one of two ways: SX126x parts can drive it
@@ -51,7 +51,7 @@ A complex chip-DIO switch *table* (some LR11x0/LR2021 boards) isn't expressible
 as two pins yet — that needs a board-supplied table.
 
 Each radio registers with rnsd as its own interface `lora/<slot>`
-(`lora/0`, `lora/1`, …); tr-lora owns the name's uniqueness (rnsd takes
+(`lora/0`, `lora/1`, …); iface-lora owns the name's uniqueness (rnsd takes
 it verbatim).
 
 Configuration (runtime, per radio — replace `<n>` with the slot index):
@@ -73,7 +73,7 @@ Configuration (runtime, per radio — replace `<n>` with the slot index):
 
 - Power gating of the LoRa rail — that's the consuming app's board
   HAL (e.g. hw-tdeck's `tdeckPowerInit()`, which brings the shared
-  peripheral rail up before `spangapInit()`). tr-lora assumes the rail
+  peripheral rail up before `spangapInit()`). iface-lora assumes the rail
   is already live.
 - The SX1262 antenna selection (PCB-trace vs IPEX vs SMA) — that's
   hardware, not software.

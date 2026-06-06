@@ -62,7 +62,7 @@ static const char* TAG = "lora";
  * class name, family). The X-macro generates the LoraChip enum, the name table,
  * the family map, and the constructor switch from this one list — and its order
  * fixes the numeric CONFIG_LORAn_CHIP_ID the Kconfig choice resolves to, so keep
- * it in lockstep with tr-lora/esp-idf/Kconfig (id = position, from 0). Families
+ * it in lockstep with iface-lora/esp-idf/Kconfig (id = position, from 0). Families
  * differ only in begin() shape + a couple of init extras (see radioBegin). */
 enum LoraFamily { FAM_SX126X, FAM_SX127X, FAM_SX128X, FAM_LR11X0, FAM_LR2021 };
 
@@ -813,38 +813,6 @@ static void loraTaskMain(void*) {
     }
 }
 
-#if CONFIG_SPANGAP_LCD
-#include "lcd.h"
-/* Settings → Reticulum → Transports → LoRa. Targets radio 0 (the common
- * single-radio case); a per-radio selector is a follow-up. Mirrors the
- * web LoraPanel — selects store the raw wire values. */
-static void loraSettingsPane(void* arg) {
-    lv_obj_t* p = static_cast<lv_obj_t*>(arg);
-    lcdSettingSection (p, "LoRa");
-    lcdSettingSwitch  (p, "Enable", "s.lora.0.enable");
-    lcdSettingSection (p, "Radio");
-    /* Sub-GHz presets first, then the 2.4 GHz set (SX128x) and SX128x
-     * bandwidths — pick the ones valid for the slot's chip. */
-    lcdSettingDropdown(p, "Frequency", "s.lora.0.frequency",
-                       "433000000,868100000,869525000,915000000,923000000,"
-                       "2400000000,2450000000,2480000000");
-    lcdSettingDropdown(p, "Bandwidth", "s.lora.0.bandwidth",
-                       "125000,250000,500000,203125,406250,812500,1625000");
-    lcdSettingDropdown(p, "Spreading", "s.lora.0.spreading_factor", "7,8,9,10,11,12");
-    lcdSettingDropdown(p, "Coding rate", "s.lora.0.coding_rate", "5,6,7,8");
-    lcdSettingSlider  (p, "TX power", "s.lora.0.tx_power", -9, 22);
-    lcdSettingSlider  (p, "Preamble", "s.lora.0.preamble", 6, 32);
-    lcdSettingText    (p, "Sync word", "s.lora.0.sync_word");
-    lcdSettingDropdown(p, "Mode", "s.lora.0.mode",
-                       "full,gateway,access_point,roaming,boundary");
-    lcdSettingSection (p, "Status");
-    lcdSettingValue   (p, "State", "lora.0.state");
-    lcdSettingValue   (p, "Chip", "lora.0.chip");
-    lcdSettingValue   (p, "Bitrate", "lora.0.bitrate_eff");
-    lcdSettingValue   (p, "RSSI", "lora.0.stats.rssi_last");
-}
-#endif
-
 void loraInit(void) {
     char kb[48];
     if (storageGetInt("s.lora.version", 0) < LORA_VERSION) {
@@ -863,10 +831,6 @@ void loraInit(void) {
         storageSet("s.lora.version", LORA_VERSION);
     }
 
-#if CONFIG_SPANGAP_LCD
-    lcdRegisterSettings("Reticulum/Transports/LoRa", "LoRa", loraSettingsPane);
-#endif
-
     cliRegisterCmd("lora", cliLora);
 
     /* Larger stack than other transports for the LoRa frame buffers and
@@ -877,7 +841,7 @@ void loraInit(void) {
 #else  /* ── no radios configured (CONFIG_LORA_COUNT = 0) ── */
 
 void loraInit(void) {
-    /* tr-lora staged but inert: no LoRa pins configured for this board.
+    /* iface-lora staged but inert: no LoRa pins configured for this board.
      * RadioLib links out; set CONFIG_LORA_COUNT and the pins to enable. */
 }
 

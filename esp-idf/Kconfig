@@ -1,11 +1,11 @@
-menu "LoRa radios"
+menu "spangap: reticulous iface-lora"
 
 config LORA_COUNT
     int "Number of LoRa radios"
     range 0 4
     default 0
     help
-        How many LoRa modems this board drives. 0 means no LoRa: tr-lora
+        How many LoRa modems this board drives. 0 means no LoRa: iface-lora
         compiles to a no-op (loraInit() returns immediately, RadioLib is
         linked out). Each radio registers with the transport daemon as a
         separate interface named lora/<slot> (lora/0, lora/1, ...).

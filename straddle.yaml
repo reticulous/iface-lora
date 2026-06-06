@@ -1,4 +1,4 @@
-# tr-lora — SX126x LoRa transport for reticulous.
+# iface-lora — SX126x LoRa transport for reticulous.
 #
 # Carries the RadioLib ESP-IDF HAL (esp_idf_hal.cpp/h). Owns DIO1 ISR;
 # implements RNode on-air framing for ecosystem interop. Drives up to
@@ -9,7 +9,7 @@
 # LORAn_*), resolved from the buildable's sdkconfig. The board sets them in
 # its sdkconfig.defaults; staged-but-inert when CONFIG_LORA_COUNT=0.
 schema_version: 1
-name: reticulous/tr-lora
+name: reticulous/iface-lora
 prefix: rns_lora
 version: 0.1.0
 firmware: esp-idf
@@ -18,11 +18,14 @@ platforms: [idf]
 requires:
   - reticulous/rns
 optional_requires:
-  # lora.cpp registers a Settings pane via lcdSetting* helpers,
-  # gated on CONFIG_SPANGAP_LCD.
+  # On-device LoRa Settings pane — esp-idf/conditional/spangap-lcd/src/lora_lcd.cpp,
+  # compiled only when spangap-lcd is staged and registered via the when:-gated
+  # loraLcdRegister init hook below.
   - spangap/spangap-lcd
 # Auto-init: folded into the generated spangapInitStraddles() dispatcher.
 # loraInit() self-registers with rnsd via ITS; `requires: reticulous/rns` puts
 # rnsd ahead of it in dependency-topo order, so its port surface is up first.
 init:
   - call: loraInit
+  - call: loraLcdRegister
+    when: spangap/spangap-lcd
