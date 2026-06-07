@@ -17,11 +17,6 @@ browser: browser
 platforms: [idf]
 requires:
   - reticulous/rns
-optional_requires:
-  # On-device LoRa Settings pane — esp-idf/conditional/spangap-lcd/src/lora_lcd.cpp,
-  # compiled only when spangap-lcd is staged and registered via the when:-gated
-  # loraLcdRegister init hook below.
-  - spangap/spangap-lcd
 # Auto-init: folded into the generated spangapInitStraddles() dispatcher.
 # loraInit() self-registers with rnsd via ITS; `requires: reticulous/rns` puts
 # rnsd ahead of it in dependency-topo order, so its port surface is up first.
