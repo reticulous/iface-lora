@@ -805,6 +805,12 @@ static void loraTaskMain(void*) {
         probeRadio(r);
     }
 
+    /* Wait for a valid clock before bringing radios on-air, so our first
+     * announces aren't 1970-stamped. LoRa has no IP path to SNTP — time comes
+     * from GPS/RTC if the board has one. A LoRa-only node with no time source
+     * just eats the bounded timeout each boot; set s.sys.time_wait_s=0 there. */
+    waitForTime(0);
+
     for (;;) {
         if (s_configDirty) {
             s_configDirty = false;
