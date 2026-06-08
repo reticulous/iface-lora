@@ -146,6 +146,9 @@ struct LoraRadio {
     bool            enabled;
     uint8_t         curMode;
     uint32_t        curBitrate;
+    char            curIfacNetname[32];   /* IFAC network_name (s.) */
+    char            curIfacNetkey[64];    /* IFAC passphrase (secrets.) */
+    uint8_t         curIfacSize;          /* IFAC access-code length */
 
     /* Split-RX reassembly — one in-flight split at a time per radio. */
     uint8_t         splitBuf[RNS_MTU + 16];
@@ -333,6 +336,9 @@ static bool registerWithRnsd(LoraRadio* r) {
     reg.in = reg.out = 1;
     reg.fwd = (r->curMode == RNS_IFACE_MODE_FULL || r->curMode == RNS_IFACE_MODE_GATEWAY) ? 1 : 0;
     reg.rpt = 0;
+    reg.ifac_size = r->curIfacSize;
+    safeStrncpy(reg.ifac_netname, r->curIfacNetname, sizeof(reg.ifac_netname));
+    safeStrncpy(reg.ifac_netkey,  r->curIfacNetkey,  sizeof(reg.ifac_netkey));
     /* ref = radio index — onRnsdDisconnect uses it to find the radio. */
     r->rnsdHandle = itsConnect("rnsd", RNSD_PORT_TRANSPORT, &reg, sizeof(reg),
                                pdMS_TO_TICKS(500), r->idx,
@@ -410,6 +416,15 @@ static bool radioStart(LoraRadio* r) {
     storageGetStr(sk(kb, sizeof kb, r->idx, "mode"), mode, sizeof(mode), "gateway");
     r->curMode    = modeFromString(mode);
     r->curBitrate = computeBitrate(sf, bw_hz, cr);
+
+    /* IFAC: network_name is config (s.), passphrase is a secret (secrets.). */
+    storageGetStr(sk(kb, sizeof kb, r->idx, "ifac_netname"), r->curIfacNetname, sizeof(r->curIfacNetname), "");
+    {
+        char skb[48];
+        snprintf(skb, sizeof skb, "secrets.lora.%d.ifac_netkey", r->idx);
+        storageGetStr(skb, r->curIfacNetkey, sizeof(r->curIfacNetkey), "");
+    }
+    r->curIfacSize = (uint8_t)storageGetInt(sk(kb, sizeof kb, r->idx, "ifac_size"), 0);
 
     storageSet(rk(kb, sizeof kb, r->idx, "chip"), chipName(r->slot->chip));
     storageSet(rk(kb, sizeof kb, r->idx, "bitrate_eff"), (int)r->curBitrate);
@@ -748,6 +763,7 @@ static void loraTaskMain(void*) {
 
     itsClientInit(kNumRadios);
     storageSubscribeChanges("s.lora", onCfgChange);
+    storageSubscribeChanges("secrets.lora", onCfgChange);  /* IFAC passphrase */
 
     /* Construct radio + HAL per slot. The shared SPI bus is brought up
      * idempotently by spi_helper (EspIdfHal::init), so every radio adds
