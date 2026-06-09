@@ -76,6 +76,5 @@ private:
     int                 _sckPin, _mosiPin, _misoPin, _csPin;
     int                 _sxClockHz;
     spi_device_handle_t _spiDev = nullptr;
-    bool                _isrServiceInstalled = false;
     bool                _inited = false;
 };

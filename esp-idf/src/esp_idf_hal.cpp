@@ -66,15 +66,9 @@ void EspIdfHal::init()
         return;
     }
 
-    /* GPIO ISR service for attachInterrupt — install once, lazily. */
-    if (!_isrServiceInstalled) {
-        r = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
-        if (r == ESP_OK || r == ESP_ERR_INVALID_STATE /* someone beat us */) {
-            _isrServiceInstalled = true;
-        } else {
-            warn("gpio_install_isr_service: %s", esp_err_to_name(r));
-        }
-    }
+    /* GPIO ISR service for attachInterrupt — shared one-shot across the app
+     * (display input INT lines install it too); see spiHelperEnsureGpioIsr. */
+    spiHelperEnsureGpioIsr(ESP_INTR_FLAG_IRAM);
     _inited = true;
 }
 
