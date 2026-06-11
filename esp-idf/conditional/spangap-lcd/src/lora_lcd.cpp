@@ -46,5 +46,5 @@ static void loraSettingsPane(void* arg) {
  * (spangap/spangap-lcd). Plain C++ linkage to match the generated dispatcher's
  * forward decl. */
 void loraLcdRegister(void) {
-    lcdRegisterSettings("Reticulum/Transports/LoRa", "LoRa", loraSettingsPane);
+    lcdRegisterSettings("Mesh Network/RNS Interfaces/LoRa", "LoRa", loraSettingsPane);
 }
