@@ -205,6 +205,36 @@ static PhysicalLayer* radioNew(LoraChip c, Module* m) {
     return nullptr;
 }
 
+/* Human-readable RadioLib status code (RADIOLIB_ERR_* in TypeDef.h) for
+ * the codes our begin/startReceive/transmit paths can hit. Call sites print the
+ * raw code alongside so unlisted values stay searchable in RadioLib docs. */
+static const char* rlErrName(int16_t st) {
+    switch (st) {
+        case RADIOLIB_ERR_NONE:                        return "ok";
+        case RADIOLIB_ERR_UNKNOWN:                     return "unknown error";
+        case RADIOLIB_ERR_CHIP_NOT_FOUND:              return "chip not found";
+        case RADIOLIB_ERR_PACKET_TOO_LONG:             return "packet too long";
+        case RADIOLIB_ERR_TX_TIMEOUT:                  return "tx timeout";
+        case RADIOLIB_ERR_RX_TIMEOUT:                  return "rx timeout";
+        case RADIOLIB_ERR_INVALID_BANDWIDTH:           return "invalid bandwidth";
+        case RADIOLIB_ERR_INVALID_SPREADING_FACTOR:    return "invalid spreading factor";
+        case RADIOLIB_ERR_INVALID_CODING_RATE:         return "invalid coding rate";
+        case RADIOLIB_ERR_INVALID_FREQUENCY:           return "invalid frequency";
+        case RADIOLIB_ERR_INVALID_OUTPUT_POWER:        return "invalid output power";
+        case RADIOLIB_ERR_SPI_WRITE_FAILED:            return "SPI write failed";
+        case RADIOLIB_ERR_INVALID_PREAMBLE_LENGTH:     return "invalid preamble length";
+        case RADIOLIB_ERR_WRONG_MODEM:                 return "wrong modem";
+        case RADIOLIB_ERR_INVALID_FREQUENCY_DEVIATION: return "invalid frequency deviation";
+        case RADIOLIB_ERR_INVALID_RX_BANDWIDTH:        return "invalid rx bandwidth";
+        case RADIOLIB_ERR_INVALID_SYNC_WORD:           return "invalid sync word";
+        case RADIOLIB_ERR_INVALID_TCXO_VOLTAGE:        return "invalid TCXO voltage";
+        case RADIOLIB_ERR_SPI_CMD_TIMEOUT:             return "SPI cmd timeout";
+        case RADIOLIB_ERR_SPI_CMD_INVALID:             return "SPI cmd invalid";
+        case RADIOLIB_ERR_SPI_CMD_FAILED:              return "SPI cmd failed";
+        default:                                       return "unknown";
+    }
+}
+
 /* LR11x0's begin() takes neither frequency nor power — set them (and the TCXO)
  * after. `high` selects the 2.4 GHz front-end on parts that have one. */
 static int16_t lr11x0Begin(LoraRadio* r, float freq, float bw, uint8_t sf, uint8_t cr,
@@ -403,10 +433,10 @@ static bool radioStart(LoraRadio* r) {
     int16_t st = radioBegin(r, freq_mhz, bw_khz, (uint8_t)sf, (uint8_t)cr,
                             (uint8_t)syncWord, (int8_t)txp, (uint16_t)preamble, tcxo_v);
     if (st != RADIOLIB_ERR_NONE) {
-        /* Common SX126x return codes: -2 chip not found, -705 SPI cmd timeout
-         * (often TCXO/PLL), -12 invalid frequency for the band. radioBegin also
-         * applies the DIO2-as-RF-switch option (SX126x) before returning. */
-        err("lora/%d %s begin failed: %d", r->idx, chipName(r->slot->chip), (int)st);
+        /* SPI cmd timeout is often TCXO/PLL. radioBegin also applies the
+         * DIO2-as-RF-switch option (SX126x) before returning. */
+        err("lora/%d %s begin failed: %s (%d)",
+            r->idx, chipName(r->slot->chip), rlErrName(st), (int)st);
         publishState(r, "error");
         return false;
     }
@@ -433,7 +463,7 @@ static bool radioStart(LoraRadio* r) {
     r->radio->setPacketReceivedAction(loraRadioIsr);
     st = r->radio->startReceive();
     if (st != RADIOLIB_ERR_NONE) {
-        err("lora/%d startReceive failed: %d", r->idx, (int)st);
+        err("lora/%d startReceive failed: %s (%d)", r->idx, rlErrName(st), (int)st);
         publishState(r, "error");
         return false;
     }
@@ -471,8 +501,8 @@ static void probeRadio(LoraRadio* r) {
         storageSet(rk(b, sizeof b, r->idx, "chip"), chip);
         r->radio->sleep();
     } else {
-        warn("lora/%d: %s NOT found at cs=%d (begin=%d)",
-             r->idx, chip, r->slot->cs, (int)st);
+        warn("lora/%d: %s NOT found at cs=%d (begin: %s (%d))",
+             r->idx, chip, r->slot->cs, rlErrName(st), (int)st);
     }
 }
 
@@ -552,7 +582,8 @@ static bool sendOneFrame(LoraRadio* r, const uint8_t* frame, size_t flen) {
     /* RadioLib leaves the radio in standby after transmit; re-arm RX. */
     r->radio->startReceive();
     if (st != RADIOLIB_ERR_NONE) {
-        warn("lora/%d transmit %u B failed: %d", r->idx, (unsigned)flen, (int)st);
+        warn("lora/%d transmit %u B failed: %s (%d)",
+             r->idx, (unsigned)flen, rlErrName(st), (int)st);
         return false;
     }
     r->txFrames++;
