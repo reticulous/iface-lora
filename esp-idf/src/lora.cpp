@@ -45,6 +45,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cmath>
 
 static const char* TAG = "lora";
 
@@ -303,12 +304,34 @@ static IRAM_ATTR void loraRadioIsr(void) {
 
 /* ─────────────── helpers ─────────────── */
 
-static uint32_t computeBitrate(int sf, int bw_hz, int cr_denom) {
-    /* LoRa raw bit rate (bits/s) = SF * (BW / 2^SF) * (4 / cr_denom). */
-    if (sf <= 0 || bw_hz <= 0 || cr_denom < 5 || cr_denom > 8) return 0;
-    double rb = (double)sf * (double)bw_hz * 4.0
-              / ((double)((uint32_t)1 << sf) * (double)cr_denom);
-    return (uint32_t)rb;
+/* Time-on-air (seconds) for a `payload`-byte LoRa frame, per Semtech
+ * AN1200.13. Symbol time Tsym = 2^SF / BW; the preamble runs (n+4.25)
+ * symbols and the payload rounds up into whole symbols, with low-data-rate
+ * optimisation (DE) engaged once a symbol exceeds 16 ms. Assumes explicit
+ * header and CRC on — the config radioStart brings the radio up with. */
+static double loraAirtimeSeconds(int sf, int bw_hz, int cr_denom,
+                                 int preamble, int payload) {
+    if (sf <= 0 || bw_hz <= 0 || cr_denom < 5 || cr_denom > 8) return 0.0;
+    double tSym = (double)((uint32_t)1 << sf) / (double)bw_hz;
+    int    de   = (tSym > 0.016) ? 1 : 0;          /* low-data-rate optimize */
+    int    cr   = cr_denom - 4;                    /* coded bits 1..4 */
+    double num  = 8.0 * payload - 4.0 * sf + 28.0 + 16.0 /*CRC*/ - 0.0 /*explicit header*/;
+    double den  = 4.0 * (sf - 2 * de);
+    double payloadSym = 8.0 + fmax(ceil(num / den) * (cr + 4), 0.0);
+    return (preamble + 4.25) * tSym + payloadSym * tSym;
+}
+
+/* Effective bps to register with rnsd. RNS derives its first-hop link
+ * timeout as MTU*8/bitrate + 6 s, so registering bitrate = 4000/ceil(toa)
+ * makes that term equal the (whole-second-rounded) airtime of one MTU — the
+ * link establishment budget then tracks how long a 500-byte frame really
+ * takes on this SF/BW/CR/preamble. */
+static uint32_t computeBitrate(int sf, int bw_hz, int cr_denom, int preamble) {
+    double toa = loraAirtimeSeconds(sf, bw_hz, cr_denom, preamble, RNS_MTU);
+    if (toa <= 0.0) return 0;
+    double secs = ceil(toa);
+    if (secs < 1.0) secs = 1.0;
+    return (uint32_t)((double)(RNS_MTU * 8) / secs);
 }
 
 static uint8_t modeFromString(const char* s) {
@@ -445,7 +468,7 @@ static bool radioStart(LoraRadio* r) {
     char mode[24] = "gateway";
     storageGetStr(sk(kb, sizeof kb, r->idx, "mode"), mode, sizeof(mode), "gateway");
     r->curMode    = modeFromString(mode);
-    r->curBitrate = computeBitrate(sf, bw_hz, cr);
+    r->curBitrate = computeBitrate(sf, bw_hz, cr, preamble);
 
     /* IFAC: network_name is config (s.), passphrase is a secret (secrets.). */
     storageGetStr(sk(kb, sizeof kb, r->idx, "ifac_netname"), r->curIfacNetname, sizeof(r->curIfacNetname), "");

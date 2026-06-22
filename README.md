@@ -64,6 +64,13 @@ Configuration (runtime, per radio — replace `<n>` with the slot index):
 - `s.lora.<n>.tx_power` — dBm (-9..22)
 - `s.lora.<n>.mode` — RNS iface mode (full/gateway/access_point/roaming/boundary)
 
+The interface registers an effective bitrate (`lora.<n>.bitrate_eff`)
+derived from the **time-on-air of one 500-byte frame** at the configured
+SF/BW/CR/preamble (Semtech AN1200.13), reported as `4000 / ceil(airtime_s)`
+bps. That makes RNS's first-hop link-establishment timeout
+(`MTU*8/bitrate + 6 s`) equal `ceil(airtime) + 6 s`, so link setup waits
+roughly one frame's airtime plus margin instead of a fixed budget.
+
 ## Dependencies
 
 - [rns](../rns)
