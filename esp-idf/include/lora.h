@@ -1,5 +1,5 @@
 /**
- * lora — RadioLib LoRa transport task.
+ * lora — RadioLib LoRa interface task.
  *
  * Drives any RadioLib LoRa chip (SX126x, SX127x/RFM9x, SX128x, LR11x0, LR2021;
  * per-radio Kconfig) via RadioLib + a custom ESP-IDF HAL. The chip's IRQ line

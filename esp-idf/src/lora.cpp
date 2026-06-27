@@ -1,5 +1,5 @@
 /**
- * lora — LoRa transport task (one or more radios).
+ * lora — LoRa interface task (one or more radios).
  *
  * Drives up to CONFIG_LORA_COUNT LoRa modems off one shared SPI bus. Pins
  * and per-radio type come from Kconfig (LORA_* / LORAn_*), set by the
@@ -59,7 +59,7 @@ static const char* TAG = "lora";
 
 /* ─────────────── Kconfig → descriptor table ─────────────── */
 
-/* Every RadioLib LoRa chip this transport drives, as (enum suffix, RadioLib
+/* Every RadioLib LoRa chip this interface drives, as (enum suffix, RadioLib
  * class name, family). The X-macro generates the LoraChip enum, the name table,
  * the family map, and the constructor switch from this one list — and its order
  * fixes the numeric CONFIG_LORAn_CHIP_ID the Kconfig choice resolves to, so keep
@@ -381,7 +381,7 @@ static void deregisterFromRnsd(LoraRadio* r) {
 
 static bool registerWithRnsd(LoraRadio* r) {
     deregisterFromRnsd(r);
-    rnsd_transport_t reg = {};
+    rnsd_iface_t reg = {};
     snprintf(reg.name, sizeof(reg.name), "lora/%d", r->idx);
     reg.mtu     = RNS_MTU;
     reg.bitrate = r->curBitrate;
@@ -393,7 +393,7 @@ static bool registerWithRnsd(LoraRadio* r) {
     safeStrncpy(reg.ifac_netname, r->curIfacNetname, sizeof(reg.ifac_netname));
     safeStrncpy(reg.ifac_netkey,  r->curIfacNetkey,  sizeof(reg.ifac_netkey));
     /* ref = radio index — onRnsdDisconnect uses it to find the radio. */
-    r->rnsdHandle = itsConnect("rnsd", RNSD_PORT_TRANSPORT, &reg, sizeof(reg),
+    r->rnsdHandle = itsConnect("rnsd", RNSD_PORT_IFACE, &reg, sizeof(reg),
                                pdMS_TO_TICKS(500), r->idx,
                                onRnsdRecv, onRnsdDisconnect);
     if (r->rnsdHandle < 0) {
@@ -835,7 +835,7 @@ static void loraTaskMain(void*) {
      * its own device on the one bus. begin() is deferred to applyConfig
      * so we only touch RF hardware when a radio is enabled. The board's
      * peripheral power rail (if any) is already up — the buildable owns
-     * it (e.g. hw-tdeck's tdeckPowerInit), not this transport. */
+     * it (e.g. hw-tdeck's tdeckPowerInit), not this interface. */
     for (int i = 0; i < kNumRadios; i++) {
         LoraRadio* r = &s_radios[i];
         r->idx        = i;
@@ -906,7 +906,9 @@ void loraInit(void) {
         /* Per-radio defaults. Frequency + TX power are user-must-pick
          * (region / antenna); everything else defaults so an enable-toggle
          * alone gets a radio up. */
-        for (int i = 0; i < kNumRadios; i++) {
+        /* Radio 0 is seeded from the settings: block in straddle.yaml; this loop
+         * covers radios 1.. on multi-radio boards. */
+        for (int i = 1; i < kNumRadios; i++) {
             storageDefault(sk(kb, sizeof kb, i, "enable"), 0);
             storageDefault(sk(kb, sizeof kb, i, "mode"), "gateway");
             storageDefault(sk(kb, sizeof kb, i, "bandwidth"), 125000);     /* 125 kHz */
@@ -920,7 +922,7 @@ void loraInit(void) {
 
     cliRegisterCmd("lora", cliLora);
 
-    /* Larger stack than other transports for the LoRa frame buffers and
+    /* Larger stack than other interfaces for the LoRa frame buffers and
      * RadioLib state machine. PSRAM stack. */
     s_task = spawnTask(loraTaskMain, TAG, 8192, nullptr, 2, 0, STACK_PSRAM);
 }
