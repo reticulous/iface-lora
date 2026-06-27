@@ -22,11 +22,86 @@ requires:
 # rnsd ahead of it in dependency-topo order, so its port surface is up first.
 init:
   - call: loraInit
-  - call: loraLcdRegister
-    when: spangap/spangap-lcd
 
 # Browser-side UI registration (parallel to init: above) — auto-wired into
 # the buildable SPA via straddles.gen.ts; no web-interface edit needed.
 browser_register:
   - call: registerLora
     module: modules/lora
+
+# Declarative settings: LCD pane + radio-0 storage defaults generated from this
+# block. web: false — LoraPanel.vue keeps the web leaf (IFAC secret, descriptive
+# option labels, status badges). Radio 0 only; radios 1.. seeded by the loop in
+# lora.cpp. Frequency + TX power carry no default (region/antenna — user must pick).
+settings:
+  - menu:
+      - { id: mesh, label: "Mesh Network", placement: 3 }
+      - { id: interfaces, label: "RNS Interfaces", placement: 2 }
+      - { id: lora, label: "LoRa" }
+    web: false
+    rows:
+      - section: "LoRa"
+      - switch: { label: "Enable", key: "s.lora.0.enable", default: 0 }
+      - section: "Radio"
+      - dropdown:
+          label: "Frequency"
+          key: "s.lora.0.frequency"
+          options:
+            - { v: 433000000,  l: "433 MHz" }
+            - { v: 868100000,  l: "868.1 MHz" }
+            - { v: 869525000,  l: "869.525 MHz" }
+            - { v: 915000000,  l: "915 MHz" }
+            - { v: 923000000,  l: "923 MHz" }
+            - { v: 2400000000, l: "2400 MHz" }
+            - { v: 2450000000, l: "2450 MHz" }
+            - { v: 2480000000, l: "2480 MHz" }
+      - dropdown:
+          label: "Bandwidth"
+          key: "s.lora.0.bandwidth"
+          default: 125000
+          options:
+            - { v: 125000,  l: "125 kHz" }
+            - { v: 250000,  l: "250 kHz" }
+            - { v: 500000,  l: "500 kHz" }
+            - { v: 203125,  l: "203 kHz" }
+            - { v: 406250,  l: "406 kHz" }
+            - { v: 812500,  l: "812 kHz" }
+            - { v: 1625000, l: "1625 kHz" }
+      - dropdown:
+          label: "Spreading"
+          key: "s.lora.0.spreading_factor"
+          default: 7
+          options:
+            - { v: 7,  l: "SF7" }
+            - { v: 8,  l: "SF8" }
+            - { v: 9,  l: "SF9" }
+            - { v: 10, l: "SF10" }
+            - { v: 11, l: "SF11" }
+            - { v: 12, l: "SF12" }
+      - dropdown:
+          label: "Coding rate"
+          key: "s.lora.0.coding_rate"
+          default: 5
+          options:
+            - { v: 5, l: "4/5" }
+            - { v: 6, l: "4/6" }
+            - { v: 7, l: "4/7" }
+            - { v: 8, l: "4/8" }
+      - slider: { label: "TX power", key: "s.lora.0.tx_power", min: -9, max: 22 }
+      - slider: { label: "Preamble", key: "s.lora.0.preamble", min: 6, max: 32, default: 12 }
+      - text:   { label: "Sync word", key: "s.lora.0.sync_word", default: "0x42" }
+      - dropdown:
+          label: "Mode"
+          key: "s.lora.0.mode"
+          default: "gateway"
+          options:
+            - { v: "full",         l: "Full" }
+            - { v: "gateway",      l: "Gateway" }
+            - { v: "access_point", l: "Access point" }
+            - { v: "roaming",      l: "Roaming" }
+            - { v: "boundary",     l: "Boundary" }
+      - section: "Status"
+      - value: { label: "State", key: "lora.0.state" }
+      - value: { label: "Chip", key: "lora.0.chip" }
+      - value: { label: "Bitrate", key: "lora.0.bitrate_eff" }
+      - value: { label: "RSSI", key: "lora.0.stats.rssi_last" }
