@@ -1,8 +1,9 @@
 /**
  * EspIdfHal — RadioLib HAL implementation on top of ESP-IDF.
  *
- * Owns the SPI device handle for the SX1262 (bus is initialized once, in
- * loraInit). GPIO pin numbers are passed through verbatim — the radio
+ * Owns one SPI device handle on the shared bus per radio (the bus is brought
+ * up idempotently via spi_helper). GPIO pin numbers are passed through
+ * verbatim — the radio
  * module hands us back whatever we set as `inputPin`/`outputPin`/etc. in
  * the ctor, so we map our HAL constants 1:1 onto ESP-IDF enums.
  *

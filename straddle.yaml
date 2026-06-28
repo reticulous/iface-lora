@@ -1,9 +1,9 @@
-# iface-lora — SX126x LoRa transport for reticulous.
+# iface-lora — LoRa interface for reticulous.
 #
-# Carries the RadioLib ESP-IDF HAL (esp_idf_hal.cpp/h). Owns DIO1 ISR;
-# implements RNode on-air framing for ecosystem interop. Drives up to
-# CONFIG_LORA_COUNT radios on one shared SPI bus, each registering with
-# rnsd as lora/<slot>.
+# Carries the RadioLib ESP-IDF HAL (esp_idf_hal.cpp/h). Owns the radio IRQ
+# line; frames RNS packets with a self-contained 1-byte-header split format
+# (≤2 LoRa frames per 500-byte packet). Drives up to CONFIG_LORA_COUNT radios
+# on one shared SPI bus, each registering with rnsd as lora/<slot>.
 #
 # Pins + per-radio type come from this component's own Kconfig (LORA_* /
 # LORAn_*), resolved from the buildable's sdkconfig. The board sets them in

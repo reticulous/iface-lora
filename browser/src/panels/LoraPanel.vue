@@ -3,7 +3,7 @@
     <PanelHeading title="LoRa" />
 
     <div class="text-caption" style="opacity:0.7">
-      SX1262 LoRa transport. Pick a band, bandwidth, spreading factor, and
+      LoRa interface. Pick a band, bandwidth, spreading factor, and
       coding rate; the radio stays disabled until you enable it.
     </div>
 
@@ -96,8 +96,9 @@ const snr       = computed(() => Number(device.get('lora.0.stats.snr_last')  ?? 
 const rxFrames  = computed(() => Number(device.get('lora.0.stats.rx_frames') ?? 0))
 const txFrames  = computed(() => Number(device.get('lora.0.stats.tx_frames') ?? 0))
 
-/* No preselected defaults (plan §12.4). All values stored as ints
- * (frequency in Hz, bandwidth in Hz) so storage stays type-clean. */
+/* Frequency and TX power have no preselected default (region/antenna — the
+ * user must pick). All values stored as ints (frequency in Hz, bandwidth in
+ * Hz) so storage stays type-clean. */
 
 /* Storage values are stored as strings here (matching spangap's
  * SettingSelect type); storageGetInt on the device side atoi's them. */

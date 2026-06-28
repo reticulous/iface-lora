@@ -16,18 +16,18 @@
  * single task services every radio: each radio's IRQ line notifies the task; on
  * wake the task polls each radio's IRQ flags (read-only, so polling one never
  * disturbs another's in-flight RX), drains the one that completed, reassembles
- * RNode-framed packets, and forwards to rnsd.
+ * split-framed packets, and forwards to rnsd.
  *
- * RNode on-air framing (mandatory for interop, see plan §7.1):
+ * On-air split framing (a self-contained 1-byte-header format local to this
+ * codebase — not RNode/HDLC/KISS, no byte-stuffing):
  *   [1B header][≤254B payload]
  *   header upper nibble = random sequence id
  *   header bit 0       = SPLIT (this is part of a 2-frame split packet)
+ * A 500-byte RNS packet rides at most two frames.
  *
  * TX: synchronous radio.transmit() in the task. The radio is half-duplex so
  * we cannot transmit while a split RX is pending — guarded per radio by
  * splitPending.
- *
- * See docs/component-plan.md §7 / §12.
  */
 #include "lora.h"
 #include "esp_idf_hal.h"
