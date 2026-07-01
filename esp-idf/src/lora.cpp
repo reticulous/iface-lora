@@ -345,6 +345,10 @@ static uint8_t modeFromString(const char* s) {
 
 static void publishStats(LoraRadio* r) {
     char b[48];
+    /* One bracket → one storage op. Unbracketed this fired ~8 separate sync
+     * round-trips to the storage task every second; under an inbound-message
+     * burst those pile up on the storage op port and stall the radio task. */
+    storageBegin();
     storageSet(rk(b, sizeof b, r->idx, "stats.tx_bytes"),  (int)(r->txBytes & 0x7fffffff));
     storageSet(rk(b, sizeof b, r->idx, "stats.rx_bytes"),  (int)(r->rxBytes & 0x7fffffff));
     storageSet(rk(b, sizeof b, r->idx, "stats.tx_frames"), (int)(r->txFrames & 0x7fffffff));
@@ -353,6 +357,7 @@ static void publishStats(LoraRadio* r) {
     storageSet(rk(b, sizeof b, r->idx, "stats.split_rx_timeout"), (int)(r->splitTimeouts & 0x7fffffff));
     storageSet(rk(b, sizeof b, r->idx, "stats.rssi_last"), (int)r->rssiLast);
     storageSet(rk(b, sizeof b, r->idx, "stats.snr_last"),  (int)r->snrLast);
+    storageEnd();
 }
 
 static void publishState(LoraRadio* r, const char* state) {
