@@ -11,7 +11,7 @@
 schema_version: 1
 name: reticulous/iface-lora
 prefix: rns_lora
-version: 0.1.0
+version: 0.0.0
 firmware: esp-idf
 browser: browser
 platforms: [idf]
