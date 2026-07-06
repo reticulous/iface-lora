@@ -47,8 +47,6 @@
 #include <cstdint>
 #include <cmath>
 
-static const char* TAG = "lora";
-
 #define LORA_VERSION         2
 #define RNS_MTU              500
 #define RNODE_MAX_PAYLOAD    254
@@ -56,6 +54,8 @@ static const char* TAG = "lora";
 #define SPLIT_RX_TIMEOUT_MS  5000
 
 #if defined(CONFIG_LORA0_CS_PIN)   /* ── at least one radio configured ── */
+
+static const char* TAG = "lora";
 
 /* ─────────────── Kconfig → descriptor table ─────────────── */
 
