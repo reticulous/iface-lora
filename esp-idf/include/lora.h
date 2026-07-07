@@ -10,4 +10,9 @@
  */
 #pragma once
 
-void loraInit(void);
+#include "service.h"
+
+class LoraService : public Service {
+public:
+    void onInit() override;
+};

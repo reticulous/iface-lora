@@ -905,7 +905,7 @@ static void loraTaskMain(void*) {
     }
 }
 
-void loraInit(void) {
+void LoraService::onInit() {
     char kb[48];
     if (storageGetInt("s.lora.version", 0) < LORA_VERSION) {
         /* Per-radio defaults. Frequency + TX power are user-must-pick
@@ -934,7 +934,7 @@ void loraInit(void) {
 
 #else  /* ── no radios configured (CONFIG_LORA_COUNT = 0) ── */
 
-void loraInit(void) {
+void LoraService::onInit() {
     /* iface-lora staged but inert: no LoRa pins configured for this board.
      * RadioLib links out; set CONFIG_LORA_COUNT and the pins to enable. */
 }

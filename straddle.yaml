@@ -17,11 +17,11 @@ browser: browser
 platforms: [idf]
 requires:
   - reticulous/rns
-# Auto-init: folded into the generated spangapInitStraddles() dispatcher.
-# loraInit() self-registers with rnsd via ITS; `requires: reticulous/rns` puts
-# rnsd ahead of it in dependency-topo order, so its port surface is up first.
-init:
-  - call: loraInit
+# Boot-registered Service: LoraService::onInit() self-registers with rnsd via
+# ITS; `requires: reticulous/rns` puts rnsd ahead of it in dependency-topo
+# order, so its port surface is up first.
+services:
+  - { class: LoraService, header: lora.h }
 
 # Browser-side UI registration (parallel to init: above) — auto-wired into
 # the buildable SPA via straddles.gen.ts; no web-interface edit needed.
