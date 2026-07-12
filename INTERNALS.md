@@ -260,16 +260,44 @@ the radio (full config is re-applied on the next start, so config retention
 doesn't matter), clears split state, deregisters from `rnsd`, and publishes
 `state = down`.
 
-## 10. Defaults seeding
+## 10. MHz/kHz unit bridge
+
+`s.lora.<n>.frequency` and `.bandwidth` are stored in **Hz**, but the settings
+pane and the `lora` CLI speak **MHz / kHz**. So each radio mirrors its two Hz
+config keys to a pair of **ephemeral** display keys — `lora.<n>.freq_mhz` and
+`lora.<n>.bw_khz` — holding a trimmed decimal (`hzToUnit`). The `straddle.yaml`
+pane binds two plain `text` rows to those ephemeral keys (not to `s.lora.*`), so
+the operator types any value in human units — no preset dropdown.
+
+Both directions run on the task, never in a storage callback:
+
+- **Hz → display** (`loraPublishDisplay`): after every config apply (and once at
+  `onInit`, so the pane has values before the `rns.ready` barrier lifts) each
+  radio re-publishes its display keys.
+- **display → Hz** (`loraApplyDisplay`): editing a display key fires
+  `onDisplayChange`, which raises `s_displayDirty` + notifies. The task parses
+  each field (`unitToHz`); a valid, in-range, **changed** value is written back
+  to the `s.lora.<n>.*` Hz key (which re-fires `onCfgChange` → radio reconfig +
+  re-publish); an unparseable or out-of-range entry is reverted to the stored
+  value.
+
+The "write only on a real change" guard on both sides is what keeps the
+round-trip from looping. Bounds are int32-safe (`freq ≤ 2 GHz`) — storage ints
+are 32-bit, so a 2.4 GHz value would overflow regardless.
+
+## 11. Defaults seeding
 
 `loraInit` registers the `lora` CLI and spawns the task. It seeds per-radio
 defaults under a `s.lora.version` gate (`LORA_VERSION = 2`) for radios **1..**
 only — radio 0's defaults come from this straddle's `settings:` block in
-`straddle.yaml`. Frequency and TX power carry no default (region/antenna — the
-user must pick); everything else defaults so an enable-toggle alone gets a radio
-up. `loraInit` does **not** touch any power pin — the board owns the LoRa rail.
+`straddle.yaml`, **except** `s.lora.0.bandwidth`: its pane row binds the kHz
+display key rather than the Hz config key, so `loraInit` seeds that one default
+(125 kHz) for radio 0 directly. Frequency and TX power carry no default
+(region/antenna — the user must pick); everything else defaults so an
+enable-toggle alone gets a radio up. `loraInit` does **not** touch any power pin
+— the board owns the LoRa rail.
 
-## 11. Pitfalls
+## 12. Pitfalls
 
 - **The LoRa rail is the board's, not this straddle's.** The radio is unreachable
   on SPI until whatever powers it is up and settled; `begin()` then returns

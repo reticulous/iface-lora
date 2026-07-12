@@ -43,30 +43,12 @@ settings:
       - section: "LoRa"
       - switch: { label: "Enable", key: "s.lora.0.enable", default: 0 }
       - section: "Radio"
-      - dropdown:
-          label: "Frequency"
-          key: "s.lora.0.frequency"
-          options:
-            - { v: 433000000,  l: "433 MHz" }
-            - { v: 868100000,  l: "868.1 MHz" }
-            - { v: 869525000,  l: "869.525 MHz" }
-            - { v: 915000000,  l: "915 MHz" }
-            - { v: 923000000,  l: "923 MHz" }
-            - { v: 2400000000, l: "2400 MHz" }
-            - { v: 2450000000, l: "2450 MHz" }
-            - { v: 2480000000, l: "2480 MHz" }
-      - dropdown:
-          label: "Bandwidth"
-          key: "s.lora.0.bandwidth"
-          default: 125000
-          options:
-            - { v: 125000,  l: "125 kHz" }
-            - { v: 250000,  l: "250 kHz" }
-            - { v: 500000,  l: "500 kHz" }
-            - { v: 203125,  l: "203 kHz" }
-            - { v: 406250,  l: "406 kHz" }
-            - { v: 812500,  l: "812 kHz" }
-            - { v: 1625000, l: "1625 kHz" }
+      # Frequency/bandwidth are stored in Hz but entered here in MHz/kHz. These
+      # rows bind ephemeral display keys, not s.lora.0.*; lora.cpp mirrors the Hz
+      # config to them and converts edits back (so any value works, not presets).
+      # Bandwidth's s.lora.0.bandwidth default is seeded in lora.cpp, not here.
+      - text: { label: "Frequency (MHz)", key: "lora.0.freq_mhz" }
+      - text: { label: "Bandwidth (kHz)", key: "lora.0.bw_khz" }
       - dropdown:
           label: "Spreading"
           key: "s.lora.0.spreading_factor"

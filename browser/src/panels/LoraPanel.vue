@@ -3,16 +3,26 @@
     <PanelHeading title="LoRa" />
 
     <div class="text-caption" style="opacity:0.7">
-      LoRa interface. Pick a band, bandwidth, spreading factor, and
-      coding rate; the radio stays disabled until you enable it.
+      LoRa interface. Set frequency and bandwidth directly, pick a spreading
+      factor and coding rate; the radio stays disabled until you enable it.
     </div>
 
     <SettingToggle label="Enabled" k="s.lora.0.enable" />
 
     <div class="section-heading">Radio</div>
 
-    <SettingSelect label="Frequency" k="s.lora.0.frequency" :options="freqOptions" />
-    <SettingSelect label="Bandwidth" k="s.lora.0.bandwidth" :options="bwOptions" />
+    <div class="row items-center no-wrap">
+      <div class="col-4 text-caption">Frequency</div>
+      <q-input class="col" :model-value="freqText" dense outlined debounce="500"
+        suffix="MHz" inputmode="decimal" placeholder="e.g. 869.525"
+        @update:model-value="setFreq" />
+    </div>
+    <div class="row items-center no-wrap">
+      <div class="col-4 text-caption">Bandwidth</div>
+      <q-input class="col" :model-value="bwText" dense outlined debounce="500"
+        suffix="kHz" inputmode="decimal" placeholder="e.g. 125"
+        @update:model-value="setBw" />
+    </div>
     <SettingSelect label="Spreading factor" k="s.lora.0.spreading_factor" :options="sfOptions" />
     <SettingSelect label="Coding rate" k="s.lora.0.coding_rate" :options="crOptions" />
     <SettingSlider label="TX power (dBm)" k="s.lora.0.tx_power" :min="-9" :max="22" />
@@ -96,33 +106,35 @@ const snr       = computed(() => Number(device.get('lora.0.stats.snr_last')  ?? 
 const rxFrames  = computed(() => Number(device.get('lora.0.stats.rx_frames') ?? 0))
 const txFrames  = computed(() => Number(device.get('lora.0.stats.tx_frames') ?? 0))
 
-/* Frequency and TX power have no preselected default (region/antenna — the
- * user must pick). All values stored as ints (frequency in Hz, bandwidth in
- * Hz) so storage stays type-clean. */
+/* Frequency and bandwidth are stored in Hz (int) but entered in human units —
+ * MHz for frequency, kHz for bandwidth — so any value is allowed, not just a
+ * fixed set of presets. Frequency has no default (region/antenna — the user
+ * must pick); the device rejects an unconfigured/out-of-band radio too.
+ *
+ * hzToUnit renders the stored Hz as a trimmed decimal in `scale` units;
+ * commitHz parses the entry back to Hz and writes it. A non-numeric or
+ * out-of-range entry is ignored, so storage keeps its last good value. */
+function hzToUnit(raw: unknown, scale: number): string {
+  const hz = Number(raw ?? 0)
+  if (!(hz > 0)) return ''
+  return (hz / scale).toFixed(6).replace(/\.?0+$/, '')
+}
+function commitHz(k: string, val: string | number | null,
+                 scale: number, minHz: number, maxHz: number) {
+  const n = parseFloat(String(val ?? ''))
+  if (!Number.isFinite(n)) return                 // non-numeric → keep current
+  const hz = Math.round(n * scale)
+  if (hz < minHz || hz > maxHz) return            // out of range → ignore
+  device.set(k, hz)
+}
 
-/* Storage values are stored as strings here (matching spangap's
- * SettingSelect type); storageGetInt on the device side atoi's them. */
-const freqOptions = [
-  { label: '433.000 MHz (ISM EU/AS)', value: '433000000' },
-  { label: '868.100 MHz (EU868)',     value: '868100000' },
-  { label: '869.525 MHz (EU868 RNS)', value: '869525000' },
-  { label: '915.000 MHz (US915)',     value: '915000000' },
-  { label: '923.000 MHz (AS923)',     value: '923000000' },
-  /* 2.4 GHz — SX128x only */
-  { label: '2400.000 MHz (2.4 GHz)',  value: '2400000000' },
-  { label: '2450.000 MHz (2.4 GHz)',  value: '2450000000' },
-  { label: '2480.000 MHz (2.4 GHz)',  value: '2480000000' },
-]
-const bwOptions = [
-  { label: '125 kHz', value: '125000' },
-  { label: '250 kHz', value: '250000' },
-  { label: '500 kHz', value: '500000' },
-  /* SX128x (2.4 GHz) bandwidths */
-  { label: '203 kHz (SX128x)',  value: '203125' },
-  { label: '406 kHz (SX128x)',  value: '406250' },
-  { label: '812 kHz (SX128x)',  value: '812500' },
-  { label: '1625 kHz (SX128x)', value: '1625000' },
-]
+const freqText = computed(() => hzToUnit(device.get('s.lora.0.frequency'), 1e6))
+const bwText   = computed(() => hzToUnit(device.get('s.lora.0.bandwidth'), 1e3))
+/* Bounds span every chip family this interface drives: ~137 MHz (SX127x low)
+ * to 2.5 GHz (SX128x), and 7.8 kHz to 1625 kHz bandwidth. */
+const setFreq = (v: string | number | null) => commitHz('s.lora.0.frequency', v, 1e6, 137e6, 2600e6)
+const setBw   = (v: string | number | null) => commitHz('s.lora.0.bandwidth', v, 1e3, 5e3, 1700e3)
+
 const sfOptions = [
   { label: 'SF7 (fast, short range)',  value: '7' },
   { label: 'SF8',                       value: '8' },
