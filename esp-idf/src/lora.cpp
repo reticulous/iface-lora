@@ -679,6 +679,14 @@ static bool radioStart(LoraRadio* r) {
         publishState(r, "error");
         return false;
     }
+    /* Make DIO1 a genuine light-sleep wake source. RadioLib's attachInterrupt
+     * armed it POSEDGE, but edges are invisible in light sleep (the GPIO clock is
+     * gated), so an incoming packet couldn't wake the SoC — RX only landed on the
+     * next ~1 Hz poll. Re-arm HIGH_LEVEL (DIO1 asserts high on IRQ): the level
+     * both wakes us and re-fires the isr trampoline, and the task drops the line
+     * by clearing the IRQ in readData(). This is the level-triggered DIO1 the
+     * re-arm paths already assume; paired with pmGpioWakeDisable in radioStop. */
+    pmGpioWakeEnable(r->slot->dio1, GPIO_INTR_HIGH_LEVEL);
 
     r->running = true;
     publishState(r, "up");
