@@ -317,6 +317,138 @@ static const char* rk(char* b, size_t n, int i, const char* leaf) {
     snprintf(b, n, "lora.%d.%s", i, leaf); return b;
 }
 
+/* ─────────────── per-packet debug trace (`log lora debug`) ───────────────
+ *
+ * Decodes the Reticulum header of a whole (reassembled) RNS frame into a
+ * one-line summary at debug level; at verbose level the entire frame is also
+ * dumped as hex. This traces the RNS packet, not the on-air split frame — so
+ * it runs at the reassembly boundary (deliverInbound for rx, sendRnsPacket for
+ * tx), free of the local 1-byte split header.
+ *
+ * RNS wire header (RNS/Packet.py):
+ *   byte0 flags: [IFAC 0x80][hdr2 0x40][ctxflag 0x20][transport 0x10]
+ *                [dest-type 0x0C][packet-type 0x03]
+ *   byte1 hops
+ *   [IFAC access code: ifac_size bytes, present iff IFAC flag set]
+ *   [transport-id: 16 bytes, present iff hdr2 (HEADER_2)]
+ *   [destination hash: 16 bytes]
+ *   [context: 1 byte]
+ *   [data ...]
+ */
+
+static void loraHex(char* out, const uint8_t* d, size_t n) {
+    static const char H[] = "0123456789abcdef";
+    for (size_t i = 0; i < n; i++) { out[2*i] = H[d[i] >> 4]; out[2*i+1] = H[d[i] & 0xF]; }
+    out[2*n] = '\0';
+}
+
+static const char* loraPktType(uint8_t t) {   /* flags & 0x03 */
+    switch (t) { case 0: return "data"; case 1: return "announce";
+                 case 2: return "linkreq"; default: return "proof"; }
+}
+static const char* loraDestType(uint8_t t) {   /* (flags >> 2) & 0x03 */
+    switch (t) { case 0: return "single"; case 1: return "group";
+                 case 2: return "plain"; default: return "link"; }
+}
+static const char* loraCtx(uint8_t c) {        /* context byte; NULL = unknown */
+    switch (c) {
+        case 0x00: return nullptr;                 /* none — omitted from the line */
+        case 0x01: return "resource";
+        case 0x02: return "resource-adv";
+        case 0x03: return "resource-req";
+        case 0x04: return "resource-hmu";
+        case 0x05: return "resource-prf";
+        case 0x06: return "resource-icl";
+        case 0x07: return "resource-rcl";
+        case 0x08: return "cache-req";
+        case 0x09: return "request";
+        case 0x0a: return "response";
+        case 0x0b: return "path-resp";
+        case 0x0c: return "command";
+        case 0x0d: return "command-status";
+        case 0x0e: return "channel";
+        case 0xfa: return "keepalive";
+        case 0xfb: return "link-identify";
+        case 0xfc: return "link-close";
+        case 0xfd: return "link-proof";
+        case 0xfe: return "link-rtt";
+        case 0xff: return "link-req-proof";
+        default:   return nullptr;                 /* unknown → flag the line */
+    }
+}
+
+/* Full frame as an offset-prefixed hexdump, 16 bytes/line, no ASCII. Verbose
+ * only — the level check guards the per-row formatting cost. */
+static void loraHexdump(int idx, const char* dir, const uint8_t* p, size_t len) {
+    if (esp_log_level_get(TAG) < ESP_LOG_VERBOSE) return;
+    for (size_t off = 0; off < len; off += 16) {
+        char row[16 * 3 + 8];
+        int o = snprintf(row, sizeof row, "%04x", (unsigned)off);
+        for (size_t i = 0; i < 16 && off + i < len; i++)
+            o += snprintf(row + o, sizeof row - (size_t)o, " %02x", p[off + i]);
+        verb("lora/%d %s %s", idx, dir, row);
+    }
+}
+
+/* Trace one whole RNS frame, gated on `log lora debug`. haveQual: fold in the
+ * radio's last rx rssi/snr (rx); false on tx. logIsDebug short-circuits the
+ * decode when off, so this is free on the hot path in normal operation. */
+static void loraTracePacket(LoraRadio* r, const char* dir,
+                            const uint8_t* p, size_t len, bool haveQual) {
+    if (!logIsDebug(TAG)) return;
+
+    char qual[24] = "";
+    if (haveQual)
+        snprintf(qual, sizeof qual, " %ddBm snr%.1f",
+                 (int)r->rssiLast, (double)r->snrLast);
+
+    bool   ifac   = len >= 1 && (p[0] & 0x80);
+    bool   hdr2   = len >= 1 && (p[0] & 0x40);
+    size_t ifacB  = ifac ? (r->curIfacSize ? r->curIfacSize : 1u) : 0;
+    size_t addrB  = hdr2 ? 32 : 16;                 /* [transport 16] + dest 16 */
+    size_t hdrEnd = 2 + ifacB + addrB + 1;          /* through the context byte */
+
+    /* Too short to hold a header — decode nothing, show the first ≤10 bytes so
+     * a stray/foreign frame is still visible. */
+    if (len < 2 || len < hdrEnd) {
+        size_t s = len < 10 ? len : 10;
+        char hx[21];
+        loraHex(hx, p, s);
+        dbg("lora/%d %s%s <unparsed %uB> %s", r->idx, dir, qual, (unsigned)len, hx);
+        loraHexdump(r->idx, dir, p, len);
+        return;
+    }
+
+    uint8_t  flags     = p[0];
+    uint8_t  hops      = p[1];
+    bool     transport = flags & 0x10;              /* 0 broadcast, 1 transport */
+    uint8_t  dtype     = (flags >> 2) & 0x03;
+    uint8_t  ptype     = flags & 0x03;
+    const uint8_t* dest = p + 2 + ifacB + (hdr2 ? 16 : 0);
+    uint8_t  ctx       = p[2 + ifacB + addrB];
+
+    char destHex[33]; loraHex(destHex, dest, 16);
+
+    char via[48] = "";
+    if (hdr2) { char v[33]; loraHex(v, p + 2 + ifacB, 16); snprintf(via, sizeof via, " via %s", v); }
+
+    bool anomaly = hops > 128;                      /* RNS caps hops at 128 */
+    char ctxbuf[24] = "";
+    if (ctx != 0x00) {
+        const char* cn = loraCtx(ctx);
+        if (cn) snprintf(ctxbuf, sizeof ctxbuf, " ctx=%s", cn);
+        else { snprintf(ctxbuf, sizeof ctxbuf, " ctx=0x%02x", ctx); anomaly = true; }
+    }
+
+    dbg("lora/%d %s%s %s %s %s %s%s%s hops=%u%s",
+        r->idx, dir, qual,
+        loraPktType(ptype), transport ? "to" : "bcast",
+        loraDestType(dtype), destHex, via, ctxbuf,
+        (unsigned)hops, anomaly ? " ?" : "");
+
+    loraHexdump(r->idx, dir, p, len);
+}
+
 /* ─────────────── ISR ─────────────── */
 
 static IRAM_ATTR void loraRadioIsr(void) {
@@ -366,6 +498,17 @@ static uint8_t modeFromString(const char* s) {
     if (strcmp(s, "roaming")      == 0) return RNS_IFACE_MODE_ROAMING;
     if (strcmp(s, "boundary")     == 0) return RNS_IFACE_MODE_BOUNDARY;
     return RNS_IFACE_MODE_GATEWAY;
+}
+
+static const char* modeName(uint8_t m) {
+    switch (m) {
+        case RNS_IFACE_MODE_FULL:         return "full";
+        case RNS_IFACE_MODE_GATEWAY:      return "gateway";
+        case RNS_IFACE_MODE_ACCESS_POINT: return "access_point";
+        case RNS_IFACE_MODE_ROAMING:      return "roaming";
+        case RNS_IFACE_MODE_BOUNDARY:     return "boundary";
+        default:                          return "?";
+    }
 }
 
 static void publishStats(LoraRadio* r) {
@@ -430,8 +573,8 @@ static bool registerWithRnsd(LoraRadio* r) {
         warn("lora/%d rnsd register failed", r->idx);
         return false;
     }
-    info("registered as iface lora/%d (mtu=%u bitrate=%u mode=0x%02x)",
-         r->idx, (unsigned)RNS_MTU, (unsigned)r->curBitrate, (unsigned)r->curMode);
+    info("registered as iface lora/%d (mtu=%u bitrate=%u mode=%s)",
+         r->idx, (unsigned)RNS_MTU, (unsigned)r->curBitrate, modeName(r->curMode));
     return true;
 }
 
@@ -577,6 +720,7 @@ static void probeRadio(LoraRadio* r) {
 /* ─────────────── inbound (radio → rnsd) ─────────────── */
 
 static void deliverInbound(LoraRadio* r, const uint8_t* data, size_t len) {
+    loraTracePacket(r, "rx", data, len, true);
     if (r->rnsdHandle < 0) return;
     size_t s = itsSend(r->rnsdHandle, data, len, pdMS_TO_TICKS(100));
     if (s == 0) warn("lora/%d rnsd ITS send dropped (%u B)", r->idx, (unsigned)len);
@@ -597,7 +741,13 @@ static void drainRadioIrq(LoraRadio* r) {
     uint8_t frame[1 + RNODE_MAX_PAYLOAD];
     int16_t st = r->radio->readData(frame, pktLen);
     if (st != RADIOLIB_ERR_NONE) {
-        if (st == RADIOLIB_ERR_CRC_MISMATCH) r->crcErr++;
+        if (st == RADIOLIB_ERR_CRC_MISMATCH) {
+            r->crcErr++;
+            if (logIsDebug("lora"))       /* CRC = the RX error-check info */
+                dbg("lora/%d rx CRC-FAIL %uB rssi=%.0f snr=%.1f",
+                    r->idx, (unsigned)pktLen,
+                    (double)r->radio->getRSSI(), (double)r->radio->getSNR());
+        }
         r->radio->startReceive();
         gpio_intr_enable((gpio_num_t)r->slot->dio1);
         return;
@@ -743,6 +893,8 @@ static bool sendOneFrame(LoraRadio* r, const uint8_t* frame, size_t flen) {
 
 static void sendRnsPacket(LoraRadio* r, const uint8_t* data, size_t len) {
     if (!r->running || len == 0 || len > RNS_MTU) return;
+
+    loraTracePacket(r, "tx", data, len, false);
 
     /* Random 4-bit seq id in the upper nibble. */
     uint8_t seq = (uint8_t)((esp_random() & 0x0F) << 4);

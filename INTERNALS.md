@@ -197,6 +197,13 @@ Outbound packets arrive from `rnsd` over the registered handle: `onRnsdRecv`
 calls `drainOneOutbound`, which — once LBT clears — `itsRecv`s one packet and
 transmits it. One packet per loop turn so RX re-arms between back-to-back sends.
 
+**Per-frame trace.** `log lora debug` turns on a `dbg` line per on-air frame
+(`loraTraceFrame`): direction, length, and a 20-byte hex preview — RX lines also
+carry `rssi`/`snr`, and a CRC-failed RX logs `rx CRC-FAIL` with rssi/snr (LoRa's
+error-check is the CRC; RadioLib exposes no corrected-bit count). The formatting
+is guarded by `logIsDebug("lora")`, so the trace costs nothing when off. The tag
+is the task name `lora`, so `log lora debug` is what gates it.
+
 ## 7. rnsd registration
 
 `registerWithRnsd(r)` opens an ITS connection to `RNSD_PORT_IFACE` with an
