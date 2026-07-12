@@ -53,6 +53,19 @@
 #define RNODE_FLAG_SPLIT     0x01
 #define SPLIT_RX_TIMEOUT_MS  5000
 
+/* ── RNode-style CSMA / listen-before-talk ──
+ * Non-blocking DIFS + exponential contention-window backoff, run from the task
+ * loop. Carrier sense is instantaneous channel RSSI vs a tracked noise floor,
+ * matching RNode's channel-free test. No airtime accounting yet. */
+#define CSMA_CW_MIN          2       /* initial CW exponent → up to 2^2 = 4 slots */
+#define CSMA_CW_MAX          6       /* CW ceiling → up to 2^6 = 64 slots */
+#define CSMA_RSSI_MARGIN_DB  6.0f    /* dB above noise floor that reads as busy */
+#define CSMA_NOISE_FLOOR_DBM (-105.0f)  /* initial noise-floor estimate */
+#define CSMA_SLOT_MS_MIN     2       /* slot-time clamp (derived from symbol time) */
+#define CSMA_SLOT_MS_MAX     25
+
+enum CsmaPhase : uint8_t { CSMA_IDLE, CSMA_DIFS, CSMA_BACKOFF };
+
 #if defined(CONFIG_LORA0_CS_PIN)   /* ── at least one radio configured ── */
 
 static const char* TAG = "lora";
@@ -157,6 +170,18 @@ struct LoraRadio {
     uint8_t         splitSeq;
     bool            splitPending;
     TickType_t      splitDeadline;
+
+    /* CSMA / listen-before-talk. slotTicks/difsTicks derive from the LoRa
+     * symbol time at config; the phase machine is driven from the task loop. */
+    bool            lbt;             /* carrier-sense enabled (s.lora.<i>.lbt) */
+    TickType_t      slotTicks;       /* CSMA slot time */
+    TickType_t      difsTicks;       /* inter-frame listen before backoff */
+    CsmaPhase       csmaPhase;
+    int             csmaCw;          /* current contention-window exponent */
+    int             csmaBackoff;     /* backoff slots remaining */
+    TickType_t      csmaDifsStart;   /* tick the current unbroken free window began */
+    TickType_t      csmaSlotDeadline;/* next backoff slot boundary */
+    float           noiseFloor;      /* tracked channel noise floor, dBm */
 
     /* Stats — published to ephemeral storage once per task tick. */
     uint64_t        txBytes, rxBytes, txFrames, rxFrames, crcErr, splitTimeouts;
@@ -469,6 +494,21 @@ static bool radioStart(LoraRadio* r) {
         return false;
     }
 
+    /* CSMA/LBT: derive the slot time from the LoRa symbol time (2^SF / BW),
+     * clamped to a sane range; DIFS is two slots. Enabled by default; a
+     * per-radio toggle (s.lora.<i>.lbt=0) falls back to blind transmit. */
+    double tSymMs = (double)((uint32_t)1 << sf) / (double)bw_hz * 1000.0;
+    uint32_t slotMs = (uint32_t)(tSymMs + 0.5);
+    if (slotMs < CSMA_SLOT_MS_MIN) slotMs = CSMA_SLOT_MS_MIN;
+    if (slotMs > CSMA_SLOT_MS_MAX) slotMs = CSMA_SLOT_MS_MAX;
+    r->slotTicks = pdMS_TO_TICKS(slotMs);
+    if (r->slotTicks < 1) r->slotTicks = 1;
+    r->difsTicks = 2 * r->slotTicks;
+    r->lbt = storageGetInt(sk(kb, sizeof kb, r->idx, "lbt"), 1) != 0;
+    r->csmaPhase = CSMA_IDLE;
+    r->csmaCw = CSMA_CW_MIN;
+    r->noiseFloor = CSMA_NOISE_FLOOR_DBM;
+
     /* Mode for RNS iface registration. */
     char mode[24] = "gateway";
     storageGetStr(sk(kb, sizeof kb, r->idx, "mode"), mode, sizeof(mode), "gateway");
@@ -603,6 +643,89 @@ static void drainRadioIrq(LoraRadio* r) {
     gpio_intr_enable((gpio_num_t)r->slot->dio1);
 }
 
+/* ─────────────── CSMA / listen-before-talk ─────────────── */
+
+/* Instantaneous channel RSSI (dBm), read without leaving continuous RX.
+ * getRSSI(false) is the "current channel" overload (vs the base getRSSI() which
+ * returns last-packet RSSI); it lives on the concrete chip class, not on
+ * PhysicalLayer, so dispatch per chip like radioBegin does. */
+static float channelRssi(LoraRadio* r) {
+    PhysicalLayer* p = r->radio;
+    switch (r->slot->chip) {
+        case CHIP_SX1261: case CHIP_SX1262: case CHIP_SX1268: case CHIP_LLCC68:
+            return static_cast<SX126x*>(p)->getRSSI(false);
+        case CHIP_SX1272:
+            return static_cast<SX1272*>(p)->getRSSI(false);
+        case CHIP_SX1276: case CHIP_SX1277: case CHIP_SX1278:
+            return static_cast<SX1278*>(p)->getRSSI(false);
+        case CHIP_SX1280: case CHIP_SX1281: case CHIP_SX1282:
+            return static_cast<SX128x*>(p)->getRSSI(false);
+        case CHIP_LR1110: case CHIP_LR1120: case CHIP_LR1121:
+            return static_cast<LR11x0*>(p)->getRSSI(false);
+        case CHIP_LR2021:
+            return static_cast<LR2021*>(p)->getRSSI(false);
+    }
+    return -200.0f;   /* unhandled chip → read as free (fail open to blind TX) */
+}
+
+/* Carrier sense: sample the channel and decide busy/free, tracking the noise
+ * floor as the low envelope of RSSI (snap down fast, creep up slowly) so an
+ * active channel can't inflate the reference it's compared against. Also busy
+ * while a multi-frame reception is being reassembled (half-duplex). */
+static bool channelBusy(LoraRadio* r) {
+    if (r->splitPending) return true;
+    float rssi = channelRssi(r);
+    if (rssi < r->noiseFloor) r->noiseFloor = rssi;
+    else                      r->noiseFloor += 0.02f * (rssi - r->noiseFloor);
+    return rssi > r->noiseFloor + CSMA_RSSI_MARGIN_DB;
+}
+
+/* Advance the channel-access state machine. Returns true only on the tick the
+ * medium is granted (DIFS observed idle, then a random backoff drained without
+ * the channel going busy). Otherwise updates state and returns false; the
+ * caller leaves the frame queued and nextDeadline() re-wakes at the next slot.
+ * cw grows on every busy encounter (exponential backoff) and resets after a
+ * grant. Mirrors RNode's CSMA/CA, minus airtime-based persistence. */
+static bool csmaClear(LoraRadio* r) {
+    if (!r->lbt) return true;                       /* LBT off → blind transmit */
+
+    TickType_t now = xTaskGetTickCount();
+    bool busy = channelBusy(r);
+
+    switch (r->csmaPhase) {
+        case CSMA_IDLE:
+            /* New frame: begin an inter-frame (DIFS) listen. */
+            r->csmaCw = CSMA_CW_MIN;
+            r->csmaPhase = CSMA_DIFS;
+            r->csmaDifsStart = busy ? 0 : now;      /* 0 = free window not begun */
+            return false;
+
+        case CSMA_DIFS:
+            if (busy) { r->csmaDifsStart = 0; return false; }   /* restart on activity */
+            if (r->csmaDifsStart == 0) r->csmaDifsStart = now;
+            if ((TickType_t)(now - r->csmaDifsStart) < r->difsTicks) return false;
+            /* DIFS observed idle → draw a backoff in [0, 2^cw) slots. */
+            r->csmaBackoff = (int)(esp_random() & ((1u << r->csmaCw) - 1));
+            if (r->csmaBackoff == 0) { r->csmaPhase = CSMA_IDLE; return true; }
+            r->csmaPhase = CSMA_BACKOFF;
+            r->csmaSlotDeadline = now + r->slotTicks;
+            return false;
+
+        case CSMA_BACKOFF:
+            if (busy) {                             /* lost the medium → widen, re-listen */
+                if (r->csmaCw < CSMA_CW_MAX) r->csmaCw++;
+                r->csmaPhase = CSMA_DIFS;
+                r->csmaDifsStart = 0;
+                return false;
+            }
+            if ((int32_t)(now - r->csmaSlotDeadline) < 0) return false;  /* slot not up */
+            r->csmaSlotDeadline = now + r->slotTicks;
+            if (--r->csmaBackoff <= 0) { r->csmaPhase = CSMA_IDLE; return true; }
+            return false;
+    }
+    return true;
+}
+
 /* ─────────────── outbound (rnsd → radio) ─────────────── */
 
 static bool sendOneFrame(LoraRadio* r, const uint8_t* frame, size_t flen) {
@@ -649,7 +772,11 @@ static void sendRnsPacket(LoraRadio* r, const uint8_t* data, size_t len) {
  * ITS stream buffer (our outbound TX queue) and revisit once it clears. */
 static void drainOneOutbound(LoraRadio* r) {
     if (!r->running || r->splitPending || r->rnsdHandle < 0) return;
-    if (itsBytesAvailable(r->rnsdHandle) == 0) return;
+    if (itsBytesAvailable(r->rnsdHandle) == 0) {
+        r->csmaPhase = CSMA_IDLE;   /* nothing queued → reset channel-access state */
+        return;
+    }
+    if (!csmaClear(r)) return;      /* listen-before-talk not yet satisfied */
     static uint8_t pkt[RNS_MTU + 16];
     size_t n = itsRecv(r->rnsdHandle, pkt, sizeof(pkt), 0);
     if (n > 0) sendRnsPacket(r, pkt, n);
@@ -804,10 +931,19 @@ static TickType_t nextDeadline(void) {
     TickType_t soonest = pdMS_TO_TICKS(1000);   /* cap so we publish stats */
     for (int i = 0; i < kNumRadios; i++) {
         LoraRadio* r = &s_radios[i];
-        /* Outbound queued and radio free → loop immediately. */
+        /* Outbound queued and radio free. With LBT off, loop immediately.
+         * With LBT on and channel access mid-procedure, wake at the next slot
+         * boundary to re-sense — never spin at 0, which would peg the task. */
         if (r->running && !r->splitPending && r->rnsdHandle >= 0
             && itsBytesAvailable(r->rnsdHandle) > 0) {
-            return 0;
+            if (!r->lbt) return 0;
+            TickType_t d = r->slotTicks;
+            if (r->csmaPhase == CSMA_BACKOFF) {
+                int32_t rem = (int32_t)(r->csmaSlotDeadline - now);
+                d = rem > 0 ? (TickType_t)rem : 0;
+            }
+            if (d == 0) return 0;
+            if (d < soonest) soonest = d;
         }
         if (r->splitPending) {
             TickType_t d = (r->splitDeadline > now) ? (r->splitDeadline - now) : 0;

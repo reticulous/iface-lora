@@ -167,12 +167,35 @@ each LoRa frame.
 split RX must not be interrupted. `drainOneOutbound` early-outs while
 `r->splitPending` is set (or the radio isn't running, or `rnsd` isn't
 connected); the outbound packet stays in the ITS stream buffer and is revisited
-once the split completes or times out. There is **no TX state machine and no
-listen-before-talk / CAD** — the only TX guard is `splitPending`.
+once the split completes or times out.
+
+**Listen-before-talk (CSMA/CA).** Before a queued frame is transmitted it must
+pass `csmaClear(r)`, a non-blocking channel-access state machine modelled on
+RNode's CSMA/CA (airtime-based persistence is not yet implemented). Carrier
+sense is the instantaneous channel RSSI — `channelRssi(r)` reads `getRSSI(false)`
+without leaving continuous RX (dispatched per chip, since that overload isn't on
+`PhysicalLayer`) — compared against a tracked noise floor (`channelBusy`: the
+floor snaps down fast and creeps up slowly, so an active channel can't inflate
+its own reference; busy = `rssi > floor + CSMA_RSSI_MARGIN_DB`). The machine:
+
+- `CSMA_IDLE` → begin an inter-frame (DIFS) listen.
+- `CSMA_DIFS` → require the channel idle for `difsTicks`; any activity restarts
+  the window. Once satisfied, draw a backoff of `[0, 2^cw)` slots.
+- `CSMA_BACKOFF` → count the backoff down one slot at a time while the channel
+  stays idle; if it goes busy, widen `cw` (exponential, capped at `CSMA_CW_MAX`)
+  and re-listen. Backoff drained on a free channel → grant TX, reset `cw`.
+
+`slotTicks` derives from the LoRa symbol time (`2^SF / BW`, clamped
+`CSMA_SLOT_MS_MIN..MAX`); `difsTicks` is two slots. The machine is driven from
+the task loop: when access is deferred the frame stays queued and
+`nextDeadline()` wakes the task at the next slot boundary to re-sense (never at
+0, which would peg the task). Per-radio toggle `s.lora.<n>.lbt` (default on);
+`lbt=0` reverts to blind transmit. The only other TX guard remains
+`splitPending`.
 
 Outbound packets arrive from `rnsd` over the registered handle: `onRnsdRecv`
-calls `drainOneOutbound`, which `itsRecv`s one packet and transmits it. One
-packet per loop turn so RX re-arms between back-to-back sends.
+calls `drainOneOutbound`, which — once LBT clears — `itsRecv`s one packet and
+transmits it. One packet per loop turn so RX re-arms between back-to-back sends.
 
 ## 7. rnsd registration
 
