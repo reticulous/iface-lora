@@ -531,8 +531,10 @@ static void publishStats(LoraRadio* r) {
 
 static void publishState(LoraRadio* r, const char* state) {
     char b[48];
+    storageBegin();
     storageSet(rk(b, sizeof b, r->idx, "state"), state);
     storageSet(rk(b, sizeof b, r->idx, "up"), r->running ? 1 : 0);
+    storageEnd();
 }
 
 /* ─────────────── rnsd registration ─────────────── */
@@ -668,8 +670,10 @@ static bool radioStart(LoraRadio* r) {
     }
     r->curIfacSize = (uint8_t)storageGetInt(sk(kb, sizeof kb, r->idx, "ifac_size"), 0);
 
+    storageBegin();
     storageSet(rk(kb, sizeof kb, r->idx, "chip"), chipName(r->slot->chip));
     storageSet(rk(kb, sizeof kb, r->idx, "bitrate_eff"), (int)r->curBitrate);
+    storageEnd();
 
     /* Arm RX and hook the chip's IRQ line (unified API maps to the right DIO). */
     r->radio->setPacketReceivedAction(loraRadioIsr);
@@ -1012,10 +1016,12 @@ static int unitToHz(const char* s, double scale) {
 /* Hz config → ephemeral display keys (one radio). */
 static void loraPublishDisplay(int i) {
     char kb[48], vb[24];
+    storageBegin();
     hzToUnit(vb, sizeof vb, storageGetInt(sk(kb, sizeof kb, i, "frequency"), 0), 1.0e6);
     storageSet(rk(kb, sizeof kb, i, "freq_mhz"), vb);
     hzToUnit(vb, sizeof vb, storageGetInt(sk(kb, sizeof kb, i, "bandwidth"), 0), 1.0e3);
     storageSet(rk(kb, sizeof kb, i, "bw_khz"), vb);
+    storageEnd();
 }
 
 /* Edited display keys → Hz config (one radio). Each field writes only on a real
@@ -1024,6 +1030,7 @@ static void loraPublishDisplay(int i) {
 static void loraApplyDisplay(int i) {
     char kb[48], vb[24];
 
+    storageBegin();
     storageGetStr(rk(kb, sizeof kb, i, "freq_mhz"), vb, sizeof vb, "");
     int want = unitToHz(vb, 1.0e6);
     if (want >= LORA_FREQ_MIN_HZ && want <= LORA_FREQ_MAX_HZ) {
@@ -1043,6 +1050,7 @@ static void loraApplyDisplay(int i) {
         hzToUnit(vb, sizeof vb, storageGetInt(sk(kb, sizeof kb, i, "bandwidth"), 0), 1.0e3);
         storageSet(rk(kb, sizeof kb, i, "bw_khz"), vb);
     }
+    storageEnd();
 }
 
 static void onDisplayChange(const char* /*key*/, const char* /*val*/) {
@@ -1110,7 +1118,9 @@ static void cliLora(const char* args) {
     /* `lora up|down` → all radios. */
     if (nt == 1 && (strcmp(tok[0], "up") == 0 || strcmp(tok[0], "down") == 0)) {
         int v = strcmp(tok[0], "up") == 0 ? 1 : 0;
+        storageBegin();
         for (int i = 0; i < kNumRadios; i++) storageSet(sk(kb, sizeof kb, i, "enable"), v);
+        storageEnd();
         cliPrintf("%s %d radio(s)\n", v ? "enabled" : "disabled", kNumRadios);
         return;
     }
@@ -1300,6 +1310,7 @@ void LoraService::onInit() {
          * bandwidth — its pane row now binds the kHz display key, not
          * s.lora.0.bandwidth, so seed that one default here. This loop covers
          * radios 1.. on multi-radio boards. */
+        storageBegin();
         storageDefault(sk(kb, sizeof kb, 0, "bandwidth"), 125000);         /* 125 kHz */
         for (int i = 1; i < kNumRadios; i++) {
             storageDefault(sk(kb, sizeof kb, i, "enable"), 0);
@@ -1311,6 +1322,7 @@ void LoraService::onInit() {
             storageDefault(sk(kb, sizeof kb, i, "sync_word"), "0x42");
         }
         storageSet("s.lora.version", LORA_VERSION);
+        storageEnd();
     }
 
     /* Seed the ephemeral MHz/kHz display keys up front, so the settings pane
