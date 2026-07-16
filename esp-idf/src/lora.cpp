@@ -1175,11 +1175,38 @@ static void cliLora(const char* args) {
 
 /* ─────────────── task ─────────────── */
 
+/* Stats publishing is event-driven, not timed. Every stat is either a cumulative
+ * counter or a last-packet reading, so none of them move without a tx/rx event —
+ * republishing on a timer just burns battery. So we publish only after a counter
+ * changes, and at most once a second (a change inside the 1 s window is deferred
+ * to the boundary, then coalesced). RX is IRQ-woken (loraRadioIsr → task notify;
+ * DIO1 is a light-sleep wake source) and outbound wakes via ITS, so with nothing
+ * pending the task blocks until a real event and the chip light-sleeps. */
+#define LORA_STATS_MIN_MS 1000
+static TickType_t s_statsLastPub = 0;      /* tick of the last publish */
+static bool       s_statsPend    = false;  /* counter moved; publish owed at the 1 Hz boundary */
+static uint64_t   s_statsSig     = 0;      /* last-seen sum of all counters */
+
 static TickType_t nextDeadline(void) {
     TickType_t now = xTaskGetTickCount();
-    TickType_t soonest = pdMS_TO_TICKS(1000);   /* cap so we publish stats */
+    /* Idle default: block until an ISR/ITS wake. Shrunk below only for real
+     * pending work — a deferred stats flush, a registration retry, or outbound. */
+    TickType_t soonest = portMAX_DELAY;
+    /* A counter change is waiting to be flushed at the next 1 Hz boundary. */
+    if (s_statsPend) {
+        TickType_t due = s_statsLastPub + pdMS_TO_TICKS(LORA_STATS_MIN_MS);
+        TickType_t d = (int32_t)(due - now) > 0 ? (TickType_t)(due - now) : 0;
+        if (d < soonest) soonest = d;
+    }
     for (int i = 0; i < kNumRadios; i++) {
         LoraRadio* r = &s_radios[i];
+        /* Registration retry while a radio is running-but-unregistered (a
+         * transient window: onRnsdDisconnect nulls the handle and the loop
+         * re-registers). Poll at 1 Hz until it takes. */
+        if (r->running && r->enabled && r->rnsdHandle < 0) {
+            TickType_t d = pdMS_TO_TICKS(LORA_STATS_MIN_MS);
+            if (d < soonest) soonest = d;
+        }
         /* Outbound queued and radio free. With LBT off, loop immediately.
          * With LBT on and channel access mid-procedure, wake at the next slot
          * boundary to re-sense — never spin at 0, which would peg the task. */
@@ -1271,6 +1298,11 @@ static void loraTaskMain(void*) {
      * just eats the bounded timeout each boot; set s.sys.time_wait_s=0 there. */
     waitForTime(0);
 
+    /* Seed the stat keys once so consumers see a radio before any traffic; from
+     * here publishing is purely event-driven (see the stats block below). */
+    for (int i = 0; i < kNumRadios; i++) publishStats(&s_radios[i]);
+    s_statsLastPub = xTaskGetTickCount();
+
     for (;;) {
         if (s_configDirty) {
             s_configDirty = false;
@@ -1281,6 +1313,10 @@ static void loraTaskMain(void*) {
             s_displayDirty = false;
             for (int i = 0; i < kNumRadios; i++) loraApplyDisplay(i);     /* MHz/kHz → Hz */
         }
+
+        /* Sum every published field across radios; a change means a tx/rx event
+         * moved a counter (or a last-packet reading) this pass. */
+        uint64_t sig = 0;
 
         for (int i = 0; i < kNumRadios; i++) {
             LoraRadio* r = &s_radios[i];
@@ -1293,7 +1329,22 @@ static void loraTaskMain(void*) {
             }
             if (r->running && r->rnsdHandle < 0 && r->enabled) registerWithRnsd(r);
             drainOneOutbound(r);
-            publishStats(r);
+            sig += r->txBytes + r->rxBytes + r->txFrames + r->rxFrames +
+                   r->crcErr + r->splitTimeouts +
+                   (uint32_t)r->rssiLast + (uint32_t)r->snrLast;
+        }
+
+        /* Publish only after an event, at most once a second. A change inside the
+         * 1 s window sets s_statsPend; nextDeadline() then wakes us at the boundary
+         * to flush the latest values (coalescing any changes in between). */
+        if (sig != s_statsSig) { s_statsSig = sig; s_statsPend = true; }
+        if (s_statsPend) {
+            TickType_t nowp = xTaskGetTickCount();
+            if ((int32_t)(nowp - s_statsLastPub) >= (int32_t)pdMS_TO_TICKS(LORA_STATS_MIN_MS)) {
+                for (int i = 0; i < kNumRadios; i++) publishStats(&s_radios[i]);
+                s_statsLastPub = nowp;
+                s_statsPend    = false;
+            }
         }
 
         itsPoll(nextDeadline());

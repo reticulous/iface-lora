@@ -47,14 +47,27 @@ probes for presence (§4), and `waitForTime(0)` so the first announces aren't
 
 **Single wait point.** `itsPoll(nextDeadline())` is the only blocking call. It
 wakes on an ITS message (an outbound packet from `rnsd`, or a config-change
-notify), a task notification from any radio's IRQ ISR, or a computed deadline
-(the soonest split-RX timeout, capped at 1 s so stats publish). When outbound
-bytes are queued and a radio is free, `nextDeadline` returns 0 to drain on the
-next turn.
+notify), a task notification from any radio's IRQ ISR, or a computed deadline.
+When outbound bytes are queued and a radio is free, `nextDeadline` returns 0 to
+drain on the next turn. With nothing pending — no queued outbound, no split-RX
+in flight, no deferred stats flush, no unregistered radio — it returns
+`portMAX_DELAY`, so an idle link blocks until a real ISR/ITS event and the chip
+can light-sleep. RX stays prompt regardless: DIO1 is a light-sleep GPIO wake
+source and the ISR notifies the task.
 
 **Per-turn, per radio:** drain completed RX (§6), expire a stale split, re-
 register with `rnsd` if the handle dropped while enabled, drain one outbound
-packet, publish stats.
+packet.
+
+**Stats are event-driven, not timed.** Every published stat is a cumulative
+counter (tx/rx bytes and frames, `crc_err`, `split_rx_timeout`) or a last-packet
+reading (`rssi_last`, `snr_last`) — none move without a tx/rx event, so a timed
+republish would only burn battery. The task sums the counters each turn; a change
+means traffic happened, and stats are published **at most once a second** (a
+change inside the 1 s window defers to the boundary, where `nextDeadline` wakes
+the task to flush the coalesced values). The keys are seeded once at startup so a
+consumer sees a radio before any traffic. A running-but-unregistered radio holds
+a 1 Hz retry wake until registration takes.
 
 ## 3. SPI bus + the RadioLib HAL
 
