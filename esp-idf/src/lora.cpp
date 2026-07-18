@@ -566,6 +566,7 @@ static bool registerWithRnsd(LoraRadio* r) {
     reg.fwd = (r->curMode == RNS_IFACE_MODE_FULL || r->curMode == RNS_IFACE_MODE_GATEWAY) ? 1 : 0;
     reg.rpt = 0;
     reg.ifac_size = r->curIfacSize;
+    reg.rx_signal = 1;   /* inbound data frames carry the 4-byte RSSI/SNR prefix */
     safeStrncpy(reg.ifac_netname, r->curIfacNetname, sizeof(reg.ifac_netname));
     safeStrncpy(reg.ifac_netkey,  r->curIfacNetkey,  sizeof(reg.ifac_netkey));
     /* ref = radio index — onRnsdDisconnect uses it to find the radio. */
@@ -735,7 +736,18 @@ static void probeRadio(LoraRadio* r) {
 static void deliverInbound(LoraRadio* r, const uint8_t* data, size_t len) {
     loraTracePacket(r, "rx", data, len, true);
     if (r->rnsdHandle < 0) return;
-    size_t s = itsSend(r->rnsdHandle, data, len, pdMS_TO_TICKS(100));
+    /* Prefix this packet's signal telemetry (rnsd strips it, sets it on the
+     * received packet): int16 rssi(dBm) | int16 snr(dB*10), big-endian. Captured
+     * in the same synchronous RX call as `data`, so it correlates exactly. */
+    auto rnd = [](float x) { return (int16_t)(x < 0 ? x - 0.5f : x + 0.5f); };
+    int16_t rssi = rnd(r->rssiLast);
+    int16_t snr  = rnd(r->snrLast * 10.0f);
+    uint8_t f[4 + RNS_MTU + 16];
+    if (len > sizeof(f) - 4) len = sizeof(f) - 4;   /* defensive clamp */
+    f[0] = (uint8_t)(rssi >> 8); f[1] = (uint8_t)rssi;
+    f[2] = (uint8_t)(snr  >> 8); f[3] = (uint8_t)snr;
+    memcpy(f + 4, data, len);
+    size_t s = itsSend(r->rnsdHandle, f, 4 + len, pdMS_TO_TICKS(100));
     if (s == 0) warn("lora/%d rnsd ITS send dropped (%u B)", r->idx, (unsigned)len);
 }
 
