@@ -72,16 +72,26 @@ settings:
       - slider: { label: "TX power", key: "s.lora.0.tx_power", min: -9, max: 22 }
       - slider: { label: "Preamble", key: "s.lora.0.preamble", min: 6, max: 32, default: 12 }
       - text:   { label: "Sync word", key: "s.lora.0.sync_word", default: "0x42" }
+      # LoRa defaults to access_point: a radio segment is almost always the
+      # edge of the network, and this stops the node re-broadcasting the whole
+      # transport network's announces onto the slow RF link. full/gateway are
+      # still valid values on this key for anyone who deliberately wants a LoRa
+      # backbone — set s.lora.0.mode=gateway by hand — they're just kept out of
+      # the picker to avoid people footgunning their airtime.
       - dropdown:
           label: "Mode"
           key: "s.lora.0.mode"
-          default: "gateway"
+          default: "access_point"
           options:
-            - { v: "full",         l: "Full" }
-            - { v: "gateway",      l: "Gateway" }
             - { v: "access_point", l: "Access point" }
             - { v: "roaming",      l: "Roaming" }
             - { v: "boundary",     l: "Boundary" }
+      - slider:
+          label: "Announce cap %"
+          key: "s.lora.0.announce_cap"
+          min: 1
+          max: 100
+          default: 2
       - section: "Status"
       - value: { label: "State", key: "lora.0.state" }
       - value: { label: "Chip", key: "lora.0.chip" }

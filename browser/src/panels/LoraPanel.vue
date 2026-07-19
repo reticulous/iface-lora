@@ -32,6 +32,7 @@
     <div class="section-heading">RNS interface</div>
 
     <SettingSelect label="Mode" k="s.lora.0.mode" :options="modeOptions" />
+    <SettingSlider label="Announce cap (%)" k="s.lora.0.announce_cap" :min="1" :max="100" />
 
     <q-expansion-item dense dense-toggle label="Advanced" header-class="text-caption" class="q-mt-xs">
       <div class="q-pl-sm q-gutter-y-sm q-pt-sm">
@@ -149,9 +150,12 @@ const crOptions = [
   { label: '4/7', value: '7' },
   { label: '4/8', value: '8' },
 ]
+// A LoRa segment is almost always the edge of the network, so only the edge
+// modes are offered. full/gateway remain valid on s.lora.0.mode for anyone who
+// deliberately wants a LoRa backbone — they set the key by hand — but they're
+// kept out of the picker to avoid re-broadcasting the whole transport network's
+// announces onto the slow RF link.
 const modeOptions = [
-  { label: 'Full',         value: 'full' },
-  { label: 'Gateway',      value: 'gateway' },
   { label: 'Access point', value: 'access_point' },
   { label: 'Roaming',      value: 'roaming' },
   { label: 'Boundary',     value: 'boundary' },

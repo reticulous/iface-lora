@@ -226,9 +226,19 @@ is the task name `lora`, so `log lora debug` is what gates it.
   verbatim);
 - `mtu` = 500, `bitrate` = the airtime-derived value (§8);
 - `mode` from `s.lora.<n>.mode` via `modeFromString` → an `RNS_IFACE_MODE_*`
-  value (default `GATEWAY`);
+  value. **Default is `access_point`** — a LoRa segment is almost always the
+  edge of the network, and access-point mode stops the node re-broadcasting the
+  whole transport network's announces onto the slow RF link. `full`/`gateway`
+  remain valid on the key for a deliberate LoRa backbone (set `s.lora.<n>.mode`
+  by hand) but are kept out of the settings picker (`straddle.yaml`,
+  `LoraPanel.vue`) to avoid footgunning airtime;
 - `in = out = 1`, `fwd = 1` for `FULL`/`GATEWAY` (forwarding/transport modes),
   `rpt = 0`;
+- `announce_cap` from `s.lora.<n>.announce_cap` (percent, default
+  `RNS_IFACE_ANNOUNCE_CAP_DEFAULT` = 2) — the max share of interface bandwidth
+  announces may use; `point_to_point` is left 0 (LoRa is a shared radio medium
+  with hidden nodes, so announces are still re-broadcast for peers out of range
+  of the origin — see `rns/INTERNALS.md` §1.1.1);
 - IFAC fields from `s.lora.<n>.ifac_netname` / `ifac_size` and
   `secrets.lora.<n>.ifac_netkey`.
 

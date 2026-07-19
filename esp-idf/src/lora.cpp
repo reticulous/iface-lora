@@ -25,9 +25,13 @@
  *   header bit 0       = SPLIT (this is part of a 2-frame split packet)
  * A 500-byte RNS packet rides at most two frames.
  *
- * TX: synchronous radio.transmit() in the task. The radio is half-duplex so
- * we cannot transmit while a split RX is pending — guarded per radio by
- * splitPending.
+ * TX: non-blocking. startTransmit() fires the chip and returns; the TxDone IRQ
+ * (the same DIO1 line as RX) wakes the task, which finishes and either sends a
+ * split-second frame or re-arms RX. The task is free for the whole airtime, so
+ * nothing on core 0 is starved even at SF12. serviceRadio() reads the chip's IRQ
+ * flags to decide what completed rather than guessing TX-vs-RX from state. The
+ * radio is half-duplex, so we never start a transmit while a split RX is being
+ * reassembled (splitPending) or another transmit is on-air (txActive).
  */
 #include "lora.h"
 #include "esp_idf_hal.h"
@@ -163,6 +167,7 @@ struct LoraRadio {
     char            curIfacNetname[32];   /* IFAC network_name (s.) */
     char            curIfacNetkey[64];    /* IFAC passphrase (secrets.) */
     uint8_t         curIfacSize;          /* IFAC access-code length */
+    uint8_t         curAnnounceCap;       /* % bandwidth cap for announces (s.) */
 
     /* Split-RX reassembly — one in-flight split at a time per radio. */
     uint8_t         splitBuf[RNS_MTU + 16];
@@ -181,10 +186,27 @@ struct LoraRadio {
     int             csmaBackoff;     /* backoff slots remaining */
     TickType_t      csmaDifsStart;   /* tick the current unbroken free window began */
     TickType_t      csmaSlotDeadline;/* next backoff slot boundary */
+    TickType_t      csmaStart;       /* tick this frame's channel-access attempt began */
     float           noiseFloor;      /* tracked channel noise floor, dBm */
+    uint32_t        lbtTimeoutMs;    /* drop a frame LBT can't clear within this (s.lora.<i>.lbt_timeout) */
+    TickType_t      lbtTimeoutTicks; /* lbtTimeoutMs in ticks; 0 = never drop */
+
+    /* Non-blocking TX: startTransmit() fires the chip and returns; the TxDone IRQ
+     * (same DIO1 line as RX) wakes the task, which finishes and either sends the
+     * split-second frame or re-arms RX. txActive gates RX servicing and new
+     * outbound so the half-duplex radio is never asked to do two things at once. */
+    bool            txActive;        /* a frame is on-air, awaiting TxDone */
+    TickType_t      txDeadline;      /* watchdog: recover if TxDone never arrives */
+    TickType_t      txWatchTicks;    /* per-frame TxDone watchdog budget (airtime + margin) */
+    uint8_t         txSeq;           /* 4-bit seq nibble shared by a split pair */
+    uint8_t         txFrame[2][1 + RNODE_MAX_PAYLOAD];  /* prebuilt on-air frame(s) */
+    size_t          txFrameLen[2];
+    uint8_t         txFrameCount;    /* 1, or 2 for a split packet */
+    uint8_t         txFrameSent;     /* completed frames so far */
+    size_t          txPayloadBytes;  /* RNS payload bytes, credited on completion */
 
     /* Stats — published to ephemeral storage once per task tick. */
-    uint64_t        txBytes, rxBytes, txFrames, rxFrames, crcErr, splitTimeouts;
+    uint64_t        txBytes, rxBytes, txFrames, rxFrames, crcErr, splitTimeouts, txDropped;
     float           rssiLast, snrLast;
 };
 
@@ -323,7 +345,7 @@ static const char* rk(char* b, size_t n, int i, const char* leaf) {
  * Decodes the Reticulum header of a whole (reassembled) RNS frame into a
  * one-line summary at debug level; at verbose level the entire frame is also
  * dumped as hex. This traces the RNS packet, not the on-air split frame — so
- * it runs at the reassembly boundary (deliverInbound for rx, sendRnsPacket for
+ * it runs at the reassembly boundary (deliverInbound for rx, beginTx for
  * tx), free of the local 1-byte split header.
  *
  * RNS wire header (RNS/Packet.py):
@@ -524,6 +546,7 @@ static void publishStats(LoraRadio* r) {
     storageSet(rk(b, sizeof b, r->idx, "stats.rx_frames"), (int)(r->rxFrames & 0x7fffffff));
     storageSet(rk(b, sizeof b, r->idx, "stats.crc_err"),   (int)(r->crcErr & 0x7fffffff));
     storageSet(rk(b, sizeof b, r->idx, "stats.split_rx_timeout"), (int)(r->splitTimeouts & 0x7fffffff));
+    storageSet(rk(b, sizeof b, r->idx, "stats.tx_dropped"), (int)(r->txDropped & 0x7fffffff));
     storageSet(rk(b, sizeof b, r->idx, "stats.rssi_last"), (int)r->rssiLast);
     storageSet(rk(b, sizeof b, r->idx, "stats.snr_last"),  (int)r->snrLast);
     storageEnd();
@@ -566,6 +589,7 @@ static bool registerWithRnsd(LoraRadio* r) {
     reg.fwd = (r->curMode == RNS_IFACE_MODE_FULL || r->curMode == RNS_IFACE_MODE_GATEWAY) ? 1 : 0;
     reg.rpt = 0;
     reg.ifac_size = r->curIfacSize;
+    reg.announce_cap = r->curAnnounceCap;
     reg.rx_signal = 1;   /* inbound data frames carry the 4-byte RSSI/SNR prefix */
     safeStrncpy(reg.ifac_netname, r->curIfacNetname, sizeof(reg.ifac_netname));
     safeStrncpy(reg.ifac_netkey,  r->curIfacNetkey,  sizeof(reg.ifac_netkey));
@@ -598,6 +622,7 @@ static void radioStop(LoraRadio* r) {
     r->running = false;
     r->splitPending = false;
     r->splitLen = 0;
+    r->txActive = false;   /* any in-flight transmit is abandoned with the radio */
     deregisterFromRnsd(r);
     publishState(r, "down");
 }
@@ -652,13 +677,25 @@ static bool radioStart(LoraRadio* r) {
     if (r->slotTicks < 1) r->slotTicks = 1;
     r->difsTicks = 2 * r->slotTicks;
     r->lbt = storageGetInt(sk(kb, sizeof kb, r->idx, "lbt"), 1) != 0;
+    /* Hidden safety valve: if LBT can't win the channel within lbt_timeout ms the
+     * frame is dropped rather than backing off forever. 0 = never drop. */
+    r->lbtTimeoutMs = (uint32_t)storageGetInt(sk(kb, sizeof kb, r->idx, "lbt_timeout"), 5000);
+    r->lbtTimeoutTicks = r->lbtTimeoutMs ? pdMS_TO_TICKS(r->lbtTimeoutMs) : 0;
     r->csmaPhase = CSMA_IDLE;
     r->csmaCw = CSMA_CW_MIN;
     r->noiseFloor = CSMA_NOISE_FLOOR_DBM;
 
-    /* Mode for RNS iface registration. */
-    char mode[24] = "gateway";
-    storageGetStr(sk(kb, sizeof kb, r->idx, "mode"), mode, sizeof(mode), "gateway");
+    /* Non-blocking TX watchdog: 2.5× the airtime of a full frame (+100 ms floor)
+     * — long enough never to fire in normal operation, short enough that a wedged
+     * transmit can't pin the outbound queue. */
+    double maxToa = loraAirtimeSeconds(sf, bw_hz, cr, preamble, RNODE_MAX_PAYLOAD);
+    r->txWatchTicks = pdMS_TO_TICKS((uint32_t)(maxToa * 1000.0 * 2.5) + 100);
+    r->txActive = false;
+
+    /* Mode for RNS iface registration. LoRa defaults to access_point (edge
+     * segment); see straddle.yaml for why full/gateway are opt-in-by-hand. */
+    char mode[24] = "access_point";
+    storageGetStr(sk(kb, sizeof kb, r->idx, "mode"), mode, sizeof(mode), "access_point");
     r->curMode    = modeFromString(mode);
     r->curBitrate = computeBitrate(sf, bw_hz, cr, preamble);
 
@@ -670,6 +707,7 @@ static bool radioStart(LoraRadio* r) {
         storageGetStr(skb, r->curIfacNetkey, sizeof(r->curIfacNetkey), "");
     }
     r->curIfacSize = (uint8_t)storageGetInt(sk(kb, sizeof kb, r->idx, "ifac_size"), 0);
+    r->curAnnounceCap = (uint8_t)storageGetInt(sk(kb, sizeof kb, r->idx, "announce_cap"), RNS_IFACE_ANNOUNCE_CAP_DEFAULT);
 
     storageBegin();
     storageSet(rk(kb, sizeof kb, r->idx, "chip"), chipName(r->slot->chip));
@@ -751,16 +789,21 @@ static void deliverInbound(LoraRadio* r, const uint8_t* data, size_t len) {
     if (s == 0) warn("lora/%d rnsd ITS send dropped (%u B)", r->idx, (unsigned)len);
 }
 
-static void drainRadioIrq(LoraRadio* r) {
-    /* Read-only IRQ check: leaves an in-progress reception on another
-     * radio untouched. Only act when this radio actually completed RX. */
-    uint32_t flags = r->radio->getIrqFlags();
-    if (!(flags & (1UL << RADIOLIB_IRQ_RX_DONE))) return;
+/* Re-arm continuous RX and re-enable the level-triggered DIO1 (the trampoline
+ * disables it on each fire; a completed readData()/finishTransmit() has cleared
+ * the chip IRQ so the line has dropped low and the next edge fires again).
+ * Shared by the RX drain and the post-TX return to listening. */
+static void rearmRx(LoraRadio* r) {
+    r->radio->startReceive();
+    gpio_intr_enable((gpio_num_t)r->slot->dio1);
+}
 
+/* Drain a completed reception. serviceRadio has already confirmed RX_DONE from
+ * the chip's IRQ flags, so go straight to reading the packet. */
+static void handleRxDone(LoraRadio* r) {
     size_t pktLen = r->radio->getPacketLength();
     if (pktLen == 0 || pktLen > 1 + RNODE_MAX_PAYLOAD) {
-        r->radio->startReceive();
-        gpio_intr_enable((gpio_num_t)r->slot->dio1);
+        rearmRx(r);
         return;
     }
     uint8_t frame[1 + RNODE_MAX_PAYLOAD];
@@ -773,8 +816,7 @@ static void drainRadioIrq(LoraRadio* r) {
                     r->idx, (unsigned)pktLen,
                     (double)r->radio->getRSSI(), (double)r->radio->getSNR());
         }
-        r->radio->startReceive();
-        gpio_intr_enable((gpio_num_t)r->slot->dio1);
+        rearmRx(r);
         return;
     }
     r->rxFrames++;
@@ -811,11 +853,7 @@ static void drainRadioIrq(LoraRadio* r) {
         r->splitDeadline = xTaskGetTickCount() + pdMS_TO_TICKS(SPLIT_RX_TIMEOUT_MS);
     }
 
-    /* Re-arm RX and re-enable the level-triggered DIO1 (the trampoline
-     * disables it on each fire; readData() cleared the IRQ so DIO1 has
-     * dropped low and the next packet's rising edge will fire again). */
-    r->radio->startReceive();
-    gpio_intr_enable((gpio_num_t)r->slot->dio1);
+    rearmRx(r);
 }
 
 /* ─────────────── CSMA / listen-before-talk ─────────────── */
@@ -872,6 +910,7 @@ static bool csmaClear(LoraRadio* r) {
             /* New frame: begin an inter-frame (DIFS) listen. */
             r->csmaCw = CSMA_CW_MIN;
             r->csmaPhase = CSMA_DIFS;
+            r->csmaStart = now;                     /* start the lbt_timeout clock */
             r->csmaDifsStart = busy ? 0 : now;      /* 0 = free window not begun */
             return false;
 
@@ -903,60 +942,120 @@ static bool csmaClear(LoraRadio* r) {
 
 /* ─────────────── outbound (rnsd → radio) ─────────────── */
 
-static bool sendOneFrame(LoraRadio* r, const uint8_t* frame, size_t flen) {
-    int16_t st = r->radio->transmit((uint8_t*)frame, flen);
-    /* RadioLib leaves the radio in standby after transmit; re-arm RX. */
-    r->radio->startReceive();
-    if (st != RADIOLIB_ERR_NONE) {
-        warn("lora/%d transmit %u B failed: %s (%d)",
-             r->idx, (unsigned)flen, rlErrName(st), (int)st);
-        return false;
-    }
-    r->txFrames++;
-    return true;
+/* Return the radio to continuous RX after a transmit finishes or aborts. */
+static void txRearmRx(LoraRadio* r) {
+    r->txActive = false;
+    rearmRx(r);
 }
 
-static void sendRnsPacket(LoraRadio* r, const uint8_t* data, size_t len) {
+/* Fire frame `idx` of the current outbound packet. startTransmit() writes the
+ * FIFO and issues SetTx, then returns — the chip modulates on its own and raises
+ * TxDone on DIO1 when done (serviceRadio handles it). Non-blocking: the task is
+ * free for the whole airtime, so nothing on core 0 is starved at high SF. */
+static void startTxFrame(LoraRadio* r, int idx) {
+    int16_t st = r->radio->startTransmit(r->txFrame[idx], r->txFrameLen[idx]);
+    if (st != RADIOLIB_ERR_NONE) {
+        warn("lora/%d startTransmit %u B failed: %s (%d)",
+             r->idx, (unsigned)r->txFrameLen[idx], rlErrName(st), (int)st);
+        txRearmRx(r);
+        return;
+    }
+    r->txActive   = true;
+    r->txDeadline = xTaskGetTickCount() + r->txWatchTicks;
+    gpio_intr_enable((gpio_num_t)r->slot->dio1);   /* arm DIO1 for this frame's TxDone */
+}
+
+/* Begin transmitting one RNS packet. >RNODE_MAX_PAYLOAD splits into two frames
+ * sharing a seq nibble; the second is fired from serviceRadio once the first
+ * completes. Returns immediately — the airtime runs on the chip, not the task. */
+static void beginTx(LoraRadio* r, const uint8_t* data, size_t len) {
     if (!r->running || len == 0 || len > RNS_MTU) return;
 
     loraTracePacket(r, "tx", data, len, false);
 
-    /* Random 4-bit seq id in the upper nibble. */
-    uint8_t seq = (uint8_t)((esp_random() & 0x0F) << 4);
+    r->txSeq          = (uint8_t)((esp_random() & 0x0F) << 4);   /* 4-bit seq, upper nibble */
+    r->txPayloadBytes = len;
+    r->txFrameSent    = 0;
 
     if (len <= RNODE_MAX_PAYLOAD) {
-        uint8_t frame[1 + RNODE_MAX_PAYLOAD];
-        frame[0] = seq;
-        std::memcpy(frame + 1, data, len);
-        if (sendOneFrame(r, frame, 1 + len)) r->txBytes += len;
+        r->txFrame[0][0] = r->txSeq;
+        std::memcpy(r->txFrame[0] + 1, data, len);
+        r->txFrameLen[0] = 1 + len;
+        r->txFrameCount  = 1;
     } else {
         size_t first  = RNODE_MAX_PAYLOAD;
         size_t second = len - first;
-        uint8_t f1[1 + RNODE_MAX_PAYLOAD];
-        f1[0] = seq | RNODE_FLAG_SPLIT;
-        std::memcpy(f1 + 1, data, first);
-        if (!sendOneFrame(r, f1, 1 + first)) return;
-
-        uint8_t f2[1 + RNODE_MAX_PAYLOAD];
-        f2[0] = seq | RNODE_FLAG_SPLIT;
-        std::memcpy(f2 + 1, data + first, second);
-        if (sendOneFrame(r, f2, 1 + second)) r->txBytes += len;
+        r->txFrame[0][0] = r->txSeq | RNODE_FLAG_SPLIT;
+        std::memcpy(r->txFrame[0] + 1, data, first);
+        r->txFrameLen[0] = 1 + first;
+        r->txFrame[1][0] = r->txSeq | RNODE_FLAG_SPLIT;
+        std::memcpy(r->txFrame[1] + 1, data + first, second);
+        r->txFrameLen[1] = 1 + second;
+        r->txFrameCount  = 2;
     }
+    startTxFrame(r, 0);
 }
 
 /* Drain one pending outbound packet for this radio if it's free.
- * Half-duplex: while a split RX is in flight we leave bytes sitting in the
- * ITS stream buffer (our outbound TX queue) and revisit once it clears. */
+ * Half-duplex: while a split RX is being reassembled OR a transmit is already
+ * on-air (txActive) we leave bytes sitting in the ITS stream buffer (our
+ * outbound TX queue) and revisit once the radio is idle. */
 static void drainOneOutbound(LoraRadio* r) {
-    if (!r->running || r->splitPending || r->rnsdHandle < 0) return;
+    if (!r->running || r->splitPending || r->txActive || r->rnsdHandle < 0) return;
     if (itsBytesAvailable(r->rnsdHandle) == 0) {
         r->csmaPhase = CSMA_IDLE;   /* nothing queued → reset channel-access state */
         return;
     }
-    if (!csmaClear(r)) return;      /* listen-before-talk not yet satisfied */
+    if (!csmaClear(r)) {            /* listen-before-talk not yet satisfied */
+        /* Channel never cleared within lbt_timeout → drop the head frame instead
+         * of blocking the outbound queue behind a wedged-busy channel. */
+        if (r->lbtTimeoutTicks &&
+            (TickType_t)(xTaskGetTickCount() - r->csmaStart) >= r->lbtTimeoutTicks) {
+            static uint8_t drop[RNS_MTU + 16];
+            size_t n = itsRecv(r->rnsdHandle, drop, sizeof(drop), 0);
+            r->txDropped++;
+            err("lora/%d LBT: channel busy > %u ms, dropped %u B frame",
+                r->idx, (unsigned)r->lbtTimeoutMs, (unsigned)n);
+            r->csmaPhase = CSMA_IDLE;   /* re-arm access state for the next frame */
+        }
+        return;
+    }
     static uint8_t pkt[RNS_MTU + 16];
     size_t n = itsRecv(r->rnsdHandle, pkt, sizeof(pkt), 0);
-    if (n > 0) sendRnsPacket(r, pkt, n);
+    if (n > 0) beginTx(r, pkt, n);
+}
+
+/* Ask the chip what just completed and act on it — the IRQ flags are ground
+ * truth, so we never guess TX-vs-RX from software state. Half-duplex, so at most
+ * one of TX_DONE / RX_DONE is set. txActive is consulted only to run the TxDone
+ * watchdog when the chip reports nothing (a wedged transmit). */
+static void serviceRadio(LoraRadio* r) {
+    uint32_t flags = r->radio->getIrqFlags();
+
+    if (flags & (1UL << RADIOLIB_IRQ_TX_DONE)) {
+        r->radio->finishTransmit();          /* clear IRQ, chip → standby */
+        r->txFrames++;
+        if (++r->txFrameSent < r->txFrameCount) {   /* split: send the second half */
+            startTxFrame(r, r->txFrameSent);
+            return;
+        }
+        r->txBytes += r->txPayloadBytes;
+        txRearmRx(r);                        /* whole packet sent → back to listening */
+        return;
+    }
+
+    if (flags & (1UL << RADIOLIB_IRQ_RX_DONE)) {
+        handleRxDone(r);
+        return;
+    }
+
+    /* Nothing completed. If a transmit is outstanding and overdue, the chip is
+     * wedged — recover rather than block outbound forever. */
+    if (r->txActive && (int32_t)(xTaskGetTickCount() - r->txDeadline) >= 0) {
+        warn("lora/%d TxDone timeout — aborting frame, re-arming RX", r->idx);
+        r->radio->finishTransmit();
+        txRearmRx(r);
+    }
 }
 
 static void onRnsdRecv(int handle, size_t /*bytesAvail*/) {
@@ -1092,7 +1191,7 @@ static void cliPrintSlot(int i) {
     int  cr      = storageGetInt(sk(kb, sizeof kb, i, "coding_rate"), 0);
     int  txp     = storageGetInt(sk(kb, sizeof kb, i, "tx_power"), 0);
     int  pre     = storageGetInt(sk(kb, sizeof kb, i, "preamble"), 12);
-    char mode[24]; storageGetStr(sk(kb, sizeof kb, i, "mode"), mode, sizeof mode, "gateway");
+    char mode[24]; storageGetStr(sk(kb, sizeof kb, i, "mode"), mode, sizeof mode, "access_point");
     char sync[16]; storageGetStr(sk(kb, sizeof kb, i, "sync_word"), sync, sizeof sync, "0x42");
     cliPrintf("        freq=%.3f MHz  bw=%.0f kHz  sf=%d  cr=4/%d  txp=%d dBm  preamble=%d\n",
               freq_hz / 1.0e6, bw_hz / 1.0e3, sf, cr, txp, pre);
@@ -1221,8 +1320,10 @@ static TickType_t nextDeadline(void) {
         }
         /* Outbound queued and radio free. With LBT off, loop immediately.
          * With LBT on and channel access mid-procedure, wake at the next slot
-         * boundary to re-sense — never spin at 0, which would peg the task. */
-        if (r->running && !r->splitPending && r->rnsdHandle >= 0
+         * boundary to re-sense — never spin at 0, which would peg the task.
+         * Skipped while a transmit is on-air (txActive): the TxDone IRQ drives
+         * the next step, and drainOneOutbound would no-op anyway. */
+        if (r->running && !r->splitPending && !r->txActive && r->rnsdHandle >= 0
             && itsBytesAvailable(r->rnsdHandle) > 0) {
             if (!r->lbt) return 0;
             TickType_t d = r->slotTicks;
@@ -1231,6 +1332,12 @@ static TickType_t nextDeadline(void) {
                 d = rem > 0 ? (TickType_t)rem : 0;
             }
             if (d == 0) return 0;
+            if (d < soonest) soonest = d;
+        }
+        /* TxDone watchdog fallback — the IRQ normally wakes us first. */
+        if (r->txActive) {
+            int32_t rem = (int32_t)(r->txDeadline - now);
+            TickType_t d = rem > 0 ? (TickType_t)rem : 0;
             if (d < soonest) soonest = d;
         }
         if (r->splitPending) {
@@ -1332,7 +1439,7 @@ static void loraTaskMain(void*) {
 
         for (int i = 0; i < kNumRadios; i++) {
             LoraRadio* r = &s_radios[i];
-            if (r->running) drainRadioIrq(r);
+            if (r->running) serviceRadio(r);
 
             if (r->splitPending &&
                 (int32_t)(xTaskGetTickCount() - r->splitDeadline) >= 0) {
@@ -1342,7 +1449,7 @@ static void loraTaskMain(void*) {
             if (r->running && r->rnsdHandle < 0 && r->enabled) registerWithRnsd(r);
             drainOneOutbound(r);
             sig += r->txBytes + r->rxBytes + r->txFrames + r->rxFrames +
-                   r->crcErr + r->splitTimeouts +
+                   r->crcErr + r->splitTimeouts + r->txDropped +
                    (uint32_t)r->rssiLast + (uint32_t)r->snrLast;
         }
 
@@ -1377,7 +1484,7 @@ void LoraService::onInit() {
         storageDefault(sk(kb, sizeof kb, 0, "bandwidth"), 125000);         /* 125 kHz */
         for (int i = 1; i < kNumRadios; i++) {
             storageDefault(sk(kb, sizeof kb, i, "enable"), 0);
-            storageDefault(sk(kb, sizeof kb, i, "mode"), "gateway");
+            storageDefault(sk(kb, sizeof kb, i, "mode"), "access_point");
             storageDefault(sk(kb, sizeof kb, i, "bandwidth"), 125000);     /* 125 kHz */
             storageDefault(sk(kb, sizeof kb, i, "spreading_factor"), 7);   /* SF7 */
             storageDefault(sk(kb, sizeof kb, i, "coding_rate"), 5);        /* 4/5 */
