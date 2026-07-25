@@ -187,6 +187,7 @@ struct LoraRadio {
     TickType_t      csmaDifsStart;   /* tick the current unbroken free window began */
     TickType_t      csmaSlotDeadline;/* next backoff slot boundary */
     TickType_t      csmaStart;       /* tick this frame's channel-access attempt began */
+    bool            csmaStalled;     /* stall warning emitted for this frame (once) */
     float           noiseFloor;      /* tracked channel noise floor, dBm */
     uint32_t        lbtTimeoutMs;    /* drop a frame LBT can't clear within this (s.lora.<i>.lbt_timeout) */
     TickType_t      lbtTimeoutTicks; /* lbtTimeoutMs in ticks; 0 = never drop */
@@ -683,6 +684,7 @@ static bool radioStart(LoraRadio* r) {
     r->lbtTimeoutTicks = r->lbtTimeoutMs ? pdMS_TO_TICKS(r->lbtTimeoutMs) : 0;
     r->csmaPhase = CSMA_IDLE;
     r->csmaCw = CSMA_CW_MIN;
+    r->csmaStalled = false;
     r->noiseFloor = CSMA_NOISE_FLOOR_DBM;
 
     /* Non-blocking TX watchdog: 2.5× the airtime of a full frame (+100 ms floor)
@@ -1007,19 +1009,41 @@ static void drainOneOutbound(LoraRadio* r) {
         return;
     }
     if (!csmaClear(r)) {            /* listen-before-talk not yet satisfied */
+        TickType_t waited = xTaskGetTickCount() - r->csmaStart;
+        /* Radio contention is otherwise invisible until the drop valve fires —
+         * name it explicitly once per frame so a "nothing went out" hunt can
+         * rule the channel in or out at a glance. */
+        if (!r->csmaStalled && r->csmaPhase != CSMA_IDLE &&
+            waited >= pdMS_TO_TICKS(1000)) {
+            r->csmaStalled = true;
+            warn("lora/%d LBT: tx stalled %u ms by channel contention "
+                 "(phase=%s cw=%d noise=%.0f dBm)",
+                 r->idx, (unsigned)(waited * portTICK_PERIOD_MS),
+                 r->csmaPhase == CSMA_DIFS ? "difs" : "backoff",
+                 r->csmaCw, (double)r->noiseFloor);
+        }
         /* Channel never cleared within lbt_timeout → drop the head frame instead
          * of blocking the outbound queue behind a wedged-busy channel. */
-        if (r->lbtTimeoutTicks &&
-            (TickType_t)(xTaskGetTickCount() - r->csmaStart) >= r->lbtTimeoutTicks) {
+        if (r->lbtTimeoutTicks && waited >= r->lbtTimeoutTicks) {
             static uint8_t drop[RNS_MTU + 16];
             size_t n = itsRecv(r->rnsdHandle, drop, sizeof(drop), 0);
             r->txDropped++;
+            /* Consumers gate send-failure attribution on this counter at
+             * settle time, so it is mirrored the moment a frame is shed —
+             * the coalesced stats flush alone lags up to a second. */
+            {
+                char b[48];
+                storageSet(rk(b, sizeof b, r->idx, "stats.tx_dropped"),
+                           (int)(r->txDropped & 0x7fffffff));
+            }
             err("lora/%d LBT: channel busy > %u ms, dropped %u B frame",
                 r->idx, (unsigned)r->lbtTimeoutMs, (unsigned)n);
             r->csmaPhase = CSMA_IDLE;   /* re-arm access state for the next frame */
+            r->csmaStalled = false;
         }
         return;
     }
+    r->csmaStalled = false;
     static uint8_t pkt[RNS_MTU + 16];
     size_t n = itsRecv(r->rnsdHandle, pkt, sizeof(pkt), 0);
     if (n > 0) beginTx(r, pkt, n);
@@ -1376,7 +1400,7 @@ static void loraTaskMain(void*) {
      * its own device on the one bus. begin() is deferred to applyConfig
      * so we only touch RF hardware when a radio is enabled. The board's
      * peripheral power rail (if any) is already up — the buildable owns
-     * it (e.g. hw-tdeck's tdeckPowerInit), not this interface. */
+     * it (e.g. hw-lilygo-tdeck's tdeckPowerInit), not this interface. */
     for (int i = 0; i < kNumRadios; i++) {
         LoraRadio* r = &s_radios[i];
         r->idx        = i;
