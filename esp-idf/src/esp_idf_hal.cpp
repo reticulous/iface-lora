@@ -83,8 +83,19 @@ void EspIdfHal::term()
     _inited = false;
 }
 
+/* RadioLib hands back RADIOLIB_NC (0xFFFFFFFF) for pins a module doesn't wire —
+ * e.g. an SX126x board with no separate RF-switch or DIO lines. Any pin outside
+ * the chip's GPIO range is such a not-connected pin: treat it as a no-op rather
+ * than passing it to the driver, where `1ULL << pin` overflows the pin mask and
+ * gpio_config rejects it with "GPIO_PIN mask error". */
+static inline bool halPinConnected(uint32_t pin)
+{
+    return pin < (uint32_t)GPIO_NUM_MAX;
+}
+
 void EspIdfHal::pinMode(uint32_t pin, uint32_t mode)
 {
+    if (!halPinConnected(pin)) return;
     gpio_config_t io = {};
     io.pin_bit_mask  = 1ULL << pin;
     io.mode          = (gpio_mode_t)mode;
@@ -96,11 +107,13 @@ void EspIdfHal::pinMode(uint32_t pin, uint32_t mode)
 
 void EspIdfHal::digitalWrite(uint32_t pin, uint32_t value)
 {
+    if (!halPinConnected(pin)) return;
     gpio_set_level((gpio_num_t)pin, value ? 1 : 0);
 }
 
 uint32_t EspIdfHal::digitalRead(uint32_t pin)
 {
+    if (!halPinConnected(pin)) return 0;
     return (uint32_t)gpio_get_level((gpio_num_t)pin);
 }
 
