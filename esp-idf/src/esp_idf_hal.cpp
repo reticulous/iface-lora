@@ -22,6 +22,7 @@
 
 #include "esp_timer.h"
 #include "freertos/task.h"
+#include "hal/gpio_ll.h"   /* gpio_ll_intr_disable — IRAM-inline, safe with cache off */
 
 #include <cstring>
 
@@ -131,8 +132,14 @@ void IRAM_ATTR isrTrampoline(void* arg) {
      * pins registered with pm as light-sleep wake sources) it prevents
      * the ISR from re-firing continuously while the line is asserted.
      * The consumer task re-enables via gpio_intr_enable after servicing
-     * the peripheral that pulled the line. */
-    gpio_intr_disable((gpio_num_t)pin);
+     * the peripheral that pulled the line.
+     *
+     * Use the IRAM-inline low-level call, not gpio_intr_disable(): this ISR is
+     * installed ESP_INTR_FLAG_IRAM and so can fire while the flash cache is
+     * disabled (mid internal-flash write). gpio_intr_disable() lives in flash
+     * unless CONFIG_GPIO_CTRL_FUNC_IN_IRAM is set, so calling it here would jump
+     * into uncached flash and panic with a cache error. */
+    gpio_ll_intr_disable(&GPIO, (gpio_num_t)pin);
     if (pin < kMaxPins && g_isrCb[pin]) g_isrCb[pin]();
 }
 }
