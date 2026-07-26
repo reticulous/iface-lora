@@ -164,6 +164,9 @@ struct LoraRadio {
     bool            enabled;
     uint8_t         curMode;
     uint32_t        curBitrate;
+    /* Live modem params, kept for per-packet airtime accounting (the airtime
+     * formula needs SF/BW/CR/preamble, and only radioStart reads them). */
+    int             cfgSf, cfgBwHz, cfgCr, cfgPreamble;
     char            curIfacNetname[32];   /* IFAC network_name (s.) */
     char            curIfacNetkey[64];    /* IFAC passphrase (secrets.) */
     uint8_t         curIfacSize;          /* IFAC access-code length */
@@ -418,13 +421,20 @@ static void loraHexdump(int idx, const char* dir, const uint8_t* p, size_t len) 
  * radio's last rx rssi/snr (rx); false on tx. logIsDebug short-circuits the
  * decode when off, so this is free on the hot path in normal operation. */
 static void loraTracePacket(LoraRadio* r, const char* dir,
-                            const uint8_t* p, size_t len, bool haveQual) {
+                            const uint8_t* p, size_t len, bool haveQual,
+                            double airMs, int frames) {
     if (!logIsDebug(TAG)) return;
 
     char qual[24] = "";
     if (haveQual)
         snprintf(qual, sizeof qual, " %ddBm snr%.1f",
                  (int)r->rssiLast, (double)r->snrLast);
+
+    /* Computed airtime of the on-air frame(s) at the live modem params; a
+     * 2-frame split shows its per-frame count so the doubled preamble is clear. */
+    char air[24] = "";
+    if (frames == 2) snprintf(air, sizeof air, " air=%.0fms/2frm", airMs);
+    else             snprintf(air, sizeof air, " air=%.0fms", airMs);
 
     bool   ifac   = len >= 1 && (p[0] & 0x80);
     bool   hdr2   = len >= 1 && (p[0] & 0x40);
@@ -438,7 +448,7 @@ static void loraTracePacket(LoraRadio* r, const char* dir,
         size_t s = len < 10 ? len : 10;
         char hx[21];
         loraHex(hx, p, s);
-        dbg("lora/%d %s%s <unparsed %uB> %s", r->idx, dir, qual, (unsigned)len, hx);
+        dbg("lora/%d %s%s%s <unparsed %uB> %s", r->idx, dir, qual, air, (unsigned)len, hx);
         loraHexdump(r->idx, dir, p, len);
         return;
     }
@@ -464,8 +474,8 @@ static void loraTracePacket(LoraRadio* r, const char* dir,
         else { snprintf(ctxbuf, sizeof ctxbuf, " ctx=0x%02x", ctx); anomaly = true; }
     }
 
-    dbg("lora/%d %s%s %s %s %s %s%s%s hops=%u%s",
-        r->idx, dir, qual,
+    dbg("lora/%d %s%s%s %s %s %s %s%s%s hops=%u%s",
+        r->idx, dir, qual, air,
         loraPktType(ptype), transport ? "to" : "bcast",
         loraDestType(dtype), destHex, via, ctxbuf,
         (unsigned)hops, anomaly ? " ?" : "");
@@ -500,6 +510,19 @@ static double loraAirtimeSeconds(int sf, int bw_hz, int cr_denom,
     double den  = 4.0 * (sf - 2 * de);
     double payloadSym = 8.0 + fmax(ceil(num / den) * (cr + 4), 0.0);
     return (preamble + 4.25) * tSym + payloadSym * tSym;
+}
+
+/* Total on-air time (ms) for the frame(s) that carry one RNS packet, at the
+ * radio's live SF/BW/CR/preamble. Each LoRa frame carries its own preamble,
+ * header and CRC, so a split packet's airtime is the SUM of its frames' — never
+ * one airtime over the combined length. frameLens[i] is each frame's full
+ * on-air byte count (1-byte split header included). */
+static double loraPacketAirtimeMs(const LoraRadio* r, const size_t* frameLens, int frames) {
+    double s = 0.0;
+    for (int i = 0; i < frames; i++)
+        s += loraAirtimeSeconds(r->cfgSf, r->cfgBwHz, r->cfgCr, r->cfgPreamble,
+                                (int)frameLens[i]);
+    return s * 1000.0;
 }
 
 /* Effective bps to register with rnsd. RNS derives its first-hop link
@@ -700,6 +723,7 @@ static bool radioStart(LoraRadio* r) {
     storageGetStr(sk(kb, sizeof kb, r->idx, "mode"), mode, sizeof(mode), "access_point");
     r->curMode    = modeFromString(mode);
     r->curBitrate = computeBitrate(sf, bw_hz, cr, preamble);
+    r->cfgSf = sf; r->cfgBwHz = bw_hz; r->cfgCr = cr; r->cfgPreamble = preamble;
 
     /* IFAC: network_name is config (s.), passphrase is a secret (secrets.). */
     storageGetStr(sk(kb, sizeof kb, r->idx, "ifac_netname"), r->curIfacNetname, sizeof(r->curIfacNetname), "");
@@ -773,8 +797,9 @@ static void probeRadio(LoraRadio* r) {
 
 /* ─────────────── inbound (radio → rnsd) ─────────────── */
 
-static void deliverInbound(LoraRadio* r, const uint8_t* data, size_t len) {
-    loraTracePacket(r, "rx", data, len, true);
+static void deliverInbound(LoraRadio* r, const uint8_t* data, size_t len,
+                           double airMs, int frames) {
+    loraTracePacket(r, "rx", data, len, true, airMs, frames);
     if (r->rnsdHandle < 0) return;
     /* Prefix this packet's signal telemetry (rnsd strips it, sets it on the
      * received packet): int16 rssi(dBm) | int16 snr(dB*10), big-endian. Captured
@@ -831,7 +856,8 @@ static void handleRxDone(LoraRadio* r) {
     size_t   payloadLen = pktLen - 1;
 
     if (!isSplit) {
-        deliverInbound(r, frame + 1, payloadLen);
+        size_t fl = pktLen;                        /* whole on-air frame (incl. header) */
+        deliverInbound(r, frame + 1, payloadLen, loraPacketAirtimeMs(r, &fl, 1), 1);
         r->rxBytes += payloadLen;
     } else if (!r->splitPending) {
         std::memcpy(r->splitBuf, frame + 1, payloadLen);
@@ -841,9 +867,12 @@ static void handleRxDone(LoraRadio* r) {
         r->splitDeadline = xTaskGetTickCount() + pdMS_TO_TICKS(SPLIT_RX_TIMEOUT_MS);
     } else if (r->splitSeq == seq) {
         if (r->splitLen + payloadLen <= sizeof(r->splitBuf)) {
+            /* Two on-air frames, each with its own preamble/header/CRC. */
+            size_t fl[2] = { r->splitLen + 1, payloadLen + 1 };
             std::memcpy(r->splitBuf + r->splitLen, frame + 1, payloadLen);
             r->splitLen += payloadLen;
-            deliverInbound(r, r->splitBuf, r->splitLen);
+            deliverInbound(r, r->splitBuf, r->splitLen,
+                           loraPacketAirtimeMs(r, fl, 2), 2);
             r->rxBytes += r->splitLen;
         }
         r->splitPending = false;
@@ -973,8 +1002,6 @@ static void startTxFrame(LoraRadio* r, int idx) {
 static void beginTx(LoraRadio* r, const uint8_t* data, size_t len) {
     if (!r->running || len == 0 || len > RNS_MTU) return;
 
-    loraTracePacket(r, "tx", data, len, false);
-
     r->txSeq          = (uint8_t)((esp_random() & 0x0F) << 4);   /* 4-bit seq, upper nibble */
     r->txPayloadBytes = len;
     r->txFrameSent    = 0;
@@ -995,6 +1022,13 @@ static void beginTx(LoraRadio* r, const uint8_t* data, size_t len) {
         r->txFrameLen[1] = 1 + second;
         r->txFrameCount  = 2;
     }
+
+    /* Trace after framing so the airtime sums the actual on-air frame(s) — a
+     * split packet's two frames each carry their own preamble/header/CRC. */
+    loraTracePacket(r, "tx", data, len, false,
+                    loraPacketAirtimeMs(r, r->txFrameLen, r->txFrameCount),
+                    r->txFrameCount);
+
     startTxFrame(r, 0);
 }
 
