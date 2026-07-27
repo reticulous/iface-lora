@@ -28,7 +28,7 @@
  * TX: non-blocking. startTransmit() fires the chip and returns; the TxDone IRQ
  * (the same DIO1 line as RX) wakes the task, which finishes and either sends a
  * split-second frame or re-arms RX. The task is free for the whole airtime, so
- * nothing on core 0 is starved even at SF12. serviceRadio() reads the chip's IRQ
+ * nothing on its core is starved even at SF12. serviceRadio() reads the chip's IRQ
  * flags to decide what completed rather than guessing TX-vs-RX from state. The
  * radio is half-duplex, so we never start a transmit while a split RX is being
  * reassembled (splitPending) or another transmit is on-air (txActive).
@@ -218,6 +218,7 @@ static LoraRadio     s_radios[kNumRadios];
 static TaskHandle_t  s_task = nullptr;
 static volatile bool s_configDirty = true;
 static volatile bool s_displayDirty = false;   /* an MHz/kHz display key was edited */
+static volatile bool     s_radioIrq  = false;  /* DIO1 fired; gate the chip SPI poll on it */
 
 /* ─────────────── chip dispatch ───────────────
  *
@@ -487,7 +488,9 @@ static void loraTracePacket(LoraRadio* r, const char* dir,
 
 static IRAM_ATTR void loraRadioIsr(void) {
     /* Shared across radios — any DIO1 wakes the task, which polls each
-     * radio's IRQ flags to find the one(s) that completed. */
+     * radio's IRQ flags to find the one(s) that completed. The flag lets the
+     * loop skip the chip poll on wakes that weren't a DIO1 (ITS / cfg / stats). */
+    s_radioIrq = true;
     BaseType_t hp = pdFALSE;
     vTaskNotifyGiveFromISR(s_task, &hp);
     portYIELD_FROM_ISR(hp);
@@ -559,6 +562,10 @@ static const char* modeName(uint8_t m) {
 }
 
 static void publishStats(LoraRadio* r) {
+    /* Skip the churn on a headless, WiFi-down node — nothing pulls these keys
+     * there. A UI (web over WiFi, or an LCD build) re-populates them when it
+     * appears; see uiTelemetryWanted(). */
+    if (!uiTelemetryWanted()) return;
     char b[48];
     /* One bracket → one storage op. Unbracketed this fired ~8 separate sync
      * round-trips to the storage task every second; under an inbound-message
@@ -982,7 +989,7 @@ static void txRearmRx(LoraRadio* r) {
 /* Fire frame `idx` of the current outbound packet. startTransmit() writes the
  * FIFO and issues SetTx, then returns — the chip modulates on its own and raises
  * TxDone on DIO1 when done (serviceRadio handles it). Non-blocking: the task is
- * free for the whole airtime, so nothing on core 0 is starved at high SF. */
+ * free for the whole airtime, so nothing on its core is starved at high SF. */
 static void startTxFrame(LoraRadio* r, int idx) {
     int16_t st = r->radio->startTransmit(r->txFrame[idx], r->txFrameLen[idx]);
     if (st != RADIOLIB_ERR_NONE) {
@@ -1279,7 +1286,7 @@ static void cliLora(const char* args) {
         cliPrintf("%-*s status for one radio\n",            CLI_HELP_COL, "lora <n>");
         cliPrintf("%-*s enable/disable (no <n> = all)\n",   CLI_HELP_COL, "lora [<n>] up|down");
         cliPrintf("%-*s freq MHz / bw kHz / sf / cr /\n",   CLI_HELP_COL, "lora <n> <param> <val>");
-        cliPrintf("%-*s   txp dBm / preamble / sync / mode\n", CLI_HELP_COL, "");
+        cliPrintf("%-*s   txp dBm / preamble / sync / mode / lbt 0|1\n", CLI_HELP_COL, "");
         return;
     }
 
@@ -1307,7 +1314,7 @@ static void cliLora(const char* args) {
     if (strcmp(cmd, "up") == 0)   { storageSet(sk(kb, sizeof kb, idx, "enable"), 1); cliPrintf("lora/%ld enabled\n", idx);  return; }
     if (strcmp(cmd, "down") == 0) { storageSet(sk(kb, sizeof kb, idx, "enable"), 0); cliPrintf("lora/%ld disabled\n", idx); return; }
 
-    if (nt < 3) { cliPrintf("usage: lora %ld <freq|bw|sf|cr|txp|preamble|sync|mode> <value>\n", idx); return; }
+    if (nt < 3) { cliPrintf("usage: lora %ld <freq|bw|sf|cr|txp|preamble|sync|mode|lbt> <value>\n", idx); return; }
     const char* val = tok[2];
 
     /* Human units in: frequency MHz, bandwidth kHz. Storage stays in Hz. */
@@ -1337,8 +1344,12 @@ static void cliLora(const char* args) {
     } else if (strcmp(cmd, "mode") == 0) {
         storageSet(sk(kb, sizeof kb, idx, "mode"), val);
         cliPrintf("lora/%ld mode = %s\n", idx, val);
+    } else if (strcmp(cmd, "lbt") == 0) {
+        int on = atoi(val) != 0;
+        storageSet(sk(kb, sizeof kb, idx, "lbt"), on);
+        cliPrintf("lora/%ld lbt = %s\n", idx, on ? "on (carrier-sense before tx)" : "off (blind tx)");
     } else {
-        cliPrintf("unknown: lora %ld %s (try freq|bw|sf|cr|txp|preamble|sync|mode)\n", idx, cmd);
+        cliPrintf("unknown: lora %ld %s (try freq|bw|sf|cr|txp|preamble|sync|mode|lbt)\n", idx, cmd);
     }
 }
 
@@ -1491,13 +1502,20 @@ static void loraTaskMain(void*) {
             for (int i = 0; i < kNumRadios; i++) loraApplyDisplay(i);     /* MHz/kHz → Hz */
         }
 
+        /* Poll the chip only when a DIO1 actually fired (or a transmit is in
+         * flight, for the watchdog). A wake from ITS / cfg / stats must not cost
+         * a getIrqFlags SPI round-trip — that turned every task nudge into radio
+         * bus traffic. Atomic read-and-clear so a fire during servicing isn't
+         * lost (it re-sets the flag and re-notifies for the next pass). */
+        bool radioIrq = __atomic_exchange_n(&s_radioIrq, false, __ATOMIC_SEQ_CST);
+
         /* Sum every published field across radios; a change means a tx/rx event
          * moved a counter (or a last-packet reading) this pass. */
         uint64_t sig = 0;
 
         for (int i = 0; i < kNumRadios; i++) {
             LoraRadio* r = &s_radios[i];
-            if (r->running) serviceRadio(r);
+            if (r->running && (radioIrq || r->txActive)) serviceRadio(r);
 
             if (r->splitPending &&
                 (int32_t)(xTaskGetTickCount() - r->splitDeadline) >= 0) {
@@ -1560,8 +1578,11 @@ void LoraService::onInit() {
     cliRegisterCmd("lora", cliLora);
 
     /* Larger stack than other interfaces for the LoRa frame buffers and
-     * RadioLib state machine. PSRAM stack. */
-    s_task = spawnTask(loraTaskMain, TAG, 8192, nullptr, 2, 0, STACK_PSRAM);
+     * RadioLib state machine. PSRAM stack. On a no-LCD build the driver runs on
+     * the secondary core so its RX/TX bursts overlap the rnsd processing they
+     * feed on the primary core, aligning both cores' idle windows for light
+     * sleep; an LCD build keeps it on the primary (secondary is busy rendering). */
+    s_task = spawnTask(loraTaskMain, TAG, 8192, nullptr, 2, CORE_SECONDARY_NO_LCD, STACK_PSRAM);
 }
 
 #else  /* ── no radios configured (CONFIG_LORA_COUNT = 0) ── */

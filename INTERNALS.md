@@ -32,9 +32,14 @@ contributes:
 
 ## 2. The task
 
-One FreeRTOS task — **core 0, priority 2, 8 KB PSRAM stack** (larger than other
+One FreeRTOS task — **priority 2, 8 KB PSRAM stack** (larger than other
 interfaces for the LoRa frame buffers and RadioLib state). It services *all*
-radios; per-radio state lives in `s_radios[]` (`LoraRadio`).
+radios; per-radio state lives in `s_radios[]` (`LoraRadio`). Its **core** is
+`CORE_SECONDARY_NO_LCD` (`compat.h`): on a no-LCD build it runs on core 1,
+opposite the `rnsd` it feeds on core 0, so their RX/processing bursts overlap and
+both cores idle together for light sleep; an LCD build keeps it on the primary
+(core 1 is busy rendering). See
+[power-management: core placement](../spangap-core/docs/power-management.md#core-placement--overlap-for-light-sleep).
 
 **Boot order.** The task first waits on `rns.ready` (`waitForFlag`, 120 s) — a
 brownout/boot-loop node must never reach RF TX, and registering before `rnsd`'s
@@ -54,6 +59,14 @@ in flight, no deferred stats flush, no unregistered radio — it returns
 `portMAX_DELAY`, so an idle link blocks until a real ISR/ITS event and the chip
 can light-sleep. RX stays prompt regardless: DIO1 is a light-sleep GPIO wake
 source and the ISR notifies the task.
+
+**The chip is polled only on a real IRQ.** The DIO1 ISR sets a flag
+(`s_radioIrq`); each turn the loop reads it once (atomic read-and-clear) and calls
+`serviceRadio` (a SPI `getIrqFlags` + whatever completed) only when it was set — or
+when a transmit is in flight, for the TxDone watchdog. A wake for ITS / config /
+stats does **not** touch the chip. Without this gate, `getIrqFlags` ran on every
+task wake, so SPI-bus traffic tracked task *wakes* rather than *packets* and idle
+housekeeping showed up as phantom radio load.
 
 **Per-turn, per radio:** drain completed RX (§6), expire a stale split, re-
 register with `rnsd` if the handle dropped while enabled, drain one outbound
@@ -202,9 +215,23 @@ its own reference; busy = `rssi > floor + CSMA_RSSI_MARGIN_DB`). The machine:
 `CSMA_SLOT_MS_MIN..MAX`); `difsTicks` is two slots. The machine is driven from
 the task loop: when access is deferred the frame stays queued and
 `nextDeadline()` wakes the task at the next slot boundary to re-sense (never at
-0, which would peg the task). Per-radio toggle `s.lora.<n>.lbt` (default on);
-`lbt=0` reverts to blind transmit. The only other TX guard remains
-`splitPending`.
+0, which would peg the task). Per-radio toggle `s.lora.<n>.lbt` (default on),
+also settable live with `lora <n> lbt 0|1`; `lbt=0` reverts to blind transmit.
+The only other TX guard remains `splitPending`.
+
+**On the SPI cost.** Each sense is one `getRSSI(false)` — a single SPI
+transaction, read at the DFS floor (the re-sense wakes are timeout-driven, so
+they don't boost the CPU). A transmit therefore issues a burst of these across
+its DIFS + backoff slots, which makes `spi_master` the dominant SPI source while
+traffic flows — but the transfers are ~55 µs APB holds at 80 MHz, ~0.1 % of wall
+time, so LBT costs no measurable power (confirmed by an `lbt 0`/`lbt 1` A/B: SPI
+halves, light-sleep % is unchanged). The chip *does* have a hardware
+alternative — `startChannelScan()` (Channel Activity Detection, CAD), a
+LoRa-preamble-aware sense that IRQs on `CadDone` — but it costs **more** SPI per sense (standby → DIO → clear → setCad
+→ read result ≈ 6 transactions vs. 1) and drops RX to standby for each sense, so
+it is *not* an SPI win. CAD's only edge is sensing quality: it ignores non-LoRa
+ambient RF that an RSSI threshold trips on. Reach for it only if a quiet-but-noisy
+channel is causing spurious backoffs, not to cut the bus count.
 
 Outbound packets arrive from `rnsd` over the registered handle: `onRnsdRecv`
 calls `drainOneOutbound`, which — once LBT clears — `itsRecv`s one packet and

@@ -93,6 +93,8 @@ defaults come from this straddle's `settings:` block; radios 1.. are seeded by
 | `s.lora.<n>.preamble` | `12` | Preamble length in symbols, 6–32. |
 | `s.lora.<n>.sync_word` | `"0x42"` | Sync word, a string parsed as hex or decimal (`0x42` is the Reticulum-on-LoRa convention). |
 | `s.lora.<n>.mode` | `"gateway"` | RNS interface mode: `full`, `gateway`, `access_point`, `roaming`, `boundary`. |
+| `s.lora.<n>.lbt` | `1` | Listen-before-talk: CSMA/CA carrier-sense before each transmit. `0` = blind transmit (no sensing). Live. On a quiet, single-node band you can turn it off to skip the sensing; on a shared band leave it on. |
+| `s.lora.<n>.lbt_timeout` | `5000` | Drop a frame LBT can't clear within this many ms (`0` = never drop, block the queue instead). |
 | `s.lora.<n>.ifac_netname` | `""` | IFAC network name. Empty = open (non-IFAC) interface. |
 | `s.lora.<n>.ifac_size` | `0` | IFAC access-code length in bytes (`0` = rnsd default). |
 | `s.lora.version` | — | Internal defaults-seeding gate; not a user setting. |
@@ -108,7 +110,7 @@ SF/BW/CR/preamble are set; `lora.<n>.state` reads `unconfigured` until then.
 | `lora.<n>.state` | `unconfigured` / `error` / `up` / `down` / `rnsd_unavailable`. |
 | `lora.<n>.chip` | Detected chip name, e.g. `SX1262`. |
 | `lora.<n>.bitrate_eff` | Effective bitrate registered with `rnsd`, bits/s (airtime-derived). |
-| `lora.<n>.stats.{tx_bytes,rx_bytes,tx_frames,rx_frames,crc_err,split_rx_timeout,rssi_last,snr_last}` | Traffic counters and last-RX RSSI/SNR. |
+| `lora.<n>.stats.{tx_bytes,rx_bytes,tx_frames,rx_frames,crc_err,split_rx_timeout,tx_dropped,rssi_last,snr_last}` | Traffic counters (`tx_dropped` = frames shed by the LBT timeout) and last-RX RSSI/SNR. Published only when a UI can read them — see `uiTelemetryWanted()`. |
 
 ### Secrets
 
@@ -131,6 +133,7 @@ lora <n> txp <dBm>            TX power
 lora <n> preamble <sym>       preamble length
 lora <n> sync <word>          sync word (hex or decimal)
 lora <n> mode <name>          interface mode
+lora <n> lbt <0|1>            listen-before-talk on/off (carrier-sense before TX)
 lora help | -h                command summary
 ```
 
