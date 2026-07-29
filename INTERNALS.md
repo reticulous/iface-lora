@@ -142,6 +142,13 @@ The RF switch is uniform and handled at the call site, not in dispatch:
 `Module` before `begin()`, so it covers every family), or — SX126x only —
 `setDio2AsRfSwitch(true)` applied inside `radioBegin` when the slot asks for it.
 
+**RX gain (SX126x only).** SX126x/LR `begin()` sets the regulator to **DC-DC**
+(passing `useRegulatorLDO = false`). The LNA gain mode is a per-radio setting
+`s.lora.<n>.rx_boosted_gain` (default **on**, live via `lora <n> rx_boosted_gain
+0|1`): `radioBegin` calls `setRxBoostedGainMode` for the SX126x family — boosted
+buys ~+3 dB sensitivity for ~0.4 mA more RX current (~4.2 → ~4.6 mA typ.), worth
+it for a receiver that idles in RX. The key is inert on non-SX126x families.
+
 **Presence probe.** `probeRadio` runs a bare `begin()` (safe defaults + the
 slot's TCXO voltage) at boot; `RADIOLIB_ERR_NONE` means the radio answered on
 SPI. It probes in the chip's **own band** — 2450 MHz/812.5 kHz for SX128x, else
