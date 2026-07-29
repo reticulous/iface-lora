@@ -33,9 +33,11 @@
  * radio is half-duplex, so we never start a transmit while a split RX is being
  * reassembled (splitPending) or another transmit is on-air (txActive).
  */
+#include "rnsd.h"
 #include "lora.h"
 #include "esp_idf_hal.h"
 #include "spangap.h"
+#include "mem.h"           /* gp_alloc (PSRAM) for the LoRaMon ring/history buffers */
 #include "ports.h"
 
 #include <RadioLib.h>
@@ -56,6 +58,14 @@
 #define RNODE_MAX_PAYLOAD    254
 #define RNODE_FLAG_SPLIT     0x01
 #define SPLIT_RX_TIMEOUT_MS  5000
+
+/* ─────────────── LoRaMon: per-on-air-frame record ring ───────────────
+ * One record per LoRa frame (so two per split RNS packet). Always recording
+ * while a radio is up; the ring holds ~a busy hour. A LoRaMon viewer (web/LCD)
+ * pulls the whole ring once over ITS (port LORAMON_PORT) and then follows live
+ * frames via the ephemeral `lora.<n>.mon.*` storage keys. `dur_ms` is the
+ * frame's computed time-on-air; `t_ms` its start on the monotonic ms clock. */
+#define LORA_MON_CAP  4096          /* max published packet nodes per radio (FIFO backstop) */
 
 /* ── RNode-style CSMA / listen-before-talk ──
  * Non-blocking DIFS + exponential contention-window backoff, run from the task
@@ -182,6 +192,7 @@ struct LoraRadio {
     /* CSMA / listen-before-talk. slotTicks/difsTicks derive from the LoRa
      * symbol time at config; the phase machine is driven from the task loop. */
     bool            lbt;             /* carrier-sense enabled (s.lora.<i>.lbt) */
+    bool            rxBoostedGain;   /* SX126x LNA boosted RX gain (s.lora.<i>.rx_boosted_gain) */
     TickType_t      slotTicks;       /* CSMA slot time */
     TickType_t      difsTicks;       /* inter-frame listen before backoff */
     CsmaPhase       csmaPhase;
@@ -212,10 +223,19 @@ struct LoraRadio {
     /* Stats — published to ephemeral storage once per task tick. */
     uint64_t        txBytes, rxBytes, txFrames, rxFrames, crcErr, splitTimeouts, txDropped;
     float           rssiLast, snrLast;
+
+    /* LoRaMon — each on-air frame becomes a storage node lora.<n>.packets.<ms>;
+     * this FIFO of start-ms drives expiry (delete nodes > 1 h old). */
+    int8_t          cfgTxp;          /* configured TX power dBm, stamped into tx records */
+    uint32_t        txFrameStartMs;  /* start (millis) of the on-air TX frame */
+    uint32_t*       pktMs;           /* FIFO of published packet start-ms (gp_alloc'd at radioStart) */
+    uint16_t        pktCap, pktHead, pktCount;
 };
 
 static LoraRadio     s_radios[kNumRadios];
 static TaskHandle_t  s_task = nullptr;
+static volatile bool s_stop = false;   /* rns stop → break the work loop and park */
+static volatile bool s_parked = false; /* true while parked (stopped); loraStop waits on it */
 static volatile bool s_configDirty = true;
 static volatile bool s_displayDirty = false;   /* an MHz/kHz display key was edited */
 static volatile bool     s_radioIrq  = false;  /* DIO1 fired; gate the chip SPI poll on it */
@@ -307,7 +327,8 @@ static int16_t lr11x0Begin(LoraRadio* r, float freq, float bw, uint8_t sf, uint8
  * separately (lr11x0Begin); LR2021 takes everything including TCXO. We cast to
  * the concrete class (the pointer really is that class) so dispatch is correct
  * regardless of where each begin() sits in RadioLib's hierarchy. SX126x also
- * applies DIO2-as-RF-switch when the slot asks for it. */
+ * applies DIO2-as-RF-switch when the slot asks for it, and the LNA boosted-RX-gain
+ * option (r->rxBoostedGain): ~+3 dB sensitivity for ~0.4 mA more RX current. */
 static int16_t radioBegin(LoraRadio* r, float freq, float bw, uint8_t sf, uint8_t cr,
                           uint8_t sync, int8_t power, uint16_t preamble, float tcxoV) {
     PhysicalLayer* p = r->radio;
@@ -330,9 +351,11 @@ static int16_t radioBegin(LoraRadio* r, float freq, float bw, uint8_t sf, uint8_
         case CHIP_LR2021: return static_cast<LR2021*>(p)->begin(freq, bw, sf, cr, sync, power, preamble, tcxoV);
         default:          return RADIOLIB_ERR_UNKNOWN;
     }
-    /* SX126x only: DIO2 drives the antenna RF switch. */
+    /* SX126x only: DIO2 drives the antenna RF switch, and the LNA RX gain mode. */
     if (st == RADIOLIB_ERR_NONE && r->slot->dio2_rf_switch)
         st = static_cast<SX126x*>(p)->setDio2AsRfSwitch(true);
+    if (st == RADIOLIB_ERR_NONE && chipFamily(r->slot->chip) == FAM_SX126X)
+        st = static_cast<SX126x*>(p)->setRxBoostedGainMode(r->rxBoostedGain);
     return st;
 }
 
@@ -420,7 +443,10 @@ static void loraHexdump(int idx, const char* dir, const uint8_t* p, size_t len) 
 
 /* Trace one whole RNS frame, gated on `log lora debug`. haveQual: fold in the
  * radio's last rx rssi/snr (rx); false on tx. logIsDebug short-circuits the
- * decode when off, so this is free on the hot path in normal operation. */
+ * decode when off, so this is free on the hot path in normal operation.
+ * Retained for future RNS-level inspection but no longer wired into rx/tx —
+ * LoRaMon logs per on-air frame instead (loraMonPush). */
+__attribute__((unused))
 static void loraTracePacket(LoraRadio* r, const char* dir,
                             const uint8_t* p, size_t len, bool haveQual,
                             double airMs, int frames) {
@@ -583,6 +609,69 @@ static void publishStats(LoraRadio* r) {
     storageEnd();
 }
 
+/* ─────────────── LoRaMon: recording, windows, publish, ITS server ─────────────── */
+
+/* True while a LoRaMon viewer (web or LCD) is open — gates recording. */
+static bool loraMonWatched(void) {
+    return storageGetInt("sys.stats.web_loramon", 0) ||
+           storageGetInt("sys.stats.lcd_loramon", 0);
+}
+
+/* Delete published packet nodes older than the 1-hour window, and enforce the
+ * FIFO cap. The FIFO holds start-ms oldest-first; pop + delete from the front.
+ * Both callers run on the lora task, so no lock. */
+static void loraMonExpire(LoraRadio* r, uint32_t now) {
+    if (!r->pktMs) return;
+    while (r->pktCount) {
+        uint32_t oldest = r->pktMs[r->pktHead];
+        bool aged = (now - oldest) > 3600u * 1000;      /* > 1 h (u32 diff, wrap-safe) */
+        bool full = r->pktCount >= r->pktCap;           /* backstop against a flood */
+        if (!aged && !full) break;
+        char key[40];
+        snprintf(key, sizeof key, "lora.%d.packets.%u", r->idx, (unsigned)oldest);
+        storageDeleteTree(key);
+        r->pktHead = (uint16_t)((r->pktHead + 1) % r->pktCap);
+        r->pktCount--;
+    }
+}
+
+/* Record one on-air frame: always the per-frame `log lora debug` line, and —
+ * while a viewer is open — a packet node `lora.<n>.packets.<ms>` holding a
+ * packed string: "r|rssi|snr|dur|bytes" (rx) or "t|txp|dur|bytes" (tx). The
+ * leading token is the direction; snr is deci-dB. Then age old nodes out. */
+static void loraMonPush(LoraRadio* r, uint8_t dir, uint32_t t_ms, uint16_t dur_ms,
+                        uint16_t bytes, int16_t rssi, int16_t snr10, int8_t txp) {
+    if (logIsDebug(TAG)) {
+        if (dir) dbg("lora/%d tx %u..%u (%ums) %uB txp=%ddBm",
+                     r->idx, (unsigned)t_ms, (unsigned)(t_ms + dur_ms),
+                     (unsigned)dur_ms, (unsigned)bytes, (int)txp);
+        else     dbg("lora/%d rx %u..%u (%ums) %uB rssi=%d snr=%.1f",
+                     r->idx, (unsigned)t_ms, (unsigned)(t_ms + dur_ms),
+                     (unsigned)dur_ms, (unsigned)bytes, (int)rssi, (double)snr10 / 10.0);
+    }
+    if (!loraMonWatched() || !r->pktMs || !r->pktCap) return;
+
+    char key[40], val[48];
+    snprintf(key, sizeof key, "lora.%d.packets.%u", r->idx, (unsigned)t_ms);
+    if (dir) snprintf(val, sizeof val, "t|%d|%u|%u",
+                      (int)txp, (unsigned)dur_ms, (unsigned)bytes);
+    else     snprintf(val, sizeof val, "r|%d|%d|%u|%u",
+                      (int)rssi, (int)snr10, (unsigned)dur_ms, (unsigned)bytes);
+    storageSet(key, val);
+
+    loraMonExpire(r, t_ms);                              /* age out + free a slot if full */
+    r->pktMs[(r->pktHead + r->pktCount) % r->pktCap] = t_ms;
+    r->pktCount++;
+}
+
+/* Drop all of a radio's published nodes + FIFO (last viewer closed). */
+static void loraMonClear(LoraRadio* r) {
+    char pfx[32];
+    snprintf(pfx, sizeof pfx, "lora.%d.packets", r->idx);
+    storageDeleteTree(pfx);
+    r->pktHead = r->pktCount = 0;
+}
+
 static void publishState(LoraRadio* r, const char* state) {
     char b[48];
     storageBegin();
@@ -686,6 +775,11 @@ static bool radioStart(LoraRadio* r) {
     float bw_khz   = (float)bw_hz   / 1.0e3f;
     float tcxo_v   = (float)r->slot->tcxo_mv / 1000.0f;
 
+    /* SX126x LNA boosted RX gain: ~+3 dB sensitivity for ~0.4 mA more RX current.
+     * On by default; radioBegin applies it. Read before begin so it takes effect
+     * in the same bring-up. */
+    r->rxBoostedGain = storageGetInt(sk(kb, sizeof kb, r->idx, "rx_boosted_gain"), 1) != 0;
+
     int16_t st = radioBegin(r, freq_mhz, bw_khz, (uint8_t)sf, (uint8_t)cr,
                             (uint8_t)syncWord, (int8_t)txp, (uint16_t)preamble, tcxo_v);
     if (st != RADIOLIB_ERR_NONE) {
@@ -731,6 +825,14 @@ static bool radioStart(LoraRadio* r) {
     r->curMode    = modeFromString(mode);
     r->curBitrate = computeBitrate(sf, bw_hz, cr, preamble);
     r->cfgSf = sf; r->cfgBwHz = bw_hz; r->cfgCr = cr; r->cfgPreamble = preamble;
+    r->cfgTxp = (int8_t)txp;
+
+    /* LoRaMon expiry FIFO: allocated once, kept across config cycles. */
+    if (!r->pktMs) {
+        r->pktMs = (uint32_t*)gp_alloc((size_t)LORA_MON_CAP * sizeof(uint32_t));
+        r->pktCap = r->pktMs ? LORA_MON_CAP : 0;
+        r->pktHead = r->pktCount = 0;
+    }
 
     /* IFAC: network_name is config (s.), passphrase is a secret (secrets.). */
     storageGetStr(sk(kb, sizeof kb, r->idx, "ifac_netname"), r->curIfacNetname, sizeof(r->curIfacNetname), "");
@@ -806,7 +908,7 @@ static void probeRadio(LoraRadio* r) {
 
 static void deliverInbound(LoraRadio* r, const uint8_t* data, size_t len,
                            double airMs, int frames) {
-    loraTracePacket(r, "rx", data, len, true, airMs, frames);
+    (void)airMs; (void)frames;   /* per-frame recording/logging now happens in handleRxDone */
     if (r->rnsdHandle < 0) return;
     /* Prefix this packet's signal telemetry (rnsd strips it, sets it on the
      * received packet): int16 rssi(dBm) | int16 snr(dB*10), big-endian. Captured
@@ -861,6 +963,16 @@ static void handleRxDone(LoraRadio* r) {
     uint8_t  seq        = header & 0xF0;
     bool     isSplit    = (header & RNODE_FLAG_SPLIT) != 0;
     size_t   payloadLen = pktLen - 1;
+
+    /* Record this on-air frame (RX_DONE marks end-of-air, so start = end − ToA). */
+    {
+        uint32_t now = millis();
+        uint32_t dur = (uint32_t)lround(1000.0 * loraAirtimeSeconds(
+                           r->cfgSf, r->cfgBwHz, r->cfgCr, r->cfgPreamble, (int)pktLen));
+        loraMonPush(r, 0 /*rx*/, (dur <= now ? now - dur : now), (uint16_t)dur,
+                    (uint16_t)payloadLen, (int16_t)lround(r->rssiLast),
+                    (int16_t)lround(r->snrLast * 10.0), 0);
+    }
 
     if (!isSplit) {
         size_t fl = pktLen;                        /* whole on-air frame (incl. header) */
@@ -998,8 +1110,9 @@ static void startTxFrame(LoraRadio* r, int idx) {
         txRearmRx(r);
         return;
     }
-    r->txActive   = true;
-    r->txDeadline = xTaskGetTickCount() + r->txWatchTicks;
+    r->txActive       = true;
+    r->txFrameStartMs = millis();                  /* start-of-air, for the LoRaMon record */
+    r->txDeadline     = xTaskGetTickCount() + r->txWatchTicks;
     gpio_intr_enable((gpio_num_t)r->slot->dio1);   /* arm DIO1 for this frame's TxDone */
 }
 
@@ -1030,12 +1143,9 @@ static void beginTx(LoraRadio* r, const uint8_t* data, size_t len) {
         r->txFrameCount  = 2;
     }
 
-    /* Trace after framing so the airtime sums the actual on-air frame(s) — a
-     * split packet's two frames each carry their own preamble/header/CRC. */
-    loraTracePacket(r, "tx", data, len, false,
-                    loraPacketAirtimeMs(r, r->txFrameLen, r->txFrameCount),
-                    r->txFrameCount);
-
+    /* Per-frame LoRaMon records + the `log lora debug` line are emitted at each
+     * frame's TxDone (serviceRadio); the RNS-header trace (loraTracePacket) is
+     * kept but no longer called. */
     startTxFrame(r, 0);
 }
 
@@ -1100,6 +1210,13 @@ static void serviceRadio(LoraRadio* r) {
     if (flags & (1UL << RADIOLIB_IRQ_TX_DONE)) {
         r->radio->finishTransmit();          /* clear IRQ, chip → standby */
         r->txFrames++;
+        /* Record the frame that just went out (one per split half). */
+        uint8_t  doneIdx = r->txFrameSent;
+        uint32_t dur = (uint32_t)lround(1000.0 * loraAirtimeSeconds(
+                           r->cfgSf, r->cfgBwHz, r->cfgCr, r->cfgPreamble,
+                           (int)r->txFrameLen[doneIdx]));
+        loraMonPush(r, 1 /*tx*/, r->txFrameStartMs, (uint16_t)dur,
+                    (uint16_t)(r->txFrameLen[doneIdx] - 1), 0, 0, r->cfgTxp);
         if (++r->txFrameSent < r->txFrameCount) {   /* split: send the second half */
             startTxFrame(r, r->txFrameSent);
             return;
@@ -1261,6 +1378,9 @@ static void cliPrintSlot(int i) {
     cliPrintf("        freq=%.3f MHz  bw=%.0f kHz  sf=%d  cr=4/%d  txp=%d dBm  preamble=%d\n",
               freq_hz / 1.0e6, bw_hz / 1.0e3, sf, cr, txp, pre);
     cliPrintf("        sync=%s  mode=%s  bitrate=%u bit/s\n", sync, mode, (unsigned)r->curBitrate);
+    if (chipFamily(s->chip) == FAM_SX126X)
+        cliPrintf("        rx_boosted_gain=%d\n",
+                  storageGetInt(sk(kb, sizeof kb, i, "rx_boosted_gain"), 1) != 0);
     cliPrintf("        rx %u/%uB  tx %u/%uB  rssi %d dBm  snr %d dB  crc_err %u  split_to %u\n",
               (unsigned)r->rxFrames, (unsigned)r->rxBytes,
               (unsigned)r->txFrames, (unsigned)r->txBytes,
@@ -1286,7 +1406,7 @@ static void cliLora(const char* args) {
         cliPrintf("%-*s status for one radio\n",            CLI_HELP_COL, "lora <n>");
         cliPrintf("%-*s enable/disable (no <n> = all)\n",   CLI_HELP_COL, "lora [<n>] up|down");
         cliPrintf("%-*s freq MHz / bw kHz / sf / cr /\n",   CLI_HELP_COL, "lora <n> <param> <val>");
-        cliPrintf("%-*s   txp dBm / preamble / sync / mode / lbt 0|1\n", CLI_HELP_COL, "");
+        cliPrintf("%-*s   txp dBm / preamble / sync / mode / lbt 0|1 / rx_boosted_gain 0|1\n", CLI_HELP_COL, "");
         return;
     }
 
@@ -1314,7 +1434,7 @@ static void cliLora(const char* args) {
     if (strcmp(cmd, "up") == 0)   { storageSet(sk(kb, sizeof kb, idx, "enable"), 1); cliPrintf("lora/%ld enabled\n", idx);  return; }
     if (strcmp(cmd, "down") == 0) { storageSet(sk(kb, sizeof kb, idx, "enable"), 0); cliPrintf("lora/%ld disabled\n", idx); return; }
 
-    if (nt < 3) { cliPrintf("usage: lora %ld <freq|bw|sf|cr|txp|preamble|sync|mode|lbt> <value>\n", idx); return; }
+    if (nt < 3) { cliPrintf("usage: lora %ld <freq|bw|sf|cr|txp|preamble|sync|mode|lbt|rx_boosted_gain> <value>\n", idx); return; }
     const char* val = tok[2];
 
     /* Human units in: frequency MHz, bandwidth kHz. Storage stays in Hz. */
@@ -1348,8 +1468,13 @@ static void cliLora(const char* args) {
         int on = atoi(val) != 0;
         storageSet(sk(kb, sizeof kb, idx, "lbt"), on);
         cliPrintf("lora/%ld lbt = %s\n", idx, on ? "on (carrier-sense before tx)" : "off (blind tx)");
+    } else if (strcmp(cmd, "rx_boosted_gain") == 0) {
+        int on = atoi(val) != 0;
+        storageSet(sk(kb, sizeof kb, idx, "rx_boosted_gain"), on);
+        cliPrintf("lora/%ld rx_boosted_gain = %s (SX126x only)\n", idx,
+                  on ? "on (boosted, +~0.4 mA RX)" : "off (power saving)");
     } else {
-        cliPrintf("unknown: lora %ld %s (try freq|bw|sf|cr|txp|preamble|sync|mode|lbt)\n", idx, cmd);
+        cliPrintf("unknown: lora %ld %s (try freq|bw|sf|cr|txp|preamble|sync|mode|lbt|rx_boosted_gain)\n", idx, cmd);
     }
 }
 
@@ -1364,6 +1489,7 @@ static void cliLora(const char* args) {
  * pending the task blocks until a real event and the chip light-sleeps. */
 #define LORA_STATS_MIN_MS 1000
 static TickType_t s_statsLastPub = 0;      /* tick of the last publish */
+static TickType_t s_monLastPub   = 0;      /* tick of the last LoRaMon windowed-airtime publish */
 static bool       s_statsPend    = false;  /* counter moved; publish owed at the 1 Hz boundary */
 static uint64_t   s_statsSig     = 0;      /* last-seen sum of all counters */
 
@@ -1414,23 +1540,22 @@ static TickType_t nextDeadline(void) {
             if (d < soonest) soonest = d;
         }
     }
+    /* Keep a 1 Hz beat while a LoRaMon viewer is open so windowed airtime decays
+     * on screen even when the channel is idle (no rx/tx events to wake us). */
+    if (loraMonWatched()) {
+        TickType_t due = s_monLastPub + pdMS_TO_TICKS(LORA_STATS_MIN_MS);
+        TickType_t d = (int32_t)(due - now) > 0 ? (TickType_t)(due - now) : 0;
+        if (d < soonest) soonest = d;
+    }
     return soonest;
 }
 
 static void loraTaskMain(void*) {
     info("[%s] task up (%d radio%s)", TAG, kNumRadios, kNumRadios == 1 ? "" : "s");
 
-    /* Boot barrier: stay quiet until the RNS universe has settled — clock valid,
-     * network up (if configured), and the minimum settle floor elapsed. rnsd
-     * publishes rns.ready once all that holds; until then we don't register or
-     * transmit (a brownout/boot-loop node must never reach RF TX). Bounded
-     * fallback so a wedged rnsd can't pin us. No rnsd, no
-     * point — so bail (don't start) if rns.ready never comes. */
-    if (!waitForFlag("rns.ready", 120)) {
-        err("[%s] rns.ready never set — not starting", TAG);
-        killSelf();
-    }
-
+    /* No boot barrier here anymore: the RNS orchestrator only calls loraStart()
+     * (which spawns this task) after rnsd is up and past its boot window, so the
+     * universe is already settled by the time we run. */
     itsClientInit(kNumRadios);
     storageSubscribeChanges("s.lora", onCfgChange);
     storageSubscribeChanges("secrets.lora", onCfgChange);  /* IFAC passphrase */
@@ -1480,18 +1605,18 @@ static void loraTaskMain(void*) {
         probeRadio(r);
     }
 
-    /* Wait for a valid clock before bringing radios on-air, so our first
-     * announces aren't 1970-stamped. LoRa has no IP path to SNTP — time comes
-     * from GPS/RTC if the board has one. A LoRa-only node with no time source
-     * just eats the bounded timeout each boot; set s.sys.time_wait_s=0 there. */
-    waitForTime(0);
+    /* Clock was already resolved by rnsd before it declared ready (its own
+     * waitForTime + boot window ran first), so we don't wait again here. */
 
     /* Seed the stat keys once so consumers see a radio before any traffic; from
      * here publishing is purely event-driven (see the stats block below). */
     for (int i = 0; i < kNumRadios; i++) publishStats(&s_radios[i]);
     s_statsLastPub = xTaskGetTickCount();
 
-    for (;;) {
+  for (;;) {   /* Park, don't delete: this task lives across rns stop/start, so its
+                * ITS slot + boost lock are reused, not leaked (rns/INTERNALS §6.1). */
+    s_configDirty = true;   /* (re)apply config on entry + each resume → radios up + registered */
+    while (!s_stop) {
         if (s_configDirty) {
             s_configDirty = false;
             for (int i = 0; i < kNumRadios; i++) applyConfig(&s_radios[i]);
@@ -1542,8 +1667,58 @@ static void loraTaskMain(void*) {
             }
         }
 
+        /* LoRaMon expiry — 1 Hz while a viewer is open, so nodes age out of the
+         * 1 h window even on an idle channel (nextDeadline holds the beat). When
+         * the last viewer closes, drop each radio's whole packets subtree. */
+        {
+            static bool prevWatch = false;
+            bool w = loraMonWatched();
+            if (w) {
+                TickType_t nowp = xTaskGetTickCount();
+                if ((int32_t)(nowp - s_monLastPub) >= (int32_t)pdMS_TO_TICKS(LORA_STATS_MIN_MS)) {
+                    uint32_t now = millis();
+                    for (int i = 0; i < kNumRadios; i++) loraMonExpire(&s_radios[i], now);
+                    s_monLastPub = nowp;
+                }
+            } else if (prevWatch) {
+                for (int i = 0; i < kNumRadios; i++) loraMonClear(&s_radios[i]);
+            }
+            prevWatch = w;
+        }
+
         itsPoll(nextDeadline());
+    }   /* end while(!s_stop) */
+
+        /* rns stop: sleep every radio — RF dead, and radioStop deregisters us from
+         * rnsd (drops our RNSD_PORT_IFACE conns → onTransportDisconnect frees the
+         * interface). Keep the RadioLib objects for the next start. Then PARK on the
+         * inbox until loraStart() clears s_stop and notifies. */
+        for (int i = 0; i < kNumRadios; i++) {
+            LoraRadio* r = &s_radios[i];
+            if (r->running) radioStop(r);
+        }
+        s_parked = true;
+        info("[%s] stopped", TAG);
+        while (s_stop) itsPoll(portMAX_DELAY);
+        s_parked = false;
     }
+}
+
+/* ── RNS lifecycle hooks (registered with the orchestrator; see rnsServiceRegister) ── */
+static void loraStart(void) {
+    s_stop = false;
+    if (!s_task)
+        s_task = spawnTask(loraTaskMain, TAG, 8192, nullptr, 2, CORE_SECONDARY_NO_LCD, STACK_PSRAM);
+    else
+        xTaskNotifyGive(s_task);   /* un-park the resident task */
+}
+
+static void loraStop(void) {
+    if (!s_task || s_stop) return;
+    s_stop = true;
+    xTaskNotifyGive(s_task);   /* break the work loop; the task parks, not deleted */
+    for (int i = 0; i < 300 && !s_parked; i++) delay(10);   /* await park */
+    if (!s_parked) warn("[%s] stop timed out", TAG);
 }
 
 void LoraService::onInit() {
@@ -1577,12 +1752,13 @@ void LoraService::onInit() {
 
     cliRegisterCmd("lora", cliLora);
 
-    /* Larger stack than other interfaces for the LoRa frame buffers and
-     * RadioLib state machine. PSRAM stack. On a no-LCD build the driver runs on
-     * the secondary core so its RX/TX bursts overlap the rnsd processing they
-     * feed on the primary core, aligning both cores' idle windows for light
-     * sleep; an LCD build keeps it on the primary (secondary is busy rendering). */
-    s_task = spawnTask(loraTaskMain, TAG, 8192, nullptr, 2, CORE_SECONDARY_NO_LCD, STACK_PSRAM);
+    /* Register with the RNS orchestrator instead of self-spawning: rnsStart()
+     * calls loraStart() (which spawns loraTaskMain) once rnsd is up and past its
+     * boot window, and rnsStop() calls loraStop(). The larger 8 KB PSRAM stack is
+     * for the LoRa frame buffers + RadioLib state machine; core placement puts the
+     * driver opposite rnsd on a no-LCD build so their RX/TX bursts overlap and
+     * both cores idle together for light sleep. */
+    rnsServiceRegister(TAG, loraStart, loraStop, RNS_PHASE_IFACE);
 }
 
 #else  /* ── no radios configured (CONFIG_LORA_COUNT = 0) ── */

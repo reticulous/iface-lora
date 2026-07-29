@@ -16,3 +16,8 @@ class LoraService : public Service {
 public:
     void onInit() override;
 };
+
+/* LoRaMon publishes each on-air frame as a storage node
+ * `lora.<n>.packets.<ms>` = a packed string ("r|rssi|snr|dur|bytes" for rx,
+ * "t|txp|dur|bytes" for tx; snr is deci-dB). Viewers (browser + LCD) read that
+ * subtree directly — no accessor surface here. */

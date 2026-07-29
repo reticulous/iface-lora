@@ -347,7 +347,44 @@ display key rather than the Hz config key, so `loraInit` seeds that one default
 enable-toggle alone gets a radio up. `loraInit` does **not** touch any power pin
 — the board owns the LoRa rail.
 
-## 12. Pitfalls
+## 12. LoRaMon (per-frame telemetry)
+
+Every on-air frame is recorded for the LoRaMon viewers (browser + LCD). The
+storage subtree **is** the ring — no in-firmware record buffer, no ITS transfer:
+
+- **One node per frame.** `loraMonPush` (from the RX drain and each TxDone, so
+  once per on-air frame → two per split RNS packet) writes
+  `lora.<n>.packets.<ms>` = a packed string; direction is the leading token, snr
+  is deci-dB:
+  - rx: `r|<rssi>|<snr>|<dur_ms>|<bytes>`
+  - tx: `t|<txp>|<dur_ms>|<bytes>`
+  `<ms>` is the frame's start on the monotonic `millis()` clock, `<dur_ms>` its
+  computed time-on-air. The per-frame `log lora debug` line is emitted here too
+  (it replaced the RNS-header trace; `loraTracePacket` is kept but unwired).
+- **Expiry is the ring.** A per-radio start-ms FIFO (`pktMs`, cap
+  `LORA_MON_CAP`) drives deletion: on each push and once a second,
+  `loraMonExpire` pops + `storageDeleteTree`s nodes older than 1 h (the cap is a
+  flood backstop). `storageDeleteTree` emits an explicit delete op, so the
+  browser mirror sees removals — unlike the implicit ~1 Hz ephemeral
+  republish-merge, which never nulls a removed key (that asymmetry is why
+  add/delete works here but a merge-only scheme couldn't expire on the browser).
+- **Gated on a viewer.** Recording runs only while `sys.stats.web_loramon` or
+  `sys.stats.lcd_loramon` is set (`loraMonWatched`), the actmon gating pattern.
+  On the falling edge the task drops each radio's whole `lora.<n>.packets`
+  subtree — so there is no pre-open history; the graph fills from open forward.
+- **No firmware aggregation.** Windowed airtime % is computed by the viewers from
+  the nodes they hold, per direction with boundary overlap. The browser derives
+  the device clock from the newest packet ms it has seen (monotonic anchor, never
+  pulled backward); the LCD uses `millis()` directly (same clock as the keys).
+
+Consumers: the browser reads the mirrored `lora.<n>.packets` subtree
+(`iface-lora/browser`); the LCD app iterates it via `storageForEach` on a 1 s
+redraw (`conditional/spangap-lcd/`, a `when: spangap/spangap-lcd` service). Both
+draw each packet as a horizontal line at its signal level (rx = SNR-weighted
+quality, tx = txp; blue rx / yellow tx) across 1 m / 10 m / 1 h graphs. This is
+the data substrate for adaptive TX power — see `plans/adaptive-power.md`.
+
+## 13. Pitfalls
 
 - **The LoRa rail is the board's, not this straddle's.** The radio is unreachable
   on SPI until whatever powers it is up and settled; `begin()` then returns

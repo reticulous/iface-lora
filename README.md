@@ -111,6 +111,7 @@ SF/BW/CR/preamble are set; `lora.<n>.state` reads `unconfigured` until then.
 | `lora.<n>.chip` | Detected chip name, e.g. `SX1262`. |
 | `lora.<n>.bitrate_eff` | Effective bitrate registered with `rnsd`, bits/s (airtime-derived). |
 | `lora.<n>.stats.{tx_bytes,rx_bytes,tx_frames,rx_frames,crc_err,split_rx_timeout,tx_dropped,rssi_last,snr_last}` | Traffic counters (`tx_dropped` = frames shed by the LBT timeout) and last-RX RSSI/SNR. Published only when a UI can read them — see `uiTelemetryWanted()`. |
+| `lora.<n>.packets.<ms>` | LoRaMon: one node per on-air frame, keyed by start-ms — a packed string `r\|rssi\|snr\|dur\|bytes` (rx) or `t\|txp\|dur\|bytes` (tx); `snr` is deci-dB. Written only while the LoRaMon app is open (`sys.stats.{web,lcd}_loramon`) and deleted past 1 h. See INTERNALS §12. |
 
 ### Secrets
 
