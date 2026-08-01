@@ -15,14 +15,34 @@
           <button v-for="r in radios" :key="r" class="lm-tab" :class="{ active: r === activeRadio }"
                   @click="activeRadio = r">lora/{{ r }}</button>
         </div>
+        <!-- The axis names sit in the strip above their own gutters, which is
+             what pushes the pills inward. Zoomed in, the window is a fixed span
+             on the stack, so the moving-window pills are meaningless — only the
+             way back out remains. -->
+        <div class="lm-pills">
+          <span class="lm-axis lm-axis-tx">tx</span>
+          <template v-if="zoomed">
+            <button class="lm-pill lm-back" :class="{ 'lm-last': zoomStack.length === 1 }"
+                    @click="zoomOut">←</button>
+            <span class="lm-zoomlabel">{{ zoomLabel }}</span>
+          </template>
+          <button v-else v-for="w in WINDOWS" :key="w.key" class="lm-pill"
+                  :class="{ active: w.key === winKey }"
+                  @click="winKey = w.key">{{ w.label }}</button>
+          <span class="lm-axis lm-axis-rx">rx</span>
+        </div>
         <div class="lm-graphs">
-          <div v-for="(win, i) in WINDOWS" :key="win.key" class="lm-graph">
-            <canvas :ref="el => setCanvas(i, el)" class="lm-canvas" />
+          <div class="lm-graph">
+            <canvas ref="canvasRef" class="lm-canvas"
+                    @pointerdown="onDown"
+                    @pointermove="onMove"
+                    @pointerup="onUp"
+                    @pointercancel="onUp" />
             <div class="lm-caption">
-              <span class="lm-win">{{ win.label }}</span>
-              <span class="lm-air">airtime
-                <span class="c-rx">{{ airVals[win.key]?.rx ?? '0%' }} rx</span> /
-                <span class="c-tx">{{ airVals[win.key]?.tx ?? '0%' }} tx</span>
+              <span class="lm-air">tx airtime {{ air.tx }}</span>
+              <span class="lm-air">channel busy {{ air.busy }}</span>
+              <span class="lm-legend">
+                <span class="c-rns">rnsd</span> / <span class="c-rnode">rnode</span> / <span class="c-ours">rfprobe</span>
               </span>
             </div>
           </div>
@@ -37,6 +57,9 @@ import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import FloatingWindow from 'spangap-browser/components/FloatingWindow.vue'
 import { useDeviceStore } from 'spangap-browser/stores/device'
 import { getSession } from 'spangap-browser/lib/webrtc-session'
+import { focusedWindowId } from 'spangap-browser/lib/windows'
+
+const WIN_ID = 'loramon'          // must match the id given to FloatingWindow
 
 const props = defineProps<{ visible: boolean; title: string; focusToken?: number }>()
 const emit = defineEmits<{ 'update:visible': [value: boolean] }>()
@@ -50,16 +73,41 @@ const defaultGeom = isPhoneInit
 
 const HOUR_MS = 3600 * 1000
 const MAX_RADIOS = 4
-const C_RX = '#4088E8'        // received frames (blue)
-const C_TX = '#E8D040'        // transmitted frames (yellow)
+const GUT_L_CSS = 30          // left scale gutter (tx dBm), CSS px
+const GUT_R_CSS = 34          // right scale gutter (rx dBm) — four-digit labels
+
+/* Colour is the frame's protocol, not its direction — direction is the axis a
+ * bar is read against, and the tinted background under a transmit. Types match
+ * the firmware's LORA_PKT_*. */
+const C_RNS = '#E8D040'       // Reticulum traffic (yellow)
+const C_OURS = '#E84040'      // our own air protocol: rfprobe + hash linkage (red)
+const C_RNODE = '#E89040'     // the attached RNode client's traffic (orange)
+
+/* Band gradient, bottom → top of each band, and the reddish cast of the same
+ * gradient that marks the air being ours. The darkest tone doubles as the
+ * timescale grid, so the grid reads as part of the background. */
+const BG_LO = '#242424', BG_HI = '#313131'
+const TX_LO = '#3a2323', TX_HI = '#4a3030'
+const C_GRID = BG_LO
 
 const WINDOWS = [
-  { key: '1m',  ms: 60 * 1000,   label: '1 min' },
-  { key: '10m', ms: 600 * 1000,  label: '10 min' },
-  { key: '1h',  ms: HOUR_MS,     label: '1 hour' },
+  { key: '10s', ms: 10 * 1000,  label: '10s' },
+  { key: '1m',  ms: 60 * 1000,  label: '1m'  },
+  { key: '5m',  ms: 300 * 1000, label: '5m'  },
+  { key: '10m', ms: 600 * 1000, label: '10m' },
+  { key: '30m', ms: 1800 * 1000, label: '30m' },
+  { key: '1h',  ms: HOUR_MS,    label: '1hr' },
 ] as const
 
-interface Rec { t: number; dir: number; dur: number; bytes: number; rssi: number; snr10: number; txp: number }
+/* One plot, two dBm axes reading the same four bands: transmit power down the
+ * left gutter in 10 dB steps, received strength down the right in 25 dB. RX
+ * needs the wider step because its range is 100 dB against TX's 40, and both
+ * have to land on the same band edges for a single grid to serve them. */
+const NBANDS = 4
+const AX_TX = { lo: -10, hi: 30 }     // 10 dB per band
+const AX_RX = { lo: -130, hi: -30 }   // 25 dB per band
+
+interface Rec { t: number; dir: number; dur: number; bytes: number; rssi: number; snr10: number; txp: number; type: number; wait: number }
 
 /* recs = the active radio's packets, rebuilt each tick from the mirrored
  * `lora.<n>.packets` subtree (the firmware adds/deletes those nodes). */
@@ -68,7 +116,59 @@ let devClock = 0              // newest packet ms seen = device clock reference
 let devClockAt = 0           // Date.now() when devClock was captured
 
 const activeRadio = ref(0)
-const airVals = ref<Record<string, { rx: string; tx: string }>>({})
+const winKey = ref<string>('1m')
+const air = ref<{ tx: string; busy: string }>({ tx: '0%', busy: '0%' })
+
+/* Zoom stack: each entry is an absolute [t0,t1] device-time span. Empty = the
+ * live moving window chosen by the pills. Selecting inside a zoomed view pushes
+ * a further span, so the stack is the zoom history and back pops one level. */
+const zoomStack = ref<{ t0: number; t1: number }[]>([])
+const zoomed = computed(() => zoomStack.value.length > 0)
+
+/* Selection in progress, held as DEVICE TIMES, not pixels: that is what makes a
+ * still finger widen the highlight on a moving graph — the anchor time stays
+ * put while "now" advances, so the anchor drifts left under the pointer. */
+const sel = ref<{ anchor: number; cur: number } | null>(null)
+
+const winMs = computed(() => WINDOWS.find(w => w.key === winKey.value)?.ms ?? 60000)
+
+function fmtSpan(ms: number): string {
+  if (ms < 1000) return `${Math.round(ms)} ms`
+  if (ms < 60000) return `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)} s`
+  if (ms < HOUR_MS) return `${(ms / 60000).toFixed(ms < 600000 ? 1 : 0)} min`
+  return `${(ms / HOUR_MS).toFixed(1)} h`
+}
+
+/* Timescale of the frozen view: division lines and the ms/div they are worth.
+ * Divisions come off the 1-2-5-10 ladder, whose widest gap is ×2.5 (2 → 5), so
+ * a band of allowed pixels-per-division at least 2.5× wide always contains a
+ * step, whatever the span and however wide the canvas is. 70 CSS px up gives 5
+ * divisions on a phone-width window and 12 docked; the minimum is what is
+ * chosen from, the 175 px it implies is only the other edge. */
+const DIV_PX_MIN = 70
+
+/* Finest grid the band allows: the smallest 1-2-5 step at least DIV_PX_MIN
+ * wide. Floored at 1 ms — records are ms-stamped, so a finer division would
+ * draw precision the data doesn't have. */
+function divStepMs(msPerPx: number): number {
+  const want = msPerPx * DIV_PX_MIN
+  if (!(want > 1)) return 1
+  const dec = Math.pow(10, Math.floor(Math.log10(want)))
+  const m = want / dec
+  return dec * (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10)
+}
+
+/* Set by the draw, read by the caption: the step needs the canvas width. */
+const divMs = ref(0)
+
+/* Depth is the back button's colour (blue = one level left), so the label is
+ * free to carry what the frozen view can't show any other way: its timescale. */
+const zoomLabel = computed(() => {
+  const v = zoomStack.value[zoomStack.value.length - 1]
+  if (!v) return ''
+  const span = `${fmtSpan(v.t1 - v.t0)} window`
+  return divMs.value > 0 ? `${span} · ${fmtSpan(divMs.value)} / div` : span
+})
 
 /* Radios that exist = those the firmware has published a state key for. */
 const radios = computed<number[]>(() => {
@@ -78,13 +178,26 @@ const radios = computed<number[]>(() => {
   return out.length ? out : [0]
 })
 
-/* ── canvases (one per window) ── */
-const canvases: (HTMLCanvasElement | null)[] = [null, null, null]
-function setCanvas(i: number, el: unknown) { canvases[i] = (el as HTMLCanvasElement) ?? null }
+/* Estimated device clock (ms) now, extrapolated from the newest packet seen. */
+function devNow(): number {
+  return devClock ? devClock + (Date.now() - devClockAt) : 0
+}
+
+/* The time span currently on screen: the top of the zoom stack if there is
+ * one, else the live window ending at "now". */
+function view(): { lo: number; hi: number } {
+  const top = zoomStack.value[zoomStack.value.length - 1]
+  if (top) return { lo: top.t0, hi: top.t1 }
+  const dnow = devNow()
+  return { lo: dnow - winMs.value, hi: dnow }
+}
+
+/* ── canvas ── */
+const canvasRef = ref<HTMLCanvasElement | null>(null)
 
 /* Size the canvas backing store to its displayed pixels × DPR (full resolution,
  * tracks resize). */
-function fit(cv: HTMLCanvasElement | null): { ctx: CanvasRenderingContext2D; w: number; h: number } | null {
+function fit(cv: HTMLCanvasElement | null): { ctx: CanvasRenderingContext2D; w: number; h: number; dpr: number } | null {
   if (!cv) return null
   const dpr = window.devicePixelRatio || 1
   const w = Math.max(1, Math.round(cv.clientWidth * dpr))
@@ -93,69 +206,195 @@ function fit(cv: HTMLCanvasElement | null): { ctx: CanvasRenderingContext2D; w: 
   if (cv.height !== h) cv.height = h
   const ctx = cv.getContext('2d')
   if (!ctx) return null
-  return { ctx, w, h }
+  return { ctx, w, h, dpr }
 }
 
-function drawBands(ctx: CanvasRenderingContext2D, w: number, h: number) {
-  const q = h / 4
-  for (let i = 0; i < 4; i++) {
-    const yTop = h - (i + 1) * q
-    const g = ctx.createLinearGradient(0, yTop + q, 0, yTop)
-    g.addColorStop(0, '#242424'); g.addColorStop(1, '#313131')
+/* Four gradient bands across the plot, with both axes labelled in their own
+ * gutter so a bar's height reads directly as dBm — transmit power on the left,
+ * received strength on the right. */
+function drawBands(ctx: CanvasRenderingContext2D, w: number, h: number, dpr: number,
+                   gl: number, gr: number) {
+  const bh = h / NBANDS
+  for (let i = 0; i < NBANDS; i++) {
+    const yTop = h - (i + 1) * bh
+    const g = ctx.createLinearGradient(0, yTop + bh, 0, yTop)
+    g.addColorStop(0, BG_LO); g.addColorStop(1, BG_HI)
     ctx.fillStyle = g
-    ctx.fillRect(0, yTop, w, q)
+    ctx.fillRect(gl, yTop, w - gl - gr, bh)
+  }
+  ctx.font = `${Math.round(9 * dpr)}px 'SF Mono','Menlo','Consolas',monospace`
+  ctx.fillStyle = '#8a8a8a'
+  ctx.textBaseline = 'middle'
+  const pad = Math.round(4 * dpr)
+  for (let i = 0; i <= NBANDS; i++) {
+    let y = h - i * bh
+    if (i === 0) y -= Math.round(5 * dpr)          // keep the end labels on-canvas
+    if (i === NBANDS) y += Math.round(5 * dpr)
+    ctx.textAlign = 'right'
+    ctx.fillText(String(AX_TX.lo + i * (AX_TX.hi - AX_TX.lo) / NBANDS), gl - pad, y)
+    ctx.textAlign = 'left'
+    ctx.fillText(String(AX_RX.lo + i * (AX_RX.hi - AX_RX.lo) / NBANDS), w - gr + pad, y)
   }
 }
 
 const clamp01 = (x: number) => Math.max(0, Math.min(1, x))
 
-/* Normalised bar height 0..1. RX: SNR-weighted link quality with RSSI secondary
- * (LoRa decodes below the noise floor, so SNR headroom is the meaningful metric).
- * TX: transmit power over the radio's −9..+22 dBm range. */
-function barNorm(r: Rec): number {
-  if (r.dir === 1) return clamp01((r.txp + 9) / (22 + 9))
-  const snrN = clamp01((r.snr10 / 10 + 20) / 30)   // SNR −20 … +10 dB
-  const rssiN = clamp01((r.rssi + 130) / 90)        // RSSI −130 … −40 dBm
-  return 0.6 * snrN + 0.4 * rssiN
-}
-
-/* Estimated device clock (ms) now, extrapolated from the newest packet seen. */
-function devNow(): number {
-  return devClock ? devClock + (Date.now() - devClockAt) : 0
-}
-
-function drawGraph(i: number, winMs: number) {
-  const f = fit(canvases[i])
+function drawGraph() {
+  const f = fit(canvasRef.value)
   if (!f) return
-  const { ctx, w, h } = f
-  drawBands(ctx, w, h)
-  const dnow = devNow()
-  if (!dnow) return
-  const lo = dnow - winMs
+  const { ctx, w, h, dpr } = f
+  const gl = Math.round(GUT_L_CSS * dpr)
+  const gr = Math.round(GUT_R_CSS * dpr)
+  ctx.clearRect(0, 0, w, h)
+  drawBands(ctx, w, h, dpr, gl, gr)
+  if (!devClock) return
+  const { lo, hi } = view()
+  const ms = hi - lo
+  if (ms <= 0) return
+  const span = w - gl - gr
+  if (span <= 0) return
+  const xAt = (t: number) => gl + clamp01((t - lo) / ms) * span
+  const bh = h / NBANDS
+
+  /* Air we are holding ourselves: the same gradient cast red, over the frame's
+   * time-on-air only. The wait before it is channel access, not transmission —
+   * tinting that would claim airtime the radio never spent. */
+  const txSpans: { x: number; w: number }[] = []
+  for (const rec of recs) {
+    if (rec.dir !== 1) continue
+    const s = rec.t, e = rec.t + rec.dur
+    if (e < lo || s > hi) continue
+    const xs = xAt(s)
+    txSpans.push({ x: xs, w: Math.max(1, xAt(e) - xs) })
+  }
+  if (txSpans.length) {
+    for (let i = 0; i < NBANDS; i++) {
+      const yTop = h - (i + 1) * bh
+      const g = ctx.createLinearGradient(0, yTop + bh, 0, yTop)
+      g.addColorStop(0, TX_LO); g.addColorStop(1, TX_HI)
+      ctx.fillStyle = g
+      for (const s of txSpans) ctx.fillRect(s.x, yTop, s.w, bh)
+    }
+  }
+
+  /* Frozen view only: a live one slides, and a grid on absolute time would
+   * crawl across it. Lines are laid on round multiples of the step, under the
+   * frames so a bar always wins the pixels it lands on. */
+  if (zoomed.value) {
+    const step = divStepMs(ms / Math.max(1, span / dpr))
+    divMs.value = step
+    const lw = Math.max(1, dpr)
+    ctx.fillStyle = C_GRID
+    for (let t = Math.ceil(lo / step) * step; t <= hi; t += step)
+      ctx.fillRect(xAt(t), 0, lw, h)
+  }
+
   for (const rec of recs) {
     const s = rec.t, e = rec.t + rec.dur
-    if (e < lo || s > dnow) continue
-    const xs = clamp01((s - lo) / winMs) * w
-    const xe = clamp01((e - lo) / winMs) * w
-    const bw = Math.max(1, xe - xs)
-    const th = Math.max(1, h * 0.05)          // line thickness = 5% of graph height
-    let y = h - barNorm(rec) * h              // line at the power level
+    if (e < lo || s > hi) continue
+    const xs = xAt(s)
+    const bw = Math.max(1, xAt(e) - xs)
+    const th = Math.max(1, h * 0.05)
+    const ax = rec.dir === 1 ? AX_TX : AX_RX
+    const dbm = rec.dir === 1 ? rec.txp : rec.rssi
+    let y = h - clamp01((dbm - ax.lo) / (ax.hi - ax.lo)) * h
     if (y > h - th) y = h - th
     if (y < 0) y = 0
-    ctx.fillStyle = rec.dir ? C_TX : C_RX
+    const col = rec.type === 2 ? C_RNODE : rec.type === 1 ? C_OURS : C_RNS
+    /* Time the frame waited before its first bit went on air: queue latency for
+     * queued traffic (the radio held by something else, then DIFS/backoff
+     * against a busy channel), carrier sense alone for the frames that bypass
+     * the queue. A tick at the wait's start, then a hairline at mid-height
+     * running up to the bar: light enough that channel occupancy still reads as
+     * the filled area alone, so a long wait can't be mistaken for airtime. */
+    if (rec.wait > 0) {
+      const xq = xAt(s - rec.wait)
+      if (xs - xq >= 1) {
+        const lw = Math.max(1, dpr)
+        ctx.fillStyle = col
+        ctx.fillRect(xq, y, lw, th)                             /* when it queued */
+        ctx.fillRect(xq, y + (th - lw) / 2, xs - xq, lw)        /* how long it sat */
+      }
+    }
+    ctx.fillStyle = col
     ctx.fillRect(xs, y, bw, th)
+  }
+
+  if (sel.value) {
+    const a = Math.min(sel.value.anchor, sel.value.cur)
+    const b = Math.max(sel.value.anchor, sel.value.cur)
+    const xa = xAt(a), xb = xAt(b)
+    ctx.fillStyle = 'rgba(255,255,255,0.16)'
+    ctx.fillRect(xa, 0, Math.max(1, xb - xa), h)
+    ctx.strokeStyle = 'rgba(255,255,255,0.55)'
+    ctx.lineWidth = Math.max(1, dpr)
+    ctx.beginPath()
+    ctx.moveTo(xa, 0); ctx.lineTo(xa, h)
+    ctx.moveTo(xb, 0); ctx.lineTo(xb, h)
+    ctx.stroke()
   }
 }
 
-function redraw() {
-  for (let i = 0; i < WINDOWS.length; i++) drawGraph(i, WINDOWS[i].ms)
+function redraw() { drawGraph() }
+
+/* ── selection → zoom ── */
+function xToTime(ev: PointerEvent): number | null {
+  const cv = canvasRef.value
+  if (!cv) return null
+  const rect = cv.getBoundingClientRect()
+  const span = rect.width - GUT_L_CSS - GUT_R_CSS
+  if (span <= 0) return null
+  const frac = clamp01((ev.clientX - rect.left - GUT_L_CSS) / span)
+  const { lo, hi } = view()
+  return lo + frac * (hi - lo)
+}
+
+function onDown(ev: PointerEvent) {
+  /* A press that raises this window from behind another only raises it — the
+   * same swallow FloatingWindow gives a click, which pointer events bypass.
+   * Without it, reaching for an occluded LoRaMon costs you a zoom. The press
+   * still travels: FloatingWindow brings the window to the front on mousedown,
+   * which arrives after this. */
+  if (focusedWindowId.value !== WIN_ID) return
+  const t = xToTime(ev)
+  if (t == null) return
+  ;(ev.currentTarget as HTMLElement).setPointerCapture?.(ev.pointerId)
+  sel.value = { anchor: t, cur: t }
+  ev.preventDefault()
+}
+
+function onMove(ev: PointerEvent) {
+  if (!sel.value) return
+  const t = xToTime(ev)
+  if (t == null) return
+  sel.value = { anchor: sel.value.anchor, cur: t }
+}
+
+function onUp() {
+  const s = sel.value
+  sel.value = null
+  if (!s) return
+  const t0 = Math.min(s.anchor, s.cur)
+  const t1 = Math.max(s.anchor, s.cur)
+  const { lo, hi } = view()
+  /* A tap that never widened (a static, already-zoomed view) is not a zoom. */
+  if (t1 - t0 < (hi - lo) * 0.01 || t1 - t0 < 5) return
+  zoomStack.value = [...zoomStack.value, { t0, t1 }]
+  tick()
+  nextTick(redraw)
+}
+
+function zoomOut() {
+  zoomStack.value = zoomStack.value.slice(0, -1)
+  tick()
+  nextTick(redraw)
 }
 
 /* ── rebuild recs from the mirrored subtree ── */
 function parseRec(t: number, s: string): Rec | null {
   const p = s.split('|')
-  if (p[0] === 'r') return { t, dir: 0, rssi: +p[1], snr10: +p[2], dur: +p[3], bytes: +p[4], txp: 0 }
-  if (p[0] === 't') return { t, dir: 1, txp: +p[1], dur: +p[2], bytes: +p[3], rssi: 0, snr10: 0 }
+  if (p[0] === 'r') return { t, dir: 0, rssi: +p[1], snr10: +p[2], dur: +p[3], bytes: +p[4], txp: 0, type: +(p[5] ?? 0), wait: 0 }
+  if (p[0] === 't') return { t, dir: 1, txp: +p[1], dur: +p[2], bytes: +p[3], rssi: 0, snr10: 0, type: +(p[4] ?? 0), wait: +(p[5] ?? 0) }
   return null
 }
 
@@ -179,30 +418,46 @@ function rebuild() {
   if (anchor > 0) { devClock = anchor; devClockAt = Date.now() }
 }
 
-/* Airtime % over a window for one direction, overlap-counted. */
-function pct(winMs: number, dir: number, dnow: number): string {
-  if (!dnow) return '0%'
-  const lo = dnow - winMs
+const fmtPct = (p: number) => `${p.toFixed(p >= 10 ? 0 : 1)}%`
+
+/* Busy milliseconds in one direction over a span, overlap-counted from the
+ * frame records. */
+function busyMs(dir: number, lo: number, hi: number): number {
   let busy = 0
   for (const r of recs) {
     if (r.dir !== dir) continue
     let s = r.t, e = r.t + r.dur
-    if (e <= lo || s >= dnow) continue
+    if (e <= lo || s >= hi) continue
     if (s < lo) s = lo
-    if (e > dnow) e = dnow
+    if (e > hi) e = hi
     if (e > s) busy += e - s
   }
-  const p = busy / winMs * 100
-  return `${p.toFixed(p >= 10 ? 0 : 1)}%`
+  return busy
+}
+
+/* Airtime over whatever span is on screen: what we transmitted, and how much of
+ * the channel was in use at all (ours + theirs — the radio is half duplex, so
+ * the two never overlap). The live hour is the exception: it needs more history
+ * than a viewer has usually been open for, so the firmware publishes those two
+ * figures (per mille). A zoomed span is always computed locally. */
+function airFor(): { tx: string; busy: string } {
+  if (!zoomed.value && winKey.value === '1h') {
+    const tx = device.get(`lora.${activeRadio.value}.air1h.tx`)
+    const rx = device.get(`lora.${activeRadio.value}.air1h.rx`)
+    if (tx == null || rx == null) return { tx: '—', busy: '—' }
+    return { tx: fmtPct(Number(tx) / 10), busy: fmtPct((Number(tx) + Number(rx)) / 10) }
+  }
+  const { lo, hi } = view()
+  const ms = hi - lo
+  if (ms <= 0) return { tx: '0%', busy: '0%' }
+  const tx = busyMs(1, lo, hi)
+  return { tx: fmtPct(tx / ms * 100), busy: fmtPct((tx + busyMs(0, lo, hi)) / ms * 100) }
 }
 
 function tick() {
   if (props.visible) device.set('sys.stats.web_loramon', 1)   // heartbeat while open
   rebuild()
-  const dnow = devNow()
-  const v: Record<string, { rx: string; tx: string }> = {}
-  for (const w of WINDOWS) v[w.key] = { rx: pct(w.ms, 0, dnow), tx: pct(w.ms, 1, dnow) }
-  airVals.value = v
+  air.value = airFor()
 }
 
 let timer: ReturnType<typeof setInterval> | null = null
@@ -238,8 +493,11 @@ watch(() => props.visible, v => {
   if (v) { tick(); nextTick(redraw) }
 })
 
+watch(winKey, () => { tick(); if (props.visible) nextTick(redraw) })
+
 watch(activeRadio, () => {
   devClock = 0; devClockAt = 0; recs = []
+  zoomStack.value = []; sel.value = null
   tick()
   if (props.visible) nextTick(redraw)
 })
@@ -258,11 +516,40 @@ watch(activeRadio, () => {
 }
 .lm-tab.active { background: #2c2c2c; color: #fff; }
 
-.lm-graphs { flex: 1 1 auto; display: flex; flex-direction: column; gap: 12px; padding: 8px 8px 4px; min-height: 0; }
-.lm-graph { flex: 1 1 0; display: flex; flex-direction: column; min-height: 0; }
-.lm-canvas { flex: 1 1 auto; display: block; width: 100%; min-height: 0; }
+/* No wrapping: the axis names have to stay on the gutters they label, so a
+ * cramped window clips the pill row rather than folding it. */
+.lm-pills { display: flex; gap: 4px; padding: 6px 8px 2px; flex: 0 0 auto; flex-wrap: nowrap; align-items: center; overflow: hidden; }
+.lm-pill {
+  padding: 2px 10px;
+  border: 1px solid #3a3a3a; border-radius: 999px;
+  background: #181818; color: #9a9a9a;
+  font: 11px/1.4 'SF Mono', 'Menlo', 'Consolas', monospace;
+  cursor: pointer;
+}
+.lm-pill.active { background: #3a3a3a; border-color: #6a6a6a; color: #fff; }
+/* Blue = one level of zoom left, so pressing it returns to the live window.
+ * Grey means the stack is deeper and there is another frozen view behind. */
+/* The arrow is the one pill you aim for without reading it, so it gets a glyph
+ * a size up and room on both sides rather than the row's usual 4 px gap. */
+.lm-back { color: #e8e8e8; padding: 0 18px; margin: 0 6px; font-size: 15px; line-height: 1.3; }
+.lm-back.lm-last { background: #2b5cc4; border-color: #5a86e0; color: #fff; }
+.lm-zoomlabel { font: 11px/1.4 'SF Mono', 'Menlo', 'Consolas', monospace; color: #7a7a7a; white-space: nowrap; }
 
-/* Caption sits below its graph, left-aligned. */
+/* Each axis name stands over its own gutter, so the widths here are the canvas
+ * gutter widths and `tx` reads as the heading of the scale below it. */
+.lm-axis {
+  flex: 0 0 auto;
+  font: 11px/1.4 'SF Mono', 'Menlo', 'Consolas', monospace;
+  color: #c8c8c8;
+}
+.lm-axis-tx { width: 30px; text-align: right; }
+.lm-axis-rx { width: 34px; text-align: left; margin-left: auto; }
+
+.lm-graphs { flex: 1 1 auto; display: flex; flex-direction: column; gap: 12px; padding: 2px 8px 4px; min-height: 0; }
+.lm-graph { flex: 1 1 0; display: flex; flex-direction: column; min-height: 0; }
+.lm-canvas { flex: 1 1 auto; display: block; width: 100%; min-height: 0; touch-action: none; cursor: crosshair; }
+
+/* Caption sits below the graph, left-aligned. */
 .lm-caption {
   flex: 0 0 auto;
   padding: 3px 0 0 2px;
@@ -270,8 +557,9 @@ watch(activeRadio, () => {
   font: 11px/1.2 'SF Mono', 'Menlo', 'Consolas', monospace;
   color: #c8c8c8;
 }
-.lm-win { color: #e8e8e8; }
 .lm-air { color: #a8a8a8; }
-.lm-caption .c-rx { color: #4088E8; }
-.lm-caption .c-tx { color: #E8D040; }
+.lm-legend { color: #7a7a7a; }
+.lm-legend .c-rns { color: #E8D040; }
+.lm-legend .c-ours { color: #E84040; }
+.lm-legend .c-rnode { color: #E89040; }
 </style>

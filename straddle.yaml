@@ -100,6 +100,12 @@ settings:
           min: 1
           max: 100
           default: 2
+      # RNode endpoint: an RNS RNodeInterface client attaches over USB serial
+      # and/or TCP 7633 and shares this radio segment. The rest of the group
+      # (.radio / .serial / .tcp) is seeded in lora.cpp — one switch is what a
+      # pane needs, the ports are a considered choice typed once.
+      - section: "RNode endpoint"
+      - switch: { label: "Enable", key: "s.lora.rnode.enable", default: 0 }
       - section: "Status"
       - value: { label: "State", key: "lora.0.state" }
       - value: { label: "Chip", key: "lora.0.chip" }
