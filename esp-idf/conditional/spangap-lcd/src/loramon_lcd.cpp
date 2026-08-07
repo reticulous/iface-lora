@@ -12,7 +12,7 @@
  *   red, over its time-on-air only, so which direction a bar belongs to is
  *   legible without asking the colour: colour is the frame's PROTOCOL —
  *   Reticulum traffic yellow, the RNode client's orange, this straddle's own
- *   air protocol (rfprobe, hash linkage) red.
+ *   air protocol, SUPE (BATCH, sweep, power requests) red.
  *
  *   Touching the graph starts a highlighted span at that instant. Because the
  *   anchor is a *time*, not a pixel, holding still on a live graph widens the
@@ -441,7 +441,7 @@ void drawAll() {
          * as an error. */
         char b[128];
         snprintf(b, sizeof b,
-                 "tx %d.%d%%  busy %d.%d%%  #E8D040 rnsd# #E89040 rnode# #E84040 rfprobe#",
+                 "tx %d.%d%%  busy %d.%d%%  #E8D040 rnsd# #E89040 rnode# #E84040 SUPE#",
                  tx / 10, tx % 10, busy / 10, busy % 10);
         lv_label_set_text(s.cap, b);
     }

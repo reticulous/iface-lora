@@ -29,21 +29,34 @@
           <button v-else v-for="w in WINDOWS" :key="w.key" class="lm-pill"
                   :class="{ active: w.key === winKey }"
                   @click="winKey = w.key">{{ w.label }}</button>
+          <span class="lm-legend">
+            <span class="c-rns">rnsd</span> / <span class="c-rnode">rnode</span> / <span class="c-ours">SUPE</span>
+          </span>
           <span class="lm-axis lm-axis-rx">rx</span>
         </div>
         <div class="lm-graphs">
-          <div class="lm-graph">
+          <div class="lm-graph lm-graph-main">
             <canvas ref="canvasRef" class="lm-canvas"
                     @pointerdown="onDown"
                     @pointermove="onMove"
                     @pointerup="onUp"
                     @pointercancel="onUp" />
             <div class="lm-caption">
+              <span class="lm-chan">{{ chanLabel(0) }}</span>
               <span class="lm-air">tx airtime {{ air.tx }}</span>
               <span class="lm-air">channel busy {{ air.busy }}</span>
-              <span class="lm-legend">
-                <span class="c-rns">rnsd</span> / <span class="c-rnode">rnode</span> / <span class="c-ours">rfprobe</span>
-              </span>
+            </div>
+          </div>
+          <!-- One graph per agile channel of the regime in force, stacked under
+               the hailing channel's at a quarter its height. Same width, so the
+               same time axis: a moment is the same column in every one of them.
+               Same bands, same dBm scale, same window — only the gutter labels
+               are left off, since repeating one scale ten times is noise. -->
+          <div v-for="c in agileChans" :key="c" class="lm-graph lm-graph-chan">
+            <canvas :ref="el => setChanCanvas(c, el)" class="lm-canvas" />
+            <div class="lm-caption lm-caption-chan">
+              <span class="lm-chan">{{ chanLabel(c) }}</span>
+              <span class="lm-air">tx {{ chanTx(c) }}</span>
             </div>
           </div>
         </div>
@@ -80,7 +93,7 @@ const GUT_R_CSS = 34          // right scale gutter (rx dBm) — four-digit labe
  * bar is read against, and the tinted background under a transmit. Types match
  * the firmware's LORA_PKT_*. */
 const C_RNS = '#E8D040'       // Reticulum traffic (yellow)
-const C_OURS = '#E84040'      // our own air protocol: rfprobe + hash linkage (red)
+const C_OURS = '#E84040'      // our own air protocol, SUPE: BATCH, sweep, power requests (red)
 const C_RNODE = '#E89040'     // the attached RNode client's traffic (orange)
 
 /* Band gradient, bottom → top of each band, and the reddish cast of the same
@@ -107,11 +120,42 @@ const NBANDS = 4
 const AX_TX = { lo: -10, hi: 30 }     // 10 dB per band
 const AX_RX = { lo: -130, hi: -30 }   // 25 dB per band
 
-interface Rec { t: number; dir: number; dur: number; bytes: number; rssi: number; snr10: number; txp: number; type: number; wait: number }
+/* The channel-noise floor the traffic sits on: very light grey, so a bar always
+ * wins the pixels it lands on and the floor reads as background texture. */
+const C_FLOOR = 'rgba(255,255,255,0.09)'
+
+interface Rec { t: number; dir: number; dur: number; bytes: number; rssi: number; snr10: number; txp: number; type: number; wait: number; ch: number }
 
 /* recs = the active radio's packets, rebuilt each tick from the mirrored
  * `lora.<n>.packets` subtree (the firmware adds/deletes those nodes). */
 let recs: Rec[] = []
+
+/* Channel RSSI, accumulated live rather than mirrored as history: the firmware
+ * publishes only the newest sweep (`lora.<n>.rssi` = "<ms>|<ch0>|<ch1>|…"), so
+ * the series starts when the window opens — the same rule the packet nodes
+ * follow. A beat the radio skipped (carrier sense had it) republishes nothing,
+ * so the key is unchanged, no point is appended, and the gap draws as a gap. */
+const CH_MAX = 10
+interface Floor { t: number; dbm: number }
+let floorSeries: Floor[][] = Array.from({ length: CH_MAX }, () => [])
+let floorLastMs = 0
+
+/* The channels the regime in force puts up, from `lora.<n>.chans`. Index 0 is
+ * always the hailing channel at the radio's configured frequency; a list of one
+ * means no agility, which is how the viewer knows not to draw the extra graphs
+ * without needing a separate flag. */
+interface Chan { freq: number; bw: number }
+const chanList = ref<Chan[]>([])
+const agileChans = computed<number[]>(() =>
+  chanList.value.slice(1).map((_, i) => i + 1))
+
+const fmtMHz = (hz: number) => (hz / 1e6).toFixed(hz % 100000 === 0 ? 2 : 3)
+const fmtBw = (hz: number) => hz >= 1e6 ? `${hz / 1e6}M` : `${Math.round(hz / 1e3)}k`
+
+function chanLabel(c: number): string {
+  const k = chanList.value[c]
+  return k ? `${fmtMHz(k.freq)} ${fmtBw(k.bw)}` : '—'
+}
 let devClock = 0              // newest packet ms seen = device clock reference
 let devClockAt = 0           // Date.now() when devClock was captured
 
@@ -213,7 +257,7 @@ function fit(cv: HTMLCanvasElement | null): { ctx: CanvasRenderingContext2D; w: 
  * gutter so a bar's height reads directly as dBm — transmit power on the left,
  * received strength on the right. */
 function drawBands(ctx: CanvasRenderingContext2D, w: number, h: number, dpr: number,
-                   gl: number, gr: number) {
+                   gl: number, gr: number, labels: boolean) {
   const bh = h / NBANDS
   for (let i = 0; i < NBANDS; i++) {
     const yTop = h - (i + 1) * bh
@@ -222,6 +266,7 @@ function drawBands(ctx: CanvasRenderingContext2D, w: number, h: number, dpr: num
     ctx.fillStyle = g
     ctx.fillRect(gl, yTop, w - gl - gr, bh)
   }
+  if (!labels) return
   ctx.font = `${Math.round(9 * dpr)}px 'SF Mono','Menlo','Consolas',monospace`
   ctx.fillStyle = '#8a8a8a'
   ctx.textBaseline = 'middle'
@@ -239,15 +284,24 @@ function drawBands(ctx: CanvasRenderingContext2D, w: number, h: number, dpr: num
 
 const clamp01 = (x: number) => Math.max(0, Math.min(1, x))
 
-function drawGraph() {
-  const f = fit(canvasRef.value)
+/* Draw one channel's plot. `ch` selects the records and the RSSI series.
+ *
+ * The gutters are reserved on every graph, labelled only on the hailing
+ * channel's. Reserved because that is what makes the stack readable: the plots
+ * begin and end at the same x, so a moment is the same column in all ten and
+ * the eye can run down it. Unlabelled because the scale is identical on each
+ * and a quarter-height band has no room for the numbers anyway. */
+function drawOne(cv: HTMLCanvasElement | null, ch: number, main: boolean) {
+  const f = fit(cv)
   if (!f) return
   const { ctx, w, h, dpr } = f
   const gl = Math.round(GUT_L_CSS * dpr)
   const gr = Math.round(GUT_R_CSS * dpr)
   ctx.clearRect(0, 0, w, h)
-  drawBands(ctx, w, h, dpr, gl, gr)
+  drawBands(ctx, w, h, dpr, gl, gr, main)
   if (!devClock) return
+  const recsCh = recs.filter(r => r.ch === ch)
+  const floorPts = floorSeries[ch] ?? []
   const { lo, hi } = view()
   const ms = hi - lo
   if (ms <= 0) return
@@ -260,7 +314,7 @@ function drawGraph() {
    * time-on-air only. The wait before it is channel access, not transmission —
    * tinting that would claim airtime the radio never spent. */
   const txSpans: { x: number; w: number }[] = []
-  for (const rec of recs) {
+  for (const rec of recsCh) {
     if (rec.dir !== 1) continue
     const s = rec.t, e = rec.t + rec.dur
     if (e < lo || s > hi) continue
@@ -277,19 +331,45 @@ function drawGraph() {
     }
   }
 
+  /* The channel noise floor: each sample a bar from the bottom of the plot up
+   * to its dBm on the RX axis, held until the next sample so a 1 Hz series
+   * reads as a continuous floor rather than a picket fence. Drawn after the
+   * transmit tint and before the frames — traffic lies on top of the noise it
+   * had to get above.
+   *
+   * A gap in the series is a beat carrier sense took the radio for. It is left
+   * empty on purpose: the bar would otherwise be drawn from a reading that
+   * described the transmission we were queued behind. */
+  if (floorPts.length) {
+    ctx.fillStyle = C_FLOOR
+    for (let i = 0; i < floorPts.length; i++) {
+      const p = floorPts[i]
+      const next = floorPts[i + 1]
+      /* Hold for one beat at most: a longer silence is a gap, not a level. */
+      const end = Math.min(next ? next.t : p.t + 1000, p.t + 1000)
+      if (end < lo || p.t > hi) continue
+      const xs = xAt(p.t)
+      const bw = Math.max(1, xAt(end) - xs)
+      const y = h - clamp01((p.dbm - AX_RX.lo) / (AX_RX.hi - AX_RX.lo)) * h
+      ctx.fillRect(xs, y, bw, h - y)
+    }
+  }
+
   /* Frozen view only: a live one slides, and a grid on absolute time would
    * crawl across it. Lines are laid on round multiples of the step, under the
    * frames so a bar always wins the pixels it lands on. */
   if (zoomed.value) {
     const step = divStepMs(ms / Math.max(1, span / dpr))
-    divMs.value = step
+    /* The label quotes the main graph's grid — an agile channel is a quarter
+     * the width, so its own step is coarser and would overwrite it. */
+    if (main) divMs.value = step
     const lw = Math.max(1, dpr)
     ctx.fillStyle = C_GRID
     for (let t = Math.ceil(lo / step) * step; t <= hi; t += step)
       ctx.fillRect(xAt(t), 0, lw, h)
   }
 
-  for (const rec of recs) {
+  for (const rec of recsCh) {
     const s = rec.t, e = rec.t + rec.dur
     if (e < lo || s > hi) continue
     const xs = xAt(s)
@@ -320,7 +400,7 @@ function drawGraph() {
     ctx.fillRect(xs, y, bw, th)
   }
 
-  if (sel.value) {
+  if (main && sel.value) {
     const a = Math.min(sel.value.anchor, sel.value.cur)
     const b = Math.max(sel.value.anchor, sel.value.cur)
     const xa = xAt(a), xb = xAt(b)
@@ -335,7 +415,17 @@ function drawGraph() {
   }
 }
 
-function redraw() { drawGraph() }
+/* Canvases of the agile channels, collected by the v-for's ref callback. */
+const chanCanvas = new Map<number, HTMLCanvasElement>()
+function setChanCanvas(c: number, el: unknown) {
+  if (el instanceof HTMLCanvasElement) chanCanvas.set(c, el)
+  else chanCanvas.delete(c)
+}
+
+function redraw() {
+  drawOne(canvasRef.value, 0, true)
+  for (const c of agileChans.value) drawOne(chanCanvas.get(c) ?? null, c, false)
+}
 
 /* ── selection → zoom ── */
 function xToTime(ev: PointerEvent): number | null {
@@ -393,9 +483,46 @@ function zoomOut() {
 /* ── rebuild recs from the mirrored subtree ── */
 function parseRec(t: number, s: string): Rec | null {
   const p = s.split('|')
-  if (p[0] === 'r') return { t, dir: 0, rssi: +p[1], snr10: +p[2], dur: +p[3], bytes: +p[4], txp: 0, type: +(p[5] ?? 0), wait: 0 }
-  if (p[0] === 't') return { t, dir: 1, txp: +p[1], dur: +p[2], bytes: +p[3], rssi: 0, snr10: 0, type: +(p[4] ?? 0), wait: +(p[5] ?? 0) }
+  if (p[0] === 'r') return { t, dir: 0, rssi: +p[1], snr10: +p[2], dur: +p[3], bytes: +p[4], txp: 0, type: +(p[5] ?? 0), wait: 0, ch: +(p[6] ?? 0) }
+  if (p[0] === 't') return { t, dir: 1, txp: +p[1], dur: +p[2], bytes: +p[3], rssi: 0, snr10: 0, type: +(p[4] ?? 0), wait: +(p[5] ?? 0), ch: +(p[6] ?? 0) }
   return null
+}
+
+/* Append the newest channel-RSSI sweep if it is one we haven't seen. Keyed on
+ * the device timestamp leading the value, so a repeat publish of an unchanged
+ * key adds nothing and a skipped beat leaves a hole. */
+function pollFloor() {
+  const raw = device.get(`lora.${activeRadio.value}.rssi`)
+  if (raw == null) return
+  const p = String(raw).split('|')
+  const t = +p[0]
+  if (!Number.isFinite(t) || t === floorLastMs) return
+  floorLastMs = t
+  const cut = t - HOUR_MS
+  for (let c = 0; c < CH_MAX && c + 1 < p.length; c++) {
+    /* An empty field is a channel that did not answer this beat — the radio
+     * was elsewhere, or the receiver had not settled. No point, so a gap. */
+    if (p[c + 1] === '') continue
+    const dbm = +p[c + 1]
+    if (!Number.isFinite(dbm)) continue
+    const s = floorSeries[c]
+    s.push({ t, dbm })
+    if (s.length > 8 && s[0].t < cut) floorSeries[c] = s.filter(f => f.t >= cut)
+  }
+  if (t > devClock) { devClock = t; devClockAt = Date.now() }
+}
+
+/* The regime's channel list. Cheap to reparse; it only changes on a config
+ * apply, so compare the raw string before touching the reactive ref. */
+let chansRaw = ''
+function pollChans() {
+  const raw = String(device.get(`lora.${activeRadio.value}.chans`) ?? '')
+  if (raw === chansRaw) return
+  chansRaw = raw
+  chanList.value = raw ? raw.split('|').map(s => {
+    const [f, b] = s.split(',')
+    return { freq: +f, bw: +b }
+  }).filter(k => Number.isFinite(k.freq) && Number.isFinite(k.bw)) : []
 }
 
 function rebuild() {
@@ -422,10 +549,10 @@ const fmtPct = (p: number) => `${p.toFixed(p >= 10 ? 0 : 1)}%`
 
 /* Busy milliseconds in one direction over a span, overlap-counted from the
  * frame records. */
-function busyMs(dir: number, lo: number, hi: number): number {
+function busyMs(dir: number, lo: number, hi: number, ch: number): number {
   let busy = 0
   for (const r of recs) {
-    if (r.dir !== dir) continue
+    if (r.dir !== dir || r.ch !== ch) continue
     let s = r.t, e = r.t + r.dur
     if (e <= lo || s >= hi) continue
     if (s < lo) s = lo
@@ -450,14 +577,38 @@ function airFor(): { tx: string; busy: string } {
   const { lo, hi } = view()
   const ms = hi - lo
   if (ms <= 0) return { tx: '0%', busy: '0%' }
-  const tx = busyMs(1, lo, hi)
-  return { tx: fmtPct(tx / ms * 100), busy: fmtPct((tx + busyMs(0, lo, hi)) / ms * 100) }
+  const tx = busyMs(1, lo, hi, 0)
+  return { tx: fmtPct(tx / ms * 100), busy: fmtPct((tx + busyMs(0, lo, hi, 0)) / ms * 100) }
+}
+
+/* Each agile channel's transmit airtime over the window on screen. Always
+ * computed locally — the firmware's published hour is the radio's total, which
+ * is the hailing channel's while nothing transmits anywhere else. "Channel
+ * busy" is deliberately absent here: what another node is doing on a channel we
+ * only visit to measure says little, and the figure would invite reading it as
+ * occupancy when it is one instant sampled per second.
+ *
+ * Held in a ref rather than computed in the template: `recs` is a plain array
+ * rebuilt each tick, so a template call would not re-run when it changed. */
+const chanAir = ref<string[]>([])
+const chanTx = (c: number) => chanAir.value[c] ?? '0%'
+
+function chanAirFor(): string[] {
+  const { lo, hi } = view()
+  const ms = hi - lo
+  const out: string[] = []
+  for (const c of agileChans.value)
+    out[c] = ms > 0 ? fmtPct(busyMs(1, lo, hi, c) / ms * 100) : '0%'
+  return out
 }
 
 function tick() {
   if (props.visible) device.set('sys.stats.web_loramon', 1)   // heartbeat while open
+  pollChans()
+  pollFloor()
   rebuild()
   air.value = airFor()
+  chanAir.value = chanAirFor()
 }
 
 let timer: ReturnType<typeof setInterval> | null = null
@@ -497,6 +648,9 @@ watch(winKey, () => { tick(); if (props.visible) nextTick(redraw) })
 
 watch(activeRadio, () => {
   devClock = 0; devClockAt = 0; recs = []
+  floorSeries = Array.from({ length: CH_MAX }, () => [])
+  floorLastMs = 0; chansRaw = ''; chanList.value = []
+  chanCanvas.clear()
   zoomStack.value = []; sel.value = null
   tick()
   if (props.visible) nextTick(redraw)
@@ -545,8 +699,13 @@ watch(activeRadio, () => {
 .lm-axis-tx { width: 30px; text-align: right; }
 .lm-axis-rx { width: 34px; text-align: left; margin-left: auto; }
 
-.lm-graphs { flex: 1 1 auto; display: flex; flex-direction: column; gap: 12px; padding: 2px 8px 4px; min-height: 0; }
-.lm-graph { flex: 1 1 0; display: flex; flex-direction: column; min-height: 0; }
+/* Graphs stack, so every one of them spans the same width and therefore the
+ * same time axis — a moment is the same column in all ten. The flex ratios are
+ * the heights: the hailing channel takes 4, each agile channel 1. */
+.lm-graphs { flex: 1 1 auto; display: flex; flex-direction: column; gap: 8px; padding: 2px 8px 4px; min-height: 0; }
+.lm-graph { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+.lm-graph-main { flex: 4 1 0; }
+.lm-graph-chan { flex: 1 1 0; }
 .lm-canvas { flex: 1 1 auto; display: block; width: 100%; min-height: 0; touch-action: none; cursor: crosshair; }
 
 /* Caption sits below the graph, left-aligned. */
@@ -557,8 +716,20 @@ watch(activeRadio, () => {
   font: 11px/1.2 'SF Mono', 'Menlo', 'Consolas', monospace;
   color: #c8c8c8;
 }
+/* A quarter-height row has little to spare, so the caption is smaller and
+ * clips rather than wraps — every channel's block has to stay the same height
+ * or the plots stop lining up. */
+.lm-caption-chan {
+  padding-top: 1px;
+  font-size: 10px; gap: 10px;
+  white-space: nowrap; overflow: hidden;
+}
+.lm-chan { color: #c8c8c8; }
 .lm-air { color: #a8a8a8; }
-.lm-legend { color: #7a7a7a; }
+/* One pill's worth of space off the window row, so the colour key reads as its
+ * own thing rather than as another pill. */
+.lm-legend { color: #7a7a7a; margin-left: 28px; white-space: nowrap;
+             font: 11px/1.4 'SF Mono', 'Menlo', 'Consolas', monospace; }
 .lm-legend .c-rns { color: #E8D040; }
 .lm-legend .c-ours { color: #E84040; }
 .lm-legend .c-rnode { color: #E89040; }

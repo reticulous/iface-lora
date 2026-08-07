@@ -98,8 +98,10 @@ defaults come from this straddle's `settings:` block; radios 1.. are seeded by
 | `s.lora.<n>.lbt_timeout` | `5000` | Drop a frame LBT can't clear within this many ms (`0` = never drop, block the queue instead). Note that a fully-loaded `appc` radio can legitimately back off for 5.2 s at SF10 and 5.8 s at SF11/SF12, past this default, so a congested slow link will shed frames — raise it or set `0` if that matters more than queue latency. SF9 and below stay inside it in every band. |
 | `s.lora.<n>.ifac_netname` | `""` | IFAC network name. Empty = open (non-IFAC) interface. |
 | `s.lora.<n>.ifac_size` | `0` | IFAC access-code length in bytes (`0` = rnsd default). |
-| `s.lora.<n>.adaptive_txpwr` | `0` | Transmit to each neighbour node at a power measured for it rather than at `tx_power`. With it on, any node heard recently that has no power yet is probed once (`lora rf`), and the result — or, if the probe found nothing, the `EST` reciprocity estimate plus 5 dB — becomes the power for every hash that node owns. Also enables the **power request** (`0x04`): opening a link to a peer that speaks our air protocol prefixes a 4-byte frame suggesting the power it should answer at, which then governs the whole session; absence of that frame means "use your maximum". Announces always go out at `tx_power`. Answering someone else's probe does not need this key, but *honouring* a request does — it puts your power under a peer's control. A **first slice**: no control loop, nothing re-measures, nothing yet notices a link that broke. Shown as `USE` in `lora n`. See INTERNALS §15. |
-| `s.lora.assumed_peer_txp` | `22` | TX power (dBm) credited to a peer whose own power we don't know, for the reciprocity estimate shown as `EST` in `lora n` and compared against the measurement in `lora rf`. Assuming high errs safe (we over-estimate path loss and transmit higher than needed). Set it to match a bench node parked at a low `tx_power`, whose announces go out at *that* power — otherwise the estimate is off by the difference. |
+| `s.lora.<n>.announce_interval` | `30` | Minutes between announce runs. **Announces this node originates are buffered, never emitted when rnsd or the RNode client hands them over** — this interface announces at its own pace, and a run replays the whole buffer in bunches followed by a radio check (INTERNALS §14). `0` turns the beat off entirely, so the node announces only when `lora a` says so; it is not a shorter interval, it is none. Relayed announces are somebody else's traffic and are unaffected. Live. |
+| `s.lora.<n>.afa` | `0` | Frequency agility: the value **is** the regime number, not a flag. `0` means no agility — the configured frequency alone, which is all a node does until this is set. `1` is the EU 863-870 MHz plan (nine 500 kHz channels under polite spectrum access). Today a regime only puts channels up to be **measured and drawn**: every frame is still transmitted and received on the configured frequency, and nothing enforces a regime's airtime or power limits. See INTERNALS §18. Live. |
+| `s.lora.<n>.adaptive_txpwr` | `0` | Transmit to each neighbour node at a power measured for it rather than at `tx_power`. With it on, a node's power is settled from its radio check — the lowest sweep step we could still decode, which is what it needs to reach us and, path loss being reciprocal, our estimate toward it — or, for a node that never runs one, from the `EST` reciprocity estimate plus 5 dB. Either becomes the power for every hash that node owns. Also enables the **power request** (`0x04`): opening a link to a peer that speaks our air protocol prefixes a 4-byte frame suggesting the power it should answer at, which then governs the whole session; absence of that frame means "use your maximum". Announces always go out at `tx_power`. Sweeping does not need this key — a node with it off still lets its neighbours measure themselves against it — but *honouring* a request does, since that puts your power under a peer's control. A **first slice**: no control loop, nothing re-measures, nothing yet notices a link that broke. Shown as `USE` in `lora n`. See INTERNALS §15. |
+| `s.lora.assumed_peer_txp` | `22` | TX power (dBm) credited to a peer whose own power we don't know, for the reciprocity estimate shown as `EST` in `lora n` and compared against what a radio check measures. Assuming high errs safe (we over-estimate path loss and transmit higher than needed). Set it to match a bench node parked at a low `tx_power`, whose announces go out at *that* power — otherwise the estimate is off by the difference. |
 | `s.lora.rnode.enable` | `0` | Expose this device to an RNS `RNodeInterface` client — see [Using the device as an RNode](#using-the-device-as-an-rnode). Live. |
 | `s.lora.rnode.radio` | `0` | Which radio the RNode endpoint exposes. Changing it while a client is attached disconnects it. |
 | `s.lora.rnode.serial` | `-1` | Serial port the endpoint claims: `0` = the console port, `1` = the second CDC port (only exists after `usb cdc`). `-1` = no serial. |
@@ -119,7 +121,9 @@ SF/BW/CR/preamble are set; `lora.<n>.state` reads `unconfigured` until then.
 | `lora.<n>.bitrate_eff` | Effective bitrate registered with `rnsd`, bits/s (airtime-derived). |
 | `lora.<n>.stats.{tx_bytes,rx_bytes,tx_frames,rx_frames,crc_err,split_rx_timeout,tx_dropped,rssi_last,snr_last}` | Traffic counters (`tx_dropped` = frames shed by the LBT timeout) and last-RX RSSI/SNR. Published only when a UI can read them — see `uiTelemetryWanted()`. |
 | `lora.<n>.stats.{airtime_pct,cw_band}` | With `appc` on: percentage of the last ~15 s this radio spent transmitting, and the contention band (1–4) that percentage currently selects. Absent when `appc` is off. |
-| `lora.<n>.packets.<ms>` | LoRaMon: one node per on-air frame, keyed by start-ms — a packed string `r\|rssi\|snr\|dur\|bytes\|type` (rx) or `t\|txp\|dur\|bytes\|type\|wait` (tx); `snr` is deci-dB, `type` is `0` Reticulum / `1` this straddle's own air protocol / `2` traffic from an attached RNode client, and `wait` is the ms the frame spent queued before its first bit went on air (radio held by a probe or linkage frame, a split still landing, then DIFS/backoff) — carried by the first frame of a burst only, and drawn in the viewers as a tick at the moment it queued plus a mid-height line running up to the bar. Written only while the LoRaMon app is open (`sys.stats.{web,lcd}_loramon`) and deleted past 1 h. See INTERNALS §12. |
+| `lora.<n>.packets.<ms>` | LoRaMon: one node per on-air frame, keyed by start-ms — a packed string `r\|rssi\|snr\|dur\|bytes\|type\|ch` (rx) or `t\|txp\|dur\|bytes\|type\|wait\|ch` (tx); `snr` is deci-dB, `type` is `0` Reticulum / `1` this straddle's own air protocol, SUPE (Spectrum Utilization and Performance Enhancements) — the name the viewers' legends use / `2` traffic from an attached RNode client, and `wait` is the ms the frame spent queued before its first bit went on air (radio held by a radio check, a split still landing, then DIFS/backoff) — carried by the first frame of a burst only, and drawn in the viewers as a tick at the moment it queued plus a mid-height line running up to the bar. Written only while the LoRaMon app is open (`sys.stats.{web,lcd}_loramon`) and deleted past 1 h. See INTERNALS §12. |
+| `lora.<n>.chans` | The channel list the `afa` regime puts in force: `<freqHz>,<bwHz>` per channel, `\|`-separated, index = channel, `0` = the configured (hailing) frequency. A single entry means no agility, which is how a viewer knows not to draw the extra graphs. Rewritten on a config apply. |
+| `lora.<n>.rssi` | The newest channel-RSSI sample set: `<ms>\|<ch0 dBm>\|<ch1 dBm>\|…`, one field per channel in `chans`, taken once a second. The timestamp is in the value so a viewer can tell a fresh reading from a repeat; a channel that could not be measured this beat is an **empty field**, and a beat skipped entirely (the radio was busy, or the configured channel was not quiet enough to leave) republishes nothing at all — both read as gaps. Live only: no history is kept on the device. See INTERNALS §18.3. |
 | `lora.<n>.air1h.{rx,tx}` | Rolling one-hour airtime, **per mille**, per direction. The only airtime figure the device aggregates — viewers compute shorter windows from the frame records themselves. Updated at 1 Hz while a LoRaMon app is open; the underlying rollup runs regardless. |
 
 ### Secrets
@@ -138,7 +142,7 @@ lora <n> up | down            enable / disable one radio
 lora [<n>] n[eighbors] [-v]   observed direct neighbours, one numbered block per
                               node: every hash it owns with its aspect and
                               announced name, then a capability line
-                              ( TRANSPORT, ROAMING, XXX, TX <dBm>, EST <dBm>,
+                              ( TRANSPORT, ROAMING, SUPE, TX <dBm>, EST <dBm>,
                                 USE <dBm> )
                               — TX is what a probe measured, EST what
                               reciprocity infers from frames overheard, USE the
@@ -148,21 +152,18 @@ lora [<n>] n[eighbors] [-v]   observed direct neighbours, one numbered block per
                               link quality, last-hour traffic and link_ids.
                               Spelled either way; any prefix from `n` works.
                               (see INTERNALS §13)
-lora [<n>] rf[probe] <dest>   two-way minimum-TX-power probe against one
-                              cooperating neighbour (both ends must run this
-                              firmware): one carrier-sensed opener, then a
-                              fixed-time slot schedule climbing a 6 dB power
-                              ladder from low power up, reporting each
-                              direction's lowest heard power and an
-                              SNR-interpolated cliff estimate. Also asks the
-                              peer for its full hash set when it advertises
-                              more hashes than we hold. <dest> is a full dest
-                              hash or any prefix of it (4+ bytes are taken
-                              as-is; 2-3 complete from the table), a node
-                              number from the listing, or any unique substring
-                              of an announced name.
-                              Ceiling is the radio's own tx_power (see
-                              INTERNALS §14).
+lora [<n>] a[nnounce]         emit every buffered announce, then run a radio
+                              check — now, rather than waiting for the
+                              announce_interval beat (which this also restarts).
+                              The announces go out in bunches of just under a
+                              second, each bunch carrier-sensed; then one more
+                              carrier sense wins the channel for the whole
+                              ~0.5 s check, which is a manifest of what was
+                              just sent followed by a power sweep at SF7 and
+                              again at SF5. One-way: nobody answers.
+                              Every node running this firmware does the same on
+                              its own announce_interval, so this is only for
+                              when you don't want to wait (see INTERNALS §14).
 lora <n> freq <MHz>           set carrier frequency (MHz in, stored as Hz)
 lora <n> bw <kHz>             set bandwidth (kHz in, stored as Hz)
 lora <n> sf <5..12>           spreading factor
@@ -174,8 +175,33 @@ lora <n> mode <name>          interface mode
 lora <n> lbt <0|1>            listen-before-talk on/off (carrier-sense before TX)
 lora <n> appc <0|1>           adaptive contention window on/off (needs lbt on)
 lora <n> rx_boosted_gain <0|1>  SX126x RX gain boost on/off
+lora <n> tx <string>          blind-transmit <string> as one explicit-header
+                              frame at the radio's configured params. `0x<hex>`
+                              inserts raw bytes (`0x0a`, `0x48656c6c6f`);
+                              everything else is literal ASCII, spaces included.
+                              Up to 255 bytes. No carrier-sense.
+lora <n> tx_psa <string>      same as tx, but runs the normal listen-before-talk
+                              carrier-sense first (honours lbt / appc /
+                              lbt_timeout). "psa" = polite-send-after-sense.
+lora <n> tx_prot <ms>         emit an explicit header that announces a long 4/8
+                              packet, then cut the carrier before its body — every
+                              explicit-header receiver on the channel commits its
+                              RX window for ~<ms> while the air only carries the
+                              preamble + header. <ms> is the post-header commit
+                              time; its ceiling is the max-length (255 B) 4/8
+                              packet at the current SF/BW (~606 ms at SF7/BW125).
 lora help | -h                command summary
 ```
+
+`tx`, `tx_psa` and `tx_prot` are bench/test verbs: `tx`/`tx_psa` put arbitrary
+bytes on the air over the live channel, and `tx_prot` is a receiver-capture
+primitive — it exploits the LoRa rule that a valid header commits every listener
+on that freq/BW/SF/sync-word to receive for the whole announced packet duration,
+whether or not the body follows. The header is built by the chip in normal
+explicit mode (so its length/CR/CRC fields and header CRC are spec-correct); only
+the promised body is withheld. The command reports the actual committed time and
+announced length, which may be below the requested `<ms>` when it exceeds what a
+255-byte announce reaches at the current SF/BW.
 
 The `freq`/`bw`/… subcommands write the matching `s.lora.<n>.*` key, which the
 task picks up and re-applies live. Run any of these on-device through `spangap

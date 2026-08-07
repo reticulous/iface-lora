@@ -1,6 +1,7 @@
 set(LORA_SRCS
     "src/lora.cpp"
     "src/esp_idf_hal.cpp"
+    "src/rolling.cpp"
 )
 
 include(${CMAKE_CURRENT_LIST_DIR}/spangap_requires.cmake)

@@ -37,7 +37,8 @@
 #include "lora.h"
 #include "esp_idf_hal.h"
 #include "spangap.h"
-#include "mem.h"           /* gp_alloc (PSRAM) for the LoRaMon ring/history buffers */
+#include "mem.h"       /* gp_alloc (PSRAM) for the LoRaMon ring/history buffers */
+#include "rolling.h"   /* one-hour running totals in ten-minute buckets */
 #include "ports.h"
 #if CONFIG_SPANGAP_NET
 /* Only the RNode endpoint's TCP door needs net; the radio itself is bare, and
@@ -53,6 +54,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"   /* radio task → interface task record queue */
 
 #include <cstring>
 #include <cstdio>
@@ -77,11 +79,101 @@
 
 /* Per-frame protocol class, published as the record's last field and coloured
  * by the LoRaMon apps. Reticulum traffic is everything rnsd sends and receives;
- * "ours" is this straddle's own air protocol (rfprobe P1/P2/sweep, the 0x02 /
- * 0x03 hash-linkage frames). */
+ * "ours" is this straddle's own air protocol: the radio check's BATCH and sweep
+ * frames, and the 0x04 power request. */
 #define LORA_PKT_RNS    0
 #define LORA_PKT_OURS   1
 #define LORA_PKT_RNODE  2
+
+/* Channel index carried by every frame record and every RSSI sample. 0 is the
+ * reticulum hailing channel — the one a node camps on, at whatever frequency
+ * and bandwidth the radio is configured for, and the only channel that exists
+ * until frequency agility is switched on. Higher indices are the agile channels
+ * of the regime in force. */
+#define LORA_CH_HAIL    0
+#define LORA_CH_MAX     10          /* hailing channel + the largest regime's agile set */
+
+/* ─────────────── regimes ───────────────
+ *
+ * A regime is a numbered, versioned statement of what is permissible on air:
+ * the channels, and per channel the airtime allowance, the transmission-length
+ * ceilings and the power limit. It is the thing two nodes name when they agree
+ * how to behave, so the number is the negotiation currency and the table is
+ * resolved locally at each end.
+ *
+ * `s.lora.<n>.afa` IS the regime number. 0 is not a regime — it means no
+ * agility, the hailing channel alone, which is what a node does before any of
+ * this is switched on. 1 is the EU 863-870 MHz plan below.
+ *
+ * The airtime allowance is a seconds-per-window PAIR rather than a percentage,
+ * because that is what makes the table portable across regulators: EU polite
+ * spectrum access is 100 s per 3600 s, an EU duty cycle is 360 s per 3600 s,
+ * and US frequency-hopping dwell is 0.4 s per 20 s. One field pair, three
+ * regulatory shapes, and nothing downstream has to special-case any of them.
+ *
+ * Nothing enforces these yet — no transmission ever leaves channel 0. The table
+ * exists now so that records, measurements and the UI are all written against
+ * channel indices from the start rather than retrofitted later. */
+
+struct RegimeChan {
+    uint32_t freqHz;
+    uint32_t bwHz;
+    float    airtimeMaxS;    /* transmit seconds allowed … */
+    uint32_t airtimeWinS;    /* … in any window of this many seconds */
+    float    maxTxS;         /* ceiling on one transmission */
+    float    maxTxTxnS;      /* ceiling on a dialogue or polling sequence */
+    int8_t   maxTxpDbm;
+};
+
+/* Regime 1 — EU 863-870 MHz, nine 500 kHz channels on polite spectrum access
+ * (100 s/h each), 25 mW e.r.p. Channel 0 is absent from this table: it is the
+ * hailing channel and takes the radio's configured frequency and bandwidth,
+ * because that is a user choice and not ours to fix. */
+static const RegimeChan kRegime1[] = {
+    { 863350000, 500000, 100.0f, 3600, 1.0f, 4.0f, 14 },
+    { 864050000, 500000, 100.0f, 3600, 1.0f, 4.0f, 14 },
+    { 864750000, 500000, 100.0f, 3600, 1.0f, 4.0f, 14 },
+    { 865450000, 500000, 100.0f, 3600, 1.0f, 4.0f, 14 },
+    { 866150000, 500000, 100.0f, 3600, 1.0f, 4.0f, 14 },
+    { 866850000, 500000, 100.0f, 3600, 1.0f, 4.0f, 14 },
+    { 867550000, 500000, 100.0f, 3600, 1.0f, 4.0f, 14 },
+    { 868250000, 500000, 100.0f, 3600, 1.0f, 4.0f, 14 },
+    { 868950000, 500000, 100.0f, 3600, 1.0f, 4.0f, 14 },
+};
+
+/* The agile channels of a regime, or none at all for regime 0. */
+static const RegimeChan* regimeChans(uint8_t regime, int* count) {
+    switch (regime) {
+        case 1: *count = (int)(sizeof kRegime1 / sizeof kRegime1[0]); return kRegime1;
+        default: *count = 0; return nullptr;
+    }
+}
+
+/* Channel-RSSI sampling cadence. One getRSSI(false) per beat: a single SPI
+ * transaction against a radio that is already in RX, so it costs no measurable
+ * power. Carrier sense outranks it — see rssiSamplePoll. */
+#define LORA_RSSI_SAMPLE_MS 1000
+
+/* Settling allowed after entering RX on a retuned channel, before the reading
+ * is believed. `GetRssiInst` is only meaningful once the receiver is actually
+ * running: asked earlier it answers 0xFF, which decodes to −127.5 dBm and looks
+ * exactly like a very quiet channel. That is below the thermal noise of any
+ * bandwidth this part receives, which is what makes it detectable as garbage
+ * rather than data — see LORA_RSSI_INVALID_DBM.
+ *
+ * STDBY_RC → FS → RX is tens of µs on an SX126x; this is several times that,
+ * and the whole nine-channel sweep still fits the excursion budget in
+ * plans/psa.md §3.5. */
+#define LORA_RSSI_SETTLE_US   200
+
+/* Thermal noise in the narrowest bandwidth in use is about −123 dBm
+ * (−174 + 10·log₁₀(125 kHz) + 6 dB noise figure ≈ −117, with margin). Anything
+ * at or below this is the receiver not being ready, not a quiet channel. */
+#define LORA_RSSI_INVALID_DBM (-125.0f)
+
+/* "No reading this beat" — positive, so it cannot collide with a dBm value.
+ * Published as an empty field, which the viewers draw as a gap. */
+#define LORA_RSSI_NONE        1
 
 /* Where a locally-originated packet entered the radio segment. The three
  * endpoints — the radio, rnsd, and an attached RNode client — are one segment,
@@ -90,6 +182,14 @@
  * and its neighbour row. */
 #define LORA_ORIG_RNSD   0
 #define LORA_ORIG_RNODE  1
+
+/* Manual CLI transmit (`lora <n> tx | tx_psa | tx_prot`). One request at a time
+ * per radio: the CLI fills the request fields and notifies the task, which does
+ * the actual radio work in its own loop and bumps a result generation the CLI
+ * polls on. MTX_RAW blind-transmits a payload, MTX_PSA carrier-senses first,
+ * MTX_PROT emits a header that commits receivers for a chosen time. */
+enum : uint8_t { MTX_RAW = 0, MTX_PSA = 1, MTX_PROT = 2 };
+enum : uint8_t { MTXP_OFF = 0, MTXP_LBT = 1, MTXP_TX = 2 };
 
 /* ─────────────── RNode endpoint ───────────────
  * A stock Reticulum RNodeInterface client attaches to this device as if it were
@@ -268,15 +368,14 @@ struct Neighbor {
     uint32_t lastHeardMs;
     uint32_t frames;
     /* Link quality: EWMA (0–255) of elicited proofs that came back (LR→LRPROOF,
-     * data to a dest that has proven before, our probes) — direct dests only. */
+     * data to a dest that has proven before) — direct dests only. */
     bool     haveQuality;
     uint8_t  quality;
     uint16_t qSent, qProved;
     bool     provesData;            /* has proven a plain data packet (PROVE_ALL) */
     bool     transit;               /* seen rebroadcasting announces (a transport node) */
-    /* Cooperative linkage (0x02/0x03): hashes this node told us are its own,
-     * held as first-4 because that is all the linkage frames carry. `node4` is
-     * the node's rnstransport first-4 — the key those frames are addressed by. */
+    /* Hashes learned to belong to this node, held as first-4. `node4` is the
+     * node's rnstransport first-4. Both are populated by the identity join. */
     uint8_t  node4[4];
     bool     haveNode4;
     uint8_t  link4[NEI_LINK4_MAX][4];
@@ -414,158 +513,131 @@ struct NeiState {
 
 enum CsmaPhase : uint8_t { CSMA_IDLE, CSMA_DIFS, CSMA_BACKOFF };
 
-/* ─────────────── rfprobe: two-node RF link characterisation ───────────────
- * `lora [<n>] rfprobe <dest>` measures, with one cooperating neighbour, the
- * lowest TX power that still closes the link — in BOTH directions — in well
- * under a second of air (at low SF). ONE carrier-sensed packet, then a
- * fixed-time slotted schedule in which nothing is sensed at all:
+/* ─────────────── announce buffer + radio check ───────────────
+ * Full protocol in plans/iface-lora/announce-batch-and-radio-check.md.
  *
- *   P1 opener — 12 B, explicit header, normal modem cfg (sync 0x42), LBT, at
- *               our probe max. The LAST listen-before-talk frame of the run.
- *                 [0] 0x00 magic
- *                 [1..4] our dest first-4      [5..8] their dest first-4
- *                 [9] int8 txp of this frame   [10] node flags   [11] reserved
+ * Every outgoing announce this node ORIGINATES (wire hops 0) is kept, keyed by
+ * destination hash, replaced when that destination announces again, dropped
+ * after an hour. Every 15 minutes — and on `lora a[nnounce]` — the whole buffer
+ * is replayed, followed by a radio check:
  *
- * P1's end-of-air is T0. Both ends immediately drop to the sweep regime —
- * implicit (headerless) frames, preamble 6, sync 0x23, no carrier sense —
- * and everything after is a scheduled slot of `ToA + guard`, so a missing
- * frame is data (below the cliff) rather than a stall. Slot parity: the
- * responder owns even slots, the initiator odd.
+ *   [sense] ANNOUNCE… bunched to just under 1 s of air, back-to-back
+ *   [sense] BATCH ×2  manifest of 1-byte hashes, + the power they went out at
+ *           20 ms    everyone retunes to the sweep regime
+ *           SWEEP ×7  at SF7, power walking min → max
+ *           SWEEP ×14 at SF5, the same walk
+ *           restore
  *
- *   slot 0  P2 — 8 B implicit, at the responder's probe max. No magic and no
- *               hashes: a frame landing in exactly this slot can only be the
- *               answer to our P1, which is what the 9 bytes used to buy.
- *                 [0] int8 txp   [1] rssi of P1   [2] snr of P1 (¼ dB)
- *                 [3] node flags [4..7] reserved
- *               P2 on time IS the handshake; the exchange goes straight on.
- *   slot 1+  4-byte sweep frames, the power ladder proper.
+ * One-way. Nobody answers and nothing is retried: a receiver's whole job is to
+ * notice the lowest-powered sweep frame it could decode, which is that node's
+ * power floor toward it and — path loss being reciprocal — an estimate of what
+ * we need to reach them. Every sweep frame states the power it was sent at, so
+ * the estimate is of PATH LOSS and stays valid even when the far end is itself
+ * adapting; that is what makes the reciprocity here safe where passive
+ * reciprocity is not (plans/adaptive-power.md §3).
  *
- * Each side derives its ladder from ITS OWN measurement of the peer's last
- * stated-power frame (reciprocity: path loss is symmetric) — the initiator
- * from P2, the responder from P1 — so neither waits on the other and there is
- * no shared derivation to keep bit-identical. Start = predicted cliff − 2
- * steps (≥ −9 dBm, the protocol floor), PROBE_RUNGS rungs of 6 dB, clamped to
- * each node's own probe max. Since the slot count is a protocol constant and
- * every frame states its own power, the two ladders need not agree.
- *
- * Sweep frame (4 B), self-describing:
- *   [DONE|AT_MAX|AT_MIN|txp+9] [echo txp+9 | heard-count] [rssi] [snr ¼dB]
- * echo = the lowest of the peer's powers we heard, with our measurement of it
- * — an exact link-budget sample (power stated by the sender, signal measured
- * by us). A node is DONE once the peer echoes one of its rungs; it then stops
- * climbing and transmits at (found + 1 step) so its remaining frames keep
- * reporting the other direction without shouting. Both DONE and mutually
- * known → one final frame each and an early exit. AT_MIN / AT_MAX flag a rung
- * clamped at the chip's floor or at the node's probe max.
- *
- * Node flags byte (P1, P2, and the 0x02/0x03 linkage packets alike):
- *   bit 0    roaming — a moving node wants more margin than a fixed one
- *   bits 1-5 how many destination hashes this node believes are its own
- *   bits 6-7 reserved
- *
- * Timing discipline: T0 is the µs stamp the DIO1 ISR took for P1's end-of-air
- * IRQ — the initiator's TxDone and the responder's RxDone are the same
- * physical instant to within ISR latency, so both ends share a µs-accurate
- * anchor no matter what their tasks are doing. Each owned slot fires from an
- * esp_timer one-shot whose callback (esp_timer task, high priority) builds
- * the frame and starts the transmit directly — the lora task (priority 2,
- * 10 ms tick quantization) is never in the TX timing path. A probe holds a
- * PM_NO_LIGHT_SLEEP lock for its whole (bounded, seconds) run: light-sleep
- * timekeeping rides the RTC slow clock — the ~150 kHz RC oscillator on most
- * boards, off by orders of magnitude more ppm than the guard tolerates — so
- * the µs schedule is only trustworthy while the XTAL-fed systimer runs.
- * Awake, inter-node crystal drift over a sweep is ppm-level (µs), far inside
- * the slot guard.
- *
- * Probe max power: the radio's configured tx_power, chip-clamped — the same
- * ceiling real traffic obeys, so a rung the ladder reaches is by construction a
- * power an RNS frame may also use. The reported cliff interpolates below the
- * found rung using measured SNR headroom to the SF demodulation floor (RSSI
- * against sensitivity once SNR saturates), so 6 dB rungs yield a ~1–2 dB
- * estimate. Design lineage: plans/adaptive-power.md §8. */
-#define PROBE_MAGIC_P1        0x00
-#define PROBE_P1_LEN          12
-#define PROBE_P2_LEN          8
-#define PROBE_SWEEP_LEN       4
-#define PROBE_SYNCWORD        0x23
-#define PROBE_PREAMBLE        6
-#define PROBE_FLOOR_DBM       (-9)   /* protocol floor; chips clamp up + flag AT_MIN */
-#define PROBE_STEP_DB         6
-#define PROBE_RUNGS           6      /* fixed → the slot count is a protocol constant */
-#define PROBE_TAIL_SLOTS      4      /* extra report slots after the last rung */
-#define PROBE_TOTAL_SLOTS     (1 + 2 * PROBE_RUNGS + PROBE_TAIL_SLOTS)
-/* Two guards, because they cover different things. Slot 0 is **task**-latency
- * bound: the responder must take the P1 rx IRQ, wake the lora task (priority 2,
- * 10 ms tick), parse, switch the modem to the sweep regime and arm its timer,
- * all before slot 0 fires — miss it and P2 never goes out. Slots 1+ fire from
- * the esp_timer with the frame already decided, so they only need TX-start
- * latency and RX→TX turnaround, and can be much tighter. */
-#define PROBE_START_GUARD_MS  15     /* T0 → slot 0: task wake + modem switch */
-#define PROBE_SLOT_GUARD_MS   15     /* inter-slot: turnaround + TX start.
-                                      * Tried at 8, 9 and 12 and returned to 15
-                                      * each time — the few ms per slot are not
-                                      * worth the reliability, on a ladder that
-                                      * climbs its full range anyway. It also
-                                      * cannot be tuned per board: both ends
-                                      * derive the schedule from this constant,
-                                      * so it must suit the SLOWEST node in the
-                                      * mesh, and a mismatch between two builds
-                                      * desynchronizes them silently (§16). The
-                                      * pressure on it is a slot TX held off by
-                                      * SPI-bus contention (an LCD DMA flush on a
-                                      * T-Deck) or the callback yielding to a
-                                      * reception still landing; both are counted
-                                      * as `forfeit` / `skip` in the probe report
-                                      * if this is ever revisited. */
-/* Frames to keep sending once we hold both directions' answers. The peer needs
- * to hear our echo to close its own side, so a couple of chances is right — but
- * only a couple. Running the schedule out means transmitting into a peer that
- * has already finished and gone back to normal config. */
-#define PROBE_DONE_TAIL       3
-#define PROBE_TXWAIT_MS       3000   /* LBT must clear P1 within this */
+ * The replayed announces need no new coupling path: an announce is an announce,
+ * so neiObserve's hops-0 ingest and cryptographic identity join (§13) run on
+ * them unchanged. The radio check adds only the power floor, which passive
+ * observation cannot give. */
+#define ANN_MAX_ENTRIES   16                      /* bounds RAM *and* the manifest, hence the tail's airtime */
+#define ANN_MAX_LEN       256                     /* an announce is ~167 B + app_data; longer is not buffered */
+#define ANN_TTL_MS        (60u * 60u * 1000u)     /* an hour, replayed or not */
+#define ANN_INTERVAL_DEF  30                      /* s.lora.<i>.announce_interval, minutes */
+#define ANN_JITTER_PCT    10                      /* ± this much, so a fleet does not synchronise */
 
-/* Node flags byte, shared by P1/P2/0x02/0x03. */
-#define NODEF_ROAMING         0x01
-#define NODEF_COUNT_SHIFT     1
-#define NODEF_COUNT_MASK      0x1F
-static inline uint8_t nodeFlagsMake(bool roaming, int hashes) {
-    if (hashes < 0) hashes = 0;
-    if (hashes > NODEF_COUNT_MASK) hashes = NODEF_COUNT_MASK;
-    return (uint8_t)((roaming ? NODEF_ROAMING : 0) |
-                     ((hashes & NODEF_COUNT_MASK) << NODEF_COUNT_SHIFT));
-}
-static inline bool    nodeFlagsRoaming(uint8_t f) { return (f & NODEF_ROAMING) != 0; }
-static inline uint8_t nodeFlagsCount(uint8_t f) {
-    return (uint8_t)((f >> NODEF_COUNT_SHIFT) & NODEF_COUNT_MASK);
-}
+/* One bunch of announces is filled until the next would push it past this.
+ * PSA's single-transmission ceiling (plans/psa.md §2.4) used as the bunch size:
+ * a run of separately-framed packets would more naturally be a dialogue at 4 s,
+ * but nothing wants bunches longer than a second and taking the tighter reading
+ * costs nothing. At SF7/BW125 it fits three. */
+#define ANN_BUNCH_MAX_MS  1000
 
-/* ── 0x02 / 0x03: cooperative hash linkage ──
- * Which destination hashes belong to the same node is otherwise only learnable
- * by catching an announce per hash (the cryptographic join, §13). These two
- * frames let nodes just tell each other, in the normal modem regime (explicit
- * header, sync 0x42, LBT) so any radio in earshot parses them:
- *
- *   0x02 hash-set REQUEST  [0x02][our rnstransport first-4][node flags]
- *                          [4-byte hash]…  — "for each of these nodes, send
- *        me the rest of its hashes". Sent at max power (later: at the highest
- *        power on record for any node on the list).
- *   0x03 hash-set REPLY    [0x03][our rnstransport first-4][node flags]
- *                          [4-byte hash]…  — the sender's own hashes. Always
- *        at max power, because every listener that overhears it gets the
- *        linkage for free and then never has to ask. Rate-limited to one per
- *        half hour per radio.
- *
- * Everyone parses 0x03, not just the requester. `lora rfprobe` sends a 0x02
- * when the peer's advertised hash count doesn't match what we hold for it. */
-/* Placeholder name for our mesh radio layer, shown as a node tag. */
-#define RF_PROTO_NAME         "XXX"
+#define LORA_MAGIC_BATCH  0x05
+#define RC_BATCH_REPEATS  2
+#define RC_BATCH_GAP_MS   5      /* between the two BATCH copies */
+#define RC_LEAD_MS        20     /* BATCH end → first sweep frame */
+#define RC_SWEEP_LEN      4      /* headerless, so both ends agree it statically */
+/* Two above the minimum. Nothing is being discovered — the receiver was told to
+ * expect these — but at SF5 a slot is barely 12 ms and the receiver must turn
+ * RX_DONE around and re-arm inside the guard; the extra symbols widen the
+ * window it has to catch the next frame in. Dropping to 6 costs alternate SF5
+ * frames on the receive side. */
+#define RC_SWEEP_PREAMBLE 8
+#define RC_SWEEP_SYNC     0x23   /* not 0x42 — a node not in a check never correlates */
+#define RC_STEPS_SF7      7
+#define RC_STEPS_SF5      14
+#define RC_SWEEP_SF5      5
+/* Padding on each sweep slot, so a slot is ToA + this. It is the receiver's
+ * turnaround budget: RX_DONE serviced, radio re-armed, next preamble detected.
+ * At SF5 the frame itself is under 8 ms, so too small a guard costs ALTERNATE
+ * frames — the receiver is still busy when the next one flies. Generous here is
+ * cheap: the whole tail is half of Ton_max even at this. */
+#define RC_SLOT_GUARD_MS  12
+#define RC_RETUNE_MS      10     /* SF7 → SF5 changeover */
+#define RC_FLOOR_DBM      (-9)   /* the ladder's low end; chips clamp up from it */
 
-#define LORA_MAGIC_HASHREQ    0x02
-#define LORA_MAGIC_HASHSET    0x03
-#define HASHPKT_HDR_LEN       6      /* magic + node first-4 + flags */
-#define HASHPKT_MAX_HASHES    12
-#define HASHPKT_MAX_LEN       (HASHPKT_HDR_LEN + 4 * HASHPKT_MAX_HASHES)
-#define HASHSET_MIN_GAP_MS    (30u * 60u * 1000u)   /* ≤ one 0x03 per half hour */
+/* `step` byte: phase in the high nibble, index in the low. The index is what
+ * lets a receiver that missed the LAST frame still time the changeover — and
+ * the last frame is the full-power one, so the node most likely to miss it is
+ * exactly the distant node the sweep exists to measure. */
+#define RC_PHASE_SF7      0x00
+#define RC_PHASE_SF5      0x10
+#define RC_STEP_PHASE(b)  ((uint8_t)((b) & 0xF0))
+#define RC_STEP_INDEX(b)  ((uint8_t)((b) & 0x0F))
+
+struct AnnRec {
+    uint8_t  dest[16];
+    uint16_t len;
+    uint32_t ms;                 /* millis() when stored */
+    bool     used;
+    uint8_t  data[ANN_MAX_LEN];  /* the RNS packet verbatim — it is signed, so it
+                                  * cannot be regenerated and must not be altered */
+};
+struct AnnBuf { AnnRec e[ANN_MAX_ENTRIES]; };
+
+/* Transmit side of a run, and the receive side of somebody else's. */
+enum RcPhase : uint8_t {
+    RC_OFF = 0,
+    RC_ANN,        /* replaying announce bunches, carrier-sensed per bunch */
+    RC_TAIL_LBT,   /* winning the channel for the whole tail, once */
+    RC_BATCH,      /* the two manifest copies */
+    RC_SWEEP,      /* both sweep phases, driven off the slot timer */
+    RC_LISTEN,     /* receiving somebody else's sweep */
+};
+
+struct RcState {
+    uint8_t  phase;
+    uint8_t  step;                       /* index within the current phase */
+    uint8_t  sfPhase;                    /* RC_PHASE_SF7 / RC_PHASE_SF5 */
+    uint8_t  n;                          /* manifest entries */
+    uint8_t  hashes[ANN_MAX_ENTRIES];    /* the manifest itself */
+    uint8_t  tag[2];                     /* first announce's first two dest bytes */
+    uint8_t  annIdx;                     /* next buffer slot to replay */
+    uint32_t bunchAirMs;                 /* air already committed to this bunch */
+    uint16_t tailWaitMs;                 /* carrier sense the tail paid, for the record */
+    int8_t   txpFloor, txpCeil;          /* the ladder's ends */
+    int64_t  slotUs;                     /* absolute µs of the next slot */
+    bool     req;                        /* CLI or the beat asked for a run */
+    uint32_t nextRunMs;                  /* the 15-minute beat */
+    esp_timer_handle_t timer;
+
+    /* Modem state to put back when the sweep regime comes off. */
+    uint8_t  savedSync;
+    uint16_t savedPreamble;
+    uint8_t  savedSf;
+
+    /* Receive side: whose sweep we are listening to, and what we have heard.
+     * rxDest is the full destination hash the manifest byte resolved to, so the
+     * result lands on the right neighbour row however many rows share a byte. */
+    uint8_t  rxTag[2];
+    uint8_t  rxDest[16];
+    bool     haveRxDest;
+    int8_t   rxBestTxp;                  /* lowest stated power we decoded */
+    int8_t   rxBestRssi;
+    uint8_t  rxHeard;                    /* frames decoded this run */
+    int64_t  rxUntilUs;                  /* give up listening at this µs */
+};
 
 /* ── adaptive TX power (s.lora.<i>.adaptive_txpwr, default 0) ──
  * The first slice of plans/adaptive-power.md: one power determination per
@@ -573,33 +645,34 @@ static inline uint8_t nodeFlagsCount(uint8_t f) {
  * it. There is no control loop yet — no walk-down, no failure recovery, no
  * re-measurement. One number per node, settled once, applied from then on.
  *
- * Getting the number. With the key on, any node we have heard from recently and
- * hold no determination for is probed (`lora rf`, §14), one at a time. The probe
- * yields a determination either way:
- *   - it measured our lowest rung the peer echoed  → use that,
- *   - it failed, or never got echoed               → use the reciprocity
- *     estimate (the `EST` of §13.1) plus AP_EST_MARGIN_DB.
- * The margin is on the estimate because the estimate credits an unprobed peer
- * with s.lora.assumed_peer_txp rather than knowing its power, and because noise
- * is not reciprocal even where path loss is. Recording a determination on
- * failure too is what keeps this from re-probing a vanilla peer forever: the
- * attempt happens once per node.
+ * Getting the number. **Nothing is initiated any more** — we never ask a peer
+ * to measure itself against us. Two passive sources:
  *
- * Both ends of a probe settle, not just the initiator — a probe measures both
- * directions, and the responder's own lowest echoed rung is its determination
- * for the initiator. Answering a probe is unconditional (§14); only initiating
- * one and applying a determination are gated on the key, so a node with the key
- * off still lets its neighbours measure themselves against it.
+ *   - MEASURED. A node running our code sweeps its whole power range after
+ *     every announce batch. The lowest step we can still decode is the least
+ *     power it needs to reach us, and since each sweep frame states the power
+ *     it was sent at, that is a PATH LOSS measurement — it stays valid even
+ *     while the far end adapts its own power, which a bare RSSI reading would
+ *     not. Reciprocity makes it our estimate toward them.
+ *   - ESTIMATED. Everyone else, from the reciprocity estimate of §13.1 plus
+ *     AP_EST_MARGIN_DB.
+ *
+ * The margin exists because the estimate credits an unmeasured peer with
+ * s.lora.assumed_peer_txp rather than knowing its power — and, in both cases,
+ * because ambient noise is NOT reciprocal even where path loss is. A node
+ * sitting beside an interferer needs more from us than our own quiet receiver
+ * would suggest, and no measurement we can make from here will say so.
+ *
+ * A node with the key off still sweeps, so its neighbours can measure
+ * themselves against it; only *applying* a determination is gated on the key.
  *
  * The determination is per NODE, keyed through the neighbour table's identity
  * clustering, so it covers every hash that node owns — including hashes learned
- * later by announce or by 0x03 linkage.
+ * later by announce.
  *
  * Never on a broadcast: an announce has no single next hop and must reach
  * everyone, so it always goes out at the configured tx_power. */
 #define AP_EST_MARGIN_DB      5      /* added to the estimate when nothing measured */
-#define AP_PROBE_GAP_MS       10000  /* between auto-probes, so a table that fills
-                                      * in one burst doesn't probe in one burst */
 
 /* ── 0x04: the power request ──
  * A 4-byte frame sent BACK TO BACK in front of the packet it relates to, in the
@@ -607,7 +680,7 @@ static inline uint8_t nodeFlagsCount(uint8_t f) {
  * reconfigure between the two. It carries a TX power we suggest the peer use,
  * and/or our measurement of the peer's last frame:
  *
- *   [0x04][suggested txp, int8 dBm][rssi, probeEncRssi][snr, probeEncSnr]
+ *   [0x04][suggested txp, int8 dBm][rssi, encoded][snr, encoded]
  *
  * The two payload fields map onto the two knowledge states, which is why either
  * may be absent: if we know who the peer is we hold its history and can compute
@@ -624,15 +697,13 @@ static inline uint8_t nodeFlagsCount(uint8_t f) {
  * authority on its own reception, having folded in its noise floor, antenna and
  * sensitivity, none of which a transmitter can see.
  *
- * Honouring a request is gated on s.lora.<i>.adaptive_txpwr, unlike answering an
- * rfprobe (which is unconditional). A probe run doesn't change steady-state
- * behaviour; obeying a request puts our transmit power under someone else's
- * control, observably — so a node with the key off must stay at its configured
- * power, or the opt-out isn't one.
+ * Honouring a request is gated on s.lora.<i>.adaptive_txpwr: obeying one puts
+ * our transmit power under someone else's control, observably, so a node with
+ * the key off must stay at its configured power or the opt-out isn't one.
  *
  * Nothing under 20 B on air can be an RNS packet (HEADER_MINSIZE is 19 and we
- * add a framing byte), which is how the 0x00/0x02/0x03 frames already
- * discriminate; a 4-byte frame is unambiguous on length alone.
+ * add a framing byte), which is how our own air frames discriminate; a 4-byte
+ * frame is unambiguous on length alone.
  *
  * Design and the reasoning behind each choice: plans/adaptive-power.md §3a. */
 #define LORA_MAGIC_PWRREQ     0x04
@@ -642,71 +713,14 @@ static inline uint8_t nodeFlagsCount(uint8_t f) {
                                       * is what sending nothing already means */
 #define AP_MIN_SAMPLES        3      /* recent frames before we dial a peer down */
 
-/* Outcome of the post-probe hash-linkage check, for the CLI report. */
-enum ProbeAskState : uint8_t {
-    ASK_UNKNOWN,     /* peer never stated its flags */
-    ASK_COMPLETE,    /* it advertises nothing we don't already hold */
-    ASK_QUEUED,      /* a 0x02 is on its way out */
-    ASK_BUSY,        /* wanted to ask but couldn't queue (see the reason) */
-};
-
-enum ProbePhase : uint8_t {
-    PRB_OFF,          /* idle (a responder auto-arms from here on a P1) */
-    PRB_TX_P1,        /* initiator: LBT-waiting to send P1 */
-    PRB_SWEEP,        /* fixed-time slotted schedule (slot 0 = P2, then ladder) */
-};
-
-struct ProbeState {
-    volatile uint8_t phase;          /* ProbePhase; written by the lora task */
-    bool     initiator;
-    /* CLI kick: the CLI task fills req* and raises req; the lora task consumes. */
-    volatile bool req;
-    uint8_t  reqUs[4], reqDst[4];
-    uint8_t  us[4], them[4];         /* endpoint first-4 hashes, our perspective */
-    int8_t   myMax, peerMax;
-    uint8_t  myFlags;                /* our node flags, stamped once per run */
-    uint8_t  peerFlags;              /* peer's node flags from P1/P2 */
-    bool     havePeerFlags;
-    /* Opener measurements (byte-encoded, as they go on the wire). */
-    int8_t   aTxp; uint8_t aRssiB; int8_t aSnrQ;   /* P1: initiator→responder */
-    int8_t   bTxp; uint8_t bRssiB; int8_t bSnrQ;   /* P2: responder→initiator */
-    /* schedule (µs values are truncated esp_timer time — wrap-safe int32 diffs) */
-    uint32_t deadlineMs;
-    uint32_t t0Us;                   /* ISR stamp of P1's end-of-air IRQ */
-    uint32_t slot0Us;                /* slot 0 — sized for the 8-byte P2 */
-    uint32_t slotUs;                 /* slots 1+ — sized for the 4-byte frame */
-    uint16_t slotMs;                 /* slotUs/1000, for reporting */
-    bool     haveLadder;
-    int8_t   startDbm;
-    uint8_t  nextSlot, rung;
-    bool     implShort;              /* implicit RX length switched 8 → 4 */
-    uint32_t sentMask;               /* sweep powers we transmitted, bit = txp+9 */
-    bool     myDone, peerDone, finishAfterTx;
-    uint8_t  doneTail;               /* own frames sent since we held both answers */
-    bool     peerAtMin, peerAtMax;
-    uint8_t  heardCnt, txCnt;
-    uint8_t  forfeits;               /* slots the timer callback declined to use */
-    uint8_t  skipped;                /* slots already past by the time we armed */
-    /* them→us: lowest peer sweep power heard, with our measurement of it */
-    bool     themHeard; int8_t themTxp; uint8_t themRssiB; int8_t themSnrQ;
-    /* us→them: lowest of our rungs the peer echoed, with its measurement */
-    int8_t   usTxp; uint8_t usRssiB; int8_t usSnrQ;
-    bool     pmHeld;                 /* holding the no-light-sleep lock */
-    /* Cost accounting: wall time of the run and the airtime it actually spent,
-     * split by direction (both ends' frames pass through loraMonPush). */
-    uint32_t startMs, elapsedMs, txAirMs, rxAirMs;
-    /* Linkage follow-up raised by probeMaybeAskHashes, reported by the CLI. */
-    uint8_t  askState;               /* ProbeAskState */
-    uint8_t  askedAdv, askedHave;
-    /* result handoff (the lora task bumps resGen; the CLI task then reads) */
-    volatile uint32_t resGen;
-    bool     resOk;
-    char     resReason[24];
-};
-
-#if defined(CONFIG_LORA0_CS_PIN)   /* ── at least one radio configured ── */
+#if defined(CONFIG_LORA0_CS_PIN)
 
 static const char* TAG = "lora";
+
+/* Our mesh radio layer, shown as a node tag in `lora n`: Spectrum Utilization
+ * and Performance Enhancements, designed in plans/iface-lora/SUPE.md. The same
+ * name both LoRaMon viewers give the protocol in their legends. */
+#define RF_PROTO_NAME         "SUPE"
 
 /* ─────────────── Kconfig → descriptor table ─────────────── */
 
@@ -801,7 +815,8 @@ struct LoraRadio {
     /* Live modem params, kept for per-packet airtime accounting (the airtime
      * formula needs SF/BW/CR/preamble, and only radioStart reads them). */
     int             cfgSf, cfgBwHz, cfgCr, cfgPreamble;
-    /* Framing the radio is CURRENTLY set to — tracks the rfprobe sweep regime,
+    uint8_t         airSf;           /* spreading factor CURRENTLY installed */
+    /* Framing the radio is CURRENTLY set to — tracks the radio-check sweep regime,
      * so airtime records are computed with the parameters the frame really used
      * rather than the configured ones. */
     int             airPreamble;
@@ -867,7 +882,7 @@ struct LoraRadio {
     size_t          txPayloadBytes;  /* RNS payload bytes, credited on completion */
     /* Wall time the head frame spent queued before its first bit went on air.
      * Started the first pass we have something to send and can't, so it covers
-     * every reason a frame waits — the radio held by a probe or a linkage
+     * every reason a frame waits — the radio held by a radio check or a
      * frame, a split reassembly still landing, our own transmit finishing, and
      * then DIFS/backoff against a channel that reads busy — rather than
      * contention alone. Stamped into the frame's LoRaMon record. */
@@ -882,7 +897,7 @@ struct LoraRadio {
     /* LoRaMon — each on-air frame becomes a storage node lora.<n>.packets.<ms>;
      * this FIFO of start-ms drives expiry (delete nodes > 1 h old). */
     int8_t          cfgTxp;          /* configured TX power dBm */
-    uint8_t         cfgSync;         /* configured sync word (restored after rfprobe) */
+    uint8_t         cfgSync;         /* configured sync word (restored after a sweep) */
     int8_t          txPwrNow;        /* power of the frame on-air, stamped into tx records */
     uint8_t         txType[2];       /* per frame: LORA_PKT_*. A 0x04 power request
                                       * and the RNS packet it prefixes share one
@@ -892,37 +907,73 @@ struct LoraRadio {
                                       * of it leaves (see txRearmRx). */
     AirBucket       air[AIR_BUCKETS];/* rolling one-hour airtime */
     uint32_t        txFrameStartMs;  /* start (millis) of the on-air TX frame */
+    /* LoRaMon expiry FIFO. Owned by the INTERFACE task — it is the only thing
+     * that publishes or deletes packet nodes (§ "the two tasks"). The radio
+     * task allocates it once at radioStart and never touches it again. */
     uint32_t*       pktMs;           /* FIFO of published packet start-ms (gp_alloc'd at radioStart) */
     uint16_t        pktCap, pktHead, pktCount;
+
+    /* Channel-RSSI sampling (radio task). One getRSSI(false) per beat while the
+     * radio is idle; carrier sense outranks it, so a frame contending for the
+     * medium leaves a gap in the series rather than a stale reading. */
+    /* Tick at the end of the last reception. Carrier sense cannot see every
+     * frame this radio decodes, so the receiver reports the medium it held —
+     * see csmaMediumHeld. 0 = nothing outstanding. */
+    TickType_t      rxHeldTick;
+
+    uint32_t        cfgFreqHz;       /* configured carrier — the hailing channel */
+    uint8_t         afa;             /* s.lora.<i>.afa: the regime number, 0 = no agility */
+    uint16_t        annIntervalMin;  /* s.lora.<i>.announce_interval, 0 = manual only */
+    Rolling1h       txAir[LORA_CH_MAX];  /* transmit seconds per channel, rolling hour */
+
+    TickType_t      rssiNext;        /* tick the next sample is due */
+    uint32_t        rssiDropped;     /* samples lost to a full interface queue */
+    uint32_t        monDropped;      /* frame records lost to a full interface queue */
 
     /* Passive neighbour table (gp_alloc'd at radioStart, kept across cycles). */
     NeiState*       nei;
 
+    /* Announce buffer + radio check (gp_alloc'd alongside nei, kept likewise). */
+    AnnBuf*         ann;
+    RcState         rc;
+
     /* Adaptive TX power (overview at AP_EST_MARGIN_DB). */
     bool            adaptive;        /* s.lora.<i>.adaptive_txpwr */
-    uint32_t        apGapUntilMs;    /* no auto-probe before this millis() */
     /* A 0x04 power request just received, awaiting the frame it prefixes. The
      * frame carries no binding field — it binds by adjacency alone — so this is
      * consumed or discarded by the very next rx frame, never held. */
     bool            apRxSuggestPend;
     int8_t          apRxSuggest;
 
-    /* rfprobe run state (protocol overview at the ProbeState definition). */
-    ProbeState      probe;
-    esp_timer_handle_t probeTimer;   /* one-shot slot-TX timer (created lazily) */
-    pm_lock_handle_t probePmLock;    /* no-light-sleep hold across a probe run */
 
-    /* Cooperative hash linkage (0x02/0x03): one queued frame, drained by
-     * hashPktPoll once the radio is free and LBT clears. */
-    uint8_t         hashTx[HASHPKT_MAX_LEN];
-    uint8_t         hashTxLen;
-    bool            hashTxPending;
-    uint32_t        lastHashSetMs;   /* rate limit on our own 0x03 */
-    bool            haveLastHashSet;
+    /* Manual CLI transmit (`lora <n> tx | tx_psa | tx_prot`). The CLI fills the
+     * request under mtxReq and notifies; manualTxPoll (task loop) services it and
+     * bumps mtxResGen with the outcome in mtxResOk/mtxResMsg. mtxPhase drives the
+     * PSA carrier-sense state; while it is non-OFF the normal outbound drain and
+     * the radio check stand off the radio. */
+    volatile bool     mtxReq;        /* CLI → task: a request is pending */
+    uint8_t           mtxKind;       /* MTX_RAW / MTX_PSA / MTX_PROT */
+    uint8_t           mtxData[256];  /* payload bytes (RAW / PSA) */
+    uint16_t          mtxLen;        /* payload length (RAW / PSA) */
+    uint16_t          mtxProtMs;     /* PROT: requested receiver-commit time, ms */
+    uint8_t           mtxPhase;      /* MTXP_* */
+    TickType_t        mtxDeadline;   /* PSA: give up carrier-sense at this tick */
+    volatile uint32_t mtxResGen;     /* bumped when a request completes */
+    bool              mtxResOk;      /* last request's success */
+    char              mtxResMsg[72]; /* human-readable outcome for the CLI echo */
 };
 
 static LoraRadio     s_radios[kNumRadios];
-static bool probeOnRx(LoraRadio* r, const uint8_t* frame, size_t len);
+/* Announce buffer + radio check: taps and hooks live in paths defined above
+ * their implementations (applyConfig, handleRxDone), so declare them here. */
+static uint32_t annNextGap(const LoraRadio* r);
+static bool     annOfferTx(LoraRadio* r, const uint8_t* pkt, size_t len);
+static void     rcOnBatch(LoraRadio* r, const uint8_t* f, size_t len, int16_t rssi);
+static void     rcOnSweep(LoraRadio* r, const uint8_t* f, float rssi);
+static void     rcPoll(LoraRadio* r);
+static uint32_t rcTailMs(const LoraRadio* r, int n);
+static int      annCount(const LoraRadio* r);
+static void     apSettle(LoraRadio* r, Neighbor* e, bool measured, int8_t rung);
 /* RNode endpoint (implementation in its own section, below the unit bridge — it
  * needs the frequency/bandwidth range constants defined there). */
 static void rnodeForwardData(LoraRadio* r, const uint8_t* data, size_t len, bool withStats);
@@ -934,10 +985,6 @@ static void rnodeSettleOff(void);
 static void rnodeDropSession(void);
 static void rnsdInject(LoraRadio* r, const uint8_t* data, size_t len,
                        int16_t rssi, int16_t snr10);
-static void probePmHold(LoraRadio* r, bool hold);
-/* Sweep state shared between the lora task and the probe slot-timer callback
- * (esp_timer task) — sections are byte math only, µs held. */
-static portMUX_TYPE  s_probeMux = portMUX_INITIALIZER_UNLOCKED;
 static TaskHandle_t  s_task = nullptr;
 static volatile bool s_stop = false;   /* rns stop → break the work loop and park */
 static volatile bool s_parked = false; /* true while parked (stopped); loraStop waits on it */
@@ -973,7 +1020,7 @@ static void cfgArm(uint32_t delayMs) {
 static volatile bool     s_radioIrq  = false;  /* DIO1 fired; gate the chip SPI poll on it */
 static volatile uint32_t s_radioIrqUs = 0;     /* µs stamp of the last DIO1 IRQ (truncated
                                                 * esp_timer time; 32-bit so the store is
-                                                * atomic) — the rfprobe schedule anchor */
+                                                * atomic) */
 
 /* ─────────────── chip dispatch ───────────────
  *
@@ -1639,12 +1686,6 @@ static void neiParseName(const uint8_t* p, size_t n, char* out, size_t outsz) {
     if (plausible(0, n)) copy(p, n);
 }
 
-/* This node has spoken our air protocol to us (an rfprobe frame or a linkage
- * frame), which is what earns it the mesh-layer tag in `lora neighbors`. */
-static void neiNoteOurProto(LoraRadio* r, const uint8_t b4[4]) {
-    Neighbor* e = neiFindBy4(r->nei, b4);
-    if (e) e->ourProto = true;
-}
 
 /* ── announce ingest: the identity join ── */
 
@@ -2003,7 +2044,7 @@ static IRAM_ATTR void loraRadioIsr(void) {
  * optimisation (DE) engaged once a symbol exceeds 16 ms. CRC is assumed on.
  *
  * `implicitHeader` is NOT optional bookkeeping: a headerless frame drops the
- * 20-bit header from the payload term, and the rfprobe sweep regime also runs a
+ * 20-bit header from the payload term, and the radio-check sweep also runs a
  * 6-symbol preamble instead of the configured 12. Computing a 4-byte sweep frame
  * as explicit/preamble-12 over-states its airtime by ~11 ms at SF7 — some 47% —
  * which lands in the LoRaMon bar widths, the rx start times (start = end − ToA)
@@ -2070,8 +2111,76 @@ static const char* modeName(uint8_t m) {
 /* Defined with the CSMA machine, below — needed by the telemetry flush and by
  * radio bring-up, both of which precede it. */
 static void    csmaResetAccess(LoraRadio* r);
+static void    csmaMediumHeld(LoraRadio* r, uint32_t durMs);
 static float   appcAirtime(const LoraRadio* r);
 static uint8_t appcLiveBand(const LoraRadio* r);
+
+/* ─────────────── the two tasks ───────────────
+ *
+ * `lora` is the RADIO task: it owns the chip and nothing else may call
+ * RadioLib. Sharing one task across all radios is deliberate — it serialises
+ * the SPI bus by construction, so no sibling radio can slip a transaction into
+ * a channel-access sequence. Everything it does is bounded, in-RAM work.
+ *
+ * `lora-if` is the INTERFACE task: the storage side. Publishing packet nodes,
+ * expiring them, the stats flush, the RSSI series. It runs below the radio task
+ * so it can never delay it.
+ *
+ * The line between them is **flash**. A storage write can erase a sector, and an
+ * erase blocks the instruction cache for milliseconds — which is survivable for
+ * telemetry and fatal for a channel-access deadline. Keeping every storage op
+ * off the radio task is what makes the timing arguments in plans/psa.md hold.
+ *
+ * Traffic is one way, radio → interface, over a bounded queue that is never
+ * allowed to block: a full queue drops the record and counts it. Telemetry
+ * yielding under pressure is correct; a recorder that can stall a transmit is
+ * not.
+ *
+ * The neighbour table — including its inline Ed25519 announce verification —
+ * is still on the radio task. It wants to move for the same reason, but it is
+ * read cross-task by the CLI, the probe and the adaptive-power path, so its
+ * ownership has to be settled first. */
+
+enum : uint8_t {
+    IFM_MON  = 0,   /* one on-air frame → a packet node */
+    IFM_RSSI = 1,   /* one channel-RSSI sample */
+};
+
+struct IfMsg {
+    uint8_t  kind;
+    uint8_t  radio;
+    uint8_t  dir;        /* MON: 0 rx, 1 tx */
+    uint8_t  type;       /* MON: LORA_PKT_* */
+    uint8_t  ch;         /* channel index; 0 = the reticulum hailing channel */
+    int8_t   txp;        /* MON tx: power of the frame */
+    uint32_t t_ms;       /* MON: frame start; RSSI: sample time */
+    uint16_t dur_ms;     /* MON: time on air */
+    uint16_t bytes;      /* MON: payload bytes */
+    uint16_t wait_ms;    /* MON tx: queue latency before the first bit */
+    int16_t  rssi;       /* MON rx: dBm; RSSI: channel 0's reading */
+    int16_t  snr10;      /* MON rx: deci-dB */
+    uint8_t  nch;        /* RSSI: how many of chRssi carry a reading */
+    int16_t  chRssi[LORA_CH_MAX];   /* RSSI: dBm per channel, index = channel */
+};
+
+/* Deep enough for a whole radio check (2 BATCH + 7 + 14 sweep frames) to land
+ * inside ~500 ms without the storage side having to keep up frame for frame.
+ * At 24 it overflowed at the end of every run, dropping the last records —
+ * which reads as "the last frames were never sent". */
+#define LORA_IFQ_DEPTH 48
+static QueueHandle_t s_ifq = nullptr;
+
+/* Cached by the interface task at 1 Hz so the radio task can gate recording on
+ * it without a storage read of its own. */
+static volatile bool s_monWatched = false;
+
+/* Post to the interface task. Never blocks: a full queue means the storage side
+ * is behind, and dropping telemetry is the correct answer. Returns false so the
+ * caller can count the loss against the radio it belongs to. */
+static bool ifPost(const IfMsg* m) {
+    if (!s_ifq) return false;
+    return xQueueSend(s_ifq, m, 0) == pdTRUE;
+}
 
 static void publishStats(LoraRadio* r) {
     /* Skip the churn on a headless, WiFi-down node — nothing pulls these keys
@@ -2112,7 +2221,7 @@ static bool loraMonWatched(void) {
 
 /* Delete published packet nodes older than the 1-hour window, and enforce the
  * FIFO cap. The FIFO holds start-ms oldest-first; pop + delete from the front.
- * Both callers run on the lora task, so no lock. */
+ * Interface task only — it owns the FIFO and every packet node in storage. */
 static void loraMonExpire(LoraRadio* r, uint32_t now) {
     if (!r->pktMs) return;
     while (r->pktCount) {
@@ -2128,11 +2237,34 @@ static void loraMonExpire(LoraRadio* r, uint32_t now) {
     }
 }
 
-/* Record one on-air frame: always the per-frame `log lora debug` line, and —
- * while a viewer is open — a packet node `lora.<n>.packets.<ms>` holding a
- * packed string: "r|rssi|snr|dur|bytes" (rx) or "t|txp|dur|bytes" (tx). The
- * leading token is the direction; snr is deci-dB. Then age old nodes out. */
-/* `wait_ms` is tx-only and belongs to the FIRST frame of a burst — the frames
+/* Publish one packet node `lora.<n>.packets.<ms>` holding a packed string:
+ * "r|rssi|snr|dur|bytes|type|ch" (rx) or "t|txp|dur|bytes|type|wait|ch" (tx).
+ * The leading token is the direction; snr is deci-dB; ch is the channel the
+ * frame flew on, 0 being the reticulum hailing channel. Then age old nodes out.
+ *
+ * INTERFACE TASK ONLY — this is the storage half of a record. */
+static void loraMonRecord(LoraRadio* r, const IfMsg* m) {
+    if (!r->pktMs || !r->pktCap) return;
+    char key[40], val[56];
+    snprintf(key, sizeof key, "lora.%d.packets.%u", r->idx, (unsigned)m->t_ms);
+    if (m->dir) snprintf(val, sizeof val, "t|%d|%u|%u|%u|%u|%u",
+                         (int)m->txp, (unsigned)m->dur_ms, (unsigned)m->bytes,
+                         (unsigned)m->type, (unsigned)m->wait_ms, (unsigned)m->ch);
+    else        snprintf(val, sizeof val, "r|%d|%d|%u|%u|%u|%u",
+                         (int)m->rssi, (int)m->snr10, (unsigned)m->dur_ms,
+                         (unsigned)m->bytes, (unsigned)m->type, (unsigned)m->ch);
+    storageSet(key, val);
+
+    loraMonExpire(r, m->t_ms);                           /* age out + free a slot if full */
+    r->pktMs[(r->pktHead + r->pktCount) % r->pktCap] = m->t_ms;
+    r->pktCount++;
+}
+
+/* Record one on-air frame. RADIO TASK: the in-RAM rollups, the debug line, and
+ * a hand-off to the interface task for the storage node. Nothing here touches
+ * flash.
+ *
+ * `wait_ms` is tx-only and belongs to the FIRST frame of a burst — the frames
  * behind it followed immediately and waited for nothing. */
 static void loraMonPush(LoraRadio* r, uint8_t dir, uint32_t t_ms, uint16_t dur_ms,
                         uint16_t bytes, int16_t rssi, int16_t snr10, int8_t txp,
@@ -2145,10 +2277,10 @@ static void loraMonPush(LoraRadio* r, uint8_t dir, uint32_t t_ms, uint16_t dur_m
         if (b->absIdx != absIdx) { b->absIdx = absIdx; b->rxMs = b->txMs = 0; }
         if (dir) b->txMs += dur_ms; else b->rxMs += dur_ms;
     }
-    /* Same split, scoped to a probe run — what the exchange actually cost. */
-    if (r->probe.phase != PRB_OFF) {
-        if (dir) r->probe.txAirMs += dur_ms; else r->probe.rxAirMs += dur_ms;
-    }
+    /* Transmit seconds per channel over the rolling hour — the figure the
+     * airtime ledger will gate on once anything is ever transmitted on a
+     * channel other than the hailing one. */
+    if (dir) r->txAir[LORA_CH_HAIL].add((float)dur_ms / 1000.0f);
     if (logIsDebug(TAG)) {
         if (dir) dbg("lora/%d tx %u..%u (%ums) %uB txp=%ddBm waited=%ums",
                      r->idx, (unsigned)t_ms, (unsigned)(t_ms + dur_ms),
@@ -2158,21 +2290,16 @@ static void loraMonPush(LoraRadio* r, uint8_t dir, uint32_t t_ms, uint16_t dur_m
                      r->idx, (unsigned)t_ms, (unsigned)(t_ms + dur_ms),
                      (unsigned)dur_ms, (unsigned)bytes, (int)rssi, (double)snr10 / 10.0);
     }
-    if (!loraMonWatched() || !r->pktMs || !r->pktCap) return;
+    if (!s_monWatched) return;
 
-    char key[40], val[52];
-    snprintf(key, sizeof key, "lora.%d.packets.%u", r->idx, (unsigned)t_ms);
-    if (dir) snprintf(val, sizeof val, "t|%d|%u|%u|%u|%u",
-                      (int)txp, (unsigned)dur_ms, (unsigned)bytes, (unsigned)type,
-                      (unsigned)wait_ms);
-    else     snprintf(val, sizeof val, "r|%d|%d|%u|%u|%u",
-                      (int)rssi, (int)snr10, (unsigned)dur_ms, (unsigned)bytes,
-                      (unsigned)type);
-    storageSet(key, val);
-
-    loraMonExpire(r, t_ms);                              /* age out + free a slot if full */
-    r->pktMs[(r->pktHead + r->pktCount) % r->pktCap] = t_ms;
-    r->pktCount++;
+    IfMsg m = {};
+    m.kind = IFM_MON;  m.radio = (uint8_t)r->idx;
+    m.dir  = dir;      m.type  = type;
+    m.ch   = LORA_CH_HAIL;
+    m.txp  = txp;      m.t_ms  = t_ms;
+    m.dur_ms = dur_ms; m.bytes = bytes; m.wait_ms = wait_ms;
+    m.rssi = rssi;     m.snr10 = snr10;
+    if (!ifPost(&m)) r->monDropped++;
 }
 
 /* Publish the rolling one-hour airtime, per mille, per direction. The apps
@@ -2201,6 +2328,26 @@ static void loraMonClear(LoraRadio* r) {
     snprintf(pfx, sizeof pfx, "lora.%d.packets", r->idx);
     storageDeleteTree(pfx);
     r->pktHead = r->pktCount = 0;
+}
+
+/* Publish the channel list the regime puts in force:
+ * `lora.<n>.chans` = "<freqHz>,<bwHz>|…", index = channel, 0 = hailing.
+ *
+ * One key rather than a subtree: it is a handful of numbers that only change on
+ * a config apply, and the viewers want all of it at once to label their graphs.
+ * With no agility in force it is just the hailing channel, so a viewer can tell
+ * the two cases apart by the entry count alone and needs no separate flag. */
+static void publishChannels(LoraRadio* r) {
+    int n = 0;
+    const RegimeChan* ch = regimeChans(r->afa, &n);
+    char val[24 * LORA_CH_MAX];
+    int  w = snprintf(val, sizeof val, "%u,%u",
+                      (unsigned)r->cfgFreqHz, (unsigned)r->cfgBwHz);
+    for (int i = 0; i < n && i + 1 < LORA_CH_MAX && w > 0 && w < (int)sizeof val; i++)
+        w += snprintf(val + w, sizeof val - w, "|%u,%u",
+                      (unsigned)ch[i].freqHz, (unsigned)ch[i].bwHz);
+    char kb[48];
+    storageSet(rk(kb, sizeof kb, r->idx, "chans"), val);
 }
 
 static void publishState(LoraRadio* r, const char* state) {
@@ -2275,13 +2422,13 @@ static void radioStop(LoraRadio* r) {
     r->splitLen = 0;
     r->txActive = false;   /* any in-flight transmit is abandoned with the radio */
     r->txFromRnode = false;
-    if (r->probe.phase != PRB_OFF) {   /* no RF restore — the radio is going down */
-        if (r->probeTimer) esp_timer_stop(r->probeTimer);
-        probePmHold(r, false);
-        r->probe.phase = PRB_OFF;
-        r->probe.resOk = false;
-        safeStrncpy(r->probe.resReason, "radio stopped", sizeof r->probe.resReason);
-        r->probe.resGen = r->probe.resGen + 1;
+    /* A radio check in flight dies with the radio. No RF restore: the chip is
+     * going down, and the modem regime is re-applied wholesale on the way up. */
+    if (r->rc.phase != RC_OFF) {
+        if (r->rc.timer) esp_timer_stop(r->rc.timer);
+        r->rc.phase     = RC_OFF;
+        r->rc.step      = 0;
+        r->rc.savedSync = 0;
     }
     if (r->nei)            /* proofs can't return while RF is down — drop, uncounted */
         for (int i = 0; i < NEI_PEND_MAX; i++) r->nei->pend[i].used = false;
@@ -2387,16 +2534,25 @@ static bool radioStart(LoraRadio* r) {
     r->curMode    = modeFromString(mode);
     r->curBitrate = computeBitrate(sf, bw_hz, cr, preamble);
     r->cfgSf = sf; r->cfgBwHz = bw_hz; r->cfgCr = cr; r->cfgPreamble = preamble;
-    r->airPreamble = preamble; r->airImplicit = false;
+    r->cfgFreqHz = (uint32_t)freq_hz;
+    r->airPreamble = preamble; r->airImplicit = false; r->airSf = (uint8_t)sf;
     r->cfgTxp = (int8_t)txp;
     r->cfgSync = (uint8_t)syncWord;
     r->txPwrNow = (int8_t)txp;
+
+    /* The regime in force. The key's value IS the regime number, so 0 means no
+     * agility at all rather than "regime 0" — see the regime table. An unknown
+     * number resolves to no agile channels, which is the safe reading: measure
+     * and transmit on the hailing channel only. */
+    r->afa = (uint8_t)storageGetInt(sk(kb, sizeof kb, r->idx, "afa"), 0);
+    r->annIntervalMin = (uint16_t)storageGetInt(
+        sk(kb, sizeof kb, r->idx, "announce_interval"), ANN_INTERVAL_DEF);
+    publishChannels(r);
 
     /* Adaptive TX power. Determinations already made live in the neighbour
      * table, which survives a config cycle, so turning the key back on resumes
      * with what was measured rather than re-probing the mesh. */
     r->adaptive = storageGetInt(sk(kb, sizeof kb, r->idx, "adaptive_txpwr"), 0) != 0;
-    r->apGapUntilMs = millis();
 
     /* LoRaMon expiry FIFO: allocated once, kept across config cycles. */
     if (!r->pktMs) {
@@ -2404,6 +2560,17 @@ static bool radioStart(LoraRadio* r) {
         r->pktCap = r->pktMs ? LORA_MON_CAP : 0;
         r->pktHead = r->pktCount = 0;
     }
+
+    /* Announce buffer: allocated once, kept across config cycles like the
+     * neighbour table. A failed alloc leaves the replay off (every path guards
+     * on ann) without disturbing anything else. */
+    if (!r->ann) {
+        r->ann = (AnnBuf*)gp_alloc(sizeof(AnnBuf));
+        if (r->ann) std::memset(r->ann, 0, sizeof(AnnBuf));
+    }
+    /* First beat one period out, jittered — a fleet powered up together must
+     * not converge on the same minute forever after. */
+    if (r->rc.nextRunMs == 0) r->rc.nextRunMs = millis() + annNextGap(r);
 
     /* Passive neighbour table: allocated once, history kept across cycles.
      * A failed alloc just leaves the feature off (every path guards on nei).
@@ -2528,7 +2695,7 @@ static void deliverInbound(LoraRadio* r, const uint8_t* data, size_t len,
  * the chip IRQ so the line has dropped low and the next edge fires again).
  * Shared by the RX drain and the post-TX return to listening. */
 static void rearmRx(LoraRadio* r) {
-    /* A transmit fired meanwhile (the rfprobe slot timer runs off-task) — a
+    /* A transmit fired meanwhile (the radio-check slot timer runs off-task) — a
      * startReceive now would abort it. TxDone re-arms RX when it completes. */
     if (r->txActive) {
         gpio_intr_enable((gpio_num_t)r->slot->dio1);
@@ -2546,11 +2713,19 @@ static void handleRxDone(LoraRadio* r) {
         rearmRx(r);
         return;
     }
+    /* Time on air of what just landed, from the framing it actually flew with.
+     * Computed before the CRC verdict because channel occupancy does not depend
+     * on the frame decoding — a corrupt frame held the medium exactly as long. */
+    uint32_t airMs = (uint32_t)lround(1000.0 * loraAirtimeSeconds(
+                         r->airSf, r->cfgBwHz, r->cfgCr, r->airPreamble,
+                         (int)pktLen, r->airImplicit));
+
     uint8_t frame[1 + RNODE_MAX_PAYLOAD];
     int16_t st = r->radio->readData(frame, pktLen);
     if (st != RADIOLIB_ERR_NONE) {
         if (st == RADIOLIB_ERR_CRC_MISMATCH) {
             r->crcErr++;
+            csmaMediumHeld(r, airMs);
             if (logIsDebug("lora"))       /* CRC = the RX error-check info */
                 dbg("lora/%d rx CRC-FAIL %uB rssi=%.0f snr=%.1f",
                     r->idx, (unsigned)pktLen,
@@ -2559,6 +2734,7 @@ static void handleRxDone(LoraRadio* r) {
         rearmRx(r);
         return;
     }
+    csmaMediumHeld(r, airMs);
     r->rxFrames++;
     r->rssiLast = r->radio->getRSSI();
     r->snrLast  = r->radio->getSNR();
@@ -2568,17 +2744,25 @@ static void handleRxDone(LoraRadio* r) {
     bool     isSplit    = (header & RNODE_FLAG_SPLIT) != 0;
     size_t   payloadLen = pktLen - 1;
 
-    /* Our own air protocol (rfprobe P1/P2/sweep, 0x02/0x03 linkage) is consumed
+    /* Our own air protocol (the radio check's BATCH and sweep frames) is consumed
      * here — it never enters split framing or rnsd. Classified before the
      * LoRaMon record so the record can carry its protocol colour. */
-    bool ours = probeOnRx(r, frame, pktLen);
+    /* Radio check, before the probe tap: while we are listening to somebody's
+     * sweep the modem is on the 0x23 implicit regime, so a 4-byte frame here is
+     * a sweep frame and nothing else. A BATCH arrives on the ordinary regime. */
+    bool ours = false;
+    if (r->rc.phase == RC_LISTEN && pktLen == RC_SWEEP_LEN) {
+        rcOnSweep(r, frame, r->rssiLast);
+        ours = true;
+    } else if (pktLen >= 4 && frame[0] == LORA_MAGIC_BATCH) {
+        rcOnBatch(r, frame, pktLen, (int16_t)lround(r->rssiLast));
+        ours = true;
+    }
 
     /* Record this on-air frame (RX_DONE marks end-of-air, so start = end − ToA). */
     {
         uint32_t now = millis();
-        uint32_t dur = (uint32_t)lround(1000.0 * loraAirtimeSeconds(
-                           r->cfgSf, r->cfgBwHz, r->cfgCr, r->airPreamble,
-                           (int)pktLen, r->airImplicit));
+        uint32_t dur = airMs;
         loraMonPush(r, 0 /*rx*/, (dur <= now ? now - dur : now), (uint16_t)dur,
                     (uint16_t)payloadLen, (int16_t)lround(r->rssiLast),
                     (int16_t)lround(r->snrLast * 10.0), 0,
@@ -2653,6 +2837,104 @@ static float channelRssi(LoraRadio* r) {
     return -200.0f;   /* unhandled chip → read as free (fail open to blind TX) */
 }
 
+/* Channel-RSSI sample for the LoRaMon floor: one reading a second, handed to
+ * the interface task to publish. Radio task; the reading is the same
+ * getRSSI(false) carrier sense uses, so it costs one SPI transaction.
+ *
+ * **Carrier sense outranks measurement.** While the CSMA machine holds the
+ * radio — or a transmit is on air, or a probe owns the chip, or a split is
+ * still reassembling — no sample is taken and none is published. The series
+ * goes absent for the duration and the viewers draw the gap. A reading taken
+ * mid-contention would describe the transmission we are queued behind, not the
+ * channel's resting noise, and channel access is the radio's actual job.
+ *
+ * The beat is not advanced when a sample is skipped, so sampling resumes as
+ * soon as the radio is idle again rather than waiting out the rest of a second. */
+/* Measure the agile channels of the regime in force, as one excursion off the
+ * hailing channel and back.
+ *
+ * Retune, read, retune home: standby → setFrequency → startReceive → getRSSI
+ * per channel, then the same to come home. Nine channels is roughly 2–3 ms away
+ * from the hailing channel — inside the ~4 ms an 8-symbol SF7/BW125 preamble
+ * allows before a frame could be missed (plans/psa.md §3.5). The caller has
+ * already established that nothing else wants the radio.
+ *
+ * **Bandwidth is deliberately not retuned.** Every channel is measured with the
+ * receiver the hailing channel is configured for, so the readings share one
+ * noise reference and are directly comparable — which is what a graph of nine
+ * channels needs. Measuring each at its own width would make a 500 kHz channel
+ * read ~6 dB hotter than a 125 kHz one from thermal noise alone, for no gain. A
+ * regulatory Clear Channel Assessment is the opposite case and would have to
+ * match the channel's occupied bandwidth; that is a different measurement for a
+ * different purpose, and not this one. */
+static void rssiSweepAgile(LoraRadio* r, IfMsg* m, const RegimeChan* ch, int n) {
+    for (int i = 0; i < n && i + 1 < LORA_CH_MAX; i++) {
+        r->radio->standby();
+        if (r->radio->setFrequency((float)ch[i].freqHz / 1.0e6f) != RADIOLIB_ERR_NONE)
+            continue;                                  /* out of the part's range */
+        if (r->radio->startReceive() != RADIOLIB_ERR_NONE) continue;
+        r->hal->delayMicroseconds(LORA_RSSI_SETTLE_US);
+        float dbm = channelRssi(r);
+        /* Below the thermal noise of any bandwidth this part can receive, so
+         * not a measurement — it is the receiver answering before it is
+         * listening. Leave the channel unreported rather than draw a floor
+         * that isn't one. */
+        if (dbm <= LORA_RSSI_INVALID_DBM) continue;
+        m->chRssi[i + 1] = (int16_t)lround(dbm);
+    }
+    /* Home. Unconditional and unchecked: a failed retune above must not strand
+     * the radio off the hailing channel, which is the one thing this must never
+     * do. */
+    r->radio->standby();
+    r->radio->setFrequency((float)r->cfgFreqHz / 1.0e6f);
+    r->radio->startReceive();
+}
+
+static void rssiSamplePoll(LoraRadio* r) {
+    if (!r->running || !r->enabled) return;
+    if ((int32_t)(xTaskGetTickCount() - r->rssiNext) < 0) return;
+    if (r->txActive || r->splitPending) return;
+    if (r->rc.phase != RC_OFF) return;
+    if (r->csmaPhase != CSMA_IDLE || r->mtxPhase == MTXP_LBT) return;
+
+    r->rssiNext = xTaskGetTickCount() + pdMS_TO_TICKS(LORA_RSSI_SAMPLE_MS);
+
+    IfMsg m = {};
+    m.kind  = IFM_RSSI;
+    m.radio = (uint8_t)r->idx;
+    m.ch    = LORA_CH_HAIL;
+    m.t_ms  = millis();
+    for (int i = 0; i < LORA_CH_MAX; i++) m.chRssi[i] = LORA_RSSI_NONE;
+
+    int n = 0;
+    const RegimeChan* ch = regimeChans(r->afa, &n);
+    /* The field count is the regime's channel count whether or not every one of
+     * them answered, so a viewer reads a stable set of columns and a channel
+     * that failed to measure is an empty field rather than a shifted one. */
+    m.nch = (uint8_t)((1 + n > LORA_CH_MAX) ? LORA_CH_MAX : 1 + n);
+
+    /* The hailing channel first and in place — the radio is already on it and
+     * settled, so this reading costs one transaction and no retune. */
+    float hail = channelRssi(r);
+    m.chRssi[LORA_CH_HAIL] = (int16_t)lround(hail);
+    m.rssi = m.chRssi[LORA_CH_HAIL];
+
+    /* Leaving the hailing channel mid-reception destroys the frame, and unlike
+     * a preamble there is no partial-recovery argument. The reading just taken
+     * is the cheapest available evidence that something is on air, so energy
+     * above the tracked floor cancels this beat's excursion — the agile
+     * channels simply go unreported and the viewers draw the gap.
+     *
+     * It is the same evidence carrier sense uses and carries the same blind
+     * spot: a frame below the floor is invisible to it (§4.2 of plans/psa.md).
+     * Closing that needs the preamble-detect and header-valid interrupts armed
+     * during receive, which the receive path does not currently ask for. */
+    bool quiet = hail <= r->noiseFloor + CSMA_RSSI_MARGIN_DB;
+    if (ch && n > 0 && quiet) rssiSweepAgile(r, &m, ch, n);
+
+    if (!ifPost(&m)) r->rssiDropped++;
+}
+
 /* Carrier sense: sample the channel and decide busy/free, tracking the noise
  * floor as the low envelope of RSSI (snap down fast, creep up slowly) so an
  * active channel can't inflate the reference it's compared against. Also busy
@@ -2662,7 +2944,56 @@ static bool channelBusy(LoraRadio* r) {
     float rssi = channelRssi(r);
     if (rssi < r->noiseFloor) r->noiseFloor = rssi;
     else                      r->noiseFloor += 0.02f * (rssi - r->noiseFloor);
+    /* A reception completed since the last sense (csmaMediumHeld). The medium
+     * was held for that frame's whole time on air whether or not the threshold
+     * below ever noticed, so report it busy once — that is what puts the
+     * inter-frame space after the frame instead of over the top of it.
+     *
+     * One-shot, and only if the sense caught it fresh: past one DIFS the
+     * required idle period has already elapsed as real idle time, and the
+     * sample stands on its own. */
+    if (r->rxHeldTick) {
+        TickType_t difs = r->appc ? r->appcDifsTicks : r->difsTicks;
+        bool fresh = (TickType_t)(xTaskGetTickCount() - r->rxHeldTick) < difs;
+        r->rxHeldTick = 0;
+        if (fresh) return true;
+    }
     return rssi > r->noiseFloor + CSMA_RSSI_MARGIN_DB;
+}
+
+/* End of a reception — the channel-state half of receiving a frame.
+ *
+ * Carrier sense cannot be relied on to have noticed the transmission we just
+ * decoded. LoRa demodulates below the noise floor (SF7 at −7.5 dB SNR), so a
+ * frame received perfectly may never have risen above `noiseFloor +
+ * CSMA_RSSI_MARGIN_DB`; and the sense is a point sample once per slot, not a
+ * continuous watch, so even a strong frame can fall between two of them. The
+ * receiver holds the one piece of evidence the sense lacks: it decoded
+ * something, therefore the medium was occupied.
+ *
+ * Two corrections follow, and the second is the one that bites:
+ *
+ *  - The next sense reads busy, so the inter-frame space restarts from the end
+ *    of the frame rather than from wherever the sampling happened to land.
+ *
+ *  - Under APPC the contention window is a wall-clock target accumulated
+ *    *while the medium reads free*. A reception the sense missed is therefore
+ *    not merely ignored — its whole duration is banked as credit toward our own
+ *    transmission, so hearing a neighbour out makes us more eager rather than
+ *    less. That credit is given back here. `appcCwStart` discriminates: non-zero
+ *    means the accumulator was still running when the frame ended, so the sense
+ *    never saw it and the credit is bogus; zero means a busy sense had already
+ *    stopped the clock and there is nothing to return.
+ *
+ * Called for every frame off the air, CRC failures and our own air protocol
+ * included: a frame that failed its CRC still occupied the channel, and a frame
+ * we consumed ourselves was still somebody else transmitting. */
+static void csmaMediumHeld(LoraRadio* r, uint32_t durMs) {
+    r->rxHeldTick = xTaskGetTickCount();
+    if (r->rxHeldTick == 0) r->rxHeldTick = 1;      /* 0 is the "nothing to apply" sentinel */
+    if (!r->appc || r->appcCwStart == 0) return;
+    TickType_t held = pdMS_TO_TICKS(durMs);
+    r->appcCwPassed = (r->appcCwPassed > held) ? (TickType_t)(r->appcCwPassed - held) : 0;
 }
 
 /* ── APPC: own-airtime accounting ──
@@ -2861,17 +3192,6 @@ static void csmaResetAccess(LoraRadio* r) {
     r->appcDifsStart = 0;
 }
 
-/* How long the frame just granted the medium spent in carrier sense, for the
- * LoRaMon wait mark. Valid only on the pass csmaClear() returned true: both
- * regimes stamp csmaStart on the first sense of an attempt and leave it alone
- * until the next one. With LBT off nothing was sensed and the stamp is stale.
- * Queued RNS traffic reports a wider figure of its own — time on the outbound
- * queue, which includes the radio being held by something else. */
-static uint16_t csmaWaitMs(const LoraRadio* r) {
-    if (!r->lbt) return 0;
-    uint32_t ms = (uint32_t)(xTaskGetTickCount() - r->csmaStart) * portTICK_PERIOD_MS;
-    return (uint16_t)(ms > 0xFFFF ? 0xFFFF : ms);
-}
 
 /* ─────────────── outbound (rnsd → radio) ─────────────── */
 
@@ -2902,6 +3222,85 @@ static void startTxFrame(LoraRadio* r, int idx) {
     r->txFrameStartMs = millis();                  /* start-of-air, for the LoRaMon record */
     r->txDeadline     = xTaskGetTickCount() + r->txWatchTicks;
     gpio_intr_enable((gpio_num_t)r->slot->dio1);   /* arm DIO1 for this frame's TxDone */
+}
+
+/* ─────────────── announce buffer ───────────────
+ * (overview at ANN_MAX_ENTRIES, near the top of the file) */
+
+/* Next beat, jittered ±ANN_JITTER_PCT. Without the scatter every node that
+ * booted together would announce on the same second forever. */
+static uint32_t annNextGap(const LoraRadio* r) {
+    if (r->annIntervalMin == 0) return 0;              /* 0 = only `lora a` emits */
+    uint32_t period = (uint32_t)r->annIntervalMin * 60u * 1000u;
+    uint32_t span   = period * ANN_JITTER_PCT / 100;
+    return period - span + (esp_random() % (2 * span + 1));
+}
+
+/* Drop entries past their hour. Radio task only. */
+static void annExpire(LoraRadio* r, uint32_t now) {
+    if (!r->ann) return;
+    for (int i = 0; i < ANN_MAX_ENTRIES; i++) {
+        AnnRec* e = &r->ann->e[i];
+        if (e->used && (uint32_t)(now - e->ms) > ANN_TTL_MS) e->used = false;
+    }
+}
+
+static int annCount(const LoraRadio* r) {
+    if (!r->ann) return 0;
+    int n = 0;
+    for (int i = 0; i < ANN_MAX_ENTRIES; i++) if (r->ann->e[i].used) n++;
+    return n;
+}
+
+/* Offer an outgoing packet to the buffer. Stores it only if it is an announce
+ * this node ORIGINATED — wire hops 0, which is what distinguishes our own
+ * announcement from one we are relaying for the network. Relayed announces
+ * belong to somebody else and replaying them would be speaking for them.
+ *
+ * Keyed by destination hash: a fresh announce for a destination we already hold
+ * replaces it in place rather than adding an entry, so a busy destination
+ * cannot crowd the buffer. At the cap, the oldest entry is evicted — with a
+ * one-hour TTL that only bites on a node with more than sixteen live
+ * destinations, where something has to give regardless.
+ *
+ * **Returns true when it has SWALLOWED the packet**, which is the normal case
+ * for an announce we originate. This interface announces at its own pace and
+ * nobody else's: rnsd and the RNode client hand announces over whenever their
+ * own logic fires, and we sit on them until the beat comes round or `lora a`
+ * says so. Nothing else is intercepted — a relayed announce is somebody else's
+ * traffic and goes straight out.
+ *
+ * The cost is that rnsd believes its announce is away the moment it hands it
+ * over, and it may be up to `announce_interval` before that is true. That is
+ * the trade the pacing buys, not an oversight. */
+static bool annOfferTx(LoraRadio* r, const uint8_t* pkt, size_t len) {
+    if (!r->ann || len == 0 || len > ANN_MAX_LEN) return false;
+    NeiHdr h;
+    if (!neiParse(pkt, len, &h)) return false;
+    if (h.ptype != NEI_PT_ANNOUNCE || h.hops != 0 || h.hdr2 || !h.dest) return false;
+
+    uint32_t now = millis();
+    annExpire(r, now);
+
+    AnnRec* slot = nullptr;
+    for (int i = 0; i < ANN_MAX_ENTRIES; i++) {          /* same destination → replace */
+        AnnRec* e = &r->ann->e[i];
+        if (e->used && std::memcmp(e->dest, h.dest, 16) == 0) { slot = e; break; }
+    }
+    if (!slot) for (int i = 0; i < ANN_MAX_ENTRIES; i++)  /* else a free slot */
+        if (!r->ann->e[i].used) { slot = &r->ann->e[i]; break; }
+    if (!slot) {                                          /* else evict the oldest */
+        slot = &r->ann->e[0];
+        for (int i = 1; i < ANN_MAX_ENTRIES; i++)
+            if ((int32_t)(r->ann->e[i].ms - slot->ms) < 0) slot = &r->ann->e[i];
+    }
+
+    std::memcpy(slot->dest, h.dest, 16);
+    std::memcpy(slot->data, pkt, len);
+    slot->len  = (uint16_t)len;
+    slot->ms   = now;
+    slot->used = true;
+    return true;
 }
 
 /* ── adaptive TX power: the tx-path half ──
@@ -3018,7 +3417,7 @@ static bool apPwrReqFor(LoraRadio* r, const uint8_t* pkt, size_t len, int8_t* ou
     else if (!e || neiIsLocal(e))         why = "dest hash is on no node row";
     /* Only a node that has spoken our air protocol to us will parse the frame;
      * to anyone else it is 35 ms of unparseable noise on a shared channel. That
-     * is the RF_PROTO_NAME tag in `lora n`, set by an rfprobe run or by either
+     * is the RF_PROTO_NAME tag in `lora n`, set by a radio check or by either
      * linkage frame — which is what bootstraps eligibility. */
     else if (!e->ourProto)                why = "node has not spoken our protocol";
     else if (!neiEstimateCliff10(r, e, millis(), &cliff10, &samples))
@@ -3031,7 +3430,7 @@ static bool apPwrReqFor(LoraRadio* r, const uint8_t* pkt, size_t len, int8_t* ou
     if (!why) {
         want = (cliff10 >= 0 ? cliff10 / 10 : (cliff10 - 9) / 10) + AP_EST_MARGIN_DB;
         if (want >= AP_PWR_MAX_DBM)      { why = "would ask for max anyway"; val = want; }
-        if (want < PROBE_FLOOR_DBM) want = PROBE_FLOOR_DBM;
+        if (want < RC_FLOOR_DBM) want = RC_FLOOR_DBM;
     }
 
     if (logIsDebug("lora")) {
@@ -3056,8 +3455,13 @@ static bool apPwrReqFor(LoraRadio* r, const uint8_t* pkt, size_t len, int8_t* ou
  * "presented to the radio" means transmitted, so a packet the LBT valve drops
  * never aired and is bridged nowhere. A packet is bridged if and only if it
  * went on air. */
-static void beginTx(LoraRadio* r, const uint8_t* data, size_t len, uint8_t origin) {
+static void beginTx(LoraRadio* r, const uint8_t* data, size_t len, uint8_t origin,
+                    bool fromBuffer = false) {
     if (!r->running || len == 0 || len > RNS_MTU) return;
+
+    /* Our own announces are buffered, not transmitted, until our beat emits
+     * them — except when this call IS that emission. */
+    if (!fromBuffer && annOfferTx(r, data, len)) return;
 
     neiObserve(r, data, len, true, 0, 0, origin);   /* passive neighbour tap (tx side) */
 
@@ -3118,110 +3522,573 @@ static void beginTx(LoraRadio* r, const uint8_t* data, size_t len, uint8_t origi
     startTxFrame(r, 0);
 }
 
-/* ─────────────── rfprobe implementation ───────────────
- * (wire format + protocol overview at the ProbeState definition, top of file) */
+/* ─────────────── radio check ───────────────
+ * (wire format + protocol overview at ANN_MAX_ENTRIES, top of file)
+ *
+ * Two clocks drive a run. The announce bunches are coarse — 276 ms frames, each
+ * bunch carrier-sensed — so they run off the task loop like any other transmit.
+ * The tail is not: its 5 ms and 20 ms gaps are a schedule every receiver is
+ * counting on, and the FreeRTOS tick is 10 ms. So from the first BATCH to the
+ * last SF5 frame the sequence is driven by an esp_timer one-shot against
+ * absolute µs deadlines, and nothing is sensed inside it. */
 
-static uint8_t probeEncRssi(float rssi) {
-    int v = (int)lroundf(-rssi);
-    return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
-}
-static int8_t probeEncSnr(float snr) {
-    int v = (int)lroundf(snr * 4.0f);
-    return (int8_t)(v < -128 ? -128 : v > 127 ? 127 : v);
-}
+static void rcRestoreModem(LoraRadio* r);
+static void rcEnd(LoraRadio* r, const char* why);
 
-/* Clamp a wanted TX power to what this chip can do. PhysicalLayer's default
- * checkOutputPower leaves clipped untouched, so seed it with the wanted value. */
-static int8_t probeClampTx(LoraRadio* r, int want) {
+/* How long the channel access that just granted the medium took, for the
+ * LoRaMon wait mark. Valid only on the pass csmaClear() returned true — both
+ * regimes stamp csmaStart on an attempt's first sense and leave it alone until
+ * the next. With LBT off nothing was sensed. */
+static uint16_t rcSenseWaitMs(const LoraRadio* r) {
+    if (!r->lbt) return 0;
+    uint32_t ms = (uint32_t)(xTaskGetTickCount() - r->csmaStart) * portTICK_PERIOD_MS;
+    return (uint16_t)(ms > 0xFFFF ? 0xFFFF : ms);
+}
+/* Chip dispatch, defined with the rest of it further down. */
+static int16_t radioHeaderMode(LoraRadio* r, bool implicit, size_t len);
+static int16_t radioSyncWord(LoraRadio* r, uint8_t sync);
+static int16_t radioSetSf(LoraRadio* r, uint8_t sf);
+
+static int8_t rcClampTx(LoraRadio* r, int want) {
     int8_t clipped = (int8_t)want;
     r->radio->checkOutputPower((int8_t)want, &clipped);
     return clipped;
 }
 
+/* Time on air of one sweep frame in the phase currently installed. */
+static uint32_t rcSweepToaMs(const LoraRadio* r, uint8_t sf) {
+    return (uint32_t)lround(1000.0 * loraAirtimeSeconds(
+               sf, r->cfgBwHz, r->cfgCr, RC_SWEEP_PREAMBLE, RC_SWEEP_LEN, true));
+}
+
+/* Total air the tail will occupy, computed before a single byte of it goes out.
+ * The whole thing is one transmission held to Ton_max, so this is what channel
+ * access has to be won for and what the airtime ledger has to be able to
+ * cover — not just BATCH's share of it. */
+static uint32_t rcTailMs(const LoraRadio* r, int n) {
+    uint32_t batch = (uint32_t)lround(1000.0 * loraAirtimeSeconds(
+                         r->cfgSf, r->cfgBwHz, r->cfgCr, r->cfgPreamble,
+                         4 + n, false));
+    return RC_BATCH_REPEATS * batch + (RC_BATCH_REPEATS - 1) * RC_BATCH_GAP_MS
+         + RC_LEAD_MS
+         + RC_STEPS_SF7 * (rcSweepToaMs(r, r->cfgSf) + RC_SLOT_GUARD_MS)
+         + RC_RETUNE_MS
+         + RC_STEPS_SF5 * (rcSweepToaMs(r, RC_SWEEP_SF5) + RC_SLOT_GUARD_MS);
+}
+
+/* The power ladder. Spans the chip's floor to the node's CONFIGURED power, not
+ * the chip's ceiling: a radio held to 14 dBm for regulatory reasons stays
+ * there and simply sweeps a shorter run. Nothing in this protocol may raise a
+ * node above what it was configured to transmit at. */
+static int8_t rcLadderPower(const LoraRadio* r, uint8_t step, uint8_t steps) {
+    int lo = r->rc.txpFloor, hi = r->rc.txpCeil;
+    if (steps <= 1 || hi <= lo) return (int8_t)hi;
+    int v = lo + ((hi - lo) * (int)step + (int)(steps - 1) / 2) / (int)(steps - 1);
+    return (int8_t)v;
+}
+
+/* Install / remove the sweep regime: implicit header at RC_SWEEP_LEN, preamble
+ * 6, sync 0x23. The sync word is the load-bearing part — a node not in a radio
+ * check never correlates, so these frames are silent to it rather than a stream
+ * of length-mismatched garbage. */
+static bool rcEnterSweep(LoraRadio* r, uint8_t sf) {
+    if (r->rc.savedSync == 0) {                   /* first entry: remember the way back */
+        r->rc.savedSync     = r->cfgSync;
+        r->rc.savedPreamble = r->cfgPreamble;
+        r->rc.savedSf       = r->cfgSf;
+    }
+    r->radio->standby();
+    int16_t st = radioHeaderMode(r, true, RC_SWEEP_LEN);
+    if (st == RADIOLIB_ERR_NONE) st = r->radio->setPreambleLength(RC_SWEEP_PREAMBLE);
+    if (st == RADIOLIB_ERR_NONE) st = radioSyncWord(r, RC_SWEEP_SYNC);
+    if (st == RADIOLIB_ERR_NONE && sf != r->rc.savedSf) st = radioSetSf(r, sf);
+    if (st != RADIOLIB_ERR_NONE) {
+        warn("lora/%d sweep cfg failed: %s (%d)", r->idx, rlErrName(st), (int)st);
+        return false;
+    }
+    /* The LoRaMon airtime figures must follow the framing actually in use, not
+     * the configured one, or every sweep frame is recorded at the wrong length. */
+    r->airPreamble = RC_SWEEP_PREAMBLE;
+    r->airImplicit = true;
+    r->airSf       = sf;
+    return true;
+}
+
+static void rcRestoreModem(LoraRadio* r) {
+    if (r->rc.savedSync == 0) return;             /* never entered */
+    r->radio->standby();
+    int16_t st = radioHeaderMode(r, false, RC_SWEEP_LEN);
+    if (st == RADIOLIB_ERR_NONE) st = r->radio->setPreambleLength((size_t)r->rc.savedPreamble);
+    if (st == RADIOLIB_ERR_NONE) st = radioSyncWord(r, r->rc.savedSync);
+    if (st == RADIOLIB_ERR_NONE) st = radioSetSf(r, r->rc.savedSf);
+    if (st == RADIOLIB_ERR_NONE) st = r->radio->setOutputPower(r->cfgTxp);
+    r->airPreamble  = r->rc.savedPreamble;
+    r->airImplicit  = false;
+    r->airSf        = r->rc.savedSf;
+    r->txPwrNow     = r->cfgTxp;
+    r->rc.savedSync = 0;
+    if (st != RADIOLIB_ERR_NONE) {
+        /* Stranded in the sweep regime — hardware recovery, not a config edit,
+         * and there is nothing to coalesce it with. */
+        warn("lora/%d sweep restore failed (%s (%d)) — restarting radio",
+             r->idx, rlErrName(st), (int)st);
+        cfgArm(0);
+    }
+    rearmRx(r);
+}
+
+/* Record one frame the tail put on air. The tail transmits through
+ * PhysicalLayer::transmit() rather than startTxFrame(), so the TxDone path that
+ * normally writes the LoRaMon record and credits the APPC band never runs for
+ * it — without this the whole radio check is invisible to the viewers and free
+ * as far as airtime accounting is concerned, which it very much is not.
+ *
+ * `sf`/`preamble`/`implicit` are passed rather than read off the radio because
+ * during the sweep the configured values and the installed ones differ. */
+static void rcRecordTx(LoraRadio* r, uint32_t startMs, uint8_t sf, int len,
+                       bool implicit, uint16_t preamble, int8_t txp, uint16_t waitMs) {
+    uint32_t dur = (uint32_t)lround(1000.0 * loraAirtimeSeconds(
+                       sf, r->cfgBwHz, r->cfgCr, preamble, len, implicit));
+    loraMonPush(r, 1 /*tx*/, startMs, (uint16_t)dur, (uint16_t)len,
+                0, 0, txp, LORA_PKT_OURS, waitMs);
+    appcAddAirtime(r, dur);
+}
+
+/* Build one sweep frame. `tag` couples an otherwise anonymous headerless frame
+ * to the node that sent it — without it a receiver could attribute a power
+ * floor to nobody. */
+static void rcBuildSweep(LoraRadio* r, uint8_t f[RC_SWEEP_LEN], int8_t txp, uint8_t step) {
+    f[0] = (uint8_t)txp;
+    f[1] = r->rc.tag[0];
+    f[2] = r->rc.tag[1];
+    f[3] = (uint8_t)(r->rc.sfPhase | (step & 0x0F));
+}
+
+/* One slot of the sweep, from the esp_timer. Sends this step's frame at this
+ * step's power, then arms the next slot — or hands over to SF5, or ends. */
+static void rcListenEnd(LoraRadio* r);
+
+static void rcSlotCb(void* arg) {
+    LoraRadio* r = (LoraRadio*)arg;
+    RcState*   p = &r->rc;
+
+    /* Listening to somebody else's schedule. Three events: the lead-in puts us
+     * on the sweep regime at SF7, the SF7 phase's end follows the sender to
+     * SF5, and the SF5 phase's end puts everything back. Each is timed from the
+     * BATCH, not from what we hear — a node too far away to decode a single
+     * sweep frame still tracks the phases correctly and simply records nothing. */
+    if (p->phase == RC_LISTEN) {
+        uint32_t slot7 = rcSweepToaMs(r, r->cfgSf) + RC_SLOT_GUARD_MS;
+        uint32_t slot5 = rcSweepToaMs(r, RC_SWEEP_SF5) + RC_SLOT_GUARD_MS;
+        int64_t  d;
+        switch (p->step) {
+            case 0:
+                if (!rcEnterSweep(r, r->cfgSf)) { p->phase = RC_OFF; return; }
+                rearmRx(r);
+                p->step = 1;
+                /* Land in the MIDDLE of the sender's retune gap. At its end the
+                 * reconfigure runs through the first SF5 frame; at its start any
+                 * lateness in our own schedule eats the last SF7 one. Half a gap
+                 * of margin on each side is the only symmetric choice. */
+                d = (int64_t)(RC_STEPS_SF7 * slot7 + RC_RETUNE_MS / 2) * 1000;
+                esp_timer_start_once(p->timer, (uint64_t)d);
+                return;
+            case 1:
+                if (!rcEnterSweep(r, RC_SWEEP_SF5)) { rcListenEnd(r); return; }
+                rearmRx(r);
+                p->step = 2;
+                d = (int64_t)(RC_STEPS_SF5 * slot5 + RC_SLOT_GUARD_MS * 4) * 1000;
+                esp_timer_start_once(p->timer, (uint64_t)d);
+                return;
+            default:
+                rcListenEnd(r);
+                return;
+        }
+    }
+
+    if (p->phase != RC_SWEEP) return;
+
+    uint8_t steps = (p->sfPhase == RC_PHASE_SF5) ? RC_STEPS_SF5 : RC_STEPS_SF7;
+    uint8_t sf    = (p->sfPhase == RC_PHASE_SF5) ? RC_SWEEP_SF5 : r->rc.savedSf;
+
+    if (p->step >= steps) {
+        if (p->sfPhase == RC_PHASE_SF7) {         /* SF7 done → the same walk at SF5 */
+            p->sfPhase = RC_PHASE_SF5;
+            p->step    = 0;
+            if (!rcEnterSweep(r, RC_SWEEP_SF5)) { rcEnd(r, "sf5 switch failed"); return; }
+            p->slotUs += (int64_t)RC_RETUNE_MS * 1000;
+            esp_timer_start_once(p->timer, (uint64_t)(p->slotUs - esp_timer_get_time()));
+            return;
+        }
+        rcEnd(r, nullptr);                        /* both phases done */
+        return;
+    }
+
+    uint8_t f[RC_SWEEP_LEN];
+    int8_t  txp = rcLadderPower(r, p->step, steps);
+    rcBuildSweep(r, f, txp, p->step);
+    apApplyPower(r, txp);
+    r->txPwrNow = txp;
+    uint32_t t0 = millis();
+    r->radio->standby();
+    r->radio->transmit(f, RC_SWEEP_LEN);          /* blocking: the slot IS its airtime */
+    rcRecordTx(r, t0, sf, RC_SWEEP_LEN, true, RC_SWEEP_PREAMBLE, txp, 0);
+
+    p->step++;
+    p->slotUs += (int64_t)(rcSweepToaMs(r, sf) + RC_SLOT_GUARD_MS) * 1000;
+    int64_t d = p->slotUs - esp_timer_get_time();
+    esp_timer_start_once(p->timer, (uint64_t)(d > 0 ? d : 0));
+}
+
+static bool rcEnsureTimer(LoraRadio* r) {
+    if (r->rc.timer) return true;
+    esp_timer_create_args_t a = {};
+    a.callback = rcSlotCb;
+    a.arg      = r;
+    a.dispatch_method = ESP_TIMER_TASK;
+    a.name     = "lora-rc";
+    return esp_timer_create(&a, &r->rc.timer) == ESP_OK;
+}
+
+static void rcEnd(LoraRadio* r, const char* why) {
+    RcState* p = &r->rc;
+    if (p->timer) esp_timer_stop(p->timer);
+    rcRestoreModem(r);
+    apApplyPower(r, r->cfgTxp);
+    if (why) warn("lora/%d radio check aborted: %s", r->idx, why);
+    else if (logIsDebug(TAG))
+        dbg("lora/%d radio check done (%u announces)", r->idx, (unsigned)p->n);
+    p->phase = RC_OFF;
+    p->step  = 0;
+    p->nextRunMs = millis() + annNextGap(r);
+}
+
+/* Assemble the manifest from the buffer and start a run. */
+static void rcBegin(LoraRadio* r) {
+    RcState* p = &r->rc;
+    uint32_t now = millis();
+    annExpire(r, now);
+
+    p->n = 0;
+    for (int i = 0; i < ANN_MAX_ENTRIES && p->n < ANN_MAX_ENTRIES; i++) {
+        AnnRec* e = &r->ann->e[i];
+        if (!e->used) continue;
+        if (p->n == 0) { p->tag[0] = e->dest[0]; p->tag[1] = e->dest[1]; }
+        p->hashes[p->n++] = e->dest[0];
+    }
+    if (p->n == 0) {                     /* nothing to say: no announces, no check */
+        p->phase = RC_OFF;
+        p->nextRunMs = now + annNextGap(r);
+        return;
+    }
+    p->txpCeil    = r->cfgTxp;           /* the CONFIGURED power, never the chip's */
+    p->txpFloor   = rcClampTx(r, RC_FLOOR_DBM);   /* protocol floor, chip-clamped up */
+    p->annIdx     = 0;
+    p->bunchAirMs = 0;
+    p->step       = 0;
+    p->sfPhase    = RC_PHASE_SF7;
+    p->phase      = RC_ANN;
+}
+
+/* Fire the whole tail: BATCH twice back-to-back, then the slot timer takes
+ * over. Called with the channel already won for the tail's full duration. */
+static void rcStartTail(LoraRadio* r) {
+    RcState* p = &r->rc;
+    if (!rcEnsureTimer(r)) { rcEnd(r, "no slot timer"); return; }
+
+    uint8_t f[4 + ANN_MAX_ENTRIES];
+    f[0] = LORA_MAGIC_BATCH;
+    f[2] = (uint8_t)p->txpCeil;
+    f[3] = p->n;
+    std::memcpy(f + 4, p->hashes, p->n);
+
+    apApplyPower(r, p->txpCeil);
+    r->txPwrNow = p->txpCeil;
+    p->phase = RC_BATCH;
+    for (int i = 0; i < RC_BATCH_REPEATS; i++) {
+        f[1] = (uint8_t)i;                         /* the copy index: what lets a
+                                                    * receiver time the sweep from
+                                                    * EITHER copy, so losing the
+                                                    * first costs nothing */
+        uint32_t t0 = millis();
+        r->radio->standby();
+        r->radio->transmit(f, (size_t)(4 + p->n));
+        rcRecordTx(r, t0, r->cfgSf, 4 + p->n, false, r->cfgPreamble, p->txpCeil,
+                   i == 0 ? p->tailWaitMs : 0);
+        /* Busy-wait, not delay(): the FreeRTOS tick is 10 ms, so a 5 ms
+         * vTaskDelay rounds to zero and the gap silently vanishes — while every
+         * listener's sweep_start arithmetic still assumes it happened. Every
+         * interval in this tail is finer than the tick and none of them may be
+         * expressed in ticks. */
+        if (i + 1 < RC_BATCH_REPEATS) r->hal->delayMicroseconds(RC_BATCH_GAP_MS * 1000);
+    }
+
+    /* The sweep starts RC_LEAD_MS after the last BATCH ends — the window every
+     * receiver uses to retune. Anchor the slot schedule on that instant. */
+    p->sfPhase = RC_PHASE_SF7;
+    p->step    = 0;
+    p->phase   = RC_SWEEP;
+    if (!rcEnterSweep(r, r->cfgSf)) { rcEnd(r, "sweep regime failed"); return; }
+    p->slotUs = esp_timer_get_time() + (int64_t)RC_LEAD_MS * 1000;
+    esp_timer_start_once(p->timer, (uint64_t)RC_LEAD_MS * 1000);
+}
+
+/* ── receive side ──
+ *
+ * A BATCH puts us on the sweep regime for exactly as long as the sender's
+ * schedule runs, then puts us back. Everything is derived, nothing is
+ * negotiated: the sender transmits into the dark and we work out when to
+ * listen from constants we both hold.
+ *
+ * Nothing here answers. The result is one number per node — the lowest power
+ * we could decode it at — parked in its neighbour row for adaptive TX power to
+ * read. Path loss being reciprocal, that is also our estimate of what we need
+ * to reach them; and because every sweep frame STATES the power it was sent at,
+ * that estimate survives the far end adapting its own power, which a passive
+ * RSSI reading would not (plans/adaptive-power.md §3). */
+
+/* Fold the manifest into one node, and hand back the sender's destination.
+ *
+ * **The manifest IS the coupling.** A node announces n destinations back to
+ * back and then lists them together, so every row holding one of them is the
+ * same device and they belong in one row. This is what the retired 0x03
+ * linkage frame said explicitly; here it falls out of the batch for free, and
+ * unlike 0x03 it costs no extra transmission.
+ *
+ * One byte per hash is ambiguous across a whole table but not across the
+ * candidates. Only rows heard inside RC_COUPLE_WINDOW_MS are eligible — the
+ * announces this manifest describes flew seconds ago — so the set being matched
+ * against is a handful of nodes that just spoke, not the table. That is what
+ * the byte is sized for.
+ *
+ * Local rows are never folded in: a peer's claim must not swallow our own row
+ * or the RNode client's, however its hashes happen to collide. */
+#define RC_COUPLE_WINDOW_MS  30000
+
+static void rcCoupleManifest(LoraRadio* r, const uint8_t* hashes, uint8_t n,
+                             uint8_t outDest[16], bool* haveDest) {
+    NeiState* st = r->nei;
+    uint32_t  now = millis();
+
+    /* The sender's row: the most recently heard candidate for the FIRST hash,
+     * which is also the tag its sweep frames carry. */
+    Neighbor* home = nullptr;
+    for (int i = 0; i < NEI_MAX; i++) {
+        Neighbor* e = &st->nei[i];
+        if (!e->used || neiIsLocal(e)) continue;
+        if ((uint32_t)(now - e->lastHeardMs) > RC_COUPLE_WINDOW_MS) continue;
+        for (int d = 0; d < e->nDests; d++) {
+            if (e->dests[d].hash[0] != hashes[0]) continue;
+            if (!home || (int32_t)(e->lastHeardMs - home->lastHeardMs) > 0) {
+                home = e;
+                memcpy(outDest, e->dests[d].hash, 16);
+                *haveDest = true;
+            }
+            break;
+        }
+    }
+    if (!home) return;
+
+    home->ourProto = true;                 /* it spoke our air protocol */
+
+    /* Everything else the manifest names is the same node. */
+    for (uint8_t k = 1; k < n; k++) {
+        for (int i = 0; i < NEI_MAX; i++) {
+            Neighbor* e = &st->nei[i];
+            if (!e->used || e == home || neiIsLocal(e)) continue;
+            if ((uint32_t)(now - e->lastHeardMs) > RC_COUPLE_WINDOW_MS) continue;
+            bool match = false;
+            for (int d = 0; d < e->nDests && !match; d++)
+                if (e->dests[d].hash[0] == hashes[k]) match = true;
+            if (match) neiMergeInto(home, e);
+        }
+    }
+    if (logIsDebug(TAG))
+        dbg("lora/%d coupled %u destinations under one node", r->idx, (unsigned)n);
+}
+
+/* A BATCH from somebody else. Places their sweep from the copy index, so
+ * hearing only the second copy is exactly as good as hearing the first. */
+static void rcOnBatch(LoraRadio* r, const uint8_t* f, size_t len, int16_t rssi) {
+    if (len < 4) return;
+    uint8_t i = f[1], n = f[3];
+    if (i >= RC_BATCH_REPEATS || len < (size_t)(4 + n)) return;
+    if (r->rc.phase == RC_SWEEP || r->rc.phase == RC_ANN ||
+        r->rc.phase == RC_TAIL_LBT || r->rc.phase == RC_BATCH) return;  /* ours is running */
+
+    RcState* p = &r->rc;
+    if (p->phase == RC_LISTEN && p->rxTag[0] == f[4]) return;   /* the second copy */
+
+    uint32_t batchMs = (uint32_t)lround(1000.0 * loraAirtimeSeconds(
+                           r->cfgSf, r->cfgBwHz, r->cfgCr, r->cfgPreamble,
+                           (int)len, false));
+    /* RX_DONE marks end-of-air, so "now" is this frame's end. */
+    int64_t start = esp_timer_get_time()
+                  + (int64_t)(RC_BATCH_REPEATS - 1 - i) * (batchMs + RC_BATCH_GAP_MS) * 1000
+                  + (int64_t)RC_LEAD_MS * 1000;
+
+    p->haveRxDest = false;
+    if (n && r->nei) rcCoupleManifest(r, f + 4, n, p->rxDest, &p->haveRxDest);
+    p->rxTag[0]  = n ? f[4] : 0;
+    p->rxTag[1]  = 0;                  /* the sweep's second tag byte is unknown to us
+                                        * from the manifest alone; matched loosely */
+    p->rxBestTxp = 127;
+    p->rxBestRssi = (int8_t)(rssi < -128 ? -128 : rssi);
+    p->rxHeard   = 0;
+    p->phase     = RC_LISTEN;
+    /* Listen out the sender's whole schedule plus a slot of slack. */
+    p->rxUntilUs = start + (int64_t)(rcTailMs(r, n) + RC_SLOT_GUARD_MS * 4) * 1000;
+
+    if (!rcEnsureTimer(r)) { p->phase = RC_OFF; return; }
+    /* Land HALF a lead-in early. Not now — the second BATCH copy is still to
+     * come on the ordinary regime and switching would deafen us to it — but not
+     * at `start` either, which is the instant the sender begins frame 0 and
+     * would have us reconfiguring through it. */
+    int64_t d = start - (int64_t)RC_LEAD_MS * 500 - esp_timer_get_time();
+    if (d < 0) d = 0;
+    esp_timer_start_once(p->timer, (uint64_t)d);
+}
+
+/* The listening window is over: put the modem back and bank the result.
+ *
+ * `rxBestTxp` is the lowest power at which we could still decode that node —
+ * measured, not computed, and needing no RSSI calibration. It is what adaptive
+ * TX power reads, via reciprocity, as the power WE need toward them. */
+static void rcListenEnd(LoraRadio* r) {
+    RcState* p = &r->rc;
+    if (p->timer) esp_timer_stop(p->timer);
+    rcRestoreModem(r);
+    if (p->rxHeard && logIsDebug(TAG))
+        dbg("lora/%d radio check from %02x: floor %d dBm at %d dBm rssi (%u frames)",
+            r->idx, p->rxTag[0], (int)p->rxBestTxp, (int)p->rxBestRssi,
+            (unsigned)p->rxHeard);
+    if (p->rxHeard && p->haveRxDest && r->nei) {
+        Neighbor* e = neiFindByDest(r->nei, p->rxDest);
+        if (e) {
+            e->ourProto = true;              /* it speaks our air protocol */
+            /* The lowest power we could still decode is what THEY need to reach
+             * US. Path loss is reciprocal, so it is also our estimate of what we
+             * need toward them — and because every sweep frame stated its own
+             * power, that holds even while the far end adapts its own, which a
+             * passive RSSI reading could not (plans/adaptive-power.md §3).
+             * Ambient noise is NOT reciprocal, which is what the margin is for. */
+            apSettle(r, e, /*measured=*/true, rcClampTx(r, p->rxBestTxp + AP_EST_MARGIN_DB));
+        }
+    }
+    p->haveRxDest = false;
+    p->phase = RC_OFF;
+    p->step  = 0;
+}
+
+/* One decoded sweep frame from somebody else. */
+static void rcOnSweep(LoraRadio* r, const uint8_t* f, float rssi) {
+    RcState* p = &r->rc;
+    if (p->phase != RC_LISTEN) return;
+    if (p->rxTag[0] && f[1] != p->rxTag[0]) return;    /* not the node we are timing */
+
+    int8_t txp = (int8_t)f[0];
+    p->rxHeard++;
+    if (txp < p->rxBestTxp) {
+        p->rxBestTxp  = txp;
+        p->rxBestRssi = (int8_t)lround(rssi < -128.0f ? -128.0f : rssi);
+    }
+}
+
+/* Task-loop half: the announce bunches, then winning the channel for the tail.
+ * Returns having done at most one thing, like every other poll on this loop. */
+static void rcPoll(LoraRadio* r) {
+    RcState* p = &r->rc;
+    if (!r->running || !r->ann) return;
+
+    if (p->phase == RC_OFF) {
+        /* nextRunMs is only meaningful while the beat is on; with the interval
+         * at 0 nothing but `lora a` starts a run. */
+        bool due = r->annIntervalMin && (int32_t)(millis() - p->nextRunMs) >= 0;
+        if (!p->req && !due) return;
+        if (r->txActive || r->splitPending || r->mtxPhase != MTXP_OFF) return;
+        p->req = false;
+        rcBegin(r);
+        return;
+    }
+    if (r->txActive) return;                        /* a frame of ours is still on air */
+
+    if (p->phase == RC_ANN) {
+        /* Bunch: fill with announces until the next would push past
+         * ANN_BUNCH_MAX_MS, then re-sense for the following bunch. */
+        while (p->annIdx < ANN_MAX_ENTRIES && !r->ann->e[p->annIdx].used) p->annIdx++;
+        if (p->annIdx >= ANN_MAX_ENTRIES) {         /* buffer drained → the tail */
+            p->phase = RC_TAIL_LBT;
+            csmaResetAccess(r);
+            return;
+        }
+        AnnRec*  e   = &r->ann->e[p->annIdx];
+        uint32_t toa = (uint32_t)lround(1000.0 * loraAirtimeSeconds(
+                           r->cfgSf, r->cfgBwHz, r->cfgCr, r->cfgPreamble,
+                           (int)e->len + 1, false));
+        if (p->bunchAirMs != 0 && p->bunchAirMs + toa > ANN_BUNCH_MAX_MS) {
+            p->bunchAirMs = 0;                      /* bunch full → sense again */
+            csmaResetAccess(r);
+            return;
+        }
+        uint16_t wait = 0;
+        if (p->bunchAirMs == 0) {
+            if (!csmaClear(r)) return;                    /* one sense per bunch */
+            wait = rcSenseWaitMs(r);
+        }
+        /* Only the first frame of a bunch waited for anything; the rest followed
+         * it back-to-back. Stamped explicitly because this path bypasses
+         * drainOneOutbound, whose stamp would otherwise be inherited stale and
+         * drawn as a wait reaching back over the previous announce. */
+        r->txWaitMs   = wait;
+        r->txWaitPend = false;
+        p->bunchAirMs += toa;
+        p->annIdx++;
+        /* Replay the stored bytes verbatim — the announce is signed over its own
+         * contents, so it can be neither regenerated nor edited here. */
+        beginTx(r, e->data, e->len, LORA_ORIG_RNSD, /*fromBuffer=*/true);
+        return;
+    }
+
+    if (p->phase == RC_TAIL_LBT) {
+        if (!csmaClear(r)) return;
+        p->tailWaitMs = rcSenseWaitMs(r);
+        rcStartTail(r);
+        return;
+    }
+}
+
+/* Clamp a wanted TX power to what this chip can do. PhysicalLayer's default
+ * checkOutputPower leaves clipped untouched, so seed it with the wanted value. */
+
 /* This node's probe ceiling: the radio's configured tx_power, chip-clamped.
  * The same ceiling real traffic obeys, so a rung the ladder reaches is by
  * construction a power an RNS frame may also use. */
-static int8_t probeMaxPwr(LoraRadio* r) {
-    return probeClampTx(r, r->cfgTxp);
-}
 
 /* Link-budget headroom (deci-dB) of one measurement, computed from the
  * byte-encoded rssi/snr — integer/deterministic so both ends derive the
  * identical ladder from the exchanged bytes. SNR against the SF demodulation
  * floor while SNR is meaningful; RSSI against sensitivity once it saturates. */
-static int probeHeadroom10(const LoraRadio* r, uint8_t rssiB, int8_t snrQ) {
-    int floor10 = 100 - 25 * r->cfgSf;             /* SF7 −7.5 dB … SF12 −20 dB */
-    int snr10   = ((int)snrQ * 10) / 4;
-    if (snr10 < 50)
-        return snr10 - floor10;
-    int sens10 = (int)lround(10.0 * (-174.0 + 10.0 * log10((double)r->cfgBwHz) + 6.0))
-                 + floor10;                        /* thermal + 6 dB NF + SF floor */
-    return -(int)rssiB * 10 - sens10;
-}
 
 /* ToA of one 4-byte sweep frame (implicit header, CRC on, preamble 6). */
 /* ToA of a `len`-byte implicit-header sweep-regime frame (CRC on, preamble 6). */
-static double probeToaS(const LoraRadio* r, int len) {
-    return loraAirtimeSeconds(r->cfgSf, r->cfgBwHz, r->cfgCr, PROBE_PREAMBLE, len, true);
-}
 
 /* Slot lengths. The schedule knows exactly which frame rides in which slot, so
  * each slot is only as long as its own frame needs: slot 0 carries the 8-byte
  * P2, every slot after it a 4-byte sweep frame. Sizing them all for the longest
  * frame would leave ~10 ms of dead air in every slot but the first. Both ends
  * derive these from SF/BW/CR, so they agree without exchanging anything. */
-static void probeSchedule(LoraRadio* r) {
-    ProbeState* p = &r->probe;
-    p->slot0Us = (uint32_t)lround(probeToaS(r, PROBE_P2_LEN) * 1e6) + PROBE_SLOT_GUARD_MS * 1000u;
-    p->slotUs  = (uint32_t)lround(probeToaS(r, PROBE_SWEEP_LEN) * 1e6) + PROBE_SLOT_GUARD_MS * 1000u;
-    p->slotMs  = (uint16_t)(p->slotUs / 1000u);
-}
 
 /* Start of slot `k`, µs after T0. */
-static uint32_t probeSlotOffUs(const ProbeState* p, int k) {
-    if (k <= 0) return PROBE_START_GUARD_MS * 1000u;
-    return PROBE_START_GUARD_MS * 1000u + p->slot0Us + (uint32_t)(k - 1) * p->slotUs;
-}
 
 /* Our own ladder, from reciprocity: `rssiB/snrQ` is OUR measurement of a peer
  * frame sent at `peerTxp`, which gives the path loss and so the power we need.
  * Start two steps under that, floor at −9 dBm, clamp to our own probe max.
  * The peer derives its ladder the same way from its own measurement — the two
  * need not match, since every frame states the power it went out at. */
-static void probeLadder(LoraRadio* r, int8_t peerTxp, uint8_t rssiB, int8_t snrQ) {
-    ProbeState* p = &r->probe;
-    int cliff10 = (int)peerTxp * 10 - probeHeadroom10(r, rssiB, snrQ);
-    int start = (cliff10 >= 0 ? cliff10 / 10 : (cliff10 - 9) / 10) - 2 * PROBE_STEP_DB;
-    if (start < PROBE_FLOOR_DBM) start = PROBE_FLOOR_DBM;
-    if (start > p->myMax)        start = p->myMax;
-    p->startDbm   = (int8_t)start;
-    p->haveLadder = true;
-}
 
 /* Fire one raw probe frame at an explicit power — no framing byte; carrier
  * sense, and so the wait it reports, is the caller's job. Reuses the normal
  * non-blocking TX machinery. */
-static void probeStartTx(LoraRadio* r, const uint8_t* f, size_t len, int8_t txp,
-                         uint16_t waitMs) {
-    int16_t st = r->radio->setOutputPower(txp);
-    if (st != RADIOLIB_ERR_NONE)
-        warn("lora/%d rfprobe setOutputPower(%d): %s (%d)",
-             r->idx, (int)txp, rlErrName(st), (int)st);
-    memcpy(r->txFrame[0], f, len);
-    r->txFrameLen[0]  = len;
-    r->txFrameCount   = 1;
-    r->txFrameSent    = 0;
-    r->txPayloadBytes = 0;          /* our frames don't count as RNS payload */
-    r->txPwrNow       = txp;
-    r->txType[0]      = LORA_PKT_OURS;
-    /* These frames run their own channel access rather than the outbound
-     * queue's, so the caller states the wait: the carrier-sense time for P1 and
-     * linkage frames, zero for a sweep frame, which fires on the schedule and
-     * senses nothing. Always assigned, so none of them can inherit the last RNS
-     * packet's figure. */
-    r->txWaitMs       = waitMs;
-    startTxFrame(r, 0);
-}
 
 /* Modem header mode: implicit with a fixed `len` (sweep regime — headerless
  * frames carry no length, so both ends must be told) vs explicit (normal).
@@ -3251,6 +4118,29 @@ static int16_t radioHeaderMode(LoraRadio* r, bool implicit, size_t len) {
     return RADIOLIB_ERR_UNKNOWN;
 }
 
+/* Coding rate (denominator 5..8). Lives on the concrete classes, not
+ * PhysicalLayer, and SX127x splits it across SX1272/SX1278 — dispatch by chip
+ * like radioHeaderMode. Used by tx_prot to put the payload on 4/8 so the header
+ * it emits announces a 4/8 packet. */
+static int16_t radioSetCodingRate(LoraRadio* r, uint8_t crDenom) {
+    PhysicalLayer* p = r->radio;
+    switch (r->slot->chip) {
+        case CHIP_SX1261: case CHIP_SX1262: case CHIP_SX1268: case CHIP_LLCC68:
+            return static_cast<SX126x*>(p)->setCodingRate(crDenom);
+        case CHIP_SX1272:
+            return static_cast<SX1272*>(p)->setCodingRate(crDenom);
+        case CHIP_SX1276: case CHIP_SX1277: case CHIP_SX1278:
+            return static_cast<SX1278*>(p)->setCodingRate(crDenom);
+        case CHIP_SX1280: case CHIP_SX1281: case CHIP_SX1282:
+            return static_cast<SX128x*>(p)->setCodingRate(crDenom);
+        case CHIP_LR1110: case CHIP_LR1120: case CHIP_LR1121:
+            return static_cast<LR11x0*>(p)->setCodingRate(crDenom);
+        case CHIP_LR2021:
+            return static_cast<LR2021*>(p)->setCodingRate(crDenom);
+    }
+    return RADIOLIB_ERR_UNKNOWN;
+}
+
 static int16_t radioSyncWord(LoraRadio* r, uint8_t sync) {
     PhysicalLayer* p = r->radio;
     switch (chipFamily(r->slot->chip)) {
@@ -3263,84 +4153,45 @@ static int16_t radioSyncWord(LoraRadio* r, uint8_t sync) {
     return RADIOLIB_ERR_UNKNOWN;
 }
 
+/* Spreading factor at runtime — the radio check's SF5 phase is the only caller.
+ * Not on PhysicalLayer (it is LoRa-specific), so dispatched per family like the
+ * sync word above. */
+static int16_t radioSetSf(LoraRadio* r, uint8_t sf) {
+    PhysicalLayer* p = r->radio;
+    switch (r->slot->chip) {
+        case CHIP_SX1261: case CHIP_SX1262: case CHIP_SX1268: case CHIP_LLCC68:
+            return static_cast<SX126x*>(p)->setSpreadingFactor(sf);
+        case CHIP_SX1272:
+            return static_cast<SX1272*>(p)->setSpreadingFactor(sf);
+        case CHIP_SX1276: case CHIP_SX1277: case CHIP_SX1278:
+            return static_cast<SX1278*>(p)->setSpreadingFactor(sf);
+        case CHIP_SX1280: case CHIP_SX1281: case CHIP_SX1282:
+            return static_cast<SX128x*>(p)->setSpreadingFactor(sf);
+        case CHIP_LR1110: case CHIP_LR1120: case CHIP_LR1121:
+            return static_cast<LR11x0*>(p)->setSpreadingFactor(sf);
+        case CHIP_LR2021:
+            return static_cast<LR2021*>(p)->setSpreadingFactor(sf);
+    }
+    return RADIOLIB_ERR_UNKNOWN;
+}
+
 /* Enter the sweep regime at implicit length `len`. Called at P1's end-of-air
  * (len 8, for slot 0's P2) and again once slot 0 is past (len 4). */
-static bool probeSweepCfg(LoraRadio* r, size_t len) {
-    int16_t st = radioHeaderMode(r, true, len);
-    if (st == RADIOLIB_ERR_NONE) st = r->radio->setPreambleLength(PROBE_PREAMBLE);
-    if (st == RADIOLIB_ERR_NONE) st = radioSyncWord(r, PROBE_SYNCWORD);
-    if (st != RADIOLIB_ERR_NONE)
-        warn("lora/%d rfprobe sweep cfg failed: %s (%d)", r->idx, rlErrName(st), (int)st);
-    r->airPreamble = PROBE_PREAMBLE;
-    r->airImplicit = true;
-    return st == RADIOLIB_ERR_NONE;
-}
 
 /* Shorten the implicit RX length to the 4-byte sweep frame, once slot 0 (the
  * only 8-byte frame in the schedule) can no longer arrive. Idempotent. */
-static void probeShorten(LoraRadio* r) {
-    ProbeState* p = &r->probe;
-    if (p->implShort) return;
-    p->implShort = true;
-    radioHeaderMode(r, true, PROBE_SWEEP_LEN);   /* callers re-arm RX */
-}
 
 /* Back to the configured modem params. On any failure, force a full radio
  * restart through the config path rather than run degraded. */
-static void probeRestoreCfg(LoraRadio* r) {
-    int16_t st = radioHeaderMode(r, false, PROBE_SWEEP_LEN);
-    if (st == RADIOLIB_ERR_NONE) st = r->radio->setPreambleLength((size_t)r->cfgPreamble);
-    if (st == RADIOLIB_ERR_NONE) st = radioSyncWord(r, r->cfgSync);
-    if (st == RADIOLIB_ERR_NONE) st = r->radio->setOutputPower(r->cfgTxp);
-    r->airPreamble = r->cfgPreamble;
-    r->airImplicit = false;
-    r->txPwrNow = r->cfgTxp;
-    if (st != RADIOLIB_ERR_NONE) {
-        warn("lora/%d rfprobe restore failed (%s (%d)) — restarting radio",
-             r->idx, rlErrName(st), (int)st);
-        /* The radio is stranded in the sweep regime: this is hardware recovery,
-         * not a configuration edit, and there is nothing to coalesce it with. */
-        cfgArm(0);
-    }
-    rearmRx(r);
-}
 
 /* Reset per-run fields (keeps the CLI request/result handshake fields). */
-static void probeClearRun(ProbeState* p) {
-    p->initiator = false;
-    p->peerFlags = 0;
-    p->havePeerFlags = false;
-    p->deadlineMs = p->t0Us = 0;
-    p->slot0Us = p->slotUs = 0;
-    p->slotMs = 0;
-    p->haveLadder = false;
-    p->startDbm = 0;
-    p->nextSlot = p->rung = 0;
-    p->implShort = false;
-    p->sentMask = 0;
-    p->myDone = p->peerDone = p->finishAfterTx = false;
-    p->doneTail = 0;
-    p->peerAtMin = p->peerAtMax = false;
-    p->heardCnt = p->txCnt = 0;
-    p->forfeits = p->skipped = 0;
-    p->themHeard = false; p->themTxp = 0; p->themRssiB = 0; p->themSnrQ = 0;
-    p->usTxp = 0; p->usRssiB = 0; p->usSnrQ = 0;
-    p->startMs = millis();
-    p->elapsedMs = p->txAirMs = p->rxAirMs = 0;
-    p->askState = ASK_UNKNOWN;
-    p->askedAdv = p->askedHave = 0;
-    p->resOk = false;
-    p->resReason[0] = '\0';
-}
 
-static void probeMaybeAskHashes(LoraRadio* r);
 
 /* ── adaptive TX power: settling one node's determination ──
  * (overview at AP_EST_MARGIN_DB, near the top of the file) */
 static bool neiEstimateCliff10(const LoraRadio* r, const Neighbor* e,
                                uint32_t now, int* cliff10, uint32_t* samples);
-static bool probeNodeFirst4(const Neighbor* e, uint8_t out[4]);
-static bool probeOwnFirst4(LoraRadio* r, uint8_t out[4]);
+static bool neiNodeFirst4(const Neighbor* e, uint8_t out[4]);
 
 /* Clamp a power to what this radio may transmit at: the chip's range, and
  * never above the configured tx_power. A measured rung already satisfies both
@@ -3348,8 +4199,8 @@ static bool probeOwnFirst4(LoraRadio* r, uint8_t out[4]);
  * what needs the clamp. */
 static int8_t apClamp(LoraRadio* r, int want) {
     if (want > r->cfgTxp)       want = r->cfgTxp;
-    if (want < PROBE_FLOOR_DBM) want = PROBE_FLOOR_DBM;
-    return probeClampTx(r, want);
+    if (want < RC_FLOOR_DBM) want = RC_FLOOR_DBM;
+    return rcClampTx(r, want);
 }
 
 /* Record the one determination for a node, at the end of a probe run. With a
@@ -3372,64 +4223,17 @@ static void apSettle(LoraRadio* r, Neighbor* e, bool measured, int8_t rung) {
     e->apFromEst = !measured;
     e->haveApPwr = true;
     uint8_t h4[4] = {};
-    probeNodeFirst4(e, h4);
+    neiNodeFirst4(e, h4);
     info("lora/%d adaptive: %02x%02x%02x%02x settled at %d dBm (%s)",
          r->idx, h4[0], h4[1], h4[2], h4[3], (int)e->apPwr,
          measured ? "measured" : "estimate + margin");
 }
 
-static void probeEnd(LoraRadio* r, bool ok, const char* reason) {
-    ProbeState* p = &r->probe;
-    p->elapsedMs = millis() - p->startMs;
-    if (r->probeTimer) esp_timer_stop(r->probeTimer);
-    probePmHold(r, false);
-    probeRestoreCfg(r);
-    csmaResetAccess(r);
-    p->phase = PRB_OFF;
-    p->resOk = ok;
-    safeStrncpy(p->resReason, reason ? reason : "", sizeof p->resReason);
-    if (!p->initiator) {
-        if (ok) {
-            char u2t[40], t2u[40];
-            if (p->myDone)
-                snprintf(u2t, sizeof u2t, "%d dBm (rssi -%u snr %.2f)",
-                         (int)p->usTxp, (unsigned)p->usRssiB, (double)p->usSnrQ / 4.0);
-            else safeStrncpy(u2t, "never echoed", sizeof u2t);
-            if (p->themHeard)
-                snprintf(t2u, sizeof t2u, "%d dBm (rssi -%u snr %.2f)",
-                         (int)p->themTxp, (unsigned)p->themRssiB, (double)p->themSnrQ / 4.0);
-            else safeStrncpy(t2u, "nothing heard", sizeof t2u);
-            info("lora/%d rfprobe with %02x%02x%02x%02x done in %u ms "
-                 "(tx %u ms, rx %u ms): us->them from %s, them->us from %s "
-                 "(%u heard / %u sent)",
-                 r->idx, p->them[0], p->them[1], p->them[2], p->them[3],
-                 (unsigned)p->elapsedMs, (unsigned)p->txAirMs, (unsigned)p->rxAirMs,
-                 u2t, t2u, (unsigned)p->heardCnt, (unsigned)p->txCnt);
-        } else {
-            info("lora/%d rfprobe (responder) aborted: %s", r->idx, p->resReason);
-        }
-    }
-    if (ok) {
-        neiNoteOurProto(r, p->them);
-        Neighbor* pe = neiFindBy4(r->nei, p->them);
-        if (pe && p->myDone) { pe->haveTxPwr = true; pe->txPwr = p->usTxp; }
-        /* Both ends settle, initiator and responder alike: the run measured
-         * both directions, and p->usTxp is our own lowest echoed rung either
-         * way. A run that ended without one is a failure as far as the
-         * determination is concerned, however cleanly it closed. */
-        apSettle(r, pe, p->myDone, p->usTxp);
-        probeMaybeAskHashes(r);
-    } else {
-        apSettle(r, neiFindBy4(r->nei, p->them), false, 0);
-    }
-    p->resGen = p->resGen + 1;   /* unblocks the waiting CLI (initiator) */
-}
 
 /* ── cooperative hash linkage (0x02 / 0x03) ──
  * Everything here keys on a hash's first 4 bytes, which is all the linkage
  * frames carry; a full 16-byte dest already in the table matches on its first
  * 4. See the format block at the top of the file. */
-static bool probeIsOurHash(LoraRadio* r, const uint8_t first4[4]);
 
 /* Find a neighbour by any first-4 it is known under: its node key, a full
  * dest hash from an announce, or a hash a 0x03 linked to it. */
@@ -3447,22 +4251,6 @@ Neighbor* neiFindBy4(NeiState* st, const uint8_t b4[4]) {
     return nullptr;
 }
 
-/* Record a first-4 as belonging to this node. If that hash is currently a row
- * of its OWN — the usual case, since every aspect announces under its own
- * identity and so builds its own row — this is the moment the two rows become
- * one device, which is the entire point of the linkage frame. */
-static void neiLink(NeiState* st, Neighbor* e, const uint8_t b4[4]) {
-    Neighbor* other = neiFindBy4(st, b4);
-    /* Never let a peer's claim swallow our own row: the linkage frame is an
-     * unauthenticated assertion, so it may group a peer's hashes but must not
-     * reach across the us/them boundary. */
-    if (other && other != e && !neiIsLocal(other) && !neiIsLocal(e)) {
-        neiMergeInto(e, other);
-        return;
-    }
-    if (other && other != e) return;
-    neiAddLink4Raw(e, b4);
-}
 
 /* How many distinct hashes we hold for a node — announced dests plus the ones
  * a 0x03 linked in. This is what we compare against a peer's advertised count. */
@@ -3470,589 +4258,194 @@ static int neiKnownHashes(const Neighbor* e) {
     return (int)e->nDests + (int)e->nLink4;
 }
 
-/* Our own hash count / roaming bit, as they go into a node flags byte. */
-static int neiOwnHashCount(LoraRadio* r) {
-    NeiState* st = r->nei;
-    int n = 0;
-    if (st)
-        for (int i = 0; i < NEI_MAX; i++)
-            if (st->nei[i].used && neiIsLocal(&st->nei[i])) n += st->nei[i].nDests;
-    return n;
-}
 
-static uint8_t probeMyFlags(LoraRadio* r) {
-    return nodeFlagsMake(r->curMode == RNS_IFACE_MODE_ROAMING, neiOwnHashCount(r));
-}
 
-/* Fold a peer's advertised flags into its table row (creating nothing — a node
- * we have never heard from directly is not ours to invent). */
-static void neiNoteFlags(LoraRadio* r, const uint8_t b4[4], uint8_t flags) {
-    Neighbor* e = neiFindBy4(r->nei, b4);
-    if (!e) return;
-    e->haveAdv   = true;
-    e->advHashes = nodeFlagsCount(flags);
-    e->roaming   = nodeFlagsRoaming(flags);
-}
 
-/* Our own rnstransport dest first-4 — the key our linkage frames are sent
- * under. Falls back to any hash of ours if that aspect hasn't announced. */
-static bool neiOurNode4(LoraRadio* r, uint8_t out[4]) {
-    NeiState* st = r->nei;
-    if (!st) return false;
-    const uint8_t* any = nullptr;
-    for (int i = 0; i < NEI_MAX; i++) {
-        Neighbor* e = &st->nei[i];
-        if (!e->used || !neiIsLocal(e)) continue;
-        for (int d = 0; d < e->nDests; d++) {
-            if (!any) any = e->dests[d].hash;
-            if (e->dests[d].haveName) {
-                const char* lbl = neiNameLabel(e->dests[d].nameHash);
-                if (lbl && strcmp(lbl, "rnstransport.probe") == 0) {
-                    memcpy(out, e->dests[d].hash, 4);
-                    return true;
-                }
-            }
-        }
-    }
-    if (!any) return false;
-    memcpy(out, any, 4);
-    return true;
-}
 
-/* Queue a linkage frame for transmission (one slot; the poll drains it). */
-static bool hashPktQueue(LoraRadio* r, uint8_t magic, const uint8_t (*list)[4], int n) {
-    if (r->hashTxPending) return false;
-    uint8_t node4[4];
-    if (!neiOurNode4(r, node4)) return false;
-    if (n > HASHPKT_MAX_HASHES) n = HASHPKT_MAX_HASHES;
-    uint8_t* f = r->hashTx;
-    f[0] = magic;
-    memcpy(f + 1, node4, 4);
-    f[5] = probeMyFlags(r);
-    for (int i = 0; i < n; i++) memcpy(f + HASHPKT_HDR_LEN + 4 * i, list[i], 4);
-    r->hashTxLen     = (uint8_t)(HASHPKT_HDR_LEN + 4 * n);
-    r->hashTxPending = true;
-    if (s_task) xTaskNotifyGive(s_task);
-    return true;
-}
 
-/* Our own hashes, as a 0x03 payload. */
-static int neiOurHashList(LoraRadio* r, uint8_t (*out)[4], int max) {
-    NeiState* st = r->nei;
-    int n = 0;
-    if (!st) return 0;
-    for (int i = 0; i < NEI_MAX && n < max; i++) {
-        Neighbor* e = &st->nei[i];
-        if (!e->used || !neiIsLocal(e)) continue;
-        for (int d = 0; d < e->nDests && n < max; d++)
-            memcpy(out[n++], e->dests[d].hash, 4);
-    }
-    return n;
-}
-
-/* Answer a 0x02 that named one of ours, rate-limited to one per half hour —
- * a 0x03 is broadcast-useful, so the limit is per radio, not per requester. */
-static void hashSetAnnounce(LoraRadio* r, uint32_t now) {
-    if (r->haveLastHashSet && (uint32_t)(now - r->lastHashSetMs) < HASHSET_MIN_GAP_MS)
-        return;
-    uint8_t list[HASHPKT_MAX_HASHES][4];
-    int n = neiOurHashList(r, list, HASHPKT_MAX_HASHES);
-    if (n <= 0) return;
-    if (!hashPktQueue(r, LORA_MAGIC_HASHSET, list, n)) return;
-    r->lastHashSetMs   = now;
-    r->haveLastHashSet = true;
-    info("lora/%d hash-set: announcing %d hash%s", r->idx, n, n == 1 ? "" : "es");
-}
-
-/* Parse an inbound 0x02/0x03. Returns true when the frame was one of ours. */
-static bool hashPktOnRx(LoraRadio* r, const uint8_t* f, size_t len) {
-    if (len < HASHPKT_HDR_LEN || len > HASHPKT_MAX_LEN) return false;
-    if (f[0] != LORA_MAGIC_HASHREQ && f[0] != LORA_MAGIC_HASHSET) return false;
-    if ((len - HASHPKT_HDR_LEN) % 4) return false;
-    int n = (int)(len - HASHPKT_HDR_LEN) / 4;
-    const uint8_t (*list)[4] = (const uint8_t (*)[4])(f + HASHPKT_HDR_LEN);
-    uint32_t now = millis();
-
-    if (f[0] == LORA_MAGIC_HASHREQ) {
-        /* A request is only interesting if it asks about us. */
-        for (int i = 0; i < n; i++)
-            if (probeIsOurHash(r, list[i])) { hashSetAnnounce(r, now); break; }
-        neiNoteFlags(r, f + 1, f[5]);
-        neiNoteOurProto(r, f + 1);
-        return true;
-    }
-
-    /* 0x03 — everyone in earshot folds the linkage in, requester or not. */
-    NeiState* st = r->nei;
-    if (!st) return true;
-    Neighbor* e = neiFindBy4(st, f + 1);
-    for (int i = 0; !e && i < n; i++) e = neiFindBy4(st, list[i]);
-    if (!e) e = neiAlloc(st, now);          /* a node we only know cooperatively */
-    if (!e || neiIsLocal(e)) return true;
-    if (!e->haveNode4) { memcpy(e->node4, f + 1, 4); e->haveNode4 = true; }
-    e->haveAdv   = true;
-    e->advHashes = nodeFlagsCount(f[5]);
-    e->roaming   = nodeFlagsRoaming(f[5]);
-    e->ourProto = true;
-    neiLink(st, e, f + 1);
-    for (int i = 0; i < n; i++) neiLink(st, e, list[i]);
-    dbg("lora/%d hash-set from %02x%02x%02x%02x: %d hash%s linked",
-        r->idx, f[1], f[2], f[3], f[4], n, n == 1 ? "" : "es");
-    return true;
-}
-
-/* After a probe, ask the peer for its full hash set when what it advertises
- * doesn't match what we hold for it — the RF measurement is done, so the
- * cheapest moment to close the linkage gap is right now. */
-static void probeMaybeAskHashes(LoraRadio* r) {
-    ProbeState* p = &r->probe;
-    if (!p->havePeerFlags) { p->askState = ASK_UNKNOWN; return; }
-    Neighbor* e = neiFindBy4(r->nei, p->them);
-    int have = e ? neiKnownHashes(e) : 0;
-    int adv  = (int)nodeFlagsCount(p->peerFlags);
-    p->askedAdv  = (uint8_t)adv;
-    p->askedHave = (uint8_t)have;
-    if (adv <= have) { p->askState = ASK_COMPLETE; return; }
-    uint8_t list[1][4];
-    memcpy(list[0], p->them, 4);
-    if (!hashPktQueue(r, LORA_MAGIC_HASHREQ, list, 1)) {
-        p->askState = ASK_BUSY;
-        warn("lora/%d hash-req not queued (%s)", r->idx,
-             r->hashTxPending ? "one already waiting for the channel"
-                              : "no own hash to send it under");
-        return;
-    }
-    p->askState = ASK_QUEUED;
-    info("lora/%d hash-req: %02x%02x%02x%02x advertises %d hashes, we hold %d",
-         r->idx, p->them[0], p->them[1], p->them[2], p->them[3], adv, have);
-}
-
-/* Drain a queued linkage frame once the radio is free and LBT clears. Sent at
- * the radio's full configured power, never a neighbour's adaptive one: a 0x03
+/* Sent at the radio's full configured power, never a neighbour's adaptive one
  * heard widely saves everyone else from asking. */
-static void hashPktPoll(LoraRadio* r) {
-    if (!r->hashTxPending || !r->running) return;
-    if (r->probe.phase != PRB_OFF || r->txActive || r->splitPending) return;
-    if (!csmaClear(r)) {
-        /* Normal outbound defers to us, so a frame that can never win the
-         * channel would block RNS traffic outright — shed it on the same valve
-         * a queued RNS frame uses. Linkage is opportunistic; dropping one costs
-         * nothing but the wait until the next probe. */
-        if (r->lbtTimeoutTicks && r->csmaPhase != CSMA_IDLE &&
-            (TickType_t)(xTaskGetTickCount() - r->csmaStart) >= r->lbtTimeoutTicks) {
-            r->hashTxPending = false;
-            csmaResetAccess(r);
-            warn("lora/%d hash-pkt dropped: channel busy > %u ms",
-                 r->idx, (unsigned)r->lbtTimeoutMs);
-        }
-        return;
-    }
-    r->hashTxPending = false;
-    probeStartTx(r, r->hashTx, r->hashTxLen, probeMaxPwr(r), csmaWaitMs(r));
-}
 
 /* Does this first-4 name one of the local rows' announced dest hashes? (us or
  * the RNode client — both terminate here, so neither is a probe target.) */
-static bool probeIsOurHash(LoraRadio* r, const uint8_t first4[4]) {
-    NeiState* st = r->nei;
-    if (!st) return false;
-    for (int i = 0; i < NEI_MAX; i++) {
-        Neighbor* e = &st->nei[i];
-        if (!e->used || !neiIsLocal(e)) continue;
-        for (int d = 0; d < e->nDests; d++)
-            if (memcmp(e->dests[d].hash, first4, 4) == 0) return true;
-    }
-    return false;
-}
 
 /* Build the next sweep frame; returns the (chip-clamped) power it must go out
  * at. Climb one rung per own-slot until DONE, then hold at found + 1 step so
  * the remaining frames report the other direction without shouting. */
-static int8_t probeBuildSweep(LoraRadio* r, uint8_t f[PROBE_SWEEP_LEN]) {
-    ProbeState* p = &r->probe;
-    bool atMax = false, atMin = false;
-    int want;
-    if (!p->myDone) {
-        /* No ladder yet (our opener measurement never landed) — shout, so the
-         * peer at least hears something and the run still yields one direction. */
-        if (!p->haveLadder) want = p->myMax;
-        else {
-            int idx = p->rung < (PROBE_RUNGS - 1) ? p->rung : (PROBE_RUNGS - 1);
-            want = p->startDbm + idx * PROBE_STEP_DB;
-        }
-        p->rung++;
-    } else {
-        /* Hold at the power they echoed — they *heard* it, so there is nothing
-         * to gain by stepping up, and a step up is a step up. */
-        want = p->usTxp;
-    }
-    if (want >= p->myMax) { want = p->myMax; atMax = true; }
-    int8_t tx = probeClampTx(r, want);
-    if (tx > want)      atMin = true;      /* chip floor sits above this rung */
-    else if (tx < want) atMax = true;
-    p->sentMask |= 1u << (tx + 9);
-    f[0] = (uint8_t)((((p->myDone ? 4 : 0) | (atMax ? 2 : 0) | (atMin ? 1 : 0)) << 5)
-                     | ((tx + 9) & 0x1F));
-    if (p->themHeard) {
-        f[1] = (uint8_t)((((p->themTxp + 9) & 0x1F) << 3) | (p->heardCnt & 0x07));
-        f[2] = p->themRssiB;
-        f[3] = (uint8_t)p->themSnrQ;
-    } else {
-        f[1] = f[2] = f[3] = 0;
-    }
-    return tx;
-}
 
-static void probeSweepRx(LoraRadio* r, const uint8_t* f) {
-    ProbeState* p = &r->probe;
-    uint8_t flags = f[0] >> 5;
-    int8_t  txp   = (int8_t)((f[0] & 0x1F) - 9);
-    uint8_t rssiB = probeEncRssi(r->rssiLast);   /* float math outside the mux */
-    int8_t  snrQ  = probeEncSnr(r->snrLast);
-    portENTER_CRITICAL(&s_probeMux);             /* vs. the slot-timer callback */
-    if (flags & 0x4) p->peerDone  = true;
-    if (flags & 0x2) p->peerAtMax = true;
-    if (flags & 0x1) p->peerAtMin = true;
-    if (p->heardCnt < 7) p->heardCnt++;
-    /* them→us: keep the lowest peer power heard, with our measurement of it. */
-    if (!p->themHeard || txp < p->themTxp) {
-        p->themHeard = true;
-        p->themTxp   = txp;
-        p->themRssiB = rssiB;
-        p->themSnrQ  = snrQ;
-    }
-    /* us→them: their echo must name a power we actually transmitted. */
-    if ((f[1] & 0x07) != 0) {
-        int8_t etxp = (int8_t)((f[1] >> 3) - 9);
-        if ((p->sentMask & (1u << (etxp + 9))) && (!p->myDone || etxp < p->usTxp)) {
-            p->usTxp   = etxp;
-            p->usRssiB = f[2];
-            p->usSnrQ  = (int8_t)f[3];
-            p->myDone  = true;
-        }
-    }
-    portEXIT_CRITICAL(&s_probeMux);
-}
 
 /* ── the precise part: slot TX from an esp_timer one-shot ──
  * Runs in the esp_timer task (high priority): build the frame under the mux
  * (byte math, µs) and fire the transmit directly — the lora task (priority 2,
  * 10 ms tick quantization) is never in the TX timing path, and the alarm
  * itself wakes the chip from light sleep. */
-static void probeSlotTimerCb(void* arg) {
-    LoraRadio*  r = (LoraRadio*)arg;
-    ProbeState* p = &r->probe;
-    if (p->phase != PRB_SWEEP) return;
-    if (r->txActive) { if (p->forfeits < 255) p->forfeits++; return; }
-    if (s_radioIrq) {              /* a frame is being landed — forfeit this slot;
-                                    * the task services it and re-arms our next */
-        if (p->forfeits < 255) p->forfeits++;
-        if (s_task) xTaskNotifyGive(s_task);
-        return;
-    }
-    uint8_t f[PROBE_P2_LEN];
-    size_t  len;
-    int8_t  tx;
-    portENTER_CRITICAL(&s_probeMux);
-    if (p->nextSlot == 0) {        /* responder, slot 0: P2 — the only 8 B frame */
-        memset(f, 0, sizeof f);
-        tx   = p->myMax;
-        len  = PROBE_P2_LEN;
-        f[0] = (uint8_t)tx;
-        f[1] = p->aRssiB;          /* our measurement of P1 */
-        f[2] = (uint8_t)p->aSnrQ;
-        f[3] = p->myFlags;
-    } else {
-        tx  = probeBuildSweep(r, f);
-        len = PROBE_SWEEP_LEN;
-        /* Done when the peer confirms it too — or, since that confirmation can
-         * itself be lost, after a bounded tail. Without the bound a lost
-         * confirmation left us transmitting for the rest of the schedule while
-         * the peer had already finished and restored its normal config. */
-        if (p->myDone && p->themHeard && p->doneTail < 255) p->doneTail++;
-        p->finishAfterTx = (p->myDone && p->peerDone) ||
-                           (p->doneTail >= PROBE_DONE_TAIL);
-    }
-    p->nextSlot += 2;
-    portEXIT_CRITICAL(&s_probeMux);
-    if (len == PROBE_SWEEP_LEN) probeShorten(r);   /* slot 0 is behind us */
-    /* Claim the radio before touching SPI so a concurrent rx-drain's rearmRx
-     * can't stomp the transmit with a startReceive. */
-    r->txActive   = true;
-    r->txDeadline = xTaskGetTickCount() + r->txWatchTicks;
-    probeStartTx(r, f, len, tx, 0);      /* slot-timed: no carrier sense to report */
-}
 
 /* Arm the one-shot for our next owned slot (absolute µs schedule off t0Us);
  * a slot we can no longer hit cleanly is skipped — never fired late. */
-static void probeArmSlot(LoraRadio* r) {
-    ProbeState* p = &r->probe;
-    if (!r->probeTimer) return;
-    esp_timer_stop(r->probeTimer);               /* errors if idle — fine */
-    uint32_t now = (uint32_t)esp_timer_get_time();
-    while (p->nextSlot < PROBE_TOTAL_SLOTS) {
-        uint32_t tS = p->t0Us + probeSlotOffUs(p, p->nextSlot);
-        int32_t rem = (int32_t)(tS - now);
-        if (rem < 500) {           /* already past — we were late arming it */
-            if (p->skipped < 255) p->skipped++;
-            p->nextSlot += 2;
-            continue;
-        }
-        esp_timer_start_once(r->probeTimer, (uint64_t)rem);
-        return;
-    }
-    /* all our slots are sent/forfeit — probePoll closes out at the deadline */
-}
 
-static bool probeEnsureTimer(LoraRadio* r) {
-    if (!r->probePmLock)
-        pmLockCreate(PM_NO_LIGHT_SLEEP, "rfprobe", &r->probePmLock);
-    if (r->probeTimer) return true;
-    const esp_timer_create_args_t a = {
-        .callback = probeSlotTimerCb,
-        .arg = r,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "rfprobe",
-        .skip_unhandled_events = true,
-    };
-    return esp_timer_create(&a, &r->probeTimer) == ESP_OK;
-}
 
 /* Light sleep hands timekeeping to the RTC slow clock (an RC oscillator on
  * most boards), which is nowhere near accurate enough for the slot schedule —
  * so a probe pins the XTAL-fed systimer by blocking light sleep end to end. */
-static void probePmHold(LoraRadio* r, bool hold) {
-    ProbeState* p = &r->probe;
-    if (hold == p->pmHeld || !r->probePmLock) return;
-    if (hold) pmLockAcquire(r->probePmLock);
-    else      pmLockRelease(r->probePmLock);
-    p->pmHeld = hold;
-}
 
 /* Enter the fixed-time schedule. `firstSlot` is our parity: 0 for the
  * responder (whose slot 0 is P2), 1 for the initiator. T0 is the ISR stamp of
  * P1's end-of-air — the same physical instant on both ends. */
-static void probeEnterSweep(LoraRadio* r, uint8_t firstSlot) {
-    ProbeState* p = &r->probe;
-    probeSchedule(r);
-    if (!probeSweepCfg(r, PROBE_P2_LEN)) { probeEnd(r, false, "modem cfg failed"); return; }
-    p->t0Us = s_radioIrqUs;
-    p->deadlineMs = millis() + (probeSlotOffUs(p, PROBE_TOTAL_SLOTS) / 1000u)
-                    + 2u * p->slotMs;
-    p->nextSlot = firstSlot;
-    p->phase = PRB_SWEEP;
-    probeArmSlot(r);
-}
 
 /* RX tap (from handleRxDone, every frame). Returns true when the frame was
  * ours and must not reach split framing / rnsd. */
-static bool probeOnRx(LoraRadio* r, const uint8_t* f, size_t len) {
-    ProbeState* p = &r->probe;
-
-    switch ((ProbePhase)p->phase) {
-
-    case PRB_OFF:
-        /* A 0x04 power request binds to the frame it prefixes by adjacency
-         * alone, so it is only ever held until the next rx frame resolves it
-         * (handleRxDone clears it either way). Honouring one is gated on the
-         * key — see the format block: it puts our power under a peer's control,
-         * which a node that hasn't opted in must not be subject to. */
-        if (len == PWRREQ_LEN && f[0] == LORA_MAGIC_PWRREQ) {
-            if (r->adaptive && (int8_t)f[1] != PWRREQ_NO_TXP) {
-                r->apRxSuggest     = (int8_t)f[1];
-                r->apRxSuggestPend = true;
-            }
-            return true;
-        }
-        if (hashPktOnRx(r, f, len)) return true;   /* 0x02 / 0x03 linkage */
-        if (len == PROBE_P1_LEN && f[0] == PROBE_MAGIC_P1) {
-            if (!probeIsOurHash(r, f + 5)) return true;   /* someone else's probe */
-            if (!probeEnsureTimer(r)) {
-                warn("lora/%d rfprobe: slot timer create failed — not answering", r->idx);
-                return true;
-            }
-            probeClearRun(p);
-            probePmHold(r, true);
-            memcpy(p->us,   f + 5, 4);
-            memcpy(p->them, f + 1, 4);
-            p->aTxp    = (int8_t)f[9];
-            p->aRssiB  = probeEncRssi(r->rssiLast);
-            p->aSnrQ   = probeEncSnr(r->snrLast);
-            p->myMax   = probeMaxPwr(r);
-            p->myFlags = probeMyFlags(r);
-            p->bTxp    = p->myMax;
-            p->peerMax = p->aTxp;      /* the opener goes out at their probe max */
-            p->peerFlags = f[10];
-            p->havePeerFlags = true;
-            neiNoteFlags(r, p->them, f[10]);
-            /* Reciprocity: our own measurement of P1 sizes our ladder. */
-            probeLadder(r, p->aTxp, p->aRssiB, p->aSnrQ);
-            info("lora/%d rfprobe: answering %02x%02x%02x%02x (their txp %d, our max %d dBm)",
-                 r->idx, f[1], f[2], f[3], f[4], (int)p->aTxp, (int)p->myMax);
-            probeEnterSweep(r, 0);     /* our slot 0 carries P2 */
-            return true;
-        }
-        return false;
-
-    case PRB_SWEEP:
-        if (len == PROBE_P2_LEN && p->initiator && !p->implShort) {
-            /* Slot 0 in the schedule can only be our peer's P2 — that timing is
-             * exactly what the old magic + swapped hashes used to establish. */
-            p->bTxp    = (int8_t)f[0];
-            p->peerMax = p->bTxp;
-            p->bRssiB  = probeEncRssi(r->rssiLast);
-            p->bSnrQ   = probeEncSnr(r->snrLast);
-            p->aRssiB  = f[1];          /* their measurement of our P1 */
-            p->aSnrQ   = (int8_t)f[2];
-            p->peerFlags = f[3];
-            p->havePeerFlags = true;
-            neiNoteFlags(r, p->them, f[3]);
-            probeLadder(r, p->bTxp, p->bRssiB, p->bSnrQ);
-            probeShorten(r);
-            if (!r->txActive) rearmRx(r);
-            return true;
-        }
-        if (len == PROBE_SWEEP_LEN) probeSweepRx(r, f);
-        return true;
-
-    case PRB_TX_P1:
-        return len == PROBE_P1_LEN && f[0] == PROBE_MAGIC_P1;
-    }
-    return false;
-}
 
 /* TxDone hook (from serviceRadio) — phase transitions ride frame completion. */
-static void probeOnTxDone(LoraRadio* r) {
-    ProbeState* p = &r->probe;
-    switch ((ProbePhase)p->phase) {
-    case PRB_TX_P1:                 /* P1's end-of-air anchors the schedule */
-        probeEnterSweep(r, 1);      /* initiator owns odd slots */
-        break;
-    case PRB_SWEEP:
-        p->txCnt++;
-        /* Our P2 is the schedule's only 8-byte frame; from here the regime is
-         * 4-byte, and we must be listening at that length before the peer's
-         * next slot. */
-        probeShorten(r);
-        if (p->finishAfterTx) { probeEnd(r, true, ""); return; }
-        probeArmSlot(r);
-        break;
-    default:
-        break;
-    }
-    rearmRx(r);
-}
 
 /* Consume a CLI kick (fields already filled by the CLI task). */
-static void probeBegin(LoraRadio* r) {
-    ProbeState* p = &r->probe;
-    p->req = false;
-    if (!r->running || p->phase != PRB_OFF || !probeEnsureTimer(r)) {
-        p->resOk = false;
-        safeStrncpy(p->resReason, !r->running ? "radio down"
-                    : p->phase != PRB_OFF ? "probe busy" : "no slot timer",
-                    sizeof p->resReason);
-        p->resGen = p->resGen + 1;
-        return;
-    }
-    probeClearRun(p);
-    probePmHold(r, true);
-    p->initiator = true;
-    memcpy(p->us,   p->reqUs, 4);
-    memcpy(p->them, p->reqDst, 4);
-    p->myMax   = probeMaxPwr(r);
-    p->myFlags = probeMyFlags(r);
-    p->aTxp    = p->myMax;
-    p->deadlineMs = millis() + PROBE_TXWAIT_MS;
-    p->phase = PRB_TX_P1;
-    csmaResetAccess(r);
-}
 
 /* Drive the probe state machine — every task-loop pass. */
-static void probePoll(LoraRadio* r) {
-    ProbeState* p = &r->probe;
-    if (p->req) probeBegin(r);
-    if (p->phase == PRB_OFF) return;
-    uint32_t now = millis();
 
-    switch ((ProbePhase)p->phase) {
 
-    case PRB_TX_P1: {               /* the one carrier-sensed frame of the run */
-        if ((int32_t)(now - p->deadlineMs) >= 0) { probeEnd(r, false, "channel busy"); return; }
-        if (r->txActive || r->splitPending) return;
-        if (!csmaClear(r)) return;
-        uint8_t f[PROBE_P1_LEN] = { PROBE_MAGIC_P1 };
-        memcpy(f + 1, p->us,   4);
-        memcpy(f + 5, p->them, 4);
-        f[9]  = (uint8_t)p->aTxp;
-        f[10] = p->myFlags;
-        f[11] = 0;
-        probeStartTx(r, f, sizeof f, p->myMax, csmaWaitMs(r));
-        return;
-    }
+/* ─────────────── manual CLI transmit (tx / tx_psa / tx_prot) ─────────────── */
 
-    case PRB_SWEEP: {
-        if ((int32_t)(now - p->deadlineMs) >= 0) {
-            /* Never heard the peer at all — P2 missed its slot, so there is no
-             * cooperating node in range at max power. */
-            if (p->initiator && !p->themHeard && !p->havePeerFlags)
-                probeEnd(r, false, "no response");
-            else
-                probeEnd(r, true, "");
-            return;
-        }
-        /* The slot timer re-arms at each own TxDone; a forfeited slot (the
-         * callback yielded to an rx in progress) is re-armed from here. */
-        if (!r->txActive && p->nextSlot < PROBE_TOTAL_SLOTS &&
-            r->probeTimer && !esp_timer_is_active(r->probeTimer))
-            probeArmSlot(r);
-        return;
-    }
-
-    default:
-        return;
-    }
+/* Finish a manual-TX request: park the state machine and hand the outcome to the
+ * CLI, which is polling mtxResGen. */
+static void manualTxFinish(LoraRadio* r, bool ok, const char* msg) {
+    r->mtxPhase = MTXP_OFF;
+    r->mtxResOk = ok;
+    safeStrncpy(r->mtxResMsg, msg ? msg : "", sizeof r->mtxResMsg);
+    r->mtxResGen = r->mtxResGen + 1;   /* release the CLI's poll loop */
 }
 
-/* ── adaptive TX power: driving the measurement ──
- * (overview at AP_EST_MARGIN_DB, near the top of the file)
+/* tx_prot: put a header on the air that announces a long 4/8 packet, then cut
+ * the carrier before the body — every explicit-header receiver on the channel
+ * commits its RX window for the announced duration while we occupy the channel
+ * only for the preamble and the 8 header symbols.
  *
- * Every hash we see resolves through the neighbour table to a node; a node we
- * hold no determination for gets probed, once. Walking the table each pass
- * rather than triggering off the rx path is the same set of nodes and costs
- * nothing extra — a hash newly linked to a node that already settled needs no
- * probe, which is precisely what the table lookup answers.
+ * The header is built by the chip in normal explicit mode, so its length/CR/CRC
+ * fields and the header CRC are spec-correct by construction; the "fake" is that
+ * the body it promises is never sent. We size the announced payload length so the
+ * post-header airtime a receiver computes for it is closest to the requested ms.
  *
- * The gate is that reciprocity can already speak for the node. That single
- * condition does two jobs: it means we have heard the node directly inside the
- * bucket ring's hour (so it is worth spending a probe on), and it guarantees
- * the fallback has something to fall back to if the probe finds nothing. */
-static void apPoll(LoraRadio* r) {
-    if (!r->adaptive || !r->running || !r->nei) return;
-    ProbeState* p = &r->probe;
-    if (p->phase != PRB_OFF || p->req) return;          /* a probe owns the radio */
-    if (r->hashTxPending || r->txActive || r->splitPending) return;
-    uint32_t now = millis();
-    if ((int32_t)(now - r->apGapUntilMs) < 0) return;
+ * Synchronous: this is a deliberate one-shot command, so a ~header-length task
+ * stall (tens of ms) is acceptable here, unlike on the RX hot path. */
+static void manualTxProt(LoraRadio* r) {
+    int    sf  = r->cfgSf, bw = r->cfgBwHz, pre = r->cfgPreamble;
+    double tSym = (double)((uint32_t)1 << sf) / (double)bw;   /* seconds */
+    int    de   = (tSym > 0.016) ? 1 : 0;                     /* LDRO, as in loraAirtimeSeconds */
 
-    uint8_t us[4];
-    if (!probeOwnFirst4(r, us)) return;                 /* nothing to probe under yet */
+    /* Announced length whose post-header 4/8 airtime is closest to the target.
+     * The receiver's commit after the header is blocks·(CR+4)·Tsym; for 4/8 that
+     * is blocks·8·Tsym. Scan against the same model the device reports airtime
+     * with so the figure matches what a receiver derives from the header. */
+    double target = (double)r->mtxProtMs / 1000.0;
+    int    bestL = 0;
+    double bestErr = 1e30, bestRem = 0.0;
+    for (int L = 0; L <= 255; L++) {
+        double num    = 8.0 * L - 4.0 * sf + 28.0 + 16.0 /*CRC on*/;
+        double den    = 4.0 * (sf - 2 * de);
+        double blocks = fmax(ceil(num / den), 0.0);
+        double rem    = blocks * 8.0 * tSym;                  /* CR+4 = 8 for 4/8 */
+        double err    = fabs(rem - target);
+        if (err < bestErr) { bestErr = err; bestL = L; bestRem = rem; }
+    }
 
-    for (int i = 0; i < NEI_MAX; i++) {
-        Neighbor* e = &r->nei->nei[i];
-        if (!e->used || neiIsLocal(e) || e->haveApPwr) continue;
-        int est10;
-        if (!neiEstimateCliff10(r, e, now, &est10, nullptr)) continue;
-        uint8_t dst[4];
-        if (!probeNodeFirst4(e, dst)) continue;
-        memcpy(p->reqUs,  us,  4);
-        memcpy(p->reqDst, dst, 4);
-        p->req = true;                                  /* probePoll consumes it */
-        r->apGapUntilMs = now + AP_PROBE_GAP_MS;
-        info("lora/%d adaptive: probing %02x%02x%02x%02x for its TX power",
-             r->idx, dst[0], dst[1], dst[2], dst[3]);
+    /* Air only the preamble + the 8-symbol header block, plus a few symbols of
+     * margin so the whole header is certainly modulated before we abort. */
+    double hdrSec = (pre + 4.25 + 8.0 + 4.0) * tSym;
+    uint16_t hdrMs = (uint16_t)ceil(hdrSec * 1000.0);
+
+    /* Explicit header (announces a length) at 4/8, so both the header's own CR
+     * field and the length→airtime mapping are those of a 4/8 packet. */
+    int16_t st = radioHeaderMode(r, false, 0);
+    if (st == RADIOLIB_ERR_NONE) st = radioSetCodingRate(r, 8);
+    if (st == RADIOLIB_ERR_NONE) st = r->radio->standby();
+    if (st != RADIOLIB_ERR_NONE) {
+        radioSetCodingRate(r, (uint8_t)r->cfgCr);
+        rearmRx(r);
+        manualTxFinish(r, false, "modem cfg failed");
         return;
     }
+    r->airImplicit = false;
+    apApplyPower(r, r->cfgTxp);
+
+    /* The body is never heard, so its contents do not matter. */
+    static uint8_t dummy[256] = {0};
+    r->txFrameStartMs = millis();
+    st = r->radio->startTransmit(dummy, (size_t)bestL);
+    if (st != RADIOLIB_ERR_NONE) {
+        radioSetCodingRate(r, (uint8_t)r->cfgCr);
+        rearmRx(r);
+        manualTxFinish(r, false, "startTransmit failed");
+        return;
+    }
+    delay(hdrMs);                     /* let the preamble + header go out … */
+    /* … then drop the carrier before the body. finishTransmit both halts
+     * modulation (chip → standby) and clears any TX-done IRQ the chip may have
+     * latched if the short body actually completed within the delay — so the
+     * next serviceRadio pass can't mistake it for a queued frame's completion. */
+    r->radio->finishTransmit();
+
+    loraMonPush(r, 1 /*tx*/, r->txFrameStartMs, hdrMs,
+                (uint16_t)bestL, 0, 0, r->cfgTxp, LORA_PKT_OURS, 0);
+    appcAddAirtime(r, hdrMs);
+    r->txFrames++;
+
+    radioSetCodingRate(r, (uint8_t)r->cfgCr);   /* restore the configured payload CR */
+    r->txActive = false;
+    rearmRx(r);
+
+    char msg[72];
+    snprintf(msg, sizeof msg, "committed ~%d ms (announced %d B / 4/8, header ~%d ms on air)",
+             (int)lround(bestRem * 1000.0), bestL, (int)hdrMs);
+    manualTxFinish(r, true, msg);
+}
+
+/* Service a pending manual-TX request and drive the PSA carrier-sense.
+ * Runs after serviceRadio in the task loop, so a completed TxDone (which clears
+ * txActive and re-arms RX) is already reflected when we check it here. */
+static void manualTxPoll(LoraRadio* r) {
+    if (r->mtxPhase == MTXP_OFF) {
+        if (!r->mtxReq) return;
+        r->mtxReq = false;
+        if (!r->running) { manualTxFinish(r, false, "radio not up"); return; }
+        if (r->splitPending || r->txActive || r->rc.phase != RC_OFF)
+            { manualTxFinish(r, false, "radio busy"); return; }
+
+        if (r->mtxKind == MTX_PROT) { manualTxProt(r); return; }
+
+        /* RAW / PSA: the payload goes on air verbatim as one explicit-header
+         * frame at the configured params — no RNS seq/split byte, so what the
+         * user passed is exactly what airs. */
+        memcpy(r->txFrame[0], r->mtxData, r->mtxLen);
+        r->txFrameLen[0]  = r->mtxLen;
+        r->txFrameCount   = 1;
+        r->txFrameSent    = 0;
+        r->txPayloadBytes = r->mtxLen;
+        r->txType[0]      = LORA_PKT_OURS;
+        r->txWaitMs       = 0;
+        apApplyPower(r, r->cfgTxp);
+
+        if (r->mtxKind == MTX_PSA && r->lbt) {   /* carrier-sense before firing */
+            r->mtxPhase    = MTXP_LBT;
+            csmaResetAccess(r);
+            r->csmaStart   = xTaskGetTickCount();
+            r->mtxDeadline = r->csmaStart +
+                (r->lbtTimeoutTicks ? r->lbtTimeoutTicks : pdMS_TO_TICKS(10000));
+            return;
+        }
+        r->mtxPhase = MTXP_TX;
+        startTxFrame(r, 0);
+        return;
+    }
+
+    if (r->mtxPhase == MTXP_LBT) {
+        if (csmaClear(r)) { r->mtxPhase = MTXP_TX; startTxFrame(r, 0); return; }
+        if ((int32_t)(xTaskGetTickCount() - r->mtxDeadline) >= 0) {
+            csmaResetAccess(r);
+            manualTxFinish(r, false, "channel busy (LBT timeout)");
+        }
+        return;
+    }
+
+    /* MTXP_TX: serviceRadio clears txActive at TxDone and re-arms RX. */
+    if (!r->txActive) manualTxFinish(r, true, "sent");
 }
 
 /* Drain one pending outbound packet for this radio if it's free.
@@ -4060,9 +4453,9 @@ static void apPoll(LoraRadio* r) {
  * on-air (txActive) we leave bytes sitting in the ITS stream buffer (our
  * outbound TX queue) and revisit once the radio is idle. */
 static void drainOneOutbound(LoraRadio* r) {
-    /* An active rfprobe owns the radio (and the CSMA machine) — normal outbound
+    /* An active radio check owns the radio (and the CSMA machine) — normal outbound
      * waits in the ITS buffer until it ends (bounded to a few seconds). A queued
-     * linkage frame owns it the same way: hashPktPoll runs just before us and is
+     * radio check owns it the same way: rcPoll runs just before us and is
      * mid-CSMA, and the "nothing queued" reset below would clear its progress
      * every pass, so it could never win the channel.
      *
@@ -4085,7 +4478,10 @@ static void drainOneOutbound(LoraRadio* r) {
     if (!any)                  r->txWaitPend = false;
     else if (!r->txWaitPend) { r->txWaitPend = true; r->txWaitStartMs = millis(); }
 
-    if (r->probe.phase != PRB_OFF || r->hashTxPending) return;
+    if (r->mtxPhase != MTXP_OFF) return;
+    /* A radio check owns the radio for its whole run: the announce bunches are
+     * back-to-back by design and the tail is a schedule receivers are timing. */
+    if (r->rc.phase != RC_OFF) return;
     if (!r->running || r->splitPending || r->txActive) return;
     if (!any) {
         csmaResetAccess(r);         /* nothing queued → reset channel-access state */
@@ -4184,7 +4580,7 @@ static void serviceRadio(LoraRadio* r) {
         uint8_t  doneIdx  = r->txFrameSent;
         uint8_t  doneType = r->txType[doneIdx];
         uint32_t dur = (uint32_t)lround(1000.0 * loraAirtimeSeconds(
-                           r->cfgSf, r->cfgBwHz, r->cfgCr, r->airPreamble,
+                           r->airSf, r->cfgBwHz, r->cfgCr, r->airPreamble,
                            (int)r->txFrameLen[doneIdx], r->airImplicit));
         /* Everything but our own air protocol carries the 1-byte seq/split
          * header on air; the record reports payload bytes, so strip it.
@@ -4202,11 +4598,6 @@ static void serviceRadio(LoraRadio* r) {
             return;
         }
         r->txBytes += r->txPayloadBytes;
-        if (r->probe.phase != PRB_OFF) {     /* probe frame — phase machinery rearms */
-            r->txActive = false;
-            probeOnTxDone(r);
-            return;
-        }
         txRearmRx(r);                        /* whole packet sent → back to listening */
         return;
     }
@@ -4835,6 +5226,19 @@ static void cliPrintSlot(int i) {
               (unsigned)r->txFrames, (unsigned)r->txBytes,
               (int)r->rssiLast, (int)r->snrLast,
               (unsigned)r->crcErr, (unsigned)r->splitTimeouts);
+    {
+        uint32_t rem = (int32_t)(r->rc.nextRunMs - millis()) > 0
+                           ? (r->rc.nextRunMs - millis()) / 1000 : 0;
+        cliPrintf("        announces %d buffered  next check in %us\n",
+                  annCount(r), (unsigned)rem);
+        /* Dropped telemetry is invisible on the graph and reads as frames that
+         * were never transmitted, so say it out loud rather than let someone
+         * chase a radio bug that isn't one. */
+        if (r->monDropped || r->rssiDropped)
+            cliPrintf("        telemetry dropped: %u frame records, %u rssi samples"
+                      " (interface queue full)\n",
+                      (unsigned)r->monDropped, (unsigned)r->rssiDropped);
+    }
 }
 
 /* ── `lora [<n>] neighbors` — the passive radio-neighbourhood picture ── */
@@ -4846,11 +5250,11 @@ static void neiAgo(char* b, size_t n, uint32_t now, uint32_t then) {
     else                snprintf(b, n, "%uh", (unsigned)(s / 3600));
 }
 
-/* ── reciprocity estimate: what `lora rf` measures, guessed for free ──
+/* ── reciprocity estimate: the radio check's measurement, guessed for free ──
  * The probe learns the TX power at which our signal lands on the peer's demod
  * floor by *asking* it. The same number can be inferred from a frame we heard
  * FROM them, if we assume a power they transmitted at: their path loss is ours.
- * This computes exactly the quantity `lora rf` reports as the us->them cliff,
+ * This computes exactly the quantity a radio check measures as the us->them cliff,
  * so the two are directly comparable — which is the point. Against a peer that
  * has been probed we have ground truth to check the estimate against; against a
  * non-cooperating peer the estimate is all there will ever be.
@@ -4888,21 +5292,36 @@ static uint32_t neiRecentSignal(const Neighbor* e, uint32_t now,
     return cnt;
 }
 
-/* Estimated us->them cliff, deci-dBm. Same units and meaning as the probe's. */
+/* Link margin above the demodulation floor, deci-dB, from an encoded rssi/snr
+ * pair. How much power the sender could have dropped and still been decoded —
+ * which, subtracted from its assumed transmit power, is the reciprocity
+ * estimate of the power we need toward it. */
+static int neiHeadroom10(const LoraRadio* r, uint8_t rssiB, int8_t snrQ) {
+    /* Semtech's required SNR per spreading factor, deci-dB: −7.5 dB at SF7 and
+     * 2.5 dB worse per factor below it, 2.5 dB better per factor above. */
+    int sf = r->cfgSf < 5 ? 5 : (r->cfgSf > 12 ? 12 : r->cfgSf);
+    int floor10 = -75 - (sf - 7) * 25;
+    int snr10   = ((int)snrQ * 10) / 4;
+    int margin  = snr10 - floor10;
+    (void)rssiB;                 /* the margin is an SNR question, not a level one */
+    return margin > 0 ? margin : 0;
+}
+
+/* Estimated us->them cliff, deci-dBm. */
 static bool neiEstimateCliff10(const LoraRadio* r, const Neighbor* e,
                                uint32_t now, int* cliff10, uint32_t* samples) {
     uint8_t rssiB; int8_t snrQ;
     uint32_t n = neiRecentSignal(e, now, &rssiB, &snrQ);
     if (samples) *samples = n;
     if (!n) return false;
-    *cliff10 = neiAssumedPeerTxp() * 10 - probeHeadroom10(r, rssiB, snrQ);
+    *cliff10 = neiAssumedPeerTxp() * 10 - neiHeadroom10(r, rssiB, snrQ);
     return true;
 }
 
 /* Walk the table in display order — us first, then the others — handing each
  * node its printed number. `want` < 0 visits everything; otherwise the walk
  * stops at that node number. Returns the matched node, or null. The printer and
- * the `lora rf <n>` resolver share this so the numbers always agree. */
+ * the CLI's node resolver share this so the numbers always agree. */
 typedef void (*NeiVisitFn)(Neighbor* e, int num, void* ud);
 static Neighbor* neiWalk(NeiState* st, int want, NeiVisitFn fn, void* ud) {
     int num = 0;
@@ -4911,7 +5330,7 @@ static Neighbor* neiWalk(NeiState* st, int want, NeiVisitFn fn, void* ud) {
             Neighbor* e = &st->nei[k];
             if (!e->used || (pass == 0) != neiIsLocal(e)) continue;
             /* Pass 0 is the local rows — us and the RNode client. Both number 0
-             * and neither is addressable: `lora rfprobe 0` would be aiming the
+             * and neither is addressable: naming `0` would be aiming the
              * radio at this device. */
             int n = neiIsLocal(e) ? 0 : ++num;
             if (want >= 0) { if (n == want && !neiIsLocal(e)) return e; continue; }
@@ -5089,29 +5508,12 @@ static void cliPrintNeighbors(int i, bool verbose) {
     }
 }
 
-/* ── `lora [<n>] rfprobe <dest>` — protocol comment at ProbeState, top of file ── */
 
-static int probeHexNib(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
 
-/* Whole-string hex → bytes; -1 on odd length, junk, or > maxB bytes. */
-static int probeParseHex(const char* s, uint8_t* out, int maxB) {
-    int n = 0;
-    for (; s[0] && s[1] && n < maxB; s += 2) {
-        int hi = probeHexNib(s[0]), lo = probeHexNib(s[1]);
-        if (hi < 0 || lo < 0) return -1;
-        out[n++] = (uint8_t)((hi << 4) | lo);
-    }
-    return *s ? -1 : n;
-}
 
 /* The first-4 a probe should be addressed to for this node — its transport
  * hash where known, since that is the one every node has. */
-static bool probeNodeFirst4(const Neighbor* e, uint8_t out[4]) {
+static bool neiNodeFirst4(const Neighbor* e, uint8_t out[4]) {
     for (int d = 0; d < e->nDests; d++) {
         const char* asp = e->dests[d].haveName ? neiNameLabel(e->dests[d].nameHash) : nullptr;
         if (asp && strcmp(asp, "rnstransport.probe") == 0) { memcpy(out, e->dests[d].hash, 4); return true; }
@@ -5122,241 +5524,126 @@ static bool probeNodeFirst4(const Neighbor* e, uint8_t out[4]) {
     return false;
 }
 
-static bool probeStrEqI(const char* hay, const char* needle) {
-    for (; *hay; hay++) {
-        const char* a = hay; const char* b = needle;
-        while (*a && *b && tolower((unsigned char)*a) == tolower((unsigned char)*b)) { a++; b++; }
-        if (!*b) return true;
-    }
-    return false;
-}
 
-/* Resolve <dest> to a first-4. Accepted, in order: the node NUMBER from
- * `lora neighbors`; a hex hash or prefix that matches the table; any substring
- * of an announced name that is unique across nodes; and finally a bare 4+ byte
- * hex hash we have never heard, so an off-table node can still be probed. */
-static bool probeResolveDst(LoraRadio* r, const char* arg, uint8_t out[4]) {
-    NeiState* st = r->nei;
 
-    /* A plain number is a node number from the listing. */
-    bool digits = arg[0] != '\0';
-    for (const char* q = arg; *q; q++) if (*q < '0' || *q > '9') { digits = false; break; }
-    if (digits && st) {
-        Neighbor* e = neiWalk(st, atoi(arg), nullptr, nullptr);
-        if (!e) { cliPrintf("rfprobe: no node %s in the listing\n", arg); return false; }
-        if (probeNodeFirst4(e, out)) return true;
-        cliPrintf("rfprobe: node %s has no usable hash yet\n", arg);
-        return false;
-    }
 
-    uint8_t b[16];
-    int n = probeParseHex(arg, b, 16);
-    if (n >= 2 && st) {                       /* hex that names something we know */
-        const uint8_t* hit = nullptr;
-        int hits = 0;
-        for (int i = 0; i < NEI_MAX; i++) {
-            Neighbor* e = &st->nei[i];
-            if (!e->used || neiIsLocal(e)) continue;
-            for (int d = 0; d < e->nDests; d++)
-                if (memcmp(e->dests[d].hash, b, (size_t)n) == 0) { hit = e->dests[d].hash; hits++; }
-            for (int l = 0; l < e->nLink4 && n <= 4; l++)
-                if (memcmp(e->link4[l], b, (size_t)n) == 0) { hit = e->link4[l]; hits++; }
-        }
-        if (hits == 1) { memcpy(out, hit, 4); return true; }
-        if (hits > 1) {
-            cliPrintf("rfprobe: '%s' matches %d hashes — be more specific\n", arg, hits);
-            return false;
-        }
-    }
 
-    if (st) {                                 /* a name from an lxmf/nomad announce */
-        Neighbor* hit = nullptr;
-        int hits = 0;
-        for (int i = 0; i < NEI_MAX; i++) {
-            Neighbor* e = &st->nei[i];
-            if (!e->used || neiIsLocal(e)) continue;
-            bool match = false;
-            for (int d = 0; d < e->nDests; d++)
-                if (e->dests[d].name[0] && probeStrEqI(e->dests[d].name, arg)) match = true;
-            if (match) { hit = e; hits++; }
-        }
-        if (hits == 1 && probeNodeFirst4(hit, out)) return true;
-        if (hits > 1) {
-            cliPrintf("rfprobe: '%s' matches %d nodes — be more specific\n", arg, hits);
-            return false;
-        }
-    }
 
-    if (n >= 4) { memcpy(out, b, 4); return true; }   /* an off-table hash */
-    cliPrintf("rfprobe: nothing matches '%s' (see `lora %d n`)\n", arg, r->idx);
-    return false;
-}
-
-/* Our own dest hash comes from the tx side of the neighbour table (our
- * announces at hops 0) — the same mechanism that names the peers. */
-static bool probeOwnFirst4(LoraRadio* r, uint8_t out[4]) {
-    if (!r->nei) return false;
-    for (int i = 0; i < NEI_MAX; i++) {
-        Neighbor* e = &r->nei->nei[i];
-        if (e->used && neiIsLocal(e) && e->nDests) {
-            memcpy(out, e->dests[0].hash, 4);
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool probeResolveUs(LoraRadio* r, uint8_t out[4]) {
-    if (probeOwnFirst4(r, out)) return true;
-    cliPrintf("rfprobe: no own dest hash observed yet (no announce sent on lora/%d)\n",
-              r->idx);
-    return false;
-}
-
-/* The first-4s we currently hold for a node, as a printable list — counts
- * alone don't say which hashes a linkage round actually resolved. */
-static void probeFmtHashes(const Neighbor* e, char* out, size_t n) {
-    size_t o = 0;
-    out[0] = '\0';
-    if (!e) return;
-    for (int d = 0; d < e->nDests && o + 10 < n; d++)
-        o += snprintf(out + o, n - o, "%s%02x%02x%02x%02x", o ? " " : "",
-                      e->dests[d].hash[0], e->dests[d].hash[1],
-                      e->dests[d].hash[2], e->dests[d].hash[3]);
-    for (int l = 0; l < e->nLink4 && o + 10 < n; l++)
-        o += snprintf(out + o, n - o, "%s%02x%02x%02x%02x", o ? " " : "",
-                      e->link4[l][0], e->link4[l][1], e->link4[l][2], e->link4[l][3]);
-}
-
-static void cliRfprobe(int idx, const char* arg) {
-    LoraRadio*  r = &s_radios[idx];
-    ProbeState* p = &r->probe;
-    if (!arg || !*arg) {
-        cliPrintf("usage: lora [<n>] rfprobe <dest-hash | prefix>\n");
-        return;
-    }
-    if (!r->running) { cliPrintf("lora/%d is not up\n", idx); return; }
-    if (p->phase != PRB_OFF || p->req) {
-        cliPrintf("lora/%d rfprobe already in progress\n", idx);
-        return;
-    }
-    if (!probeResolveUs(r, p->reqUs) || !probeResolveDst(r, arg, p->reqDst)) return;
-
-    uint32_t gen = p->resGen;
-    p->req = true;
-    if (s_task) xTaskNotifyGive(s_task);
-    cliPrintf("lora/%d rfprobe %02x%02x%02x%02x -> %02x%02x%02x%02x ...\n", idx,
-              p->reqUs[0], p->reqUs[1], p->reqUs[2], p->reqUs[3],
-              p->reqDst[0], p->reqDst[1], p->reqDst[2], p->reqDst[3]);
-
-    /* Worst case is the full ladder in (ToA + guard) slots — sub-second at SF7,
-     * tens of seconds at SF12 — plus the LBT'd handshake. Wide flat cap. */
-    for (int i = 0; i < 1200 && p->resGen == gen; i++) delay(50);
-    if (p->resGen == gen) { cliPrintf("rfprobe: no result after 60 s\n"); return; }
-    if (!p->resOk)        { cliPrintf("rfprobe failed: %s\n", p->resReason); return; }
-
-    int top = p->startDbm + (PROBE_RUNGS - 1) * PROBE_STEP_DB;
-    if (top > p->myMax) top = p->myMax;
-    cliPrintf("  opener: us->them %d dBm rssi -%u snr %.2f | them->us %d dBm rssi -%u snr %.2f\n",
-              (int)p->aTxp, (unsigned)p->aRssiB, (double)p->aSnrQ / 4.0,
-              (int)p->bTxp, (unsigned)p->bRssiB, (double)p->bSnrQ / 4.0);
-    cliPrintf("  ladder: %d..%d dBm step %d (%d rungs)  slot %u ms  heard %u  sent %u",
-              (int)p->startDbm, top, PROBE_STEP_DB, PROBE_RUNGS,
-              (unsigned)p->slotMs, (unsigned)p->heardCnt, (unsigned)p->txCnt);
-    /* A slot lost to bus contention or to a reception still landing is
-     * otherwise invisible — and it is exactly what a tighter guard risks. */
-    if (p->forfeits || p->skipped)
-        cliPrintf("  forfeit %u  skip %u", (unsigned)p->forfeits, (unsigned)p->skipped);
-    cliPrintf("\n");
-    if (p->havePeerFlags)
-        cliPrintf("  peer: %d hash%s advertised%s\n",
-                  (int)nodeFlagsCount(p->peerFlags),
-                  nodeFlagsCount(p->peerFlags) == 1 ? "" : "es",
-                  nodeFlagsRoaming(p->peerFlags) ? ", roaming" : "");
-    bool haveMeasured = p->myDone;
-    double measured10 = 0;
-    if (p->myDone) {
-        measured10 = (double)p->usTxp * 10.0 - (double)probeHeadroom10(r, p->usRssiB, p->usSnrQ);
-        cliPrintf("  us->them: heard from %d dBm (their rssi -%u snr %.2f) -> cliff ~ %.1f dBm\n",
-                  (int)p->usTxp, (unsigned)p->usRssiB, (double)p->usSnrQ / 4.0,
-                  measured10 / 10.0);
-    } else {
-        cliPrintf("  us->them: never echoed — not heard up to our %d dBm\n", (int)p->myMax);
-    }
-    if (p->themHeard)
-        cliPrintf("  them->us: heard from %d dBm (rssi -%u snr %.2f) -> cliff ~ %.1f dBm\n",
-                  (int)p->themTxp, (unsigned)p->themRssiB, (double)p->themSnrQ / 4.0,
-                  (double)p->themTxp - (double)probeHeadroom10(r, p->themRssiB, p->themSnrQ) / 10.0);
-    else
-        cliPrintf("  them->us: nothing heard up to their %d dBm\n", (int)p->peerMax);
-    if (p->peerAtMax || p->peerAtMin)
-        cliPrintf("  peer clamped:%s%s\n",
-                  p->peerAtMax ? " at its max" : "",
-                  p->peerAtMin ? " at its chip floor" : "");
-    /* Linkage follow-up — say what happened either way, so a silent run is
-     * distinguishable from one that had nothing to ask for. */
-    char held[96];
-    probeFmtHashes(neiFindBy4(r->nei, p->them), held, sizeof held);
-    switch (p->askState) {
-    case ASK_QUEUED:
-        cliPrintf("  hash-req queued: peer advertises %u, we hold %u: %s\n",
-                  (unsigned)p->askedAdv, (unsigned)p->askedHave, held);
-        break;
-    case ASK_COMPLETE:
-        cliPrintf("  hash linkage complete (%u advertised, %u held): %s\n",
-                  (unsigned)p->askedAdv, (unsigned)p->askedHave, held);
-        break;
-    case ASK_BUSY:
-        cliPrintf("  hash-req NOT sent (%u advertised, %u held): %s\n",
-                  (unsigned)p->askedAdv, (unsigned)p->askedHave,
-                  r->hashTxPending ? "one already waiting for the channel"
-                                   : "no own hash to send it under");
-        break;
-    default:
-        break;
-    }
-    /* The reason this line exists: the probe MEASURED the us->them cliff by
-     * asking, and reciprocity can GUESS it from frames we merely overheard. For
-     * a non-cooperating peer the guess is all we will ever have, so compare them
-     * here — against a peer we can measure — before trusting it anywhere. A
-     * positive delta means the estimate asks for more power than the link needs
-     * (safe); negative means it would under-power the link (not safe). */
-    {
-        Neighbor* e = neiFindBy4(r->nei, p->them);
-        int est10 = 0; uint32_t nsam = 0;
-        bool haveEst = e && neiEstimateCliff10(r, e, millis(), &est10, &nsam);
-        if (!haveEst) {
-            cliPrintf("  estimate: none yet — no recent frames heard from this node\n");
-        } else if (!haveMeasured) {
-            cliPrintf("  estimate: cliff ~ %.1f dBm (assuming peer at %+d dBm, %u frame%s)"
-                      " — nothing measured to compare against\n",
-                      (double)est10 / 10.0, neiAssumedPeerTxp(),
-                      (unsigned)nsam, nsam == 1 ? "" : "s");
-        } else {
-            double d = ((double)est10 - measured10) / 10.0;
-            cliPrintf("  estimate: cliff ~ %.1f dBm (assuming peer at %+d dBm, %u frame%s)"
-                      "  delta %+.1f dB %s\n",
-                      (double)est10 / 10.0, neiAssumedPeerTxp(),
-                      (unsigned)nsam, nsam == 1 ? "" : "s", d,
-                      d >= 0 ? "(estimate is conservative)"
-                             : "(estimate would UNDER-power)");
-        }
-    }
-    cliPrintf("Probe took %u ms (tx: %u ms, rx: %u ms)\n",
-              (unsigned)p->elapsedMs, (unsigned)p->txAirMs, (unsigned)p->rxAirMs);
-}
 
 /* `tok` abbreviates `full` when it is a prefix of it and at least `minLen`
- * long — so `lora n` / `lora neigh` / `lora neighbours` and `lora rf` /
- * `lora rfprobe` all reach the same place. */
+ * long — so `lora n` / `lora neigh` / `lora neighbours` and `lora a` /
+ * `lora announce` all reach the same place. */
 static bool cliVerb(const char* tok, const char* full, size_t minLen) {
     size_t n = strlen(tok);
     return n >= minLen && n <= strlen(full) && strncmp(tok, full, n) == 0;
 }
+/* `lora [<n>] a[nnounce]` — replay every buffered announce, then the radio
+ * check, now rather than at the next beat. The beat restarts from the run's
+ * end, so this also reschedules. */
+static void cliAnnounce(int idx) {
+    if (idx < 0 || idx >= kNumRadios) { cliPrintf("no radio %d\n", idx); return; }
+    LoraRadio* r = &s_radios[idx];
+    if (!r->running) { cliPrintf("lora/%d not running\n", idx); return; }
+    int n = annCount(r);
+    if (n == 0) {
+        cliPrintf("lora/%d nothing buffered — no announce has been originated here yet\n", idx);
+        return;
+    }
+    r->rc.req = true;
+    if (s_task) xTaskNotifyGive(s_task);
+    cliPrintf("lora/%d replaying %d announce%s, then a radio check (~%u ms)\n",
+              idx, n, n == 1 ? "" : "s", (unsigned)rcTailMs(r, n));
+}
+
 static bool cliIsNeighbors(const char* t) {
     return cliVerb(t, "neighbors", 1) || cliVerb(t, "neighbours", 1);
 }
-static bool cliIsRfprobe(const char* t) { return cliVerb(t, "rfprobe", 2); }
+
+/* Pointer into `orig` just past the first `skip` whitespace-separated tokens,
+ * with the remaining text kept verbatim (embedded spaces included). Returns null
+ * if there are fewer than `skip` tokens; may point at the terminating NUL (empty
+ * remainder). Used to recover a tx payload from the untruncated args, since the
+ * tokeniser above copies only the first bytes for dispatch. */
+static const char* cliRest(const char* orig, int skip) {
+    const char* p = orig ? orig : "";
+    for (int i = 0; i < skip; i++) {
+        while (*p == ' ') p++;
+        if (!*p) return nullptr;
+        while (*p && *p != ' ') p++;
+    }
+    while (*p == ' ') p++;
+    return p;
+}
+
+/* Parse a tx payload string into raw bytes. A literal `0x` followed by an even
+ * run of hex digits inserts those bytes (`0x0a`, `0x48656c6c6f`); every other
+ * character is taken as its own ASCII byte, spaces included. Returns the byte
+ * count, or -1 on overflow or an odd-length 0x run. */
+static int cliParseBytes(const char* s, uint8_t* out, size_t cap) {
+    auto hx = [](char c) -> int {
+        c = (char)tolower((unsigned char)c);
+        return c <= '9' ? c - '0' : c - 'a' + 10;
+    };
+    size_t n = 0;
+    while (*s) {
+        if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X') &&
+            isxdigit((unsigned char)s[2]) && isxdigit((unsigned char)s[3])) {
+            const char* h = s + 2;
+            size_t hd = 0;
+            while (isxdigit((unsigned char)h[hd])) hd++;
+            if (hd & 1) return -1;                 /* half a byte → malformed */
+            for (size_t i = 0; i < hd; i += 2) {
+                if (n >= cap) return -1;
+                out[n++] = (uint8_t)((hx(h[i]) << 4) | hx(h[i + 1]));
+            }
+            s = h + hd;
+        } else {
+            if (n >= cap) return -1;
+            out[n++] = (uint8_t)*s++;
+        }
+    }
+    return (int)n;
+}
+
+/* tx / tx_psa / tx_prot: hand a manual-transmit request to the lora task and
+ * block on its result. `cmd` is the verb, `rest` the verbatim argument tail. */
+static void cliManualTx(long idx, const char* cmd, const char* rest) {
+    LoraRadio* r = &s_radios[idx];
+    bool isProt = strcmp(cmd, "tx_prot") == 0;
+    bool isPsa  = strcmp(cmd, "tx_psa")  == 0;
+    if (!r->running)                    { cliPrintf("lora/%ld is not up\n", idx); return; }
+    if (r->mtxPhase != MTXP_OFF || r->mtxReq) {
+        cliPrintf("lora/%ld tx already in progress\n", idx); return;
+    }
+    if (isProt) {
+        if (!rest || !*rest) { cliPrintf("usage: lora %ld tx_prot <ms>\n", idx); return; }
+        long ms = strtol(rest, nullptr, 10);
+        if (ms <= 0)      { cliPrintf("tx_prot: <ms> must be > 0\n"); return; }
+        if (ms > 0xFFFF)  ms = 0xFFFF;
+        r->mtxProtMs = (uint16_t)ms;
+        r->mtxKind   = MTX_PROT;
+    } else {
+        if (!rest || !*rest) {
+            cliPrintf("usage: lora %ld %s <string>   (0x<hex> inserts raw bytes)\n", idx, cmd);
+            return;
+        }
+        int n = cliParseBytes(rest, r->mtxData, 255);   /* one explicit frame, ≤255 B */
+        if (n < 0)  { cliPrintf("%s: payload > 255 B or bad 0x<hex> run\n", cmd); return; }
+        if (n == 0) { cliPrintf("%s: empty payload\n", cmd); return; }
+        r->mtxLen  = (uint16_t)n;
+        r->mtxKind = isPsa ? MTX_PSA : MTX_RAW;
+    }
+
+    uint32_t gen = r->mtxResGen;
+    r->mtxReq = true;
+    if (s_task) xTaskNotifyGive(s_task);
+    /* RAW/PROT complete in a few ms; PSA can back off up to lbt_timeout. Cap the
+     * wait well past the worst case (SF12 APPC + a busy channel). */
+    for (int i = 0; i < 400 && r->mtxResGen == gen; i++) delay(50);   /* ≤ 20 s */
+    if (r->mtxResGen == gen) { cliPrintf("lora/%ld %s: no result (timeout)\n", idx, cmd); return; }
+    cliPrintf("lora/%ld %s: %s%s\n", idx, cmd,
+              r->mtxResOk ? "" : "failed: ", r->mtxResMsg);
+}
 
 static void cliLora(const char* args) {
     char buf[80];
@@ -5376,11 +5663,13 @@ static void cliLora(const char* args) {
         cliPrintf("%-*s status for one radio\n",            CLI_HELP_COL, "lora <n>");
         cliPrintf("%-*s enable/disable (no <n> = all)\n",   CLI_HELP_COL, "lora [<n>] up|down");
         cliPrintf("%-*s observed direct neighbours (-v for detail)\n", CLI_HELP_COL, "lora [<n>] n[eighbors]");
-        cliPrintf("%-*s two-way min-TX-power probe; <dest> is a node\n", CLI_HELP_COL, "lora [<n>] rf[probe] <dest>");
-        cliPrintf("%-*s   number, a name, or a hash prefix\n", CLI_HELP_COL, "");
+        cliPrintf("%-*s replay buffered announces, then a radio check\n", CLI_HELP_COL, "lora [<n>] a[nnounce]");
         cliPrintf("%-*s freq MHz / bw kHz / sf / cr /\n",   CLI_HELP_COL, "lora <n> <param> <val>");
         cliPrintf("%-*s   txp dBm / preamble / sync / mode / lbt 0|1 / appc 0|1 /\n", CLI_HELP_COL, "");
         cliPrintf("%-*s   rx_boosted_gain 0|1\n", CLI_HELP_COL, "");
+        cliPrintf("%-*s blind-transmit a payload (0x<hex> = raw bytes)\n", CLI_HELP_COL, "lora <n> tx <string>");
+        cliPrintf("%-*s carrier-sense (as normal tx), then transmit\n", CLI_HELP_COL, "lora <n> tx_psa <string>");
+        cliPrintf("%-*s emit a header committing receivers for <ms> (4/8)\n", CLI_HELP_COL, "lora <n> tx_prot <ms>");
         return;
     }
     if (cliIsNeighbors(tok[0])) {                           /* all radios */
@@ -5388,10 +5677,7 @@ static void cliLora(const char* args) {
         for (int i = 0; i < kNumRadios; i++) cliPrintNeighbors(i, v);
         return;
     }
-    if (cliIsRfprobe(tok[0])) {                             /* no index → radio 0 */
-        cliRfprobe(0, nt > 1 ? tok[1] : nullptr);
-        return;
-    }
+    if (cliVerb(tok[0], "announce", 1)) { cliAnnounce(0); return; }   /* no index → radio 0 */
 
     char kb[48];
     /* `lora up|down` → all radios. */
@@ -5420,7 +5706,14 @@ static void cliLora(const char* args) {
         cliPrintNeighbors((int)idx, nt > 2 && strcmp(tok[2], "-v") == 0);
         return;
     }
-    if (cliIsRfprobe(cmd)) { cliRfprobe((int)idx, nt > 2 ? tok[2] : nullptr); return; }
+    /* `lora [<n>] a[nnounce]` — replay every buffered announce, then the radio
+     * check, now rather than at the next beat. The beat restarts from here. */
+    if (cliVerb(cmd, "announce", 1)) { cliAnnounce((int)idx); return; }
+
+    if (strcmp(cmd, "tx") == 0 || strcmp(cmd, "tx_psa") == 0 || strcmp(cmd, "tx_prot") == 0) {
+        cliManualTx(idx, cmd, cliRest(args, 2));
+        return;
+    }
 
     if (nt < 3) { cliPrintf("usage: lora %ld <freq|bw|sf|cr|txp|preamble|sync|mode|lbt|appc|rx_boosted_gain> <value>\n", idx); return; }
     const char* val = tok[2];
@@ -5484,10 +5777,6 @@ static void cliLora(const char* args) {
  * DIO1 is a light-sleep wake source) and outbound wakes via ITS, so with nothing
  * pending the task blocks until a real event and the chip light-sleeps. */
 #define LORA_STATS_MIN_MS 1000
-static TickType_t s_statsLastPub = 0;      /* tick of the last publish */
-static TickType_t s_monLastPub   = 0;      /* tick of the last LoRaMon windowed-airtime publish */
-static bool       s_statsPend    = false;  /* counter moved; publish owed at the 1 Hz boundary */
-static uint64_t   s_statsSig     = 0;      /* last-seen sum of all counters */
 
 static TickType_t nextDeadline(void) {
     TickType_t now = xTaskGetTickCount();
@@ -5499,12 +5788,8 @@ static TickType_t nextDeadline(void) {
         TickType_t d = (int32_t)(s_cfgDueTick - now) > 0 ? (TickType_t)(s_cfgDueTick - now) : 0;
         if (d < soonest) soonest = d;
     }
-    /* A counter change is waiting to be flushed at the next 1 Hz boundary. */
-    if (s_statsPend) {
-        TickType_t due = s_statsLastPub + pdMS_TO_TICKS(LORA_STATS_MIN_MS);
-        TickType_t d = (int32_t)(due - now) > 0 ? (TickType_t)(due - now) : 0;
-        if (d < soonest) soonest = d;
-    }
+    /* Stats and LoRaMon maintenance keep their own beat on the interface task,
+     * so nothing here has to hold a timer for them. */
     for (int i = 0; i < kNumRadios; i++) {
         LoraRadio* r = &s_radios[i];
         /* Registration retry while a radio is running-but-unregistered (a
@@ -5519,32 +5804,15 @@ static TickType_t nextDeadline(void) {
          * boundary to re-sense — never spin at 0, which would peg the task.
          * Skipped while a transmit is on-air (txActive): the TxDone IRQ drives
          * the next step, and drainOneOutbound would no-op anyway. */
-        /* rfprobe: LBT pacing for P1, then only the schedule's close-out — the
-         * slot TXs run off the esp_timer and the TxDone IRQs wake us anyway. */
-        if (r->probe.phase != PRB_OFF) {
-            ProbeState* p = &r->probe;
-            TickType_t d = portMAX_DELAY;
-            if (p->phase == PRB_TX_P1) {
-                if (!r->txActive) d = r->slotTicks;      /* re-sense at slot pace */
-            } else {
-                int32_t rem = (int32_t)(p->deadlineMs - millis());
-                d = rem > 0 ? pdMS_TO_TICKS((uint32_t)rem) : 0;
-            }
-            if (d == 0) return 0;
-            if (d < soonest) soonest = d;
-        }
-        /* A queued 0x02/0x03 waiting on the channel: re-sense at slot pace. */
-        if (r->hashTxPending && r->running && !r->txActive &&
-            r->probe.phase == PRB_OFF) {
-            if (!r->lbt) return 0;
-            if (r->slotTicks < soonest) soonest = r->slotTicks;
-        }
+        /* A manual tx request just arrived, or its carrier-sense is mid-backoff:
+         * service it now / re-sense at slot pace. */
+        if (r->mtxReq) return 0;
+        if (r->mtxPhase == MTXP_LBT && r->slotTicks < soonest) soonest = r->slotTicks;
         /* Gating and availability are separate conjunctions: an rnode packet is
          * pending without any rnsd handle, so folding the two together would
          * leave it unable to wake the loop. Undecoded client bytes count too —
          * the pump runs on this task. */
-        bool outReady = r->running && !r->splitPending && !r->txActive &&
-                        r->probe.phase == PRB_OFF;
+        bool outReady = r->running && !r->splitPending && !r->txActive;
         bool outAvail = (r->rnsdHandle >= 0 && itsBytesAvailable(r->rnsdHandle) > 0) ||
                         (s_rnode.handle >= 0 && s_rnode.radio == r->idx &&
                          (s_rnode.txLen > 0 || itsBytesAvailable(s_rnode.handle) > 0));
@@ -5572,6 +5840,30 @@ static TickType_t nextDeadline(void) {
             TickType_t d = (r->splitDeadline > now) ? (r->splitDeadline - now) : 0;
             if (d < soonest) soonest = d;
         }
+        /* The announce/radio-check beat, and the passes a run in progress needs.
+         * The tail runs off its own esp_timer, so only the announce bunches and
+         * the tail's carrier sense want the task loop. */
+        if (r->running && r->enabled) {
+            if (r->rc.phase == RC_LISTEN) {
+                /* Mid-sweep: frames are ~14 ms apart and each one has to be
+                 * serviced and the radio re-armed before the next. The ISR wakes
+                 * us anyway; this is the belt to that brace. */
+                if (soonest > 1) soonest = 1;
+            } else if (r->rc.phase == RC_ANN || r->rc.phase == RC_TAIL_LBT) {
+                if (r->slotTicks < soonest) soonest = r->slotTicks;
+            } else if (r->rc.phase == RC_OFF && r->annIntervalMin) {
+                int32_t rem = (int32_t)(r->rc.nextRunMs - millis());
+                TickType_t d = rem > 0 ? pdMS_TO_TICKS((uint32_t)rem) : 0;
+                if (d < soonest) soonest = d;
+            }
+        }
+        /* The channel-RSSI beat. Held even on a silent channel — an idle radio
+         * is exactly when the reading means something. */
+        if (r->running && r->enabled) {
+            int32_t rem = (int32_t)(r->rssiNext - now);
+            TickType_t d = rem > 0 ? (TickType_t)rem : 0;
+            if (d < soonest) soonest = d;
+        }
         /* Outstanding proof expectations: wake at the soonest deadline so a
          * missed proof scores its quality miss without waiting for traffic. */
         if (r->nei) {
@@ -5584,14 +5876,133 @@ static TickType_t nextDeadline(void) {
             }
         }
     }
-    /* Keep a 1 Hz beat while a LoRaMon viewer is open so windowed airtime decays
-     * on screen even when the channel is idle (no rx/tx events to wake us). */
-    if (loraMonWatched()) {
-        TickType_t due = s_monLastPub + pdMS_TO_TICKS(LORA_STATS_MIN_MS);
-        TickType_t d = (int32_t)(due - now) > 0 ? (TickType_t)(due - now) : 0;
-        if (d < soonest) soonest = d;
-    }
     return soonest;
+}
+
+/* ─────────────── interface task ───────────────
+ *
+ * The storage side of the interface: packet nodes, their expiry, the stats
+ * flush, and the channel-RSSI series. Every storage write iface-lora makes on a
+ * per-frame or per-second cadence happens here and not on the radio task — see
+ * the note at IfMsg for why that separation is the point rather than tidiness.
+ *
+ * It blocks on the record queue with a short timeout, so it wakes for work and
+ * otherwise ticks its own 1 Hz maintenance beat. Priority sits below the radio
+ * task's, so a storage op that stalls on the storage task can never delay a
+ * channel-access decision. */
+/* Parked, it has nothing to block on, so it polls the stop flag. Only the
+ * unpark latency depends on this. */
+#define LORA_IF_PARK_POLL_MS 100
+
+static TaskHandle_t  s_ifTask   = nullptr;
+static volatile bool s_ifParked = false;
+
+/* Publish the newest channel-RSSI sample as one key per radio:
+ * `lora.<n>.rssi` = "<ms>|<ch0 dBm>". The device timestamp is in the value
+ * rather than the key so a viewer can tell a fresh reading from a repeated one
+ * and place it on the same clock the packet nodes use — and so a skipped beat
+ * (carrier sense had the radio) simply leaves the key unchanged and reads as a
+ * gap. One key rather than a node per sample: the series is live-only, so there
+ * is no backlog to mirror and nothing to expire.
+ *
+ * The channel list is packed rather than singular because the agile channels
+ * append to it unchanged once they exist. */
+static void loraPublishRssi(LoraRadio* r, const IfMsg* m) {
+    char kb[48], val[8 + 6 * LORA_CH_MAX];
+    int  w = snprintf(val, sizeof val, "%u", (unsigned)m->t_ms);
+    for (int i = 0; i < m->nch && i < LORA_CH_MAX && w > 0 && w < (int)sizeof val; i++)
+        w += (m->chRssi[i] == LORA_RSSI_NONE)
+                 ? snprintf(val + w, sizeof val - w, "|")
+                 : snprintf(val + w, sizeof val - w, "|%d", (int)m->chRssi[i]);
+    storageSet(rk(kb, sizeof kb, r->idx, "rssi"), val);
+}
+
+static void loraIfTaskMain(void*) {
+    info("[%s-if] task up", TAG);
+    bool       prevWatch = false;
+    TickType_t lastBeat  = 0;
+    uint64_t   statsSig   = 0;
+    for (;;) {
+        while (!s_stop) {
+            /* Block until the next record OR the next maintenance beat,
+             * whichever is sooner — so an idle interface wakes once a second,
+             * not on a poll timer. The radio task's own 1 Hz RSSI sample lands
+             * in the queue anyway, so this rarely times out in practice. */
+            TickType_t now  = xTaskGetTickCount();
+            TickType_t due  = lastBeat + pdMS_TO_TICKS(LORA_STATS_MIN_MS);
+            int32_t    rem  = (int32_t)(due - now);
+            TickType_t wait = rem > 0 ? (TickType_t)rem : 0;
+
+            IfMsg m;
+            if (s_ifq && xQueueReceive(s_ifq, &m, wait) == pdTRUE) {
+                if (m.radio < kNumRadios) {
+                    LoraRadio* r = &s_radios[m.radio];
+                    if (m.kind == IFM_MON)       loraMonRecord(r, &m);
+                    else if (m.kind == IFM_RSSI) loraPublishRssi(r, &m);
+                }
+            }
+
+            /* Checked whether or not a record arrived: a steady stream of them
+             * must not be able to starve expiry and the stats flush. */
+            now = xTaskGetTickCount();
+            if ((int32_t)(now - due) < 0) continue;
+            lastBeat = now;
+
+            /* Age every one-hour running total in the system, ours included.
+             * One call covers them all; they linked themselves up at
+             * construction. */
+            {
+                static TickType_t lastShift = 0;
+                if (lastShift == 0) lastShift = now;
+                if ((int32_t)(now - lastShift) >=
+                        (int32_t)pdMS_TO_TICKS(Rolling1h::kBucketMinutes * 60u * 1000u)) {
+                    lastShift = now;
+                    Rolling1h::shiftAll();
+                }
+            }
+
+            /* Cached for the radio task, which gates recording on it rather
+             * than reading storage itself. */
+            bool w = loraMonWatched();
+            s_monWatched = w;
+
+            /* Stats: counters only move on a tx/rx event, so publish only when
+             * the sum of them has changed since the last beat. */
+            uint64_t sig = 0;
+            for (int i = 0; i < kNumRadios; i++) {
+                LoraRadio* r = &s_radios[i];
+                sig += r->txBytes + r->rxBytes + r->txFrames + r->rxFrames +
+                       r->crcErr + r->splitTimeouts + r->txDropped +
+                       (uint32_t)r->rssiLast + (uint32_t)r->snrLast;
+            }
+            if (sig != statsSig) {
+                statsSig = sig;
+                for (int i = 0; i < kNumRadios; i++) publishStats(&s_radios[i]);
+            }
+
+            /* LoRaMon expiry — 1 Hz while a viewer is open, so nodes age out of
+             * the 1 h window even on an idle channel. When the last viewer
+             * closes, drop each radio's whole packets subtree. */
+            if (w) {
+                uint32_t nowMs = millis();
+                for (int i = 0; i < kNumRadios; i++) {
+                    loraMonExpire(&s_radios[i], nowMs);
+                    loraPublishAirtime(&s_radios[i], nowMs);
+                }
+            } else if (prevWatch) {
+                for (int i = 0; i < kNumRadios; i++) loraMonClear(&s_radios[i]);
+            }
+            prevWatch = w;
+        }
+
+        /* rns stop: the radio task parks too, so nothing more will be queued.
+         * Drop whatever is still in flight and park on the same flag. */
+        if (s_ifq) xQueueReset(s_ifq);
+        s_monWatched = false;
+        s_ifParked = true;
+        while (s_stop) vTaskDelay(pdMS_TO_TICKS(LORA_IF_PARK_POLL_MS));
+        s_ifParked = false;
+    }
 }
 
 static void loraTaskMain(void*) {
@@ -5668,9 +6079,8 @@ static void loraTaskMain(void*) {
      * waitForTime + boot window ran first), so we don't wait again here. */
 
     /* Seed the stat keys once so consumers see a radio before any traffic; from
-     * here publishing is purely event-driven (see the stats block below). */
+     * here the interface task owns publishing, and does it only on a change. */
     for (int i = 0; i < kNumRadios; i++) publishStats(&s_radios[i]);
-    s_statsLastPub = xTaskGetTickCount();
 
   for (;;) {   /* Park, don't delete: this task lives across rns stop/start, so its
                 * ITS slot + boost lock are reused, not leaked (rns/INTERNALS §6.1). */
@@ -5705,10 +6115,6 @@ static void loraTaskMain(void*) {
          * else brings us through. */
         rnodePump();
 
-        /* Sum every published field across radios; a change means a tx/rx event
-         * moved a counter (or a last-packet reading) this pass. */
-        uint64_t sig = 0;
-
         for (int i = 0; i < kNumRadios; i++) {
             LoraRadio* r = &s_radios[i];
             if (r->running && (radioIrq || r->txActive)) serviceRadio(r);
@@ -5720,48 +6126,12 @@ static void loraTaskMain(void*) {
             }
             if (r->running && r->rnsdHandle < 0 && r->enabled) registerWithRnsd(r);
             neiExpire(r, millis());
-            apPoll(r);          /* may raise probe.req; probePoll consumes it below */
-            probePoll(r);
-            hashPktPoll(r);
+            manualTxPoll(r);    /* CLI tx/tx_psa/tx_prot; holds the radio while active */
+            rcPoll(r);          /* announce replay + radio check; holds the radio too */
             drainOneOutbound(r);
-            sig += r->txBytes + r->rxBytes + r->txFrames + r->rxFrames +
-                   r->crcErr + r->splitTimeouts + r->txDropped +
-                   (uint32_t)r->rssiLast + (uint32_t)r->snrLast;
-        }
-
-        /* Publish only after an event, at most once a second. A change inside the
-         * 1 s window sets s_statsPend; nextDeadline() then wakes us at the boundary
-         * to flush the latest values (coalescing any changes in between). */
-        if (sig != s_statsSig) { s_statsSig = sig; s_statsPend = true; }
-        if (s_statsPend) {
-            TickType_t nowp = xTaskGetTickCount();
-            if ((int32_t)(nowp - s_statsLastPub) >= (int32_t)pdMS_TO_TICKS(LORA_STATS_MIN_MS)) {
-                for (int i = 0; i < kNumRadios; i++) publishStats(&s_radios[i]);
-                s_statsLastPub = nowp;
-                s_statsPend    = false;
-            }
-        }
-
-        /* LoRaMon expiry — 1 Hz while a viewer is open, so nodes age out of the
-         * 1 h window even on an idle channel (nextDeadline holds the beat). When
-         * the last viewer closes, drop each radio's whole packets subtree. */
-        {
-            static bool prevWatch = false;
-            bool w = loraMonWatched();
-            if (w) {
-                TickType_t nowp = xTaskGetTickCount();
-                if ((int32_t)(nowp - s_monLastPub) >= (int32_t)pdMS_TO_TICKS(LORA_STATS_MIN_MS)) {
-                    uint32_t now = millis();
-                    for (int i = 0; i < kNumRadios; i++) {
-                        loraMonExpire(&s_radios[i], now);
-                        loraPublishAirtime(&s_radios[i], now);
-                    }
-                    s_monLastPub = nowp;
-                }
-            } else if (prevWatch) {
-                for (int i = 0; i < kNumRadios; i++) loraMonClear(&s_radios[i]);
-            }
-            prevWatch = w;
+            /* Last, so every claim on the radio above has already been staked:
+             * the sample is only taken if nothing else wanted the chip. */
+            rssiSamplePoll(r);
         }
 
         itsPoll(nextDeadline());
@@ -5786,12 +6156,23 @@ static void loraTaskMain(void*) {
 /* ── RNS lifecycle hooks (registered with the orchestrator; see rnsServiceRegister) ── */
 static void loraStart(void) {
     s_stop = false;
+    /* The record queue outlives a stop/start cycle along with the tasks. Created
+     * before either of them so a frame recorded on the first pass has somewhere
+     * to go. */
+    if (!s_ifq) s_ifq = xQueueCreate(LORA_IFQ_DEPTH, sizeof(IfMsg));
     if (!s_task)
         /* 10 KB PSRAM stack: LoRa frame buffers + RadioLib state, plus the
          * inline Ed25519 announce verification of the neighbour table. */
         s_task = spawnTask(loraTaskMain, TAG, 10240, nullptr, 2, CORE_SECONDARY_NO_LCD, STACK_PSRAM);
     else
         xTaskNotifyGive(s_task);   /* un-park the resident task */
+    /* The interface task sits one priority below the radio task: a storage op
+     * that stalls must never be able to delay a channel-access decision. Its
+     * stack is the smaller of the two — it holds no frame buffers, only the
+     * record it popped and the key/value it formats. */
+    if (!s_ifTask)
+        s_ifTask = spawnTask(loraIfTaskMain, "lora-if", 4096, nullptr, 1,
+                             CORE_SECONDARY_NO_LCD, STACK_PSRAM);
 }
 
 static void loraStop(void) {
@@ -5800,6 +6181,10 @@ static void loraStop(void) {
     xTaskNotifyGive(s_task);   /* break the work loop; the task parks, not deleted */
     for (int i = 0; i < 300 && !s_parked; i++) delay(10);   /* await park */
     if (!s_parked) warn("[%s] stop timed out", TAG);
+    /* The interface task blocks on its queue for up to one beat, so give it
+     * comfortably more than a beat to notice the flag and park. */
+    for (int i = 0; i < 300 && !s_ifParked; i++) delay(10);
+    if (!s_ifParked) warn("[%s-if] stop timed out", TAG);
 }
 
 void LoraService::onInit() {
@@ -5818,6 +6203,12 @@ void LoraService::onInit() {
          * that only exists once someone guesses its name is not discoverable. */
         for (int i = 0; i < kNumRadios; i++)
             storageDefault(sk(kb, sizeof kb, i, "adaptive_txpwr"), 0);
+        /* Frequency agility: the regime number, 0 = none. Radio 0's copy comes
+         * from the pane row; radios 1.. are seeded in the loop below. */
+        for (int i = 1; i < kNumRadios; i++) {
+            storageDefault(sk(kb, sizeof kb, i, "afa"), 0);
+            storageDefault(sk(kb, sizeof kb, i, "announce_interval"), ANN_INTERVAL_DEF);
+        }
         /* RNode endpoint. One endpoint for the device, so the group is global
          * rather than per radio; `.enable` is seeded by the pane row in
          * straddle.yaml. Both doors default shut — enabling the endpoint must

@@ -80,6 +80,27 @@ settings:
       # SX126x LNA boosted RX gain: ~+3 dB sensitivity for ~0.4 mA more RX
       # current. On by default; inert on non-SX126x radios.
       - switch: { label: "RX boosted gain", key: "s.lora.0.rx_boosted_gain", default: 1 }
+      # Announces this node originates are BUFFERED, never emitted when rnsd
+      # hands them over — this interface announces at its own pace. 0 means the
+      # beat is off and only `lora a` emits, which is a real "never announces
+      # by itself", not a smaller number.
+      - slider:
+          label: "Announce interval (min)"
+          key: "s.lora.0.announce_interval"
+          min: 0
+          max: 240
+          default: 30
+      # The value IS the regime number, not a flag: 0 means no frequency
+      # agility (the hailing channel alone), 1 is the EU 863-870 MHz nine-channel
+      # plan. Off by default — nothing about the node's on-air behaviour changes
+      # until it is set.
+      - dropdown:
+          label: "Frequency agility"
+          key: "s.lora.0.afa"
+          default: 0
+          options:
+            - { v: 0, l: "Off" }
+            - { v: 1, l: "Regime 1 — EU 863-870" }
       # LoRa defaults to access_point: a radio segment is almost always the
       # edge of the network, and this stops the node re-broadcasting the whole
       # transport network's announces onto the slow RF link. full/gateway are
