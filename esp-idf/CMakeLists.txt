@@ -1,7 +1,24 @@
 set(LORA_SRCS
     "src/lora.cpp"
+    "src/lora_queue.cpp"
+    "src/lora_radio.cpp"
+    "src/lora_chanplan.cpp"
+    "src/lora_csma.cpp"
+    "src/lora_peers.cpp"
+    "src/lora_observe.cpp"
+    "src/lora_power.cpp"
+    "src/lora_airtime.cpp"
+    "src/lora_mon.cpp"
+    "src/lora_bridge.cpp"
+    "src/lora_rnode.cpp"
+    "src/lora_cli.cpp"
+    "src/supe_engine.cpp"
+    "src/lora_supe.cpp"
     "src/esp_idf_hal.cpp"
     "src/rolling.cpp"
+    # SUPE's pure core. Deliberately free of ESP-IDF, RadioLib and FreeRTOS so
+    # that test/ can compile it with a plain g++ — see test/Makefile.
+    "src/supe.cpp"
 )
 
 include(${CMAKE_CURRENT_LIST_DIR}/spangap_requires.cmake)

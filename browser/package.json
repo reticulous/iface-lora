@@ -13,5 +13,9 @@
     "quasar": "^2.17.0",
     "pinia": "^3.0.4",
     "spangap-browser": "*"
+  },
+  "dependencies": {
+    "iface-lora": "file:../../iface-lora/browser",
+    "rns": "file:../../rns/browser"
   }
 }

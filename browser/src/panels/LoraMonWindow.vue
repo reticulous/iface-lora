@@ -30,7 +30,7 @@
                   :class="{ active: w.key === winKey }"
                   @click="winKey = w.key">{{ w.label }}</button>
           <span class="lm-legend">
-            <span class="c-rns">rnsd</span> / <span class="c-rnode">rnode</span> / <span class="c-ours">SUPE</span>
+            <span class="c-rns">rnsd</span> / <span class="c-rnode">rnode</span> / <span class="c-ours">SUPE</span> / <span class="c-bad">CRC</span>
           </span>
           <span class="lm-axis lm-axis-rx">rx</span>
         </div>
@@ -93,14 +93,27 @@ const GUT_R_CSS = 34          // right scale gutter (rx dBm) — four-digit labe
  * bar is read against, and the tinted background under a transmit. Types match
  * the firmware's LORA_PKT_*. */
 const C_RNS = '#E8D040'       // Reticulum traffic (yellow)
-const C_OURS = '#E84040'      // our own air protocol, SUPE: BATCH, sweep, power requests (red)
+const C_OURS = '#40A0FF'      // our own air protocol, SUPE (blue)
 const C_RNODE = '#E89040'     // the attached RNode client's traffic (orange)
+const C_BAD = '#E04048'       // rx frame that failed CRC: air held, nothing decoded
+/* SUPE is blue rather than red because the transmit background IS red: a red
+ * bar on a red field is the one pair a viewer cannot separate at a glance, and
+ * the background is the more important of the two — direction is read off it
+ * for every frame, where the protocol tag matters for a few. */
+
+/* The politeness marks — what the frame waited before it went out. Near-white
+ * and thin: they are annotation on a bar, not a quantity to compare against
+ * one, and over short bursts anything stronger dominates the airtime it is
+ * describing. */
+const C_WAIT = '#E8E8E8'
 
 /* Band gradient, bottom → top of each band, and the reddish cast of the same
  * gradient that marks the air being ours. The darkest tone doubles as the
  * timescale grid, so the grid reads as part of the background. */
 const BG_LO = '#242424', BG_HI = '#313131'
-const TX_LO = '#3a2323', TX_HI = '#4a3030'
+/* The transmit cast is a real red rather than a hint of one: it is how
+ * direction is read, and at these bar widths a subtle tint is no signal at all. */
+const TX_LO = '#5e1c1c', TX_HI = '#8a2a2a'
 const C_GRID = BG_LO
 
 const WINDOWS = [
@@ -124,7 +137,7 @@ const AX_RX = { lo: -130, hi: -30 }   // 25 dB per band
  * wins the pixels it lands on and the floor reads as background texture. */
 const C_FLOOR = 'rgba(255,255,255,0.09)'
 
-interface Rec { t: number; dir: number; dur: number; bytes: number; rssi: number; snr10: number; txp: number; type: number; wait: number; ch: number }
+interface Rec { t: number; dir: number; dur: number; bytes: number; rssi: number; snr10: number; txp: number; type: number; wait: number; own: number; ch: number }
 
 /* recs = the active radio's packets, rebuilt each tick from the mirrored
  * `lora.<n>.packets` subtree (the firmware adds/deletes those nodes). */
@@ -380,22 +393,38 @@ function drawOne(cv: HTMLCanvasElement | null, ch: number, main: boolean) {
     let y = h - clamp01((dbm - ax.lo) / (ax.hi - ax.lo)) * h
     if (y > h - th) y = h - th
     if (y < 0) y = 0
-    const col = rec.type === 2 ? C_RNODE : rec.type === 1 ? C_OURS : C_RNS
-    /* Time the frame waited before its first bit went on air: queue latency for
-     * queued traffic (the radio held by something else, then DIFS/backoff
-     * against a busy channel), carrier sense alone for the frames that bypass
-     * the queue. A tick at the wait's start, then a hairline at mid-height
-     * running up to the bar: light enough that channel occupancy still reads as
-     * the filled area alone, so a long wait can't be mistaken for airtime. */
-    if (rec.wait > 0) {
-      const xq = xAt(s - rec.wait)
-      if (xs - xq >= 1) {
-        const lw = Math.max(1, dpr)
-        ctx.fillStyle = col
-        ctx.fillRect(xq, y, lw, th)                             /* when it queued */
-        ctx.fillRect(xq, y + (th - lw) / 2, xs - xq, lw)        /* how long it sat */
-      }
+    const col = rec.type === 3 ? C_BAD
+              : rec.type === 2 ? C_RNODE : rec.type === 1 ? C_OURS : C_RNS
+    /* What the frame waited before its first bit went on air, drawn as two
+     * runs because they are two different facts. Both sit at mid-height in the
+     * frame's own colour, light enough that channel occupancy still reads as
+     * the filled area alone — a long wait must not be mistaken for airtime.
+     *
+     *   solid  — CONTENTION: the channel was busy. Somebody else's traffic.
+     *   dotted — OURS: the radio was held by our own work, a split was still
+     *            landing, or we deliberately delayed (a pre-offer jitter).
+     *
+     * Ours runs first and contention second, so the pair reads left to right in
+     * the order the frame actually experienced them, ending at the bar. */
+    const lw = Math.max(1, dpr)
+    const drawWait = (fromMs: number, toMs: number, dotted: boolean) => {
+      const x0 = xAt(fromMs), x1 = xAt(toMs)
+      if (x1 - x0 < 1) return
+      ctx.fillStyle = C_WAIT
+      const yl = y + (th - lw) / 2
+      if (!dotted) { ctx.fillRect(x0, yl, x1 - x0, lw); return }
+      /* Dotted by hand rather than via setLineDash: these are fillRects on a
+       * device-pixel grid, and a dash pattern on a 1px line renders unevenly
+       * once dpr is not 1. */
+      const step = Math.max(2, Math.round(3 * dpr))
+      for (let x = x0; x < x1; x += step * 2) ctx.fillRect(x, yl, Math.min(step, x1 - x), lw)
     }
+    /* No tick at the start. These bursts are a few milliseconds wide, so a
+     * full-height mark beside them reads as the loudest thing on the graph
+     * while carrying the least — the run's left end already says when the
+     * frame first wanted the air. */
+    drawWait(s - rec.wait - rec.own, s - rec.wait, true)   /* ours, dotted */
+    drawWait(s - rec.wait, s, false)                       /* the channel's, solid */
     ctx.fillStyle = col
     ctx.fillRect(xs, y, bw, th)
   }
@@ -483,8 +512,8 @@ function zoomOut() {
 /* ── rebuild recs from the mirrored subtree ── */
 function parseRec(t: number, s: string): Rec | null {
   const p = s.split('|')
-  if (p[0] === 'r') return { t, dir: 0, rssi: +p[1], snr10: +p[2], dur: +p[3], bytes: +p[4], txp: 0, type: +(p[5] ?? 0), wait: 0, ch: +(p[6] ?? 0) }
-  if (p[0] === 't') return { t, dir: 1, txp: +p[1], dur: +p[2], bytes: +p[3], rssi: 0, snr10: 0, type: +(p[4] ?? 0), wait: +(p[5] ?? 0), ch: +(p[6] ?? 0) }
+  if (p[0] === 'r') return { t, dir: 0, rssi: +p[1], snr10: +p[2], dur: +p[3], bytes: +p[4], txp: 0, type: +(p[5] ?? 0), wait: 0, own: 0, ch: +(p[6] ?? 0) }
+  if (p[0] === 't') return { t, dir: 1, txp: +p[1], dur: +p[2], bytes: +p[3], rssi: 0, snr10: 0, type: +(p[4] ?? 0), wait: +(p[5] ?? 0), ch: +(p[6] ?? 0), own: +(p[7] ?? 0) }
   return null
 }
 
@@ -509,7 +538,10 @@ function pollFloor() {
     s.push({ t, dbm })
     if (s.length > 8 && s[0].t < cut) floorSeries[c] = s.filter(f => f.t >= cut)
   }
-  if (t > devClock) { devClock = t; devClockAt = Date.now() }
+  /* Same monotonic anchor as rebuild(): only a timestamp AHEAD of the local
+   * extrapolation may re-anchor. Re-anchoring on merely newer-than-devClock
+   * pulled "now" back by the beat's transport delay — the timeline yank. */
+  if (t > devNow()) { devClock = t; devClockAt = Date.now() }
 }
 
 /* The regime's channel list. Cheap to reparse; it only changes on a config
@@ -567,18 +599,27 @@ function busyMs(dir: number, lo: number, hi: number, ch: number): number {
  * the two never overlap). The live hour is the exception: it needs more history
  * than a viewer has usually been open for, so the firmware publishes those two
  * figures (per mille). A zoomed span is always computed locally. */
+/* Absolute airtime next to the percent: the percent says how full the window
+ * was, the seconds say what it cost. Two decimals under 10 s, then fmtSpan's
+ * coarser steps. */
+const fmtSecs = (ms: number) => ms < 10000 ? `${(ms / 1000).toFixed(2)} s` : fmtSpan(ms)
+
 function airFor(): { tx: string; busy: string } {
   if (!zoomed.value && winKey.value === '1h') {
     const tx = device.get(`lora.${activeRadio.value}.air1h.tx`)
     const rx = device.get(`lora.${activeRadio.value}.air1h.rx`)
     if (tx == null || rx == null) return { tx: '—', busy: '—' }
-    return { tx: fmtPct(Number(tx) / 10), busy: fmtPct((Number(tx) + Number(rx)) / 10) }
+    /* Firmware publishes the hour per mille → 1‰ of an hour is 3600 ms. */
+    return { tx: `${fmtPct(Number(tx) / 10)} · ${fmtSecs(Number(tx) * 3600)}`,
+             busy: `${fmtPct((Number(tx) + Number(rx)) / 10)} · ${fmtSecs((Number(tx) + Number(rx)) * 3600)}` }
   }
   const { lo, hi } = view()
   const ms = hi - lo
   if (ms <= 0) return { tx: '0%', busy: '0%' }
   const tx = busyMs(1, lo, hi, 0)
-  return { tx: fmtPct(tx / ms * 100), busy: fmtPct((tx + busyMs(0, lo, hi, 0)) / ms * 100) }
+  const rx = busyMs(0, lo, hi, 0)
+  return { tx: `${fmtPct(tx / ms * 100)} · ${fmtSecs(tx)}`,
+           busy: `${fmtPct((tx + rx) / ms * 100)} · ${fmtSecs(tx + rx)}` }
 }
 
 /* Each agile channel's transmit airtime over the window on screen. Always
@@ -597,8 +638,10 @@ function chanAirFor(): string[] {
   const { lo, hi } = view()
   const ms = hi - lo
   const out: string[] = []
-  for (const c of agileChans.value)
-    out[c] = ms > 0 ? fmtPct(busyMs(1, lo, hi, c) / ms * 100) : '0%'
+  for (const c of agileChans.value) {
+    const b = ms > 0 ? busyMs(1, lo, hi, c) : 0
+    out[c] = ms > 0 ? `${fmtPct(b / ms * 100)} · ${fmtSecs(b)}` : '0%'
+  }
   return out
 }
 
@@ -731,6 +774,7 @@ watch(activeRadio, () => {
 .lm-legend { color: #7a7a7a; margin-left: 28px; white-space: nowrap;
              font: 11px/1.4 'SF Mono', 'Menlo', 'Consolas', monospace; }
 .lm-legend .c-rns { color: #E8D040; }
-.lm-legend .c-ours { color: #E84040; }
+.lm-legend .c-ours { color: #40A0FF; }
 .lm-legend .c-rnode { color: #E89040; }
+.lm-legend .c-bad { color: #E04048; }
 </style>

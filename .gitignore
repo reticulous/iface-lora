@@ -41,3 +41,9 @@ staging/
 
 # Build artifacts (spangap-generated)
 esp-idf/build/
+
+# The host-side SUPE test binaries. `golden.txt` beside them is NOT an
+# artifact — it is the frame vectors the on-device injection test replays, so
+# it is committed and its diff is how a deliberate wire change gets reviewed.
+esp-idf/test/supe_core_test
+esp-idf/test/supe_engine_test

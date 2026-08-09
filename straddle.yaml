@@ -80,27 +80,6 @@ settings:
       # SX126x LNA boosted RX gain: ~+3 dB sensitivity for ~0.4 mA more RX
       # current. On by default; inert on non-SX126x radios.
       - switch: { label: "RX boosted gain", key: "s.lora.0.rx_boosted_gain", default: 1 }
-      # Announces this node originates are BUFFERED, never emitted when rnsd
-      # hands them over — this interface announces at its own pace. 0 means the
-      # beat is off and only `lora a` emits, which is a real "never announces
-      # by itself", not a smaller number.
-      - slider:
-          label: "Announce interval (min)"
-          key: "s.lora.0.announce_interval"
-          min: 0
-          max: 240
-          default: 30
-      # The value IS the regime number, not a flag: 0 means no frequency
-      # agility (the hailing channel alone), 1 is the EU 863-870 MHz nine-channel
-      # plan. Off by default — nothing about the node's on-air behaviour changes
-      # until it is set.
-      - dropdown:
-          label: "Frequency agility"
-          key: "s.lora.0.afa"
-          default: 0
-          options:
-            - { v: 0, l: "Off" }
-            - { v: 1, l: "Regime 1 — EU 863-870" }
       # LoRa defaults to access_point: a radio segment is almost always the
       # edge of the network, and this stops the node re-broadcasting the whole
       # transport network's announces onto the slow RF link. full/gateway are
@@ -121,6 +100,48 @@ settings:
           min: 1
           max: 100
           default: 2
+      # SUPE — unicast traffic leaves the shared channel for short private
+      # high-rate detours, negotiated in one seven-byte frame, with rnsd
+      # unmodified and unaware (plans/SUPE.md).
+      #
+      # Everything here defaults ON and `enable` is the one thing that is off:
+      # the only decision worth making is whether to speak SUPE at all, and a
+      # feature whose switches are all off by default is a feature nobody finds.
+      # With `enable` off the interface's on-air behaviour is exactly what it
+      # was, which is what makes it one thing to turn off when comparing.
+      #
+      # The regime is the statement of what is permissible on which channels —
+      # the channel raster, the airtime allowance, the length ceilings and the
+      # power limit. It also selects which channels the per-second RSSI beat
+      # measures and draws, which is all it does with SUPE off.
+      #
+      # Inert on an interface with an access code: IFAC masks the frame end to
+      # end, so the modem cannot read an address to match.
+      - section: "SUPE"
+      - switch: { label: "Enable", key: "s.lora.0.SUPE.enable", default: 0 }
+      - dropdown:
+          label: "Regime"
+          key: "s.lora.0.SUPE.afa"
+          default: 0
+          options:
+            - { v: 0, l: "0 — Single channel" }
+            - { v: 1, l: "1 — EU 863-870, nine channels" }
+      - switch: { label: "Adaptive TX power", key: "s.lora.0.SUPE.adaptive_txpower", default: 1 }
+      # Paces everything this node says about itself on its own schedule: the
+      # buffered-announce replay, the radio check behind it, and SUPE's own
+      # ANNOUNCE2. All three are this straddle's air protocol, which is why the
+      # key sits here rather than beside the radio settings.
+      #
+      # Note this DOES delay Reticulum's own announces — they are buffered and
+      # swallowed when rnsd hands them over, and replayed on this beat. 0 turns
+      # the beat off entirely, so the node announces only when `lora a` says so;
+      # that is a real "never on its own", not a longer interval.
+      - slider:
+          label: "Announce interval (min)"
+          key: "s.lora.0.SUPE.announce_interval"
+          min: 0
+          max: 240
+          default: 30
       # RNode endpoint: an RNS RNodeInterface client attaches over USB serial
       # and/or TCP 7633 and shares this radio segment. The rest of the group
       # (.radio / .serial / .tcp) is seeded in lora.cpp — one switch is what a

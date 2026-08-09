@@ -34,6 +34,23 @@
     <SettingSelect label="Mode" k="s.lora.0.mode" :options="modeOptions" />
     <SettingSlider label="Announce cap (%)" k="s.lora.0.announce_cap" :min="1" :max="100" />
 
+    <div class="section-heading">SUPE</div>
+
+    <div class="text-caption" style="opacity:0.7">
+      Moves unicast traffic off the shared channel onto short private high-rate
+      detours, negotiated in one seven-byte frame. Everything here is on by
+      default and this switch is the only thing that isn't — with it off the
+      radio behaves exactly as it did. Traffic to a peer that hasn't announced
+      itself over SUPE is untouched, so a mixed segment needs no fallback.
+      Inert on an interface with an access code.
+    </div>
+
+    <SettingToggle label="Enabled" k="s.lora.0.SUPE.enable" />
+    <SettingSelect label="Regime" k="s.lora.0.SUPE.afa" :options="regimeOptions" />
+    <SettingToggle label="Adaptive TX power" k="s.lora.0.SUPE.adaptive_txpower" />
+    <SettingSlider label="Announce interval (min)"
+                   k="s.lora.0.SUPE.announce_interval" :min="0" :max="240" />
+
     <q-expansion-item dense dense-toggle label="Advanced" header-class="text-caption" class="q-mt-xs">
       <div class="q-pl-sm q-gutter-y-sm q-pt-sm">
         <div class="text-caption" style="opacity:0.6">
@@ -159,6 +176,16 @@ const modeOptions = [
   { label: 'Access point', value: 'access_point' },
   { label: 'Roaming',      value: 'roaming' },
   { label: 'Boundary',     value: 'boundary' },
+]
+// The regime is the complete statement of what is permissible on which
+// channels — the raster, the airtime allowance, the length ceilings, the power
+// limit — so it is the one radio choice SUPE exposes and everything else about
+// a detour follows from it. Regime 0 has no channel plan and moves only the
+// spreading factor; it is also what the per-second channel-RSSI beat measures
+// and draws when SUPE is off.
+const regimeOptions = [
+  { label: '0 — Single channel',           value: '0' },
+  { label: '1 — EU 863-870, nine channels', value: '1' },
 ]
 </script>
 
