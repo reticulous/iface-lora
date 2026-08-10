@@ -27,6 +27,9 @@ services:
   # conditional/spangap-lcd/, so without the lcd straddle staged neither the
   # trampoline nor the class compiles.
   - { class: LoraMonApp, header: loramon_app.h, when: spangap/spangap-lcd }
+  # Mono-OLED page: radio state, peers/links, last-frame RSSI/SNR. Lives under
+  # conditional/tinylcd/, compiled only when tinylcd is staged.
+  - { class: LoraTinyPage, header: lora_tiny.h, when: spangap/tinylcd }
 
 # Browser-side UI registration (parallel to init: above) — auto-wired into
 # the buildable SPA via straddles.gen.ts; no web-interface edit needed.
@@ -74,12 +77,36 @@ settings:
             - { v: 6, l: "4/6" }
             - { v: 7, l: "4/7" }
             - { v: 8, l: "4/8" }
-      - slider: { label: "TX power", key: "s.lora.0.tx_power", min: -9, max: 22 }
+      # Max is the ceiling this radio can actually reach at the antenna, which
+      # only the device knows: femInit detects whether the board's front-end
+      # module is really there and publishes the answer — the part's rating
+      # (e.g. 27 on the Heltec V4) when it is, the bare SX126x's 22 when it is
+      # not. A board that declares a FEM it cannot talk to therefore offers 22
+      # rather than a figure nothing will deliver.
+      - slider:
+          label: "TX power"
+          key: "s.lora.0.tx_power"
+          min: -9
+          max: { key: "lora.0.tx_power_max", default: 22 }
       - slider: { label: "Preamble", key: "s.lora.0.preamble", min: 6, max: 32, default: 12 }
       - text:   { label: "Sync word", key: "s.lora.0.sync_word", default: "0x42" }
       # SX126x LNA boosted RX gain: ~+3 dB sensitivity for ~0.4 mA more RX
       # current. On by default; inert on non-SX126x radios.
       - switch: { label: "RX boosted gain", key: "s.lora.0.rx_boosted_gain", default: 1 }
+      # Analog front-end recalibration. An SX126x that has heard a strong signal
+      # can leave its gain control latched and go deaf, and only powering the
+      # front end down resets it — so this beat is the one periodic wake the
+      # radio task holds without a consumer asking for it. The default matches
+      # LORA_AGC_RESET_DEF_S (lora_radio.h); keep the two together.
+      - dropdown:
+          label: "AGC reset"
+          key: "s.lora.0.agc_reset"
+          default: 300
+          options:
+            - { v: 0,   l: "Off" }
+            - { v: 60,  l: "Every minute" }
+            - { v: 300, l: "Every 5 min" }
+            - { v: 900, l: "Every 15 min" }
       # LoRa defaults to access_point: a radio segment is almost always the
       # edge of the network, and this stops the node re-broadcasting the whole
       # transport network's announces onto the slow RF link. full/gateway are

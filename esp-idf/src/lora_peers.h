@@ -219,6 +219,14 @@ static inline uint16_t peersIdOf(const NeiState* st, const Neighbor* e) {
     return (uint16_t)(e - st->nei);
 }
 
+/* The row that id names, or null for LORAQ_PEER_NONE and anything out of range
+ * or since retired. */
+static inline Neighbor* peersById(NeiState* st, uint16_t id) {
+    if (!st || id >= NEI_MAX) return nullptr;
+    Neighbor* e = &st->nei[id];
+    return e->used ? e : nullptr;
+}
+
 /* ─────────────── lora_peers: the neighbour/peer table ─────────────── */
 Neighbor* peersFindByIdentity(NeiState* st, const uint8_t id[16]);
 Neighbor* peersFindByDest(NeiState* st, const uint8_t dest[16]);
@@ -236,6 +244,9 @@ void      peersPendAdd(NeiState* st, const uint8_t phash[16], const uint8_t dest
                      bool isLR, bool counted, uint32_t now);
 NeiPend*  peersPendTake(NeiState* st, const uint8_t phash[16]);
 void      peersAddId(Neighbor* e, const uint8_t id[16]);
+/* File a link identifier on a row: an address that resolves to this node for as
+ * long as the entry survives, which is what lets traffic on the link detour. */
+void      peersAddLink4(Neighbor* e, const uint8_t lid[16]);
 void      peersMergeInto(Neighbor* dst, Neighbor* src);
 Neighbor* peersFindBy4(NeiState* st, const uint8_t b4[4]);
 Neighbor* peersFindByIdent4(NeiState* st, const uint8_t b4[4]);

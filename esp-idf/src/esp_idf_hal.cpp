@@ -165,7 +165,24 @@ void EspIdfHal::detachInterrupt(uint32_t interruptNum)
 void EspIdfHal::delay(unsigned long ms)
 {
     if (ms == 0) { taskYIELD(); return; }
-    vTaskDelay(pdMS_TO_TICKS(ms));
+    /* Round UP to whole ticks. A FreeRTOS tick here is 10 ms, so
+     * pdMS_TO_TICKS() truncates every delay shorter than that to zero and
+     * vTaskDelay(0) is a bare yield — the wait does not happen at all.
+     *
+     * RadioLib's short delays are hardware timing, not politeness. The one that
+     * bites is in SX126x::sleep(): the ~500 µs the part needs to finish entering
+     * sleep before an NSS edge can wake it again. Skip it and the wake-up pulse
+     * that follows lands inside that window, the chip sleeps through it, BUSY
+     * stays high, and the next command spends RadioLib's full 1 s timeout before
+     * returning SPI_CMD_TIMEOUT. The reset pulse width and the TCXO settle are
+     * the same shape of requirement.
+     *
+     * Every caller of this is a bring-up, reset or sleep path asking for a
+     * minimum, so overshooting to a tick boundary is free — and it keeps the
+     * wait a real sleep rather than a busy-wait. */
+    TickType_t ticks = (TickType_t)((ms + portTICK_PERIOD_MS - 1) / portTICK_PERIOD_MS);
+    if (ticks == 0) ticks = 1;
+    vTaskDelay(ticks);
 }
 
 void EspIdfHal::delayMicroseconds(unsigned long us)

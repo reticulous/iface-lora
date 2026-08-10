@@ -21,12 +21,20 @@ struct SupeState {
     uint32_t annNextMs;
     bool     annPending;
     uint32_t annTryMs;
+    /* next dialect-expiry re-check; rides passes other work causes, holds no
+     * wake of its own */
+    uint32_t expiryNextMs;
 };
 
 bool     supeInit(LoraRadio* r);            /* alloc + configure; false = no memory */
 void     supeOnRadioStop(LoraRadio* r);
 bool     supeReady(const LoraRadio* r);
 bool     supeBusy(const LoraRadio* r);      /* a transaction owns the radio */
+/* Narrower: a transaction is actually under way, so what it will carry has been
+ * declared and the queue is the engine's to walk. An armed offer is not this —
+ * nothing has been said on the air yet. */
+bool     supeXactLive(const LoraRadio* r);
+uint16_t supeCargoPeer(const LoraRadio* r); /* whose cargo is arriving, if any */
 bool     supeHoldsRadio(const LoraRadio* r);
 void     supeLock(LoraRadio* r);
 void     supeUnlock(LoraRadio* r);

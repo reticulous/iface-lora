@@ -443,7 +443,16 @@ uint8_t supeSyncWordFor(uint8_t regime, const SupeCfg* c, uint8_t budget,
  *
  * Two constants and a time on air; all derived, none transmitted.
  *
- *   waiting for GRANT      armed at end of START     turnaround + toa(GRANT, hailing) + guard
+ *   waiting for GRANT      armed at end of START     turnaround + guard, then watch
+ *                          — two stages. The first expires when the GRANT must
+ *                          have BEGUN, and asks the receiver whether a frame is
+ *                          arriving. Something on the air is the answer being
+ *                          delivered, so the second stage waits it out
+ *                          (toa(GRANT, hailing) + guard). Nothing on the air at
+ *                          the moment the peer should have been transmitting is
+ *                          silence established half a frame earlier than waiting
+ *                          the airtime out would establish it, and against
+ *                          evidence rather than against an estimate.
  *   first MANIFEST         armed at end of GRANT     retune + turnaround + toa(MANIFEST, budget) + guard
  *   a train                armed at its MANIFEST     the stated length + guard
  *   reverse MANIFEST       armed at end of own train turnaround + toa(MANIFEST, budget) + guard
@@ -453,6 +462,13 @@ uint8_t supeSyncWordFor(uint8_t regime, const SupeCfg* c, uint8_t budget,
  */
 #define SUPE_RETUNE_GAP_MS  1    /* the synthesizer, not the software (§14.7) */
 
+/* When the GRANT must have started: the peer's turnaround and the slop. No time
+ * on air in it — that is the point, since what it gates is a look at the
+ * receiver rather than a decision about a frame. */
+static inline uint32_t supeGrantStartDeadlineMs(void) {
+    return SUPE_TURNAROUND_MS + SUPE_GUARD_MS;
+}
+/* And when a GRANT already on the air must have finished. */
 uint32_t supeGrantDeadlineMs(uint8_t hailSf, uint32_t hailBwHz,
                              int crDenom, int preamble);
 uint32_t supeManifestFirstDeadlineMs(const SupeCfg* c, int crDenom, int preamble);

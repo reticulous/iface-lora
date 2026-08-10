@@ -229,6 +229,12 @@ static void peersAddLink4Raw(Neighbor* e, const uint8_t b4[4]) {
     memcpy(e->link4[NEI_LINK4_MAX - 1], b4, 4);
 }
 
+void peersAddLink4(Neighbor* e, const uint8_t lid[16]) {
+    /* Stored as a first-4 stub like every other hash on a row; SUPE's 3-byte
+     * tag matches against its leading bytes. */
+    peersAddLink4Raw(e, lid);
+}
+
 /* Fold `src` into `dst` and free it. Used when two rows turn out to be one
  * device: an announce naming a dest-only row's identity, or a 0x03 asserting
  * that several hashes (and so several identities) are the same node. */

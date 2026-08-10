@@ -25,6 +25,10 @@
  * somebody else's detour, which is the likeliest cause of the silence. */
 #define SUPE_RETRY_WAIT_MIN_MS 400
 #define SUPE_RETRY_WAIT_SPAN_MS 400
+/* Retransmissions of one START before the absence ladder takes over. One: a
+ * silent channel at the answering instant says the request was not heard, which
+ * is worth saying twice and not worth saying five times. */
+#define SUPE_START_RESENDS_MAX 1
 
 /* What the requester waits after its retune before speaking, beyond the
  * synthesizer's own gap. The answerer's TxDone → tune → receive path is an
@@ -369,10 +373,54 @@ void supeEngReset(SupeEngine* e) {
     memset(&e->x, 0, sizeof e->x);
     e->x.phase = SUPE_X_IDLE;
     e->offerArmed = false;
+    e->resendArmed = false;
 }
+
+static void home(SupeEngine* e, bool success, const char* why);
 
 bool supeEngBusy(const SupeEngine* e) {
     return e->x.phase != SUPE_X_IDLE || e->offerArmed;
+}
+
+bool supeEngXactLive(const SupeEngine* e) {
+    return e->x.phase != SUPE_X_IDLE;
+}
+
+bool supeEngResendDue(const SupeEngine* e) {
+    return e->resendArmed && e->x.phase == SUPE_X_A_AWAIT_GRANT;
+}
+
+void supeEngResend(SupeEngine* e) {
+    SupeXact* x = &e->x;
+    if (!e->resendArmed) return;
+    e->resendArmed = false;
+    /* Byte for byte, so the hash a GRANT names is the hash we are waiting on.
+     * Back to START_TX, which arms stage one again on the completion — the same
+     * path the first transmission took, because this is the same request. */
+    x->phase = SUPE_X_A_START_TX;
+    if (!e->host->tx_frame(e->host->ctx, x->startFrame, x->startLen, x->startTxp)) {
+        home(e, false, "START would not retransmit");
+        return;
+    }
+    e->startsOut++;
+}
+
+void supeEngResendDrop(SupeEngine* e) {
+    if (!e->resendArmed) return;
+    e->resendArmed = false;
+    /* The medium never freed. Nothing was heard from the peer either, so this
+     * ends where an unanswered START ends — the ladder, one rung on. */
+    e->x.resends = SUPE_START_RESENDS_MAX;
+    supeEngOnTimer(e);
+}
+
+void supeEngSetIdent(SupeEngine* e, const uint8_t id[SUPE_TAG_LEN]) {
+    memcpy(e->ownIdent, id, SUPE_TAG_LEN);
+    e->haveOwnIdent = true;
+}
+
+uint16_t supeEngCargoPeer(const SupeEngine* e) {
+    return e->x.phase == SUPE_X_IDLE ? (uint16_t)LORAQ_PEER_NONE : e->x.fromPeer;
 }
 
 static void home(SupeEngine* e, bool success, const char* why);
@@ -401,6 +449,10 @@ static void home(SupeEngine* e, bool success, const char* why) {
     uint8_t was = x->phase;
     memset(x, 0, sizeof *x);
     x->phase = SUPE_X_IDLE;
+    /* The request this belonged to is over however it ended, so a retransmission
+     * still waiting for the medium is over with it — it must not survive to fire
+     * inside whatever transaction comes next. */
+    e->resendArmed = false;
     e->host->rx(e->host->ctx);
     /* The end record, whatever the log does with the line below. */
     if (was != SUPE_X_IDLE) {
@@ -464,32 +516,15 @@ uint8_t supeEngVerdict(SupeEngine* e) {
         e->dropsAbsent++;
         return SUPE_V_DROP;
     }
-    /* A queue of nothing but proofs bides its time. The proof of a packet can
-     * never ride the detour that carried the packet — it exists only after
-     * that train has landed — but it can ride the NEXT transaction in either
-     * direction: as reverse cargo when this peer opens one to us, or alongside
-     * whatever data joins the queue behind it, which releases the hold at
-     * once. So it neither launches a detour of its own nor flies plainly
-     * until it has aged out. The cost is the far end's send window, which the
-     * held proof is keeping shut — the age cap is what bounds that. */
-    if (e->holdProofMs && (p->flags & LORAQ_F_PROOF) &&
-        (uint32_t)(now - p->first_seen_ms) < e->holdProofMs) {
-        bool allProof = true;
-        for (int i = 1; allProof; i++) {
-            LoraPkt* qp = loraqAt(e->q, i);
-            if (!qp) break;
-            if (!(qp->flags & LORAQ_F_PROOF)) allProof = false;
-        }
-        if (allProof) {
-            e->offerArmed = false;
-            return SUPE_V_HOLD;
-        }
-    }
+    /* A proof takes its chances like anything else. Waiting for a ride costs the
+     * far end its send window for as long as the wait lasts, and the ride it was
+     * waiting for — the peer opening a transaction to us — takes the proof as
+     * reverse cargo whether or not the proof was holding out for it. */
     if (pv.retryWaitUntilMs && (int32_t)(pv.retryWaitUntilMs - now) > 0) {
         /* Mid-ladder: the randomised wait between requests. The packet holds
          * through it — flying plainly here would defeat the ladder. */
         e->offerArmed = false;
-        return SUPE_V_HOLD;
+        return SUPE_V_WAIT;
     }
     if (pv.backoffUntilMs && (int32_t)(pv.backoffUntilMs - now) > 0) {
         /* A refusal said how long not to ask. The peer is present; the
@@ -508,7 +543,7 @@ uint8_t supeEngVerdict(SupeEngine* e) {
     uint32_t waitUntil = 0;
     int d = shouldDetour(&pv, e->q, &cv, now, &waitUntil);
     if (d == DETOUR_NO)  { e->offerArmed = false; return SUPE_V_PLAIN; }
-    if (d == DETOUR_WAIT) { e->offerArmed = false; return SUPE_V_HOLD; }
+    if (d == DETOUR_WAIT) { e->offerArmed = false; return SUPE_V_WAIT; }
 
     if (!e->offerArmed) {
         e->offerArmed = true;
@@ -556,7 +591,12 @@ void supeEngLaunch(SupeEngine* e) {
     s.fam = e->ownFam;
     s.ceiling = ceiling;
     s.load = supeEncLoad(adjusted);
-    /* sender_ident ships with the transmitting form and not before (§4). */
+    /* sender_ident ships with the transmitting form and not before (§4): this
+     * is the requesting side, so the frame names us. It is what lets the
+     * answering side attribute the cargo — and what everyone else in earshot
+     * holds for, alongside the granter's tag, when they overhear the GRANT. */
+    s.haveIdent = e->haveOwnIdent;
+    if (s.haveIdent) memcpy(s.ident, e->ownIdent, SUPE_TAG_LEN);
     uint8_t f[SUPE_START2_ID_LEN];
     size_t n = supeEncStart2(f, sizeof f, &s);
     if (!n) return;
@@ -570,11 +610,13 @@ void supeEngLaunch(SupeEngine* e) {
                                         * answer with it or with regime 0 */
     memcpy(x->tag, p->tag, SUPE_TAG_LEN);
     memcpy(x->hash, sha, SUPE_HASH_LEN);
-    x->peerId   = pv.peerId;
+    x->fromPeer = LORAQ_PEER_NONE;   /* we are the one transmitting */
     x->peerFam  = pv.fam;
     x->attempt  = (uint8_t)(rung + 1);
     x->startTxp = txp;
     x->beganMs  = eNow(e);
+    memcpy(x->startFrame, f, n);       /* verbatim, for a retransmission */
+    x->startLen = (uint8_t)n;
     if (!e->host->tx_frame(e->host->ctx, f, (uint16_t)n, txp)) {
         home(e, false, "START would not transmit");
         return;
@@ -791,7 +833,17 @@ static void bAnswerStart(SupeEngine* e, const SupeStart2* s,
      * frame is the thing in question. */
     SupePeerView pv;
     bool havePv = e->host->peer_get(e->host->ctx, s->tag, &pv) && pv.known;
-    uint16_t revPeer = havePv ? pv.peerId : (uint16_t)LORAQ_PEER_NONE;
+    /* Who is asking. Not `pv` — that resolved the tag, which is one of OUR
+     * addresses and says nothing about the requester. The sender identity is the
+     * only thing that names it, and naming it is what makes the reverse leg
+     * possible at all: without it every queued packet for this peer looks like
+     * somebody else's and the reverse flag is never set. */
+    uint16_t revPeer = LORAQ_PEER_NONE;
+    if (s->haveIdent) {
+        SupePeerView ip;
+        if (e->host->peer_get(e->host->ctx, s->ident, &ip) && ip.known)
+            revPeer = ip.peerId;
+    }
     uint32_t revMs = 0;
     bool reverse = scanReverse(e, revPeer, gr, &cfg, &revMs) > 0;
 
@@ -839,12 +891,12 @@ static void bAnswerStart(SupeEngine* e, const SupeStart2* s,
     x->lastPktRssi = rssi;                 /* until a train packet lands */
     x->lastPktSnrQ = supeEncSnrQ(snr10);
     x->trainTxp = chanTxpCapOf(e, gr, chan);
-    if (havePv) {
-        x->peerId = pv.peerId;
-        if (e->adaptive && pv.txpOpen < x->trainTxp) x->trainTxp = pv.txpOpen;
-    } else {
-        x->peerId = LORAQ_PEER_NONE;
-    }
+    if (havePv && e->adaptive && pv.txpOpen < x->trainTxp) x->trainTxp = pv.txpOpen;
+    /* Who is about to transmit to us — the same resolution the reverse scan
+     * above used. It is what lets the cargo be attributed to a node rather than
+     * arriving from nobody in particular, and what the reverse train draws from
+     * when our turn comes. */
+    x->fromPeer = revPeer;
     if (!e->host->tx_frame(e->host->ctx, f, (uint16_t)fn, e->txpMax)) {
         home(e, false, "GRANT would not transmit");
         return;
@@ -899,7 +951,7 @@ static void bAfterTrain(SupeEngine* e) {
 static void bTurn(SupeEngine* e) {
     SupeXact* x = &e->x;
     uint32_t ms = 0;
-    uint8_t count = scanReverse(e, x->peerId, x->regime, &x->cfg, &ms);
+    uint8_t count = scanReverse(e, x->fromPeer, x->regime, &x->cfg, &ms);
 
     SupeManifest2 m = {};
     m.pwrDbm  = x->trainTxp;
@@ -937,9 +989,13 @@ static void bTurn(SupeEngine* e) {
  * requester, built during the current airtime. */
 static bool bStageNext(SupeEngine* e) {
     SupeXact* x = &e->x;
+    /* An unnamed requester has no traffic of ours by definition — without the
+     * guard the comparison below would match every packet whose own peer is
+     * equally unresolved, and send a stranger's traffic down this detour. */
+    if (x->fromPeer == LORAQ_PEER_NONE) return false;
     for (uint8_t i = 0; i < loraqDepth(e->q); i++) {
         LoraPkt* p = loraqAt(e->q, i);
-        if (p->peer_id != x->peerId) continue;
+        if (p->peer_id != x->fromPeer) continue;
         if (!e->host->stage_packet(e->host->ctx, p, x->trainTxp)) return false;
         loraqConsume(e->q, i);
         x->staged = true;
@@ -1201,8 +1257,11 @@ void supeEngOnTxDone(SupeEngine* e, bool ok) {
     switch (x->phase) {
         case SUPE_X_A_START_TX:
             x->phase = SUPE_X_A_AWAIT_GRANT;
-            x->deadlineMs = eNow(e)
-                + supeGrantDeadlineMs(e->hailSf, e->hailBwHz, e->crDenom, e->preamble);
+            /* Stage one: not "the GRANT should have arrived" but "the GRANT
+             * should have begun". What happens at that instant is a look at the
+             * receiver, so no time on air belongs in it. */
+            x->grantOnAir = false;
+            x->deadlineMs = eNow(e) + supeGrantStartDeadlineMs();
             e->host->rx(e->host->ctx);
             e->host->schedule(e->host->ctx, x->deadlineMs);
             return;
@@ -1262,6 +1321,32 @@ void supeEngOnTimer(SupeEngine* e) {
     SupeXact* x = &e->x;
     switch (x->phase) {
         case SUPE_X_A_AWAIT_GRANT: {
+            /* Stage one: the moment the GRANT had to be under way. Ask the
+             * receiver instead of guessing — a frame arriving now is the answer
+             * being delivered, and the only thing left to do is let it land. */
+            if (!x->grantOnAir && e->host->rx_busy &&
+                e->host->rx_busy(e->host->ctx)) {
+                x->grantOnAir = true;
+                x->deadlineMs = eNow(e)
+                    + supeGrantDeadlineMs(e->hailSf, e->hailBwHz,
+                                          e->crDenom, e->preamble);
+                e->host->schedule(e->host->ctx, x->deadlineMs);
+                return;
+            }
+            /* Nothing on the air at the instant the peer should have been
+             * transmitting. The request itself stands — nothing was granted,
+             * nothing was reserved, and the tag and hash are still ours — so it
+             * goes back out as a retransmission inside this same transaction:
+             * no strike, no rung, and none of the ladder's wait. Bounded,
+             * because a peer that is actually gone must not draw an unending
+             * run of frames on the shared channel; the channel access the
+             * platform puts it through is its decorrelation. */
+            if (!x->grantOnAir && x->resends < SUPE_START_RESENDS_MAX) {
+                x->resends++;
+                e->resendArmed = true;
+                eLog(e, true, "supe: no answer under way — resending START");
+                return;
+            }
             /* Silence. The ladder advances: a strike, a randomised wait, and
              * the verdict path re-requests — or, at three strikes, the peer is
              * absent and its traffic drops for a minute (§11). */
@@ -1270,6 +1355,10 @@ void supeEngOnTimer(SupeEngine* e) {
             nt.ev = SUPE_EV_STRIKE;
             nt.backoffMs = SUPE_RETRY_WAIT_MIN_MS
                 + (e->host->rand32(e->host->ctx) % SUPE_RETRY_WAIT_SPAN_MS);
+            /* Reckoned from the START, not from here: the GRANT deadline we
+             * just sat out is time already spent not asking, so the wait is
+             * what is left of it rather than a fresh one stacked on top. */
+            nt.agoMs = eNow(e) - x->beganMs;
             nt.triedTxpDbm = x->startTxp;
             e->host->peer_note(e->host->ctx, x->tag, &nt);
             home(e, false, "no GRANT");

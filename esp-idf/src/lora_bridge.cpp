@@ -116,7 +116,11 @@ static void deliverInbound(LoraRadio* r, const uint8_t* data, size_t len,
     auto rnd = [](float x) { return (int16_t)(x < 0 ? x - 0.5f : x + 0.5f); };
     int16_t rssi = rnd(r->rssiLast);
     int16_t snr  = rnd(r->snrLast * 10.0f);
-    peersObserve(r, data, len, false, rssi, snr, LORA_ORIG_RNSD);
+    /* Inside a transaction the sender is not a guess: the GRANT went to one
+     * node and this arrived under it, so the tap can attribute what the packet
+     * establishes — a link identifier above all — to that peer instead of
+     * waiting to overhear the association in the clear. */
+    peersObserve(r, data, len, false, rssi, snr, LORA_ORIG_RNSD, supeCargoPeer(r));
     /* A whole packet, which is what a train is counted in: a split packet
      * counts once, when both halves are in, which is exactly here. */
     supeOnPacketRx(r, rssi, snr);
@@ -138,7 +142,16 @@ void rearmRx(LoraRadio* r) {
         gpio_intr_enable((gpio_num_t)r->slot->dio1);
         return;
     }
-    r->radio->startReceive();
+    /* Back to plain listening with nothing chained behind it: the reference may
+     * stop again. A transaction still in flight is not idle — its next frame is
+     * as close behind as a split's second half — so it keeps the hold. Before
+     * the receiver is armed, since arming takes the standby this governs. */
+    if (!supeBusy(r)) radioHoldOsc(r, false);
+    radioStartRx(r);
+    /* A fresh receiver has no reception in progress; the evidence radioRxInProgress
+     * tracks was cleared with the chip's flags. */
+    r->rxActiveStart = 0;
+    r->rxHeaderSeen  = false;
     gpio_intr_enable((gpio_num_t)r->slot->dio1);
 }
 
@@ -331,6 +344,13 @@ static void txRearmRx(LoraRadio* r) {
  * TxDone on DIO1 when done (serviceRadio handles it). Non-blocking: the task is
  * free for the whole airtime, so nothing on its core is starved at high SF. */
 void startTxFrame(LoraRadio* r, int idx) {
+    /* Is another frame already spoken for behind this one — the second half of a
+     * split, or any frame inside a live transaction? Then the oscillator must
+     * not be allowed to stop when this frame ends, because restarting it is
+     * several ms of dead air in a gap nothing else may use. Decided here, before
+     * the frame flies, because the fallback it sets is what the chip acts on the
+     * moment TxDone arrives. */
+    radioHoldOsc(r, idx + 1 < (int)r->txFrameCount || supeBusy(r));
     int16_t st = r->radio->startTransmit(r->txFrame[idx], r->txFrameLen[idx]);
     if (st != RADIOLIB_ERR_NONE) {
         warn("lora/%d startTransmit %u B failed: %s (%d)",
@@ -432,7 +452,7 @@ void beginTx(LoraRadio* r, const uint8_t* data, size_t len, uint8_t origin,
      * timestamps and never age out. */
     if (!fromBuffer) annRecordTx(r, data, len);
 
-    peersObserve(r, data, len, true, 0, 0, origin);   /* passive neighbour tap (tx side) */
+    peersObserve(r, data, len, true, 0, 0, origin, LORAQ_PEER_NONE);   /* passive neighbour tap (tx side) */
 
     r->txSeq          = (uint8_t)((esp_random() & 0x0F) << 4);   /* 4-bit seq, upper nibble */
     r->txPayloadBytes = len;
@@ -509,7 +529,7 @@ bool stageTx(LoraRadio* r, const uint8_t* data, size_t len, uint8_t origin,
              int8_t pwr) {
     if (!r->running || len == 0 || len > RNS_MTU) return false;
 
-    peersObserve(r, data, len, true, 0, 0, origin);   /* passive tap (tx side) */
+    peersObserve(r, data, len, true, 0, 0, origin, LORAQ_PEER_NONE);   /* passive tap (tx side) */
 
     uint8_t seq = (uint8_t)((esp_random() & 0x0F) << 4);
     uint8_t pktType = (origin == LORA_ORIG_RNODE) ? LORA_PKT_RNODE : LORA_PKT_RNS;
@@ -599,9 +619,16 @@ static void annReplayFill(LoraRadio* r) {
     annExpire(r, millis());
     while (r->annIdx < ANN_MAX_ENTRIES && !r->ann->e[r->annIdx].used) r->annIdx++;
     if (r->annIdx >= ANN_MAX_ENTRIES) {
-        r->annReplay = false;
         /* Our own announcement closes the run: the identities just replayed and
-         * the radio that carries them are one statement about this node. */
+         * the radio that carries them are one statement about this node. It
+         * leaves the radio from supePoll rather than the queue, so it is armed
+         * once the last replayed announce has actually left — arming it while
+         * any are still queued would put it on the air first. */
+        for (uint8_t i = 0; i < loraqDepth(&r->q); i++) {
+            LoraPkt* p = loraqAt(&r->q, i);
+            if (p && (p->flags & LORAQ_F_REPLAY)) return;
+        }
+        r->annReplay = false;
         supeAnnArm(r);
         return;
     }
@@ -686,7 +713,6 @@ void queueFill(LoraRadio* r) {
             if (h.ptype != NEI_PT_ANNOUNCE &&
                 (h.dtype == NEI_DT_SINGLE || h.dtype == NEI_DT_LINK))
                 tag3 = h.hdr2 ? h.transportId : h.dest;
-            if (h.ptype == NEI_PT_PROOF) flags |= LORAQ_F_PROOF;
         }
         if (!loraqPush(&r->q, b, len, millis(), peer, tag3, /*refs=*/1, flags)) {
             free(b);              /* full between the check and the push */
@@ -737,17 +763,23 @@ void drainOneOutbound(LoraRadio* r) {
     /* A SUPE transaction owns the radio — its frames sit inside a schedule the
      * other end is timing against — and it owns the queue's head with it. This
      * is the one gate left on the drain, and it is radio ownership rather than
-     * one module consulting another's bookkeeping. */
-    if (supeHoldsRadio(r)) return;
-    if (!r->running || r->splitPending || r->txActive) return;
-
-    /* Ingress: everything available is enqueued. Sound without a lock for the
-     * same reason the classifier below is: the gate above has returned us if a
-     * transaction is live, so the queue is only touched here while the engine
-     * is at rest, and a stale one-shot that fires after supeEnd finds
-     * SUPE_X_IDLE and returns. */
+     * one module consulting another's bookkeeping.
+     *
+     * Ingress is the exception, and the reason is the protocol rather than
+     * tidiness. What a transaction carries is declared before it runs — the
+     * requester's load in the START, the whole duration everyone else holds for
+     * in the GRANT — so a packet arriving after that cannot join it and must not
+     * disturb the queue the engine is walking. Until then it can: a packet
+     * pulled in during the polite wait is still in the queue when `headRun`
+     * measures the load, and rides the very detour that is being waited for.
+     * That wait is hundreds of milliseconds, so it is where most of the chances
+     * to coalesce live. */
+    if (!r->running || r->splitPending) return;
+    if (supeXactLive(r)) return;
     queueFill(r);
     annReplayFill(r);
+    if (supeHoldsRadio(r) || r->txActive) return;
+
     if (loraqDepth(&r->q) == 0) {
         csmaResetAccess(r);         /* nothing queued → reset channel-access state */
         return;
@@ -759,6 +791,9 @@ void drainOneOutbound(LoraRadio* r) {
      * the medium. With SUPE off it answers PLAIN and the head simply flies. */
     uint8_t sv = supeHeadVerdict(r);
     if (sv == SUPE_V_HOLD) return;      /* the line behind it waits too */
+    /* Our own wait, not a reservation: nobody has claimed the medium, so serve
+     * the channel access underneath it and have it ready when the wait ends. */
+    if (sv == SUPE_V_WAIT) { csmaPrime(r); return; }
     if (sv == SUPE_V_DROP) { queueDiscardHead(r); return; }
     /* An offer takes the channel on its own terms — after the pre-offer
      * delay, from supePoll — so it stands down here rather than winning the
@@ -851,7 +886,7 @@ void serviceRadio(LoraRadio* r) {
 static void serviceRadioLocked(LoraRadio* r) {
     uint32_t flags = r->radio->getIrqFlags();
 
-    if (flags & (1UL << RADIOLIB_IRQ_TX_DONE)) {
+    if (flags & r->irqTxDone) {
         r->radio->finishTransmit();          /* clear IRQ, chip → standby */
         r->txFrames++;
         /* Record the frame that just went out (one per split half). */
@@ -901,7 +936,7 @@ static void serviceRadioLocked(LoraRadio* r) {
         return;
     }
 
-    if (flags & (1UL << RADIOLIB_IRQ_RX_DONE)) {
+    if (flags & r->irqRxDone) {
         handleRxDone(r);
         return;
     }
@@ -926,6 +961,26 @@ static void serviceRadioLocked(LoraRadio* r) {
         r->txAborted = true;
         txRearmRx(r);
         r->txAborted = false;
+        return;
+    }
+
+    /* Nothing completed and no transmit outstanding, yet the IRQ line is still
+     * asserted: the chip is holding an interrupt this loop has no handler for.
+     * Left alone it is a permanent wake source — the task would be recalled to
+     * this same pass forever — so clear the chip's flags and go back to
+     * listening. Re-enabling the GPIO interrupt is part of the repair: the
+     * trampoline disables it on every fire, and the path that failed to re-enable
+     * it is exactly the one that gets us here. */
+    if (!r->txActive && radioIrqLinePending(r)) {
+        static uint32_t lastWarnMs = 0;
+        uint32_t nowMs = millis();
+        if (nowMs - lastWarnMs > 10000) {
+            lastWarnMs = nowMs;
+            warn("lora/%d unhandled IRQ (flags 0x%08lx) — clearing and re-arming RX",
+                 r->idx, (unsigned long)flags);
+        }
+        radioIrqClearAll(r);
+        rearmRx(r);
     }
 }
 

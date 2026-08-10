@@ -362,7 +362,8 @@ static void observeAnnounce(LoraRadio* r, const RnsHdr* h, bool isTx,
 /* ── the per-packet observation tap ── */
 
 void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
-                       int16_t rssi, int16_t snr10, uint8_t txOrigin) {
+                       int16_t rssi, int16_t snr10, uint8_t txOrigin,
+                       uint16_t fromPeer) {
     NeiState* st = r->nei;
     if (!st) return;
     RnsHdr h;
@@ -508,6 +509,17 @@ void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
                  * the link the moment it is established, which is before our
                  * proof has necessarily left. */
                 supeTagAdd(r, lid, /*perm=*/false, SUPE_LINK_TTL_MS);
+                /* And, when the request came out of a transaction, whose link
+                 * it is. A link request carries no sender, so a link dialled to
+                 * us is normally anonymous and our whole side of the session —
+                 * the proof first — flies plainly until a MANIFEST for the link
+                 * identifier eventually files capabilities against it. Arriving
+                 * as a detour's cargo, it is not anonymous at all: the node that
+                 * asked for the detour is the node that dialled. Filing the
+                 * identifier on its row makes the very first frame back
+                 * detourable. */
+                Neighbor* from = peersById(st, fromPeer);
+                if (from && !peersIsLocal(from)) peersAddLink4(from, lid);
             }
             L->haveSig = true;                             /* initiator's setup signal */
             L->lastRssi = rssi;

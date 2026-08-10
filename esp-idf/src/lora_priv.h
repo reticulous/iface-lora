@@ -174,6 +174,25 @@ struct LoraRadio {
     PhysicalLayer*  radio;        /* RadioLib base; concrete class per slot chip */
     int             found;        /* -1 unprobed, 0 absent, 1 detected */
 
+    /* This chip's own IRQ-register bits for the flags the loop tests, translated
+     * once from RadioLib's radio-agnostic numbering (radioIrqCache). getIrqFlags
+     * returns the raw register, so the two only agree by coincidence on some
+     * families. 0 = the part has no such IRQ. */
+    uint32_t        irqTxDone, irqRxDone, irqPreamble, irqHdrValid, irqHdrErr;
+
+    /* Modem-reported reception in progress: when the preamble/header evidence
+     * first appeared, and how long each stage may stand before it is stale (a
+     * latched bit that no packet followed). See radioRxInProgress. */
+    TickType_t      rxActiveStart;    /* 0 = nothing seen */
+    bool            rxHeaderSeen;
+    TickType_t      rxPreambleTicks;  /* preamble → header-valid */
+    TickType_t      rxPacketTicks;    /* header-valid → rx-done */
+
+    /* Analog front-end recalibration (s.lora.<i>.agc_reset, seconds; 0 = off).
+     * The only standing wake this task holds by default — see radioAgcReset. */
+    uint32_t        agcResetMs;
+    TickType_t      agcNext;
+
     int             rnsdHandle;
     bool            running;
     bool            enabled;
@@ -214,6 +233,9 @@ struct LoraRadio {
     TickType_t      csmaStart;       /* tick this frame's channel-access attempt began */
     bool            csmaStalled;     /* stall warning emitted for this frame (once) */
     float           noiseFloor;      /* tracked channel noise floor, dBm */
+    float           chFloor[LORA_CH_MAX];  /* each channel's floor as this radio last
+                                            * left it, indexed by channel; the hailing
+                                            * channel is 0 (csmaFloorSwitch) */
     uint32_t        lbtTimeoutMs;    /* drop a frame LBT can't clear within this (s.lora.<i>.lbt_timeout) */
     TickType_t      lbtTimeoutTicks; /* lbtTimeoutMs in ticks; 0 = never drop */
 
@@ -239,6 +261,8 @@ struct LoraRadio {
      * split-second frame or re-arms RX. txActive gates RX servicing and new
      * outbound so the half-duplex radio is never asked to do two things at once. */
     bool            txActive;        /* a frame is on-air, awaiting TxDone */
+    bool            oscHeld;         /* the oscillator is being kept alive across the
+                                      * gaps inside a chain of frames (radioHoldOsc) */
     TickType_t      txDeadline;      /* watchdog: recover if TxDone never arrives */
     TickType_t      txWatchTicks;    /* per-frame TxDone watchdog budget (airtime + margin) */
     uint8_t         txSeq;           /* 4-bit seq nibble shared by a split pair */
@@ -275,9 +299,13 @@ struct LoraRadio {
 
     /* LoRaMon — each on-air frame becomes a storage node lora.<n>.packets.<ms>;
      * this FIFO of start-ms drives expiry (delete nodes > 1 h old). */
-    int8_t          cfgTxp;          /* configured TX power dBm */
+    int8_t          cfgTxp;          /* configured TX power dBm (ANTENNA dBm — the
+                                      * FEM gain conversion happens only at the
+                                      * chip, in femChipDbm) */
     uint8_t         cfgSync;         /* configured sync word (restored after a sweep) */
     int8_t          txPwrNow;        /* power of the frame on-air, stamped into tx records */
+    uint8_t         femType;         /* LoraFemType — external front-end module, set by femInit */
+    int8_t          maxTxDbm;        /* antenna-dBm ceiling: 22 bare chip, 27 through a FEM */
     uint8_t         txType[2];       /* per frame: LORA_PKT_*. A 0x04 power request
                                       * and the RNS packet it prefixes share one
                                       * channel access but not one protocol. */
@@ -340,7 +368,7 @@ struct LoraRadio {
     SupeState*      supe;
     bool            supeOn;          /* s.lora.<i>.SUPE.enable, AND no access code */
     bool            supeAdaptive;    /* s.lora.<i>.SUPE.adaptive_txpower */
-    uint32_t        supeHoldProofMs; /* s.lora.<i>.SUPE.tmp_hold_proof (ms) */
+    bool            supeNameSender;  /* s.lora.<i>.SUPE.sender_ident */
 
     /* Adaptive TX power (overview at AP_EST_MARGIN_DB). */
     bool            adaptive;        /* = supeAdaptive; the reciprocity
@@ -378,6 +406,9 @@ extern volatile bool s_stop;
 
 /* Config apply coalescing — ask for an apply in at most `delayMs`. */
 void cfgArm(uint32_t delayMs);
+
+/* Wake the interface task: its wake deadlines just changed. */
+void loraNudge(void);
 
 /* The module interfaces, in dependency order. */
 #include "lora_chanplan.h"

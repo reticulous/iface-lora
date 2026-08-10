@@ -6,6 +6,7 @@
  * table and the power controller.
  */
 #include "lora_priv.h"
+#include "lora_fem.h"
 
 #if defined(CONFIG_LORA0_CS_PIN)
 
@@ -36,6 +37,12 @@ static Neighbor* tagNode(LoraRadio* r, const uint8_t tag[SUPE_TAG_LEN]) {
             if (memcmp(e->dests[d].hash, tag, SUPE_TAG_LEN) == 0) return e;
         for (int l = 0; l < e->nLink4; l++)
             if (memcmp(e->link4[l], tag, SUPE_TAG_LEN) == 0) return e;
+        /* Identities, and not only the destinations derived from them: a
+         * START's sender_ident names the asking node by its identity, and
+         * nothing is ever *addressed* to an identity, so it appears in none of
+         * the lists above. */
+        for (int k = 0; k < e->nIds; k++)
+            if (memcmp(e->ids[k], tag, SUPE_TAG_LEN) == 0) return e;
     }
     /* A link identifier we initiated resolves to the node the link request was
      * addressed to (SUPE.md §5.1, §10 "links inherit") — this is what keeps a
@@ -84,10 +91,15 @@ static bool hTune(void* ctx, uint8_t chan, const SupeCfg* c, uint8_t sync) {
         warn("lora/%d supe: retune failed: %s (%d)", r->idx, rlErrName(st), (int)st);
         return false;
     }
+    /* Another channel, another noise reference: the hailing channel's floor says
+     * nothing about this one. Its own, from the last visit, says plenty — so the
+     * two are exchanged rather than thrown away. Before chNow moves, since that
+     * is the channel the floor being parked belongs to. */
+    csmaFloorSwitch(r, r->chNow, chan);
     r->airSf   = c->sf;
     r->airBwHz = (int)c->bwHz;
     r->chNow   = chan;
-    r->radio->startReceive();
+    radioStartRx(r);
     return true;
 }
 
@@ -101,14 +113,18 @@ static void hTuneHome(void* ctx) {
     radioSetSf(r, (uint8_t)r->cfgSf);
     radioSyncWord(r, r->cfgSync);
     r->radio->setPreambleLength((size_t)r->cfgPreamble);
-    r->radio->setOutputPower(r->cfgTxp);
+    r->radio->setOutputPower(femChipDbm(r, r->cfgTxp));
     r->airSf       = (uint8_t)r->cfgSf;
     r->airBwHz     = r->cfgBwHz;
     r->airPreamble = r->cfgPreamble;
     r->airImplicit = false;
     r->txPwrNow    = r->cfgTxp;
+    /* The detour's floor is not this channel's — but the hailing channel's own,
+     * from before the detour, is the best estimate in the system and the one a
+     * node returning home has to contend against straight away. */
+    csmaFloorSwitch(r, r->chNow, LORA_CH_HAIL);
     r->chNow       = LORA_CH_HAIL;
-    r->radio->startReceive();
+    radioStartRx(r);
     if (logIsDebug(TAG)) dbg("lora/%d supe: home", r->idx);
 }
 
@@ -157,6 +173,12 @@ static bool hFireStaged(void* ctx) {
 
 static void hRx(void* ctx) {
     rearmRx((LoraRadio*)ctx);
+}
+
+/* The modem's own account of whether a frame is arriving: a preamble it has
+ * locked, or a header it has validated and is still filling in. */
+static bool hRxBusy(void* ctx) {
+    return radioRxInProgress((LoraRadio*)ctx);
 }
 
 static bool hPeerGet(void* ctx, const uint8_t tag[SUPE_TAG_LEN], SupePeerView* out) {
@@ -217,7 +239,10 @@ static void hPeerNote(void* ctx, const uint8_t tag[SUPE_TAG_LEN],
         case SUPE_EV_STRIKE:
             if (e) {
                 if (e->silentCount < 255) e->silentCount++;
-                e->retryWaitUntilMs = now + n->backoffMs;
+                /* From the request, not from the strike: `agoMs` is what the
+                 * GRANT deadline already spent, and only the remainder is owed. */
+                e->retryWaitUntilMs = now + (n->backoffMs > n->agoMs
+                                             ? n->backoffMs - n->agoMs : 0);
                 if (e->silentCount >= SUPE_ABSENT_STRIKES) {
                     e->absentUntilMs = now + SUPE_ABSENT_MS;
                     if (logIsDebug(TAG))
@@ -329,6 +354,7 @@ static void hostFill(LoraRadio* r) {
     h->stage_packet = hStagePacket;
     h->fire_staged  = hFireStaged;
     h->rx        = hRx;
+    h->rx_busy   = hRxBusy;
     h->peer_get  = hPeerGet;
     h->peer_note = hPeerNote;
     h->chan_get  = hChanGet;
@@ -401,7 +427,6 @@ bool supeInit(LoraRadio* r) {
     r->supe->eng.holdEarlyMs = (uint16_t)((r->appc ? r->appcDifsTicks
                                                    : r->difsTicks)
                                           * portTICK_PERIOD_MS);
-    r->supe->eng.holdProofMs = r->supeHoldProofMs;
     /* The first beat is soon, not one interval out: a node that has just come
      * up is exactly the node its neighbours know nothing about. Jittered so a
      * fleet powered up together does not converge on the same second. */
@@ -424,6 +449,14 @@ bool supeReady(const LoraRadio* r) { return r->supeOn && r->supe != nullptr; }
 
 bool supeBusy(const LoraRadio* r) {
     return r->supe && supeEngBusy(&r->supe->eng);
+}
+
+bool supeXactLive(const LoraRadio* r) {
+    return r->supe && supeEngXactLive(&r->supe->eng);
+}
+
+uint16_t supeCargoPeer(const LoraRadio* r) {
+    return r->supe ? supeEngCargoPeer(&r->supe->eng) : (uint16_t)LORAQ_PEER_NONE;
 }
 
 bool supeHoldsRadio(const LoraRadio* r) {
@@ -475,6 +508,22 @@ static void annIngest(LoraRadio* r, const uint8_t* f, size_t len, int16_t rssi) 
     if (matched == 0 && logIsDebug(TAG))
         dbg("lora/%d supe: announcement from %02x%02x%02x matches no known node",
             r->idx, a.ids[0][0], a.ids[0][1], a.ids[0][2]);
+}
+
+/* Give the engine a name to sign its requests with: this node's first identity,
+ * truncated to a tag. The same list the announcement is built from, so what a
+ * START claims is what the neighbourhood has already filed against us — and
+ * what `tagNode` can resolve it back through. Identities arrive after the radio
+ * does (rnsd registers them as it comes up), so this is a poll rather than a
+ * one-off, and it stops looking once it has one. */
+static void supeIdentRefresh(LoraRadio* r) {
+    if (!r->supeNameSender || r->supe->eng.haveOwnIdent || !r->nei) return;
+    for (int i = 0; i < NEI_MAX; i++) {
+        Neighbor* e = &r->nei->nei[i];
+        if (!e->used || !peersIsLocal(e) || e->nIds == 0) continue;
+        supeEngSetIdent(&r->supe->eng, e->ids[0]);
+        return;
+    }
 }
 
 void supeAnnArm(LoraRadio* r) {
@@ -581,7 +630,14 @@ void supePoll(LoraRadio* r) {
     s_hosts[r->idx].dbgLevel = logIsDebug(TAG);
 
     supeEngTagExpire(e, now);
-    if (airtimePoll(r)) {
+    supeIdentRefresh(r);
+    airtimePoll(r);
+    /* The dialect deadline is days out, so it re-checks at most hourly, riding
+     * whatever pass other work causes — it holds no wake of its own, and a
+     * node idle past its expiry catches up on the announce beat's pass before
+     * anything would speak. */
+    if ((int32_t)(now - ss->expiryNextMs) >= 0) {
+        ss->expiryNextMs = now + 3600u * 1000u;
         bool was = e->expired;
         e->expired = supeExpired((uint32_t)time(nullptr));
         if (e->expired && !was)
@@ -601,6 +657,25 @@ void supePoll(LoraRadio* r) {
     }
 
     if (r->txActive || r->splitPending) { supeUnlock(r); return; }
+
+    /* A START going back out: nothing was on the air when the answer was due,
+     * so the request is repeated inside the same transaction. It owes the
+     * medium the same access the first one did — and that backoff is also the
+     * decorrelation a retransmission wants, so there is no separate jitter. */
+    if (supeEngResendDue(e)) {
+        if (csmaClear(r)) {
+            supeEngResend(e);
+            r->txWaitMs = csmaGrantWaitMs(r);
+        } else if (r->lbtTimeoutMs &&
+                   (uint32_t)(now - e->x.deadlineMs) > r->lbtTimeoutMs) {
+            /* A channel that will not free is not evidence about the peer, but
+             * the request cannot wait for it forever either. */
+            supeEngResendDrop(e);
+            csmaResetAccess(r);
+        }
+        supeUnlock(r);
+        return;
+    }
 
     /* The launch: the verdict armed an offer, the jitter has passed, and the
      * START contends for the shared medium like any other frame. */
@@ -624,9 +699,12 @@ void supePoll(LoraRadio* r) {
     }
     if (e->x.phase != SUPE_X_IDLE) { supeUnlock(r); return; }
 
-    /* The announce beat. */
+    /* The announce beat. A replay run ends with our own announcement, so the
+     * beat stands off until it is over — otherwise a beat that is already due
+     * fires here, and since annPending gates the drain it would speak ahead of
+     * the announces the replay has queued. */
     if (r->mtxPhase != MTXP_OFF) { supeUnlock(r); return; }
-    if (!ss->annPending && r->annIntervalMin && !e->expired &&
+    if (!ss->annPending && !r->annReplay && r->annIntervalMin && !e->expired &&
         (int32_t)(now - ss->annNextMs) >= 0)
         supeAnnArm(r);
     if (ss->annPending) {

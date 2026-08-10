@@ -191,6 +191,12 @@ static void hLog(void* c, const char* msg) {
     if (getenv("VERBOSE")) printf("  [%s] %s\n", ((Node*)c)->name, msg);
 }
 
+/* Each node's own identity, which its STARTs carry. The answering side has
+ * nothing else to name a requester by: the tag a START asks about is one of the
+ * ANSWERER's addresses, so resolving it says nothing about who is asking. */
+static const uint8_t IDENT_A[3] = { 0xa1, 0xa2, 0xa3 };
+static const uint8_t IDENT_B[3] = { 0xb1, 0xb2, 0xb3 };
+
 static void nodeInit(Node* n, const char* name, uint8_t regime) {
     n->name = name;
     n->host = {};
@@ -214,6 +220,7 @@ static void nodeInit(Node* n, const char* name, uint8_t regime) {
     supeEngInit(&n->eng, &n->host, &n->q);
     supeEngConfig(&n->eng, regime, SUPE_FAM_SX126X, 8, 14, true,
                   7, 125000, 5, 12, 0x42, 254);
+    supeEngSetIdent(&n->eng, name[0] == 'A' ? IDENT_A : IDENT_B);
     n->chans = {};
     n->chans.nChans = (regime == SUPE_REGIME_EU863) ? 9 : 0;
     n->chans.anyBudget = true;
@@ -287,6 +294,11 @@ static void drive(std::vector<Node*> nodes, uint32_t maxMs) {
     while ((int32_t)(end - g_now) > 0) {
         bool moved = airPump(nodes);
         fireTimers(nodes);
+        /* The platform's half of a retransmission: on a real node supePoll puts
+         * it back through channel access, which this harness has none of, so it
+         * goes out the moment it is armed. */
+        for (Node* n : nodes)
+            if (supeEngResendDue(&n->eng)) { supeEngResend(&n->eng); moved = true; }
         if (!moved) {
             bool anyBusy = false, anySched = false;
             for (Node* n : nodes) {
@@ -321,7 +333,7 @@ static void testBidirectional(void) {
     memcpy(A.peerTag, TAG, 3);
     A.peer.known = true;
     A.peer.peerId = 5;
-    memcpy(B.peerTag, TAG, 3);
+    memcpy(B.peerTag, IDENT_A, 3);      /* B knows A by A's identity */
     B.peer.known = true;
     B.peer.peerId = 9;
     supeEngTagAdd(&B.eng, TAG, true, 0);
@@ -400,7 +412,9 @@ static void testAbsenceLadder(void) {
     uint8_t ceil[3] = {};
     for (int attempt = 0; attempt < 3; attempt++) {
         /* Wait out the ladder's randomised interval, then re-request. */
-        while (supeEngVerdict(&A.eng) == SUPE_V_HOLD) g_now += 50;
+        /* WAIT, not HOLD: the ladder's pause is our own timing and reserves
+         * nothing — a real node contends underneath it. */
+        while (supeEngVerdict(&A.eng) == SUPE_V_WAIT) g_now += 50;
         launchFrom(&A);
         txp[attempt] = A.txq.back().dbm;
         ceil[attempt] = (uint8_t)(A.txq.back().bytes[5] & 0x0F);
@@ -457,7 +471,7 @@ static void testNoWaiting(void) {
     std::vector<Node*> air = { &A, &B };
     memcpy(A.peerTag, TAG, 3);
     A.peer.known = true;
-    memcpy(B.peerTag, TAG, 3);
+    memcpy(B.peerTag, IDENT_A, 3);  /* B knows A by A's identity, not by its own tag */
     B.peer.known = true;
     B.peer.peerId = 9;              /* B could answer — it just has nothing */
     supeEngTagAdd(&B.eng, TAG, true, 0);
@@ -579,36 +593,52 @@ static void testLinkCrossfire(void) {
     eqi(loraqDepth(&Y.q), 0, "Y's packet moved despite the crossfire");
 }
 
-/* A queue of nothing but proofs is held back to ride a transaction instead of
- * launching one: data joining the queue releases it at once, and the age cap
- * releases it when no ride comes. */
-static void testProofHold(void) {
+/* A proof takes the channel like anything else. The hold that used to keep one
+ * waiting for a ride cost the far end its send window for the whole wait, and
+ * the ride it waited for takes it as reverse cargo regardless. */
+static void testProofGoesOut(void) {
     Node A = {};
     nodeInit(&A, "A", SUPE_REGIME_EU863);
     memcpy(A.peerTag, TAG, 3);
     A.peer.known = true;
     A.peer.peerId = 5;
-    A.eng.holdProofMs = 1000;
 
     uint8_t* b = (uint8_t*)malloc(60);
     memset(b, 0xA5, 60);
-    ok(loraqPush(&A.q, b, 60, g_now, 5, TAG, 1,
-                 LORAQ_ORIG_RNSD | LORAQ_F_PROOF), "proof enqueues");
-    eqi(supeEngVerdict(&A.eng), SUPE_V_HOLD, "a lone young proof is held");
-    g_now += 900;
-    eqi(supeEngVerdict(&A.eng), SUPE_V_HOLD, "still held inside the age cap");
-
-    pushPkt(&A, TAG, 5, 300);
-    eqi(supeEngVerdict(&A.eng), SUPE_V_OFFER,
-        "data behind it releases the hold at once");
-
-    loraqConsume(&A.q, 1);                     /* the data leaves again */
-    g_now += 200;                              /* the proof is now past the cap */
-    eqi(supeEngVerdict(&A.eng), SUPE_V_OFFER,
-        "an aged-out proof takes the channel on its own");
-
+    ok(loraqPush(&A.q, b, 60, g_now, 5, TAG, 1, LORAQ_ORIG_RNSD), "proof enqueues");
+    eqi(supeEngVerdict(&A.eng), SUPE_V_OFFER, "a lone proof offers at once");
     loraqConsume(&A.q, 0);
     eqi(supeEngVerdict(&A.eng), SUPE_V_PLAIN, "an empty queue disarms");
+}
+
+/* The reverse leg needs the requester named, and only the START's sender
+ * identity names it. Without one the answerer cannot tell its own queued
+ * traffic for that node from anyone else's, and declares no reverse leg —
+ * which is what a node that never shipped an identity did, always. */
+static void testReverseNeedsIdent(void) {
+    Node A = {}, B = {};
+    nodeInit(&A, "A", SUPE_REGIME_EU863);
+    nodeInit(&B, "B", SUPE_REGIME_EU863);
+    std::vector<Node*> air = { &A, &B };
+    A.eng.haveOwnIdent = false;        /* a node that does not name itself */
+
+    memcpy(A.peerTag, TAG, 3);
+    A.peer.known = true;
+    A.peer.peerId = 5;
+    memcpy(B.peerTag, IDENT_A, 3);
+    B.peer.known = true;
+    B.peer.peerId = 9;
+    supeEngTagAdd(&B.eng, TAG, true, 0);
+
+    pushPkt(&A, TAG, 5, 300);
+    pushPkt(&B, nullptr, 9, 200);      /* B has traffic for A, and cannot say so */
+
+    launchFrom(&A);
+    drive(air, 20000);
+
+    eqi(A.eng.trainPktsOut, 1, "A's train still flies");
+    eqi(B.eng.trainPktsOut, 0, "B declared no reverse leg");
+    eqi(loraqDepth(&B.q), 1, "B's packet is still queued");
 }
 
 int main(void) {
@@ -619,7 +649,8 @@ int main(void) {
     testNoWaiting();
     testThirdPartyHold();
     testLinkCrossfire();
-    testProofHold();
+    testProofGoesOut();
+    testReverseNeedsIdent();
     printf("%d checks, %d failed\n", g_run, g_fail);
     return g_fail ? 1 : 0;
 }

@@ -84,6 +84,41 @@ config LORA0_RFSW_TX_PIN
     int "Radio 0 — RF-switch TX-enable GPIO (-1 if none)"
     default -1
     depends on LORA_COUNT > 0
+config LORA_TX_POWER_MAX
+    int "Antenna TX power ceiling (dBm)"
+    default 22
+    help
+        The board's real RF capability at the antenna. 22 (the bare SX126x
+        max) unless the board routes the radio through a FEM — then the board
+        sets the FEM ceiling here (e.g. 27) alongside the FEM pins below. The
+        TX-power slider's max is sized from this at build time, and femInit
+        applies it as the runtime ceiling when the FEM is actually detected.
+
+config LORA0_FEM_PWR_PIN
+    int "Radio 0 — FEM rail-enable GPIO (-1 if none)"
+    default -1
+    depends on LORA_COUNT > 0
+    help
+        External RF front-end module (PA + LNA + antenna switch) between the
+        radio and the antenna, e.g. the Heltec V4's GC1109 (board rev <= 4.2)
+        or KCT8103L (rev 4.3). EN is the FEM chip-enable and doubles as the
+        boot-time detect sense (the KCT8103L board design pulls it up); the
+        two TXSEL values name the direction pin of each candidate FEM, and
+        detection picks which one is driven. -1 on EN = no FEM: user-facing
+        TX power then caps at the bare chip's 22 dBm instead of 27. See
+        lora_fem.h.
+config LORA0_FEM_EN_PIN
+    int "Radio 0 — FEM chip-enable / detect GPIO (-1 = no FEM)"
+    default -1
+    depends on LORA_COUNT > 0
+config LORA0_FEM_TXSEL_A_PIN
+    int "Radio 0 — FEM TX-select GPIO, GC1109-style part (-1 if none)"
+    default -1
+    depends on LORA_COUNT > 0
+config LORA0_FEM_TXSEL_B_PIN
+    int "Radio 0 — FEM TX-select GPIO, KCT8103L-style part (-1 if none)"
+    default -1
+    depends on LORA_COUNT > 0
 choice
     prompt "Radio 0 — chip"
     default LORA0_RADIO_SX1262
@@ -190,6 +225,22 @@ config LORA1_RFSW_TX_PIN
     int "Radio 1 — RF-switch TX-enable GPIO (-1 if none)"
     default -1
     depends on LORA_COUNT > 1
+config LORA1_FEM_PWR_PIN
+    int "Radio 1 — FEM rail-enable GPIO (-1 if none)"
+    default -1
+    depends on LORA_COUNT > 1
+config LORA1_FEM_EN_PIN
+    int "Radio 1 — FEM chip-enable / detect GPIO (-1 = no FEM)"
+    default -1
+    depends on LORA_COUNT > 1
+config LORA1_FEM_TXSEL_A_PIN
+    int "Radio 1 — FEM TX-select GPIO, GC1109-style part (-1 if none)"
+    default -1
+    depends on LORA_COUNT > 1
+config LORA1_FEM_TXSEL_B_PIN
+    int "Radio 1 — FEM TX-select GPIO, KCT8103L-style part (-1 if none)"
+    default -1
+    depends on LORA_COUNT > 1
 choice
     prompt "Radio 1 — chip"
     default LORA1_RADIO_SX1262
@@ -290,6 +341,22 @@ config LORA2_RFSW_TX_PIN
     int "Radio 2 — RF-switch TX-enable GPIO (-1 if none)"
     default -1
     depends on LORA_COUNT > 2
+config LORA2_FEM_PWR_PIN
+    int "Radio 2 — FEM rail-enable GPIO (-1 if none)"
+    default -1
+    depends on LORA_COUNT > 2
+config LORA2_FEM_EN_PIN
+    int "Radio 2 — FEM chip-enable / detect GPIO (-1 = no FEM)"
+    default -1
+    depends on LORA_COUNT > 2
+config LORA2_FEM_TXSEL_A_PIN
+    int "Radio 2 — FEM TX-select GPIO, GC1109-style part (-1 if none)"
+    default -1
+    depends on LORA_COUNT > 2
+config LORA2_FEM_TXSEL_B_PIN
+    int "Radio 2 — FEM TX-select GPIO, KCT8103L-style part (-1 if none)"
+    default -1
+    depends on LORA_COUNT > 2
 choice
     prompt "Radio 2 — chip"
     default LORA2_RADIO_SX1262
@@ -388,6 +455,22 @@ config LORA3_RFSW_RX_PIN
         switch or the chip drives it internally (e.g. SX126x DIO2 above).
 config LORA3_RFSW_TX_PIN
     int "Radio 3 — RF-switch TX-enable GPIO (-1 if none)"
+    default -1
+    depends on LORA_COUNT > 3
+config LORA3_FEM_PWR_PIN
+    int "Radio 3 — FEM rail-enable GPIO (-1 if none)"
+    default -1
+    depends on LORA_COUNT > 3
+config LORA3_FEM_EN_PIN
+    int "Radio 3 — FEM chip-enable / detect GPIO (-1 = no FEM)"
+    default -1
+    depends on LORA_COUNT > 3
+config LORA3_FEM_TXSEL_A_PIN
+    int "Radio 3 — FEM TX-select GPIO, GC1109-style part (-1 if none)"
+    default -1
+    depends on LORA_COUNT > 3
+config LORA3_FEM_TXSEL_B_PIN
+    int "Radio 3 — FEM TX-select GPIO, KCT8103L-style part (-1 if none)"
     default -1
     depends on LORA_COUNT > 3
 choice

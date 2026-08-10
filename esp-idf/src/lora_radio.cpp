@@ -4,6 +4,7 @@
  * Knows nothing of Reticulum or SUPE.
  */
 #include "lora_priv.h"
+#include "lora_fem.h"
 
 #if defined(CONFIG_LORA0_CS_PIN)
 
@@ -88,23 +89,38 @@ static int16_t lr11x0Begin(LoraRadio* r, float freq, float bw, uint8_t sf, uint8
     return st;
 }
 
-/* begin() the radio with the common LoRa parameters. Each family's begin() has
- * a different signature: SX126x carries TCXO + regulator; SX127x a LNA-gain arm
- * (0 = AGC) and no TCXO; SX128x is 2.4 GHz and bare; LR11x0 sets freq/power
- * separately (lr11x0Begin); LR2021 takes everything including TCXO. We cast to
- * the concrete class (the pointer really is that class) so dispatch is correct
- * regardless of where each begin() sits in RadioLib's hierarchy. SX126x also
- * applies DIO2-as-RF-switch when the slot asks for it, and the LNA boosted-RX-gain
- * option (r->rxBoostedGain): ~+3 dB sensitivity for ~0.4 mA more RX current. */
-int16_t radioBegin(LoraRadio* r, float freq, float bw, uint8_t sf, uint8_t cr,
-                          uint8_t sync, int8_t power, uint16_t preamble, float tcxoV) {
+/* The PA over-current trip, in mA. RadioLib's SX126x::begin() sets this to 60 mA
+ * for every part and setOutputPower() then reads the register and writes it back
+ * unchanged, so nothing else ever raises it — an SX1262 asked for +22 dBm draws
+ * about 118 mA and trips a limit left at 60. The datasheet's own post-SetPaConfig
+ * defaults are the right values: 140 mA for the parts that reach +22 dBm, 60 mA
+ * for the SX1261, which tops out at +15 dBm and must not be given a ceiling its
+ * PA cannot survive. */
+float radioOcpMilliamps(LoraChip c) {
+    return c == CHIP_SX1261 ? 60.0f : 140.0f;
+}
+
+/* Undocumented SX1262 register bit that Semtech and Heltec both recommend for RX
+ * sensitivity; set bit 0 of 0x8B5. Applied through the Module rather than the
+ * chip class because SX126x::writeRegister is protected. Re-applied after every
+ * recalibration — CALIBRATE_ALL clears it (see radioAgcReset). */
+#define LORA_SX126X_RX_SENS_REG   0x8B5
+
+static void sx126xRxSensPatch(LoraRadio* r) {
+    if (r->mod->SPIsetRegValue(LORA_SX126X_RX_SENS_REG, 0x01, 0, 0) != RADIOLIB_ERR_NONE)
+        warn("lora/%d SX126x RX-sensitivity register patch failed", r->idx);
+}
+
+/* The family's begin(), with nothing applied after it. Split out of radioBegin so
+ * the TCXO fallback can run the whole call again with a different argument. */
+static int16_t radioBeginOnce(LoraRadio* r, float freq, float bw, uint8_t sf, uint8_t cr,
+                              uint8_t sync, int8_t power, uint16_t preamble, float tcxoV) {
     PhysicalLayer* p = r->radio;
-    int16_t st = RADIOLIB_ERR_UNKNOWN;
     switch (r->slot->chip) {
-        case CHIP_SX1261: st = static_cast<SX1261*>(p)->begin(freq, bw, sf, cr, sync, power, preamble, tcxoV, false); break;
-        case CHIP_SX1262: st = static_cast<SX1262*>(p)->begin(freq, bw, sf, cr, sync, power, preamble, tcxoV, false); break;
-        case CHIP_SX1268: st = static_cast<SX1268*>(p)->begin(freq, bw, sf, cr, sync, power, preamble, tcxoV, false); break;
-        case CHIP_LLCC68: st = static_cast<LLCC68*>(p)->begin(freq, bw, sf, cr, sync, power, preamble, tcxoV, false); break;
+        case CHIP_SX1261: return static_cast<SX1261*>(p)->begin(freq, bw, sf, cr, sync, power, preamble, tcxoV, false);
+        case CHIP_SX1262: return static_cast<SX1262*>(p)->begin(freq, bw, sf, cr, sync, power, preamble, tcxoV, false);
+        case CHIP_SX1268: return static_cast<SX1268*>(p)->begin(freq, bw, sf, cr, sync, power, preamble, tcxoV, false);
+        case CHIP_LLCC68: return static_cast<LLCC68*>(p)->begin(freq, bw, sf, cr, sync, power, preamble, tcxoV, false);
         case CHIP_SX1272: return static_cast<SX1272*>(p)->begin(freq, bw, sf, cr, sync, power, preamble, 0);
         case CHIP_SX1276: return static_cast<SX1276*>(p)->begin(freq, bw, sf, cr, sync, power, preamble, 0);
         case CHIP_SX1277: return static_cast<SX1277*>(p)->begin(freq, bw, sf, cr, sync, power, preamble, 0);
@@ -116,14 +132,311 @@ int16_t radioBegin(LoraRadio* r, float freq, float bw, uint8_t sf, uint8_t cr,
         case CHIP_LR1120:
         case CHIP_LR1121: return lr11x0Begin(r, freq, bw, sf, cr, sync, power, preamble, tcxoV);
         case CHIP_LR2021: return static_cast<LR2021*>(p)->begin(freq, bw, sf, cr, sync, power, preamble, tcxoV);
-        default:          return RADIOLIB_ERR_UNKNOWN;
     }
-    /* SX126x only: DIO2 drives the antenna RF switch, and the LNA RX gain mode. */
-    if (st == RADIOLIB_ERR_NONE && r->slot->dio2_rf_switch)
-        st = static_cast<SX126x*>(p)->setDio2AsRfSwitch(true);
-    if (st == RADIOLIB_ERR_NONE && chipFamily(r->slot->chip) == FAM_SX126X)
-        st = static_cast<SX126x*>(p)->setRxBoostedGainMode(r->rxBoostedGain);
+    return RADIOLIB_ERR_UNKNOWN;
+}
+
+/* begin() the radio with the common LoRa parameters. Each family's begin() has
+ * a different signature: SX126x carries TCXO + regulator; SX127x a LNA-gain arm
+ * (0 = AGC) and no TCXO; SX128x is 2.4 GHz and bare; LR11x0 sets freq/power
+ * separately (lr11x0Begin); LR2021 takes everything including TCXO. We cast to
+ * the concrete class (the pointer really is that class) so dispatch is correct
+ * regardless of where each begin() sits in RadioLib's hierarchy.
+ *
+ * A begin() that fails on the SPI command itself, with a TCXO voltage
+ * configured, is the classic symptom of a board whose reference is a plain
+ * crystal (or whose DIO3 does not feed the oscillator): the chip is asked to
+ * wait for a TCXO that never becomes ready and answers with a command error. The
+ * retry on a bare crystal turns that from "radio absent" into a working radio and
+ * a warning naming the wrong setting.
+ *
+ * SX126x parts then take the extras their family needs: DIO2 as the antenna RF
+ * switch when the slot asks for it, the LNA boosted-RX-gain option
+ * (r->rxBoostedGain, ~+3 dB sensitivity for ~0.4 mA more RX current), the PA
+ * over-current trip, and the RX-sensitivity register patch. */
+int16_t radioBegin(LoraRadio* r, float freq, float bw, uint8_t sf, uint8_t cr,
+                          uint8_t sync, int8_t power, uint16_t preamble, float tcxoV) {
+    PhysicalLayer* p = r->radio;
+    /* Every begin() rewrites the Rx/Tx fallback register from the driver's own
+     * flag, so clear the pair before it runs rather than after: a radio comes up
+     * idle, with the reference free to stop between frames, and a chain arms it
+     * again (radioHoldOsc) when one starts. */
+    if (chipFamily(r->slot->chip) == FAM_SX126X)
+        static_cast<SX126x*>(p)->standbyXOSC = false;
+    r->oscHeld = false;
+    power = femChipDbm(r, power);   /* antenna dBm → chip drive (identity, no FEM) */
+    int16_t st = radioBeginOnce(r, freq, bw, sf, cr, sync, power, preamble, tcxoV);
+    if (tcxoV > 0.0f &&
+        (st == RADIOLIB_ERR_SPI_CMD_TIMEOUT || st == RADIOLIB_ERR_SPI_CMD_INVALID ||
+         st == RADIOLIB_ERR_SPI_CMD_FAILED)) {
+        int16_t xtal = radioBeginOnce(r, freq, bw, sf, cr, sync, power, preamble, 0.0f);
+        if (xtal == RADIOLIB_ERR_NONE) {
+            warn("lora/%d %s answered only with the TCXO off — running on the crystal; "
+                 "CONFIG_LORA%d_TCXO_MV=%d does not match this board",
+                 r->idx, chipName(r->slot->chip), r->idx, r->slot->tcxo_mv);
+            st = xtal;
+        }
+    }
+    if (st != RADIOLIB_ERR_NONE) return st;
+    if (chipFamily(r->slot->chip) != FAM_SX126X) return st;
+
+    SX126x* sx = static_cast<SX126x*>(p);
+    if (r->slot->dio2_rf_switch) st = sx->setDio2AsRfSwitch(true);
+    if (st == RADIOLIB_ERR_NONE) st = sx->setRxBoostedGainMode(r->rxBoostedGain);
+    if (st == RADIOLIB_ERR_NONE) st = sx->setCurrentLimit(radioOcpMilliamps(r->slot->chip));
+    if (st == RADIOLIB_ERR_NONE) sx126xRxSensPatch(r);
     return st;
+}
+
+/* Hold the oscillator through the gaps inside a chain of frames.
+ *
+ * Leaving a transmit or a reception drops the part to STDBY_RC, which powers the
+ * TCXO down; the next SetTx then waits out the whole TCXO startup the driver
+ * programmed — RadioLib asks for 5 ms — before a carrier appears. That wait is
+ * the bulk of the dead air between the two halves of a split packet and between
+ * the frames of a train, gaps where the next frame is already known and nothing
+ * else may use the medium anyway. Held, the part falls back to STDBY_XOSC
+ * instead, the reference never stops, and the next frame starts as soon as the
+ * PLL locks.
+ *
+ * The price is the reference's standing current — a couple of hundred µA of chip
+ * plus whatever the board's TCXO draws, which is the larger term by an order of
+ * magnitude — so it is armed for the length of a chain and dropped the moment
+ * the radio goes back to plain listening. Never held while idle.
+ *
+ * Two settings, one state: the flag governs the standby RadioLib takes on our
+ * behalf, the register governs where the part lands by itself when a frame ends.
+ * Both have to say the same thing or the wait is only half avoided.
+ *
+ * SX126x only — it is the family whose fallback mode RadioLib exposes. Elsewhere
+ * this is a no-op and the gaps stand as they are. */
+void radioHoldOsc(LoraRadio* r, bool hold) {
+    if (chipFamily(r->slot->chip) != FAM_SX126X) return;
+    if (r->oscHeld == hold) return;
+    uint8_t mode = hold ? RADIOLIB_SX126X_RX_TX_FALLBACK_MODE_STDBY_XOSC
+                        : RADIOLIB_SX126X_RX_TX_FALLBACK_MODE_STDBY_RC;
+    int16_t st = r->mod->SPIwriteStream(RADIOLIB_SX126X_CMD_SET_RX_TX_FALLBACK_MODE,
+                                        &mode, 1);
+    if (st != RADIOLIB_ERR_NONE) {
+        /* Leave the pair at RC: a fallback the chip did not take, paired with a
+         * driver that thinks it did, would be a standby mismatch on every frame
+         * rather than a slow one. */
+        static_cast<SX126x*>(r->radio)->standbyXOSC = false;
+        r->oscHeld = false;
+        warn("lora/%d oscillator hold %s refused: %s (%d)", r->idx,
+             hold ? "on" : "off", rlErrName(st), (int)st);
+        return;
+    }
+    static_cast<SX126x*>(r->radio)->standbyXOSC = hold;
+    r->oscHeld = hold;
+}
+
+/* ─────────────── IRQ flags ─────────────── */
+
+/* Cache this chip's raw IRQ bits for the flags the task loop tests. getIrqFlags()
+ * returns the chip's own register, not RadioLib's radio-agnostic numbering, so a
+ * unified bit position tested against it is only right where the two happen to
+ * coincide. getIrqMapped() is the translation, and it reads a table the chip
+ * class fills in its constructor — so this costs nothing at run time and makes
+ * every family's flags read correctly. */
+void radioIrqCache(LoraRadio* r) {
+    PhysicalLayer* p = r->radio;
+    r->irqTxDone   = p->getIrqMapped(1UL << RADIOLIB_IRQ_TX_DONE);
+    r->irqRxDone   = p->getIrqMapped(1UL << RADIOLIB_IRQ_RX_DONE);
+    r->irqPreamble = p->getIrqMapped(1UL << RADIOLIB_IRQ_PREAMBLE_DETECTED);
+    r->irqHdrValid = p->getIrqMapped(1UL << RADIOLIB_IRQ_HEADER_VALID);
+    r->irqHdrErr   = p->getIrqMapped(1UL << RADIOLIB_IRQ_HEADER_ERR);
+}
+
+/* Enter continuous RX. Every path back to listening goes through here, so the
+ * IRQ flag set is stated in exactly one place.
+ *
+ * PREAMBLE_DETECTED is added to the *flags* — the chip's IRQ register — and not
+ * to the DIO mask, so the modem records that it heard something without raising
+ * DIO1 for it. The line keeps its single meaning (a frame completed) and an idle
+ * radio still holds no wake; radioRxInProgress reads the record when it wants it.
+ * Families whose timeout constant differs take their own arm; SX127x has no
+ * preamble-detect IRQ to latch, so it keeps the plain call. */
+int16_t radioStartRx(LoraRadio* r) {
+    PhysicalLayer* p = r->radio;
+    switch (chipFamily(r->slot->chip)) {
+        case FAM_SX126X:
+            return p->startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF, LORA_RX_IRQ_FLAGS,
+                                   RADIOLIB_IRQ_RX_DEFAULT_MASK, 0);
+        case FAM_LR11X0:
+            return p->startReceive(RADIOLIB_LR11X0_RX_TIMEOUT_INF, LORA_RX_IRQ_FLAGS,
+                                   RADIOLIB_IRQ_RX_DEFAULT_MASK, 0);
+        case FAM_LR2021:
+            return p->startReceive(RADIOLIB_LR2021_RX_TIMEOUT_INF, LORA_RX_IRQ_FLAGS,
+                                   RADIOLIB_IRQ_RX_DEFAULT_MASK, 0);
+        case FAM_SX128X:
+            return p->startReceive(RADIOLIB_SX128X_RX_TIMEOUT_INF, LORA_RX_IRQ_FLAGS,
+                                   RADIOLIB_IRQ_RX_DEFAULT_MASK, 0);
+        case FAM_SX127X:
+            break;
+    }
+    return p->startReceive();
+}
+
+/* Is a reception under way *right now*, as the modem sees it?
+ *
+ * Carrier sense answers a different question and answers it worse: LoRa
+ * demodulates below the noise floor, so a frame being received perfectly may
+ * never rise above `noiseFloor + CSMA_RSSI_MARGIN_DB`, and the sense is a point
+ * sample once a slot rather than a continuous watch. The demodulator has the
+ * evidence the sense lacks — it has locked onto a preamble, or validated a
+ * header — and it costs one register read to ask.
+ *
+ * Both bits latch until something clears them, so both need a deadline or a
+ * preamble that never became a packet would block transmit forever: a preamble
+ * has until the header should have arrived, a validated header until the longest
+ * frame this modem could still be receiving would have finished. Past that the
+ * bit is stale, and clearing it is what lets the next real one be believed.
+ *
+ * Chips without a preamble-detect IRQ report nothing rather than guess; there,
+ * carrier sense and the post-hoc csmaMediumHeld correction stand alone. */
+bool radioRxInProgress(LoraRadio* r) {
+    if (!r->irqPreamble && !r->irqHdrValid) return false;
+    if (r->txActive) return false;      /* the flags belong to the transmit in flight */
+
+    uint32_t flags = r->radio->getIrqFlags();
+    TickType_t now = xTaskGetTickCount();
+    if (now == 0) now = 1;              /* 0 is the "nothing seen" sentinel */
+
+    auto forget = [&](uint32_t clear) {
+        if (clear) r->radio->clearIrqFlags(clear);
+        r->rxActiveStart = 0;
+        r->rxHeaderSeen  = false;
+        return false;
+    };
+
+    /* A header that failed its check ends the reception then and there. */
+    if (flags & r->irqHdrErr)
+        return forget(r->irqPreamble | r->irqHdrValid | r->irqHdrErr);
+
+    if (flags & r->irqHdrValid) {
+        if (!r->rxHeaderSeen) { r->rxHeaderSeen = true; r->rxActiveStart = now; }
+        if ((TickType_t)(now - r->rxActiveStart) > r->rxPacketTicks)
+            return forget(r->irqPreamble | r->irqHdrValid);
+        return true;
+    }
+    /* The header bit went away without an RX_DONE — whatever the modem had, it
+     * no longer has. */
+    if (r->rxHeaderSeen) return forget(0);
+
+    if (flags & r->irqPreamble) {
+        if (r->rxActiveStart == 0) r->rxActiveStart = now;
+        if ((TickType_t)(now - r->rxActiveStart) > r->rxPreambleTicks)
+            return forget(r->irqPreamble);
+        return true;
+    }
+    r->rxActiveStart = 0;
+    return false;
+}
+
+/* Is the chip's IRQ line asserted? A GPIO read, no SPI: the backstop for a
+ * DIO1 whose interrupt was left disabled, which would otherwise leave the task
+ * asleep beside a radio holding a completed frame. */
+bool radioIrqLinePending(const LoraRadio* r) {
+    return r->slot->dio1 >= 0 && gpio_get_level((gpio_num_t)r->slot->dio1) != 0;
+}
+
+/* Clear every IRQ the chip has raised. The recovery arm for a raised line with
+ * nothing behind it — see serviceRadio. */
+void radioIrqClearAll(LoraRadio* r) {
+    r->radio->clearIrqFlags(0xFFFFFFFFu);
+}
+
+/* Return the receiver to a known-good analog state.
+ *
+ * An SX126x that has heard a strong signal can leave its automatic gain control
+ * latched at that setting, and a receiver stuck at low gain hears nothing
+ * afterwards. Neither standby nor a fresh startReceive resets it: only powering
+ * the analog front end down does, which is what the warm sleep here is for.
+ * Coming back up in RC standby is the state the datasheet requires for
+ * calibration; CALIBRATE_ALL then re-runs every block, and because its image
+ * calibration defaults to a band that is probably not ours, calibrateImage
+ * follows with the frequency actually in use.
+ *
+ * Calibration resets settings that were applied on top of begin(), so they are
+ * re-applied here — including the RX-sensitivity register patch, whose bit
+ * CALIBRATE_ALL clears. Leaving that out would make this beat *cost* sensitivity
+ * a minute after boot, which is the opposite of the point.
+ *
+ * The caller establishes that the radio is idle; this is a few milliseconds of
+ * chip work, on the order of the LoRaMon channel sweep's excursion. */
+bool radioAgcReset(LoraRadio* r) {
+    if (chipFamily(r->slot->chip) != FAM_SX126X) return false;
+    SX126x* sx = static_cast<SX126x*>(r->radio);
+
+    /* Each step is named so a failure says which one, and they fail in
+     * distinguishable ways: a chip that slept through its wake-up pulse times
+     * out on BUSY at `wake`, a calibration that will not run reports at
+     * `calibrate`, and a frequency this part cannot image-calibrate reports at
+     * `image`. Without the name every one of them reads as the same warning. */
+    const char* step = "sleep";
+    int16_t st = sx->sleep(/*retainConfig=*/true);
+    if (st == RADIOLIB_ERR_NONE) {
+        step = "wake";
+        st = sx->standby(RADIOLIB_SX126X_STANDBY_RC, /*wakeup=*/true);
+    }
+    if (st == RADIOLIB_ERR_NONE) {
+        step = "calibrate";
+        st = sx->calibrate(RADIOLIB_SX126X_CALIBRATE_ALL);
+    }
+    if (st == RADIOLIB_ERR_NONE) {
+        step = "image";
+        st = sx->calibrateImage((float)supeChanFreq(r, r->chNow) / 1.0e6f);
+    }
+    if (st != RADIOLIB_ERR_NONE) {
+        warn("lora/%d AGC reset failed at %s: %s (%d) — recovering",
+             r->idx, step, rlErrName(st), (int)st);
+        /* The chip may still be asleep, and a sleeping SX126x answers nothing:
+         * every command waits out BUSY and fails. Only an NSS pulse brings it
+         * back, which is what the wake-up standby is, and it is harmless on a
+         * part that is already awake — so recovery starts there rather than
+         * going straight for RX and stalling the task a second time. */
+        sx->standby(RADIOLIB_SX126X_STANDBY_RC, /*wakeup=*/true);
+        radioStartRx(r);                /* deaf beats stranded in standby */
+        return false;
+    }
+    if (r->slot->dio2_rf_switch) sx->setDio2AsRfSwitch(true);
+    sx->setRxBoostedGainMode(r->rxBoostedGain);
+    sx->setCurrentLimit(radioOcpMilliamps(r->slot->chip));
+    sx126xRxSensPatch(r);
+    /* The front end that measured the old floor no longer exists. */
+    csmaNoiseFloorReset(r);
+    radioStartRx(r);
+    return true;
+}
+
+/* The recalibration beat, driven from the task loop like every other poll.
+ *
+ * It takes the radio for a few milliseconds, so it waits for a radio that is
+ * doing nothing else: no frame in flight either way, no channel access under
+ * way, nothing queued to send, and on the hailing channel rather than partway
+ * through a detour. A beat that arrives at a busy radio is deferred rather than
+ * dropped, and deferred by a whole second — leaving the deadline in the past
+ * would turn nextDeadline() into a zero-length sleep and spin the task for as
+ * long as the radio stayed busy. */
+void agcResetPoll(LoraRadio* r) {
+    if (!r->agcResetMs || !r->running || !r->enabled) return;
+    TickType_t now = xTaskGetTickCount();
+    if ((int32_t)(now - r->agcNext) < 0) return;
+    if (r->txActive || r->splitPending || supeHoldsRadio(r) ||
+        r->chNow != LORA_CH_HAIL || r->csmaPhase != CSMA_IDLE ||
+        r->mtxPhase != MTXP_OFF || r->annReplay ||
+        loraqDepth(&r->q) > 0 || radioRxInProgress(r)) {
+        r->agcNext = now + pdMS_TO_TICKS(1000);
+        return;
+    }
+    /* The chip goes down and comes back up here, so take SUPE's lock for the
+     * same reason radioStop does: a transaction step runs on the esp_timer task
+     * and would otherwise drive a radio that is mid-sleep. */
+    supeLock(r);
+    radioAgcReset(r);
+    supeUnlock(r);
+    r->agcNext = xTaskGetTickCount() + pdMS_TO_TICKS(r->agcResetMs);
 }
 
 /* ─────────────── helpers ─────────────── */

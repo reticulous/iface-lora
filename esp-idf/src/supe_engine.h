@@ -68,6 +68,10 @@ struct SupePeerNote {
     uint8_t  ev;
     uint8_t  reason;         /* REFUSED: the SupeRefusal nibble */
     uint32_t backoffMs;      /* REFUSED/STRIKE: how long not to ask */
+    uint32_t agoMs;          /* STRIKE: how long ago the request this answers for
+                              * went out. The wait paces REQUESTS, so it runs from
+                              * the request; the deadline spent waiting for a GRANT
+                              * that never came is already time spent not asking. */
     /* PAIR / TRAIN_OK: the measurement */
     SupeCfg  cfg;            /* the configuration the level was read at */
     int16_t  rssiDbm;
@@ -109,6 +113,11 @@ struct SupeHost {
     bool     (*stage_packet)(void* ctx, const LoraPkt* p, int8_t dbm);
     bool     (*fire_staged)(void* ctx);
     void     (*rx)(void* ctx);                         /* (re)arm the receiver */
+    /* Is a frame arriving at this instant — a preamble or a valid header the
+     * modem is still working on? The one question the engine cannot answer for
+     * itself, and the difference between "nobody answered" and "the answer has
+     * not finished arriving". */
+    bool     (*rx_busy)(void* ctx);
     /* stores */
     bool     (*peer_get)(void* ctx, const uint8_t tag[SUPE_TAG_LEN], SupePeerView* out);
     void     (*peer_note)(void* ctx, const uint8_t tag[SUPE_TAG_LEN], const SupePeerNote* n);
@@ -197,10 +206,22 @@ struct SupeXact {
     uint32_t beganMs;
     uint32_t deadlineMs;           /* what the armed timer means, per phase */
     bool     retuned;
-    /* requester */
-    uint16_t peerId;
+    /* The node at the other end, as the ANSWERING side knows it: resolved from
+     * the START's sender identity, since the tag it named is one of ours and
+     * says nothing about who asked. This is what makes a link dialled to us
+     * attributable — the cargo arriving under it provably came from this node. */
+    uint16_t fromPeer;
     uint8_t  peerFam;              /* the peer's family, for resolving the GRANT */
     uint8_t  attempt;              /* the absence ladder's rung, 1.. */
+    /* The START exactly as it went out. A retransmission has to be byte-identical
+     * or its hash changes, and the hash is what a GRANT names — so the frame is
+     * kept rather than rebuilt from a queue that may have moved on. */
+    uint8_t  startFrame[SUPE_START2_ID_LEN];
+    uint8_t  startLen;
+    uint8_t  resends;              /* retransmissions spent inside this request */
+    bool     grantOnAir;           /* stage two: something was arriving when the
+                                    * GRANT was due to begin, so it is being
+                                    * waited out rather than declared missing */
     int8_t   startTxp;
     int16_t  grantRssi;            /* our reading of the GRANT */
     int8_t   grantSnrQ;
@@ -227,6 +248,13 @@ struct SupeEngine {
     /* the interface's own facts, refreshed by supeEngConfig */
     uint8_t  regime;               /* the frequency-agility key's number */
     uint8_t  ownFam;
+    /* Who we are, for the START's sender_ident: one of this node's identities,
+     * truncated. The answering side has no other way to name the requester —
+     * the tag a START carries is one of ITS addresses. Set by the platform,
+     * which is where the identity list lives; until it is, STARTs go out in
+     * the short form as before. */
+    uint8_t  ownIdent[SUPE_TAG_LEN];
+    bool     haveOwnIdent;
     uint8_t  ownTop;               /* our ceiling nibble */
     int8_t   txpMax;               /* configured tx_power (the hailing cap) */
     bool     adaptive;
@@ -242,12 +270,6 @@ struct SupeEngine {
                                     * node that politely held enters the random
                                     * draw on the same footing as one that never
                                     * heard the hint (SUPE.md §6) */
-    uint32_t holdProofMs;          /* how long a queue of nothing but proofs
-                                    * bides its time before taking the channel
-                                    * on its own — a proof exists only after
-                                    * the train that earned it, so its best
-                                    * ride is the NEXT transaction in either
-                                    * direction. 0 disables the hold. */
     bool     expired;              /* the dialect is past its date */
 
     SupeTag       tags[SUPE_TAGS_MAX];
@@ -261,6 +283,8 @@ struct SupeEngine {
     bool     offerArmed;           /* verdict said OFFER; the launch waits for the
                                     * pre-offer jitter, then the channel */
     uint32_t offerJitterUntilMs;
+    bool     resendArmed;          /* a START is waiting for the medium to go back
+                                    * out; the backoff is its decorrelation too */
 
     /* what `lora <n> supe` prints */
     uint32_t rxFrames, rxDiscard, rxForeign;
@@ -284,8 +308,16 @@ struct SupeEngine {
 };
 
 /* The classifier's verdicts, decided on the head of the queue before anything
- * contends for the medium. */
-enum : uint8_t { SUPE_V_PLAIN = 0, SUPE_V_HOLD, SUPE_V_DROP, SUPE_V_OFFER };
+ * contends for the medium.
+ *
+ * HOLD and WAIT both leave the packet queued and differ in what the medium is
+ * doing. HOLD means somebody else's GRANT reserved it: sensing it is pointless
+ * and contending through it is what the reservation exists to prevent. WAIT is
+ * our own timing — the absence ladder's pause between requests, a proof biding
+ * its time — and reserves nothing, so channel access may run underneath it and
+ * be ready the moment the wait lifts. */
+enum : uint8_t { SUPE_V_PLAIN = 0, SUPE_V_HOLD, SUPE_V_DROP, SUPE_V_OFFER,
+                 SUPE_V_WAIT };
 
 /* The one deliberately-unspecified decision (SUPE.md §18): whether to detour.
  * One call site (the classifier); inputs are the peer, the queue and the
@@ -306,6 +338,30 @@ void supeEngConfig(SupeEngine* e, uint8_t regime, uint8_t ownFam, uint8_t ownTop
 void supeEngReset(SupeEngine* e);         /* the radio went away underneath */
 void supeEngAbort(SupeEngine* e, const char* why);   /* the watchdog's exit */
 bool supeEngBusy(const SupeEngine* e);    /* a transaction owns the radio */
+/* A transaction is under way — as opposed to an offer merely armed. What a
+ * transaction will carry is already on the air in a START's load and a GRANT's
+ * duration, so the queue behind it must stand still; before that it may grow. */
+bool supeEngXactLive(const SupeEngine* e);
+/* The node whose cargo is arriving right now, or LORAQ_PEER_NONE outside a
+ * transaction we are answering. What a packet delivered under it may be
+ * attributed to — the only moment an inbound packet has a provable sender. */
+uint16_t supeEngCargoPeer(const SupeEngine* e);
+/* Name this node on the STARTs it sends. Idempotent; the platform calls it as
+ * soon as it holds an identity to give. */
+void supeEngSetIdent(SupeEngine* e, const uint8_t id[SUPE_TAG_LEN]);
+
+/* A START that went unanswered with the channel silent at the moment the answer
+ * was due: the request stands, so it is retransmitted rather than abandoned.
+ * The platform drives it because it owes the retransmission the same channel
+ * access the original had — the engine's own tx_frame fires immediately, which
+ * is right for a scheduled frame inside a transaction and wrong for this one.
+ *
+ *   supeEngResendDue   a retransmission is waiting for the medium
+ *   supeEngResend      the medium was granted: put it back on the air
+ *   supeEngResendDrop  the medium never came; fall through to the ladder */
+bool supeEngResendDue(const SupeEngine* e);
+void supeEngResend(SupeEngine* e);
+void supeEngResendDrop(SupeEngine* e);
 
 /* callbacks in — the whole surface (plan §5) */
 void supeEngOnRx(SupeEngine* e, const uint8_t* f, uint16_t len,

@@ -39,6 +39,15 @@ contributes:
 - **Listen-before-talk with an adaptive contention window** (§6, §6a) — RSSI
   carrier sense plus a backoff whose size is set by this radio's own recent
   airtime, reimplementing RNode firmware's CSMA parameters; `s.lora.<n>.appc`.
+- **The modem's own reception evidence** (§6b) — the latched preamble/header
+  IRQ bits read as a channel-busy verdict, which is the only way to see a frame
+  arriving below the noise floor, with staleness deadlines so a preamble that
+  became nothing cannot block transmit.
+- **SX126x hardware corrections** (§4, §4a) — the PA over-current trip RadioLib
+  leaves at 60 mA, the 0x8B5 RX-sensitivity register bit, a TCXO-off retry that
+  distinguishes a mis-set reference voltage from absent hardware, and the
+  periodic front-end recalibration that keeps a latched gain control from
+  deafening the receiver.
 - **IFAC plumbing** — reading `s.lora.<n>.ifac_netname` / `ifac_size` and the
   `secrets.lora.<n>.ifac_netkey` secret and handing them to `rnsd` in the
   `rnsd_iface_t` connect payload; `rnsd` does the actual access-code crypto.
@@ -134,6 +143,24 @@ the task to flush the coalesced values). The keys are seeded once at startup so 
 consumer sees a radio before any traffic. A running-but-unregistered radio holds
 a 1 Hz retry wake until registration takes.
 
+**An idle node holds almost no standing wake.** Every deadline `nextDeadline`
+computes exists only while its work does: the channel-RSSI beat only while a
+LoRaMon viewer is open (§18.3), SUPE's airtime verdict only while the window
+holds agile airtime (§19.6), proof expectations only while one is outstanding.
+With nothing pending the task blocks on `itsPoll(portMAX_DELAY)` and the SoC
+light-sleeps until DIO1 or an inbound message; with SUPE enabled a long-period
+wake is added by the announce beat (`SUPE.announce_interval`, default 30 min).
+This is a battery invariant, not an optimisation: a beat added to this task is a
+per-second CPU+SPI wake on every deployed node, so anything periodic must gate
+itself on whether its consumer exists.
+
+**The one exception, stated as one.** The front-end recalibration beat
+(`s.lora.<n>.agc_reset`, default 5 min, §4a) has no consumer to gate on, because
+the failure it prevents removes the evidence that would trigger it: a receiver
+whose gain has latched hears nothing, so no traffic arrives to wake anything. It
+is a standing wake by necessity, its period is a setting, and `0` turns it off.
+Nothing else may claim the same exemption without the same argument.
+
 ## 3. SPI bus + the RadioLib HAL
 
 `EspIdfHal : public RadioLibHal` is ~200 lines of stateless plumbing.
@@ -170,6 +197,41 @@ interpretation re-fires continuously while the line is asserted.
 and no logging from the ISR — all IRQ-status reads, FIFO drains, and re-arm
 (`startReceive`) happen task-side.
 
+**`delay()` rounds up, and must.** A FreeRTOS tick here is 10 ms, so
+`pdMS_TO_TICKS()` truncates anything shorter to zero and `vTaskDelay(0)` is a
+bare yield — the wait does not happen. RadioLib's millisecond delays are
+hardware timing, not politeness: the ~500 µs the SX126x needs to finish entering
+sleep before an NSS edge can wake it again, the reset pulse width, the TCXO
+settle. Truncated, the wake-up pulse after `SetSleep` lands while the part is
+still on its way down, the chip sleeps through it, BUSY stays high and the next
+command burns RadioLib's full 1 s BUSY timeout before returning
+`SPI_CMD_TIMEOUT`. Every caller is a bring-up, reset or sleep path asking for a
+*minimum*, so `EspIdfHal::delay` rounds up to whole ticks — overshooting is free
+there, and it keeps the wait a real sleep rather than a busy-wait.
+
+**The raised-line backstop.** Everything above depends on the task being told
+about a raised DIO1. The level trigger makes that robust — a line that goes high
+while the interrupt is disabled fires as soon as it is re-enabled, where an edge
+would have been lost — but it leaves one hole: a path that disables the interrupt
+and fails to re-enable it strands a completed frame behind a line nobody is
+watching, and the task then blocks on `portMAX_DELAY` beside a radio that will
+never speak again. So the line itself is checked, as a plain `gpio_get_level`
+with no SPI behind it (`radioIrqLinePending`): the per-radio pass services a radio
+whose line is asserted even without an ISR notification, and `nextDeadline()`
+returns 0 rather than sleeping while one is. That pair cannot spin, because
+`serviceRadio` either consumes the cause or — finding neither TxDone nor RxDone
+behind an asserted line — clears the chip's flags, re-enables the interrupt and
+re-arms RX, warning at most once per 10 s. A permanent wake source is the one
+outcome this must not have.
+
+**Chip IRQ bits are not RadioLib's.** `getIrqFlags()` returns the chip's own
+register. RadioLib's `RADIOLIB_IRQ_*` values are positions in a radio-agnostic
+enum, and the two coincide only where a family happens to lay its register out in
+the same order — which SX126x does and others do not. `radioIrqCache` translates
+the flags this loop tests once per bring-up, through `getIrqMapped()` (a table the
+chip class fills in its constructor, so no SPI), into `r->irq*`. Test against
+those, never against a bare `1 << RADIOLIB_IRQ_…`.
+
 ## 4. Chip dispatch (the X-macro)
 
 The whole runtime path is chip-agnostic: `getIrqFlags`, `setPacketReceivedAction`,
@@ -201,12 +263,78 @@ The RF switch is uniform and handled at the call site, not in dispatch:
 buys ~+3 dB sensitivity for ~0.4 mA more RX current (~4.2 → ~4.6 mA typ.), worth
 it for a receiver that idles in RX. The key is inert on non-SX126x families.
 
+**PA over-current trip (SX126x only).** RadioLib's `SX126x::begin()` writes a
+60 mA limit into the OCP register for every part, and its `setOutputPower()`
+reads that register and writes it back unchanged — so nothing in the library ever
+raises it. An SX1262 driving +22 dBm draws about 118 mA. `radioBegin` therefore
+sets the trip explicitly to the datasheet's own post-`SetPaConfig` value:
+**140 mA** for the parts that reach +22 dBm, **60 mA** for the SX1261, whose PA
+tops out at +15 dBm and must not be handed a ceiling it cannot survive
+(`radioOcpMilliamps`). Re-applied after every recalibration (§4a).
+
+**RX-sensitivity register patch (SX126x only).** Bit 0 of register **0x8B5**,
+undocumented and recommended by both Semtech and Heltec. Applied through
+`Module::SPIsetRegValue` rather than the chip class, because `SX126x::writeRegister`
+is protected. It must be re-applied after every `CALIBRATE_ALL`, which clears it
+— see §4a, where leaving it out would make the recalibration beat *cost*
+sensitivity rather than preserve it.
+
 **Presence probe.** `probeRadio` runs a bare `begin()` (safe defaults + the
 slot's TCXO voltage) at boot; `RADIOLIB_ERR_NONE` means the radio answered on
 SPI. It probes in the chip's **own band** — 2450 MHz/812.5 kHz for SX128x, else
 434 MHz/125 kHz — because a sub-GHz probe would make a 2.4 GHz part read as
 absent. The result feeds the boot log and the `lora` CLI; `radioStart`
 re-`begin()`s with the real config when the radio is enabled.
+
+**The TCXO fallback.** A `begin()` that fails with a SPI *command* error
+(`SPI_CMD_TIMEOUT` / `_INVALID` / `_FAILED`) while a TCXO voltage is configured is
+the signature of a board whose reference is a plain crystal, or whose DIO3 does
+not feed the oscillator: the chip waits for a TCXO that never reports ready and
+answers the next command with an error. `radioBegin` retries the whole call with
+the voltage at zero, and on success warns naming `CONFIG_LORAn_TCXO_MV`. Without
+it that board reads as **absent** — a wrong Kconfig value and missing hardware
+are indistinguishable in the boot log, and the wrong one is far more likely.
+
+## 4a. Analog front-end recalibration (`s.lora.<n>.agc_reset`)
+
+An SX126x that has heard a strong signal can leave its automatic gain control
+latched at that setting, and a receiver stuck at low gain hears nothing
+afterwards. Neither `standby()` nor a fresh `startReceive()` clears it; only
+powering the analog front end down does. `radioAgcReset` does exactly that and
+puts the chip back:
+
+```
+sleep(retainConfig=true)          warm sleep — the analog front end loses power
+standby(STANDBY_RC, wakeup=true)  the state calibration is specified from
+calibrate(CALIBRATE_ALL)          every block: ADC, PLL, image, RC oscillators
+calibrateImage(current channel)   CALIBRATE_ALL's image calibration defaults to
+                                  a band that is probably not ours
+re-apply DIO2-RF-switch, boosted gain, OCP, the 0x8B5 patch
+csmaNoiseFloorReset               the front end that measured the floor is gone
+radioStartRx
+```
+
+The re-apply is not belt and braces: calibration resets settings layered on top
+of `begin()`, and the 0x8B5 bit in particular, so a beat that skipped it would
+strip the RX sensitivity it exists to protect.
+
+**Scheduling is the interesting part.** This is the one periodic wake the radio
+task holds without a consumer asking for it (§2 makes that a battery invariant),
+and it is here on purpose: the failure is silent and self-sealing. A deaf
+receiver hears no traffic, so nothing wakes the task, so no event-driven repair
+can ever fire. Only a timer reaches it. The period is a setting — `agc_reset`,
+in seconds, default **300**, `0` = off — and the default is minutes rather than
+the ~60 s other LoRa firmwares use because the trade is explicit: a wake plus a
+few ms of chip work every five minutes, against a bound of five minutes on how
+long a latched receiver can stay deaf.
+
+`agcResetPoll` runs from the task loop and takes the radio only when it is
+genuinely idle: nothing in flight either way, no channel access under way,
+nothing queued, on the hailing channel rather than mid-detour, and no reception
+in progress (§6b). A beat that arrives at a busy radio is **deferred by a full
+second**, never left past-due — an overdue deadline makes `nextDeadline()` return
+zero and spins the task for as long as the radio stays busy, which is the same
+trap `rssiSamplePoll` documents.
 
 ## 5. On-air split framing
 
@@ -250,6 +378,36 @@ length; `tx_bytes` counts the RNS payload, `tx_frames` counts each LoRa frame.
 An aborted transmit (the TxDone watchdog) still credits its airtime — the
 regulation counts emissions, not successes (SUPE.md §14.4).
 
+**The oscillator across a chain of frames (`radioHoldOsc`).** A frame that ends
+drops the part to `STDBY_RC`, which powers the TCXO down, so the next `SetTx`
+waits out the whole programmed TCXO startup (RadioLib asks for 5 ms) before a
+carrier appears — the bulk of the dead air between the two halves of a split and
+between the frames of a train. Where the next frame is already spoken for and no
+one else may use the medium anyway, that wait buys nothing, so `startTxFrame`
+puts the part's Rx/Tx fallback at `STDBY_XOSC` for the length of the chain —
+another frame of this packet, or any frame inside a live transaction — and
+`rearmRx` drops it back the moment the radio returns to plain listening. The
+driver's `standbyXOSC` flag and the chip's fallback register are set together:
+the first governs the standby RadioLib takes on our behalf, the second where the
+part lands by itself, and only both together avoid the wait. Never held idle —
+the standing cost is the chip's standby delta plus the board's TCXO current, the
+larger of the two by an order of magnitude. SX126x only; other families have no
+equivalent in RadioLib and keep the gaps they have.
+
+**Ingress is gated on the transaction, not on the radio.** `drainOneOutbound`
+pulls from rnsd and the RNode client (`queueFill`) *above* the `txActive` and
+`supeHoldsRadio` returns and *below* the transaction one. The distinction is the
+protocol's: what a transaction carries is declared before it runs — the
+requester's load in the START, the duration everyone else holds for in the GRANT
+— so a packet arriving after that cannot join it and must not disturb the queue
+the engine is walking. Until then it can, and the polite wait before a START is
+hundreds of milliseconds, which is where most of the chances to coalesce live. A
+packet pulled in during that wait is still in the queue when `headRun` measures
+the load, and rides the very detour being waited for. Pulling while a frame is on
+air is safe because `queueSendHead` consumes the head the moment `beginTx` has
+copied the bytes out, so the in-flight packet is no longer in the queue for a
+later push — or a per-peer cap eviction — to touch.
+
 **Half-duplex coordination.** LoRa can't transmit while receiving, so a pending
 split RX must not be interrupted. `drainOneOutbound` early-outs while
 `r->splitPending` is set (or the radio isn't running, or `rnsd` isn't
@@ -257,8 +415,10 @@ connected); the outbound packet stays in the ITS stream buffer and is revisited
 once the split completes or times out.
 
 **Listen-before-talk (CSMA/CA).** Before a queued frame is transmitted it must
-pass `csmaClear(r)`, a non-blocking channel-access state machine. Carrier
-sense is the instantaneous channel RSSI — `channelRssi(r)` reads `getRSSI(false)`
+pass `csmaClear(r)`, a non-blocking channel-access state machine. A sense is two
+questions. First, is the modem already receiving something (§6b) — the only one
+of the two that can see a frame arriving below the noise floor. Then carrier
+sense: the instantaneous channel RSSI — `channelRssi(r)` reads `getRSSI(false)`
 without leaving continuous RX (dispatched per chip, since that overload isn't on
 `PhysicalLayer`) — compared against a tracked noise floor (`channelBusy`: the
 floor snaps down fast and creeps up slowly, so an active channel can't inflate
@@ -286,9 +446,9 @@ frame stays queued and `nextDeadline()` wakes the task at the next slot boundary
 to re-sense (never at 0, which would peg the task). `lbt=0` reverts to blind
 transmit. The only other TX guard remains `splitPending`.
 
-**On the SPI cost.** Each sense is one `getRSSI(false)` — a single SPI
-transaction, read at the DFS floor (the re-sense wakes are timeout-driven, so
-they don't boost the CPU). A transmit therefore issues a burst of these across
+**On the SPI cost.** Each sense is one `getIrqFlags()` and one `getRSSI(false)` —
+two SPI transactions, read at the DFS floor (the re-sense wakes are timeout-driven,
+so they don't boost the CPU). A transmit therefore issues a burst of these across
 its DIFS + backoff slots, which makes `spi_master` the dominant SPI source while
 traffic flows — but the transfers are ~55 µs APB holds at 80 MHz, ~0.1 % of wall
 time, so LBT costs no measurable power (confirmed by an `lbt 0`/`lbt 1` A/B: SPI
@@ -482,11 +642,73 @@ unbounded outbound queue is the worse failure), but `s.lora.<n>.lbt_timeout`
 should be raised, or set to `0`, on an SF10+ link expected to run deep into
 band 3 or 4.
 
+**One floor per channel, carried across retunes (`csmaFloorSwitch`).** The
+tracker snaps down to the first sample below it and creeps *up* at 2% of the gap
+per sense, so a seed above the real floor costs one sample and a seed below it
+costs tens. `csmaNoiseFloorReset` slams the estimate back to
+`CSMA_NOISE_FLOOR_DBM` (−105 dBm), which on a bench resting in the mid −90s reads
+busy on every sense until it has climbed past −99 — about 25 senses, a few
+hundred ms, during which the contention window accrues nothing and a transmit
+that was ready waits for a medium that was free the whole time. A node
+detouring once a second used to pay that twice a second, because both retune legs
+reseeded. Each channel's floor is now parked on the way out and restored on the
+way in; the reset constant is only ever an initial value, and the cold-start
+paths (a config apply, an AGC recalibration) clear the whole per-channel table
+because the front end that measured them is gone.
+
+**Channel access runs under our own waits, never under a reservation
+(`csmaPrime`).** A packet held back by our own timing — the absence ladder's
+pause between requests, `DETOUR_WAIT` — reserves nothing on the air, so DIFS and
+the contention window are served *during* the wait rather than after it: the
+machine advances to one step short of the grant, keeps sensing, and the first
+`csmaClear` after the wait lifts takes it. A busy medium still restarts the DIFS
+and evaporates the withheld grant, so freshness needs no timer of its own. This
+is why the classifier distinguishes `SUPE_V_WAIT` from `SUPE_V_HOLD`: the latter
+is somebody else's GRANT reserving the medium, and contending underneath it is
+exactly what the reservation exists to prevent.
+
 **Observability.** `lora <n>` prints the regime, slot/DIFS times and, under
-`appc`, the live airtime percentage with its band and window range; the same
+`appc`, the live airtime percentage with its band and window range, plus the
+tracked noise floor for the channel in force and the parked value for each
+agile channel — the two numbers every wait is decided against, and previously
+the only ones nobody could see; the same
 two figures publish as `lora.<n>.stats.{airtime_pct,cw_band}` on the ordinary
 event-driven telemetry flush. The contention stall warning names the band and
 airtime instead of the exponential regime's `cw` when `appc` is on.
+
+## 6b. Asking the modem whether it is receiving
+
+Carrier sense answers "is there power on this channel", which is not the question
+a half-duplex radio needs answered before transmitting. LoRa demodulates *below*
+the noise floor — SF7 works at −7.5 dB SNR — so a frame being received perfectly
+may never rise above `floor + CSMA_RSSI_MARGIN_DB`, and the sense is a point
+sample once a slot rather than a continuous watch, so even a strong frame can
+fall between two of them. Transmitting over it destroys both frames.
+
+The demodulator holds the evidence the sense lacks: it has locked onto a
+preamble, or validated a header. `radioRxInProgress` reads it for one register
+access. This is the **prospective** half of what `csmaMediumHeld` corrects after
+the fact — together they mean a neighbour's frame is neither transmitted over nor
+credited to us as free medium.
+
+**Latching the evidence costs nothing.** `radioStartRx` — the single place any
+path re-enters RX — arms the receiver with `LORA_RX_IRQ_FLAGS`: RadioLib's
+default set plus `PREAMBLE_DETECTED`. That goes into the chip's IRQ *register*
+and not the DIO mask, so DIO1 keeps its one meaning (a frame completed), no extra
+interrupt fires, and an idle radio still holds no wake. `HEADER_VALID` is already
+in RadioLib's default set. SX127x has no preamble-detect IRQ to latch and reports
+nothing rather than guessing; there, carrier sense and `csmaMediumHeld` stand
+alone.
+
+**Both bits latch, so both need a deadline.** A preamble that no packet followed
+would otherwise read as a reception forever and block transmit permanently. A
+preamble stands until the header it announces should have arrived — `2 × (preamble
++ 8)` symbol times, floored at 20 ms — and a validated header until the longest
+frame this modem could still be receiving would have finished (a full 254-byte
+frame's airtime + 50 ms). Past that the bit is stale, and *clearing* it is what
+lets the next real one be believed. A `HEADER_ERR` ends the reception on the spot.
+The two deadlines are computed in `radioStart` from the live modem parameters
+(`rxPreambleTicks`, `rxPacketTicks`) beside the transmit watchdog they resemble.
 
 ## 7. rnsd registration
 
@@ -697,14 +919,47 @@ storage subtree **is** the ring — no in-firmware record buffer, no ITS transfe
   add/delete works here but a merge-only scheme couldn't expire on the browser).
 - **Gated on a viewer.** Recording runs only while `sys.stats.web_loramon` or
   `sys.stats.lcd_loramon` is set (`loraMonWatched`), the actmon gating pattern.
-  On the falling edge the task drops each radio's whole `lora.<n>.packets`
-  subtree — so there is no pre-open history; the graph fills from open forward.
-- **A second series, live-only: the channel noise floor.** Once a second each
-  radio publishes its channel-RSSI sample set to `lora.<n>.rssi` (§18.3), which
-  the viewers draw as a light backdrop under the traffic on every channel's
-  graph. Unlike the packet nodes there is no history to mirror — only the newest
-  sample is published — so the series starts when the window opens and a skipped
-  beat simply reads as a gap.
+  The flag is cached (`s_monWatched`, read as `loraMonOpen()`) and updated by a
+  storage subscription on the watch keys the moment a viewer opens or closes —
+  the callback wakes both tasks (`loraNudge` + an `IFM_KICK` on the record
+  queue), because each may be blocked on the long cadence the old state
+  allowed. On the falling edge the interface task drops each radio's whole
+  `lora.<n>.packets` subtree — so there is no pre-open history; the graph
+  fills from open forward.
+- **The viewer's clock is the device's uptime, and uptime restarts.** Records are
+  keyed by `millis()`, and the browser panel anchors "now" to the newest record
+  and extrapolates from `Date.now()` between updates. That anchor is monotonic
+  *within a boot* — a deliberate choice, since pulling it backward on transport
+  jitter jerks the bars — so a device reboot under a mounted window leaves it
+  marching forward while every new record arrives tens of thousands of seconds
+  "in the past", left of every window. Both series then stop drawing while the
+  timeline keeps gliding, which looks exactly like a dead device and is not:
+  `show lora.<n>.packets` is full. `restarted()`/`reanchor()` treat a record more
+  than the one-hour window behind the extrapolation as a new boot and follow it
+  back, because the firmware expires its own nodes at an hour and can never
+  publish one that old. The RSSI beat checks it too, since on a quiet channel it
+  is the only thing publishing.
+- **Byte counts differ by one between directions.** A transmit record exempts
+  our own air protocol from the split-header subtraction (`doneType ==
+  LORA_PKT_OURS ? 0 : 1`); the receive path does not, and hands the record the
+  same `payloadLen` it computes for Reticulum framing, which SUPE frames do not
+  carry. So a 10-byte GRANT reads 10 on the sender's graph and 9 on the
+  receiver's. Cosmetic for the drawing, load-bearing when checking a frame
+  against §3 of `plans/SUPE.md`.
+- **A second series, live-only: the channel noise floor.** While a viewer is
+  open, once a second each radio publishes its channel-RSSI sample set to
+  `lora.<n>.rssi` (§18.3), which the viewers draw as a light backdrop under
+  the traffic on every channel's graph. The sampling itself is gated on the
+  viewer too — see §18.3. Unlike the packet nodes there is no history to
+  mirror — only the newest sample is published — so the series starts when the
+  window opens and a skipped beat simply reads as a gap.
+- **The interface task idles at the rollup cadence, not at 1 Hz.** Its 1 Hz
+  maintenance beat (expiry, stats flush, airtime publication) runs while a
+  viewer is open or a UI can pull stats (`uiTelemetryWanted`). Dark — no
+  viewer, no WiFi, no LCD — its only standing duty is `Rolling1h::shiftAll`,
+  one bucket per `kBucketMinutes`, so it blocks on the record queue for
+  minutes at a time and a battery node stops paying a per-second wake for
+  bookkeeping nothing reads.
 - **One aggregate only: the hour.** Every shorter window's airtime % is computed
   by the viewers from the nodes they hold, per direction with boundary overlap.
   The hour is the exception — it spans more history than a viewer is typically
@@ -1007,6 +1262,15 @@ everyone, so it always goes out at the configured `tx_power`.
 
 ## 16. Pitfalls
 
+- **A record's `wait` is not one clock.** Frames that go out through the drain
+  report `wait` (contention) and `own` (everything else since a source first had
+  bytes) — the split at the end of `drainOneOutbound`. Frames the SUPE engine
+  launches report `wait = csmaGrantWaitMs` and `own = 0`, because `hTxFrame`
+  zeroes both marks and the launch restates only the contention part. So the
+  interval between rnsd handing a packet over and this interface noticing it is
+  invisible on a START's record, and reading its absence as "the packet did not
+  exist yet" is wrong. It is also why an armed offer that blocks ingress looks
+  exactly like a daemon that has not produced the packet.
 - **The LoRa rail is the board's, not this straddle's.** The radio is unreachable
   on SPI until whatever powers it is up and settled; `begin()` then returns
   `CHIP_NOT_FOUND` (−2) or `SPI_CMD_TIMEOUT` (−705). The board HAL brings the
@@ -1330,10 +1594,18 @@ to fix.
 
 ### 18.3 The per-second channel-RSSI beat
 
-`rssiSamplePoll` runs once a second per radio and publishes one sample set to
-`lora.<n>.rssi` (§18.5). The hailing channel is read in place — the radio is
-already on it and settled, so it costs one SPI transaction and no retune — and
-that reading also decides whether the excursion happens at all.
+`rssiSamplePoll` runs once a second per radio **while a LoRaMon viewer is
+open** and publishes one sample set to `lora.<n>.rssi` (§18.5). The series is
+live-only decoration for the graphs — nothing in channel access or SUPE reads
+it (carrier sense takes its own samples and tracks its own floor, §5) — so
+with no viewer the beat is skipped outright and its deadline is not held in
+`nextDeadline`: an idle radio task sleeps until a real event instead of waking
+per second for an SPI read nobody sees. The gate is the same cached
+`loraMonOpen()` flag that gates frame recording (§12); a viewer opening flips
+it via the watch-key subscription and nudges the task, and the stale-by-then
+deadline samples on that very pass. The hailing channel is read in place — the
+radio is already on it and settled, so it costs one SPI transaction and no
+retune — and that reading also decides whether the excursion happens at all.
 
 `rssiSweepAgile` measures the regime's agile channels as **one excursion off the
 hailing channel and back**: standby → `setFrequency` → `startReceive` →
@@ -1559,6 +1831,32 @@ at maximum and budget 0 — then the peer is absent for a minute and its traffic
 drops; one request per minute thereafter; any evidence of life cancels the
 record outright (`SUPE_EV_ALIVE`).
 
+**Silence is established from the receiver, not from arithmetic.** The GRANT
+deadline is two stages. The first is `turnaround + guard` with no time on air in
+it — the instant the answer must have *begun* — and asks the host's `rx_busy`
+(`radioRxInProgress`, §6b) what the modem is doing. A frame arriving is the
+answer being delivered, so the second stage waits it out; nothing arriving is
+silence, reached half a frame earlier and without trusting an estimate of a frame
+that was never sent. Silence there retransmits the START once, byte for byte from
+`x->startFrame` — a rebuilt frame would carry a different load byte and therefore
+a different hash, orphaning the GRANT that names it — inside the same request,
+with no strike and no rung. The platform drives that retransmission
+(`supeEngResendDue`/`Resend`) rather than the engine firing it, so it pays the
+same channel access the original did, which is also its decorrelation; and when
+the peer's GRANT does start late, carrier sense sees it and the retransmission
+defers instead of transmitting over the reply.
+
+**The requester is named by the START, or not at all.** On the answering side the
+tag names one of *our own* addresses, so it says nothing about who is asking:
+`sender_ident` is the only handle. It is what `bAnswerStart` resolves into
+`x->fromPeer`, and everything that needs to know who the far end is hangs off it
+— the reverse leg's scan and staging, and filing a link identifier the cargo
+creates against the node that dialled (§10 of `plans/SUPE.md`). Without it
+`scanReverse` is handed `LORAQ_PEER_NONE` and returns 0, so the GRANT's reverse
+flag is never set and the mechanism is inert. The host tests hid exactly that for
+a long time, because their stub `peer_get` resolved *any* tag including the
+answerer's own; `testReverseNeedsIdent` is the guard against it reopening.
+
 ### 19.5 What is learned
 
 Every measurement is a path-loss pair — a level read here against the power
@@ -1581,6 +1879,17 @@ node consults it (and the 100 ms reuse gaps) before granting; hailing-channel
 frames feed the APPC contention band instead — two budgets, never one
 (SUPE.md §18: credit a detour against the hailing figure and the whole
 stays-cheap effect vanishes silently).
+
+**The verdict beat parks when it can't change a verdict.** With no cap to
+enforce (regime 0) or an empty agile window, a recompute can only restate
+"in budget", so `airtimeRecompute` drops `beatOn` and the beat holds no wake
+(`airtimeNextDeadlineMs` → `UINT32_MAX`); the first agile transmit
+(`airtimeRecord`, channel ≥ 1) re-arms it. Hailing-only traffic never does —
+channel 0 carries no SUPE budget. The dialect-expiry re-check used to ride
+this beat and now rides `supePoll` passes directly, at most hourly, holding
+no wake of its own. Net: SUPE enabled on an idle node costs the announce beat
+and nothing else; the engine's `esp_timer` is armed only inside a
+transaction, so with zero packets queued it never fires.
 
 ## 20. Known gaps in the LCD viewer
 

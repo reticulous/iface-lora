@@ -24,6 +24,11 @@ struct ChanLedger {
     bool     chanOk[SUPE_CH_MAX];    /* the precomputed verdict */
     uint32_t chanLastTxMs[SUPE_CH_MAX];  /* the frequency-reuse gap */
     uint32_t verdictNextMs;
+    /* The verdict beat runs only while it can change a verdict: with agile
+     * airtime in the window it ticks per bucket; once the window drains — or
+     * with no cap to enforce — it parks, and the first detour transmit re-arms
+     * it. An idle SUPE node holds no standing wake for this. */
+    bool     beatOn;
 };
 
 bool     airtimeInit(LoraRadio* r);

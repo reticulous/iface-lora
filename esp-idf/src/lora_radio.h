@@ -31,8 +31,26 @@ struct LoraSlot {
     int      tcxo_mv;              /* TCXO control voltage, mV (0 = XTAL); SX126x/LR only */
     bool     dio2_rf_switch;       /* SX126x: drive DIO2 as the RF switch */
     int      rfsw_rx, rfsw_tx;     /* external RF-switch GPIOs (-1 = none, see Module::setRfSwitchPins) */
+    int      fem_pwr;              /* FEM rail-enable GPIO (-1 = none) — see lora_fem.h */
+    int      fem_en;               /* FEM chip-enable GPIO (-1 = no FEM); also the detect sense */
+    int      fem_txsel_a;          /* TX-select when a GC1109-style FEM is detected */
+    int      fem_txsel_b;          /* TX-select when a KCT8103L-style FEM is detected */
     LoraChip chip;
 };
+
+/* The IRQ flags the receiver latches. RadioLib's default set plus
+ * PREAMBLE_DETECTED, which is what lets radioRxInProgress see a reception the
+ * RSSI sense is blind to. These are the chip's IRQ *register* bits, not the DIO
+ * mask — nothing extra reaches DIO1, so the line still means "a frame
+ * completed" and an idle radio still holds no wake. */
+#define LORA_RX_IRQ_FLAGS \
+    (RADIOLIB_IRQ_RX_DEFAULT_FLAGS | (1UL << RADIOLIB_IRQ_PREAMBLE_DETECTED))
+
+/* Default period of the analog front-end recalibration, in seconds
+ * (s.lora.<i>.agc_reset; 0 = off). Long enough that the wake is nothing next to
+ * a receiver's idle draw, short enough that a latched gain control costs minutes
+ * rather than the days it would otherwise last. */
+#define LORA_AGC_RESET_DEF_S  300
 
 /* ─────────────── lora_radio: chip dispatch + RadioLib calls ─────────────── */
 const char*    chipName(LoraChip c);
@@ -41,6 +59,15 @@ PhysicalLayer* radioNew(LoraChip c, Module* m);
 const char*    rlErrName(int16_t st);
 int16_t radioBegin(LoraRadio* r, float freq, float bw, uint8_t sf, uint8_t cr,
                    uint8_t sync, int8_t power, uint16_t preamble, float tcxoV);
+float   radioOcpMilliamps(LoraChip c);
+void    radioIrqCache(LoraRadio* r);
+int16_t radioStartRx(LoraRadio* r);
+bool    radioRxInProgress(LoraRadio* r);
+bool    radioIrqLinePending(const LoraRadio* r);
+void    radioIrqClearAll(LoraRadio* r);
+bool    radioAgcReset(LoraRadio* r);
+void    agcResetPoll(LoraRadio* r);
+void    radioHoldOsc(LoraRadio* r, bool hold);
 float   channelRssi(LoraRadio* r);
 int16_t radioHeaderMode(LoraRadio* r, bool implicit, size_t len);
 int16_t radioSetCodingRate(LoraRadio* r, uint8_t crDenom);

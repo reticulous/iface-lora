@@ -41,6 +41,7 @@ void publishStats(LoraRadio* r);
 void publishChannels(LoraRadio* r);
 void publishState(LoraRadio* r, const char* state);
 void rssiSamplePoll(LoraRadio* r);
+bool loraMonOpen(void);          /* a LoRaMon viewer (web or LCD) is open */
 void loraMonInit(LoraRadio* r);
 void loraMonStart(void);
 bool loraMonParked(void);

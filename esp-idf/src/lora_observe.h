@@ -26,8 +26,12 @@ struct RnsHdr {
 
 /* ─────────────── lora_observe: Reticulum packet inspection ─────────────── */
 bool        rnsParse(const uint8_t* p, size_t len, RnsHdr* h);
+/* `fromPeer` is the node that provably transmitted this packet — a transaction
+ * we granted names one — or LORAQ_PEER_NONE when it arrived in the clear and
+ * the sender is whoever the frame's own contents imply. */
 void        peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
-                       int16_t rssi, int16_t snr10, uint8_t txOrigin);
+                       int16_t rssi, int16_t snr10, uint8_t txOrigin,
+                       uint16_t fromPeer);
 void        rnsNamesInit(void);
 const char* rnsNameLabel(const uint8_t nameHash[10]);
 void        loraHex(char* out, const uint8_t* d, size_t n);

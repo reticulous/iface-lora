@@ -65,8 +65,9 @@ struct LoraRadio;
 #define LORA_MAGIC_PWRREQ     0x04
 #define PWRREQ_LEN            4
 #define PWRREQ_NO_TXP         ((int8_t)0x7F)   /* "no suggestion" sentinel */
-#define AP_PWR_MAX_DBM        22     /* no radio exceeds this, so asking for it
-                                      * is what sending nothing already means */
+/* The per-radio antenna-dBm ceiling is r->maxTxDbm (22 bare chip, 27 through
+ * a FEM — set by femInit); asking a peer for it is what sending nothing
+ * already means. */
 #define AP_MIN_SAMPLES        3      /* recent frames before we dial a peer down */
 
 #define AP_FLOOR_DECAY_MS (10u * 60u * 1000u)  /* the failure floor's decay */

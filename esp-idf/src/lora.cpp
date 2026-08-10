@@ -35,6 +35,8 @@
  */
 #include "lora_priv.h"
 
+#include "lora_fem.h"
+
 #if defined(CONFIG_LORA0_CS_PIN)
 
 #ifdef CONFIG_LORA0_DIO2_RF_SWITCH
@@ -61,20 +63,28 @@
 static const LoraSlot kSlots[] = {
     { CONFIG_LORA0_CS_PIN, CONFIG_LORA0_DIO1_PIN, CONFIG_LORA0_BUSY_PIN, CONFIG_LORA0_RST_PIN,
       CONFIG_LORA0_TCXO_MV, LORA0_DIO2, CONFIG_LORA0_RFSW_RX_PIN, CONFIG_LORA0_RFSW_TX_PIN,
+      CONFIG_LORA0_FEM_PWR_PIN, CONFIG_LORA0_FEM_EN_PIN,
+      CONFIG_LORA0_FEM_TXSEL_A_PIN, CONFIG_LORA0_FEM_TXSEL_B_PIN,
       (LoraChip)CONFIG_LORA0_CHIP_ID },
 #if defined(CONFIG_LORA1_CS_PIN)
     { CONFIG_LORA1_CS_PIN, CONFIG_LORA1_DIO1_PIN, CONFIG_LORA1_BUSY_PIN, CONFIG_LORA1_RST_PIN,
       CONFIG_LORA1_TCXO_MV, LORA1_DIO2, CONFIG_LORA1_RFSW_RX_PIN, CONFIG_LORA1_RFSW_TX_PIN,
+      CONFIG_LORA1_FEM_PWR_PIN, CONFIG_LORA1_FEM_EN_PIN,
+      CONFIG_LORA1_FEM_TXSEL_A_PIN, CONFIG_LORA1_FEM_TXSEL_B_PIN,
       (LoraChip)CONFIG_LORA1_CHIP_ID },
 #endif
 #if defined(CONFIG_LORA2_CS_PIN)
     { CONFIG_LORA2_CS_PIN, CONFIG_LORA2_DIO1_PIN, CONFIG_LORA2_BUSY_PIN, CONFIG_LORA2_RST_PIN,
       CONFIG_LORA2_TCXO_MV, LORA2_DIO2, CONFIG_LORA2_RFSW_RX_PIN, CONFIG_LORA2_RFSW_TX_PIN,
+      CONFIG_LORA2_FEM_PWR_PIN, CONFIG_LORA2_FEM_EN_PIN,
+      CONFIG_LORA2_FEM_TXSEL_A_PIN, CONFIG_LORA2_FEM_TXSEL_B_PIN,
       (LoraChip)CONFIG_LORA2_CHIP_ID },
 #endif
 #if defined(CONFIG_LORA3_CS_PIN)
     { CONFIG_LORA3_CS_PIN, CONFIG_LORA3_DIO1_PIN, CONFIG_LORA3_BUSY_PIN, CONFIG_LORA3_RST_PIN,
       CONFIG_LORA3_TCXO_MV, LORA3_DIO2, CONFIG_LORA3_RFSW_RX_PIN, CONFIG_LORA3_RFSW_TX_PIN,
+      CONFIG_LORA3_FEM_PWR_PIN, CONFIG_LORA3_FEM_EN_PIN,
+      CONFIG_LORA3_FEM_TXSEL_A_PIN, CONFIG_LORA3_FEM_TXSEL_B_PIN,
       (LoraChip)CONFIG_LORA3_CHIP_ID },
 #endif
 };
@@ -230,7 +240,21 @@ static bool radioStart(LoraRadio* r) {
     r->lbtTimeoutTicks = r->lbtTimeoutMs ? pdMS_TO_TICKS(r->lbtTimeoutMs) : 0;
     r->csmaCw = CSMA_CW_MIN;
     r->csmaStalled = false;
-    r->noiseFloor = CSMA_NOISE_FLOOR_DBM;
+    csmaNoiseFloorReset(r);
+
+    /* Translate this chip's IRQ bits once, before anything reads flags. */
+    radioIrqCache(r);
+    /* How long the modem's own reception evidence may stand before it is stale.
+     * A preamble has until the header it announces should have arrived — the
+     * preamble itself plus the sync word and start-of-frame delimiter, doubled
+     * for latency, and floored so a fast configuration still gives the header a
+     * usable window. The packet stage's budget is set beside the transmit
+     * watchdog below, from the same full-frame airtime. */
+    uint32_t preambleMs = (uint32_t)(2.0 * tSymMs * (double)(preamble + 8)) + 1;
+    if (preambleMs < 20) preambleMs = 20;
+    r->rxPreambleTicks = pdMS_TO_TICKS(preambleMs);
+    r->rxActiveStart   = 0;
+    r->rxHeaderSeen    = false;
 
     /* APPC slot/DIFS. Upstream's "fast rate" test is against the nominal LoRa
      * bitrate, which is not curBitrate — that one is deliberately distorted to
@@ -259,6 +283,19 @@ static bool radioStart(LoraRadio* r) {
     double maxToa = loraAirtimeSeconds(sf, bw_hz, cr, preamble, RNODE_MAX_PAYLOAD, false);
     r->txWatchTicks = pdMS_TO_TICKS((uint32_t)(maxToa * 1000.0 * 2.5) + 100);
     r->txActive = false;
+    /* A validated header commits the modem to the longest frame it could still
+     * be receiving; past that the bit is stale rather than a reception. */
+    r->rxPacketTicks = pdMS_TO_TICKS((uint32_t)(maxToa * 1000.0) + 50);
+
+    /* Analog front-end recalibration beat. This is the one periodic wake this
+     * task holds without a consumer asking for it, and it is here because the
+     * failure it prevents is silent: an SX126x whose gain control has latched
+     * stops hearing, and a node that cannot hear also cannot be woken by the
+     * traffic that would otherwise trigger a repair. The cost is one wake per
+     * interval plus a few ms of chip work; 0 turns it off. */
+    r->agcResetMs = (uint32_t)storageGetInt(sk(kb, sizeof kb, r->idx, "agc_reset"),
+                                            LORA_AGC_RESET_DEF_S) * 1000u;
+    r->agcNext    = xTaskGetTickCount() + pdMS_TO_TICKS(r->agcResetMs);
 
     /* Mode for RNS iface registration. LoRa defaults to access_point (edge
      * segment); see straddle.yaml for why full/gateway are opt-in-by-hand. */
@@ -271,6 +308,13 @@ static bool radioStart(LoraRadio* r) {
     r->airPreamble = preamble; r->airImplicit = false; r->airSf = (uint8_t)sf;
     r->airBwHz = bw_hz;
     r->chNow   = LORA_CH_HAIL;
+    /* The config slider ranges to the FEM ceiling (27 dBm); on a bare-chip
+     * board the capability is 22, so clamp what the user asked for. */
+    if (txp > r->maxTxDbm) {
+        warn("lora/%d tx_power %d dBm exceeds this board's %d dBm max — clamped",
+             r->idx, txp, r->maxTxDbm);
+        txp = r->maxTxDbm;
+    }
     r->cfgTxp = (int8_t)txp;
     r->cfgSync = (uint8_t)syncWord;
     r->txPwrNow = (int8_t)txp;
@@ -305,17 +349,20 @@ static bool radioStart(LoraRadio* r) {
      * is migrated at the version gate — and there is no second name to wonder
      * about. */
     r->supeAdaptive = storageGetInt(sk(kb, sizeof kb, r->idx, "SUPE.adaptive_txpower"), 1) != 0;
-    /* How long a queue of nothing but proofs waits for a ride before taking
-     * the channel on its own terms; 0 sends proofs like any other packet.
-     * tmp_: a tuning experiment, not yet a settled part of the surface. */
-    r->supeHoldProofMs = (uint32_t)storageGetInt(
-        sk(kb, sizeof kb, r->idx, "SUPE.tmp_hold_proof"), 1000);
     r->adaptive     = r->supeAdaptive;
     /* And one announce interval. SUPE's own beat and the interface's announce
      * replay are different runs on different timers, but "how often does this
      * node tell the neighbourhood about itself" is one question and deserves
      * one answer; two keys of the same name and the same default were only ever
      * going to be set inconsistently. */
+    /* Name ourselves in every START. It costs three bytes and the protocol's
+     * default anonymity — a listener learns who is talking to whom, which a
+     * Reticulum header never says — and it buys the reverse leg, which cannot
+     * exist without it: the tag a START carries is the ANSWERER's address, so
+     * an unnamed requester's queued traffic is indistinguishable from anyone
+     * else's. Off keeps the anonymity and gives that up (SUPE.md §4). */
+    r->supeNameSender = storageGetInt(
+        sk(kb, sizeof kb, r->idx, "SUPE.sender_ident"), 1) != 0;
     bool supeWanted = storageGetInt(sk(kb, sizeof kb, r->idx, "SUPE.enable"), 0) != 0;
     bool haveIfac   = storageGetInt(sk(kb, sizeof kb, r->idx, "ifac_size"), 0) != 0;
     r->supeOn = supeWanted && !haveIfac;
@@ -348,7 +395,7 @@ static bool radioStart(LoraRadio* r) {
 
     /* Arm RX and hook the chip's IRQ line (unified API maps to the right DIO). */
     r->radio->setPacketReceivedAction(loraRadioIsr);
-    st = r->radio->startReceive();
+    st = radioStartRx(r);
     if (st != RADIOLIB_ERR_NONE) {
         err("lora/%d startReceive failed: %s (%d)", r->idx, rlErrName(st), (int)st);
         publishState(r, "error");
@@ -502,6 +549,13 @@ static void onDisplayChange(const char* /*key*/, const char* /*val*/) {
     if (s_task) xTaskNotifyGive(s_task);
 }
 
+/* Wake the interface task from another task or a callback: its deadlines just
+ * changed (a LoRaMon viewer opened, say) and the blocked itsPoll must not sit
+ * out a wait computed for the old state. */
+void loraNudge(void) {
+    if (s_task) xTaskNotifyGive(s_task);
+}
+
 /* ─────────────── task ─────────────── */
 
 /* Stats publishing is event-driven, not timed. Every stat is either a cumulative
@@ -538,9 +592,25 @@ static TickType_t nextDeadline(void) {
          * boundary to re-sense — never spin at 0, which would peg the task.
          * Skipped while a transmit is on-air (txActive): the TxDone IRQ drives
          * the next step, and drainOneOutbound would no-op anyway. */
+        /* A raised IRQ line the ISR has not reported: the interrupt is disabled,
+         * so nothing will wake us for it. Service on the next pass rather than
+         * sleeping beside a radio holding a completed frame. serviceRadio always
+         * either consumes the cause or clears it, so this cannot spin.
+         *
+         * Not while a transmit is in flight: there the line's only meaning is
+         * TxDone, which serviceRadio consumes, and anything else on it belongs
+         * to the watchdog — whose deadline is below, and which a zero here would
+         * spend at full CPU instead of asleep. */
+        if (r->running && !r->txActive && radioIrqLinePending(r)) return 0;
         /* A manual tx request just arrived, or its carrier-sense is mid-backoff:
          * service it now / re-sense at slot pace. */
         if (r->mtxReq) return 0;
+        /* The recalibration beat, while one is configured. */
+        if (r->running && r->enabled && r->agcResetMs) {
+            int32_t rem = (int32_t)(r->agcNext - now);
+            TickType_t d = rem > 0 ? (TickType_t)rem : 0;
+            if (d < soonest) soonest = d;
+        }
         if (r->mtxPhase == MTXP_LBT && r->slotTicks < soonest) soonest = r->slotTicks;
         /* Gating and availability are separate conjunctions: an rnode packet is
          * pending without any rnsd handle, so folding the two together would
@@ -593,9 +663,13 @@ static TickType_t nextDeadline(void) {
          * time, so re-sense at slot pace until it drains. */
         if (r->running && r->enabled && r->annReplay && r->slotTicks < soonest)
             soonest = r->slotTicks;
-        /* The channel-RSSI beat. Held even on a silent channel — an idle radio
-         * is exactly when the reading means something. */
-        if (r->running && r->enabled) {
+        /* The channel-RSSI beat — held only while a LoRaMon viewer draws it.
+         * Held even on a silent channel then, because an idle radio is exactly
+         * when the reading means something; but with no viewer the beat (and
+         * this wake) is dropped outright, and an idle task sleeps until a real
+         * event. A viewer opening nudges the task (loraNudge), and the by-then
+         * stale deadline samples on that very pass. */
+        if (r->running && r->enabled && loraMonOpen()) {
             int32_t rem = (int32_t)(r->mon.rssiNext - now);
             TickType_t d = rem > 0 ? (TickType_t)rem : 0;
             if (d < soonest) soonest = d;
@@ -681,6 +755,19 @@ static void loraTaskMain(void*) {
                 r->slot->rfsw_rx < 0 ? RADIOLIB_NC : (uint32_t)r->slot->rfsw_rx,
                 r->slot->rfsw_tx < 0 ? RADIOLIB_NC : (uint32_t)r->slot->rfsw_tx);
         }
+        /* External FEM (PA/LNA/switch), if the board wires one: detect the
+         * part, install its RF-switch table (supersedes the two-pin form
+         * above — a board wires one or the other) and set the antenna-dBm
+         * ceiling. Before begin(), like setRfSwitchPins. */
+        femInit(r);
+        /* What this radio can actually reach at the antenna, published so a UI
+         * can size its power control to the hardware in front of it rather than
+         * to a build-time constant: the bare chip's 22 dBm unless femInit found
+         * a front-end, and that part's rating when it did. */
+        {
+            char b[48];
+            storageSet(rk(b, sizeof b, r->idx, "tx_power_max"), (int)r->maxTxDbm);
+        }
         r->radio = radioNew(r->slot->chip, r->mod);
         probeRadio(r);
     }
@@ -735,7 +822,13 @@ static void loraTaskMain(void*) {
 
         for (int i = 0; i < kNumRadios; i++) {
             LoraRadio* r = &s_radios[i];
-            if (r->running && !radioIrq && r->txActive) serviceRadio(r);
+            /* Service on a transmit in flight (the TxDone watchdog), and on a
+             * DIO1 that is asserted without the ISR having said so — the line is
+             * level-triggered, so a raised line with no notification means the
+             * interrupt is disabled, and the frame behind it would otherwise sit
+             * there unread. The check is a GPIO read, not an SPI transaction. */
+            if (r->running && !radioIrq && (r->txActive || radioIrqLinePending(r)))
+                serviceRadio(r);
 
             if (r->splitPending &&
                 (int32_t)(xTaskGetTickCount() - r->splitDeadline) >= 0) {
@@ -745,6 +838,7 @@ static void loraTaskMain(void*) {
             if (r->running && r->rnsdHandle < 0 && r->enabled) registerWithRnsd(r);
             peersExpire(r, millis());
             manualTxPoll(r);    /* CLI tx/tx_psa/tx_prot; holds the radio while active */
+            agcResetPoll(r);    /* front-end recalibration; skips a busy radio */
             supePoll(r);        /* the SUPE beat and the offer's channel access */
             drainOneOutbound(r);
             /* Last, so every claim on the radio above has already been staked:
@@ -930,11 +1024,30 @@ void LoraService::onInit() {
     rnsServiceRegister(TAG, loraStart, loraStop, RNS_PHASE_IFACE);
 }
 
+bool loraPeerSummary(int radio, lora_peer_summary* out) {
+    if (radio < 0 || radio >= kNumRadios) return false;
+    LoraRadio* r  = &s_radios[radio];
+    NeiState*  st = r->nei;
+    if (!st) return false;   /* radio has never been up */
+    out->peers = out->links = 0;
+    for (int k = 0; k < NEI_MAX; k++) {
+        Neighbor* e = &st->nei[k];
+        if (e->used && !e->isUs && !e->isRnode) out->peers++;
+    }
+    for (int k = 0; k < NEI_LINKS_MAX; k++)
+        if (st->links[k].used) out->links++;
+    out->rssi  = (int)r->rssiLast;
+    out->snr10 = (int)(r->snrLast * 10.0f);
+    return true;
+}
+
 #else  /* ── no radios configured (CONFIG_LORA_COUNT = 0) ── */
 
 void LoraService::onInit() {
     /* iface-lora staged but inert: no LoRa pins configured for this board.
      * RadioLib links out; set CONFIG_LORA_COUNT and the pins to enable. */
 }
+
+bool loraPeerSummary(int, lora_peer_summary*) { return false; }
 
 #endif

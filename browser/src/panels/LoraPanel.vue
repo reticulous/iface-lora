@@ -25,7 +25,7 @@
     </div>
     <SettingSelect label="Spreading factor" k="s.lora.0.spreading_factor" :options="sfOptions" />
     <SettingSelect label="Coding rate" k="s.lora.0.coding_rate" :options="crOptions" />
-    <SettingSlider label="TX power (dBm)" k="s.lora.0.tx_power" :min="-9" :max="22" />
+    <SettingSlider label="TX power (dBm)" k="s.lora.0.tx_power" :min="-9" :max="txMaxDbm" />
     <SettingSlider label="Preamble (sym)"  k="s.lora.0.preamble"  :min="6"  :max="32" />
     <SettingText   label="Sync word"       k="s.lora.0.sync_word" />
 
@@ -123,6 +123,12 @@ const rssi      = computed(() => Number(device.get('lora.0.stats.rssi_last') ?? 
 const snr       = computed(() => Number(device.get('lora.0.stats.snr_last')  ?? 0))
 const rxFrames  = computed(() => Number(device.get('lora.0.stats.rx_frames') ?? 0))
 const txFrames  = computed(() => Number(device.get('lora.0.stats.tx_frames') ?? 0))
+
+/* The antenna-dBm ceiling this board reaches: 22 on a bare chip, the front-end
+ * module's rating on a board that has one and whose part was detected at boot.
+ * The device publishes it, so the slider follows the hardware actually present
+ * rather than a compiled-in maximum. */
+const txMaxDbm = computed(() => Number(device.get('lora.0.tx_power_max') ?? 22))
 
 /* Frequency and bandwidth are stored in Hz (int) but entered in human units —
  * MHz for frequency, kHz for bandwidth — so any value is allowed, not just a

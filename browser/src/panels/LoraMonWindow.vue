@@ -25,6 +25,10 @@
             <button class="lm-pill lm-back" :class="{ 'lm-last': zoomStack.length === 1 }"
                     @click="zoomOut">←</button>
             <span class="lm-zoomlabel">{{ zoomLabel }}</span>
+            <!-- The span on screen, as storage lines, for pasting somewhere a
+                 screenshot of a graph would not survive. -->
+            <button class="lm-pill lm-copy" title="copy the frames in view as lora.n.packets lines"
+                    @click="copyRecords">{{ copyMark }}</button>
           </template>
           <button v-else v-for="w in WINDOWS" :key="w.key" class="lm-pill"
                   :class="{ active: w.key === winKey }"
@@ -238,6 +242,28 @@ const radios = computed<number[]>(() => {
 /* Estimated device clock (ms) now, extrapolated from the newest packet seen. */
 function devNow(): number {
   return devClock ? devClock + (Date.now() - devClockAt) : 0
+}
+
+/* The device stamps its records with millis(), so a reboot restarts that clock
+ * near zero while our extrapolation keeps marching forward. Everything the
+ * device publishes afterwards then arrives tens of thousands of seconds "in the
+ * past", falls left of every window, and nothing draws again for as long as the
+ * window stays mounted — which is why the anchor is monotonic ONLY within a
+ * boot. A record a whole hour behind "now" is not transport jitter (the device
+ * expires its own nodes at an hour, so it can never publish one that old): it
+ * is a device counting again from the start, and the anchor follows it back.
+ * The floor series and any zoom span are in the old boot's timebase, so they go
+ * with it, exactly as they do when the radio tab changes. */
+function restarted(t: number): boolean {
+  return devClock > 0 && t > 0 && t < devNow() - HOUR_MS
+}
+function reanchor(t: number) {
+  devClock = t
+  devClockAt = Date.now()
+  floorSeries = Array.from({ length: CH_MAX }, () => [])
+  floorLastMs = 0
+  zoomStack.value = []
+  sel.value = null
 }
 
 /* The time span currently on screen: the top of the zoom stack if there is
@@ -526,6 +552,10 @@ function pollFloor() {
   const p = String(raw).split('|')
   const t = +p[0]
   if (!Number.isFinite(t) || t === floorLastMs) return
+  /* Checked here too, not just in rebuild(): on a quiet channel the sample beat
+   * is the only thing publishing, so it has to be able to spot the restart by
+   * itself. Before floorLastMs moves — reanchor() clears it. */
+  if (restarted(t)) reanchor(t)
   floorLastMs = t
   const cut = t - HOUR_MS
   for (let c = 0; c < CH_MAX && c + 1 < p.length; c++) {
@@ -560,21 +590,66 @@ function pollChans() {
 function rebuild() {
   const tree = device.get(`lora.${activeRadio.value}.packets`) ?? {}
   const arr: Rec[] = []
-  let newest = devClock
+  /* The newest record actually in the mirror, 0 when there are none — kept
+   * apart from devClock so an idle radio (nothing published for over an hour)
+   * cannot read as a restart. */
+  let seen = 0
   for (const k in tree) {
     const t = Number(k)
     if (!Number.isFinite(t)) continue
     const rec = parseRec(t, String(tree[k]))
-    if (rec) { arr.push(rec); if (t > newest) newest = t }
+    if (rec) { arr.push(rec); if (t > seen) seen = t }
   }
   arr.sort((a, b) => a.t - b.t)
   recs = arr
-  /* Anchor device-now monotonically: never pull it backward (that snap caused
-   * the new-bar jerk) — advance to the newest packet or the local extrapolation,
-   * whichever is later. */
-  const cur = devNow()
-  const anchor = Math.max(newest, cur)
+  if (restarted(seen)) { reanchor(seen); return }
+  /* Anchor device-now monotonically within the boot: never pull it backward
+   * (that snap caused the new-bar jerk) — advance to the newest packet or the
+   * local extrapolation, whichever is later. */
+  const anchor = Math.max(seen, devNow())
   if (anchor > 0) { devClock = anchor; devClockAt = Date.now() }
+}
+
+/* ── the span on screen, as text ──
+ *
+ * A frozen view is usually looked at because something in it needs explaining
+ * to someone else, and a graph does not paste into a bug report. This lifts the
+ * frames under the current span out as the device's own `show lora.<n>.packets`
+ * would print them — the same `key = value` lines, in time order — so a span
+ * lands beside CLI output in the same format and nothing has to be transcribed.
+ *
+ * A frame is in view when its time on air OVERLAPS the span, which is the rule
+ * that decides whether it is drawn: a bar clipped by the left edge is on screen
+ * and belongs in the copy. The raw value comes from the mirror rather than from
+ * the parsed record, so what is pasted is exactly what the device published. */
+const copyMark = ref('⧉')
+let copyTimer: ReturnType<typeof setTimeout> | null = null
+
+function markCopy(mark: string) {
+  copyMark.value = mark
+  if (copyTimer) clearTimeout(copyTimer)
+  copyTimer = setTimeout(() => { copyMark.value = '⧉'; copyTimer = null }, 1200)
+}
+
+async function copyRecords() {
+  const { lo, hi } = view()
+  const tree = device.get(`lora.${activeRadio.value}.packets`) ?? {}
+  const lines: string[] = []
+  for (const r of recs) {                       // recs is already time-sorted
+    if (r.t + r.dur <= lo || r.t >= hi) continue
+    const raw = tree[String(r.t)]
+    if (raw == null) continue
+    lines.push(`lora.${activeRadio.value}.packets.${r.t} = ${String(raw)}`)
+  }
+  if (!lines.length) { markCopy('∅'); return }
+  try {
+    await navigator.clipboard.writeText(lines.join('\n') + '\n')
+    markCopy('✓')
+  } catch {
+    /* No clipboard (an insecure context denies it outright), so say so on the
+     * button rather than looking like a copy that worked. */
+    markCopy('✕')
+  }
 }
 
 const fmtPct = (p: number) => `${p.toFixed(p >= 10 ? 0 : 1)}%`
@@ -679,6 +754,7 @@ onMounted(() => {
 onUnmounted(() => {
   if (timer) { clearInterval(timer); timer = null }
   if (raf) { cancelAnimationFrame(raf); raf = 0 }
+  if (copyTimer) { clearTimeout(copyTimer); copyTimer = null }
   device.set('sys.stats.web_loramon', 0)
 })
 
@@ -731,6 +807,10 @@ watch(activeRadio, () => {
 .lm-back { color: #e8e8e8; padding: 0 18px; margin: 0 6px; font-size: 15px; line-height: 1.3; }
 .lm-back.lm-last { background: #2b5cc4; border-color: #5a86e0; color: #fff; }
 .lm-zoomlabel { font: 11px/1.4 'SF Mono', 'Menlo', 'Consolas', monospace; color: #7a7a7a; white-space: nowrap; }
+/* Sits with the zoom label rather than with the pills: it acts on the frozen
+ * span, not on the choice of window. Fixed width so the mark it flashes back
+ * cannot shift the label beside it. */
+.lm-copy { margin-left: 8px; padding: 2px 0; width: 26px; text-align: center; line-height: 1.4; }
 
 /* Each axis name stands over its own gutter, so the widths here are the canvas
  * gutter widths and `tx` reads as the heading of the scale below it. */

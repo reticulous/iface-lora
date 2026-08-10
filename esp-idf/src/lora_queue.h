@@ -41,9 +41,6 @@
 #define LORAQ_F_REPLAY    0x04   /* a buffered announce being replayed: goes out
                                   * verbatim and is never re-recorded */
 #define LORAQ_F_HAVE_TAG  0x08   /* `tag` holds the packet's first-address prefix */
-#define LORAQ_F_PROOF     0x10   /* a Reticulum proof: latency-tolerant traffic
-                                  * the classifier may hold back to ride a
-                                  * transaction instead of launching one */
 
 struct LoraPkt {
     uint8_t*  bytes;           /* heap block we own; free() when refs hits 0 */

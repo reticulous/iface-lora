@@ -36,6 +36,8 @@
 enum : uint8_t {
     IFM_MON  = 0,   /* one on-air frame → a packet node */
     IFM_RSSI = 1,   /* one channel-RSSI sample */
+    IFM_KICK = 2,   /* no payload: a watch transition — wake and re-block on the
+                     * cadence the new state calls for */
 };
 
 struct IfMsg {
@@ -63,9 +65,16 @@ struct IfMsg {
 #define LORA_IFQ_DEPTH 48
 static QueueHandle_t s_ifq = nullptr;
 
-/* Cached by the interface task at 1 Hz so the radio task can gate recording on
- * it without a storage read of its own. */
+/* Cached so the radio task can gate recording — and the sampling beat — on it
+ * without a storage read of its own. Updated by the watch-key subscription the
+ * moment a viewer opens or closes, and refreshed at each maintenance beat as a
+ * belt against a missed callback. */
 static volatile bool s_monWatched = false;
+
+/* The radio task's read of it: true while a LoRaMon viewer (web or LCD) is
+ * open. What hangs off this is not just recording but wake cycles — see
+ * rssiSamplePoll and nextDeadline. */
+bool loraMonOpen(void) { return s_monWatched; }
 
 /* Post to the interface task. Never blocks: a full queue means the storage side
  * is behind, and dropping telemetry is the correct answer. Returns false so the
@@ -301,6 +310,15 @@ void publishState(LoraRadio* r, const char* state) {
  * the interface task to publish. Radio task; the reading is the same
  * getRSSI(false) carrier sense uses, so it costs one SPI transaction.
  *
+ * **Only while a viewer is open.** The series is live-only decoration for the
+ * LoRaMon graphs; nothing in channel access or SUPE reads it (carrier sense
+ * takes its own samples and tracks its own floor). Unwatched, the beat is
+ * skipped here and its deadline is not held in nextDeadline(), so an idle
+ * radio task truly sleeps — a once-a-second wake with an SPI read is exactly
+ * the standing battery cost this interface must not carry for a graph nobody
+ * is looking at. A viewer opening flips s_monWatched and nudges the task; the
+ * stale-by-then deadline samples on that very pass.
+ *
  * **Carrier sense outranks measurement.** While the CSMA machine holds the
  * radio — or a transmit is on air, or a probe owns the chip, or a split is
  * still reassembling — no sample is taken and none is published. The series
@@ -332,7 +350,7 @@ static void rssiSweepAgile(LoraRadio* r, IfMsg* m, const RegimeChan* ch, int n) 
         r->radio->standby();
         if (r->radio->setFrequency((float)ch[i].freqHz / 1.0e6f) != RADIOLIB_ERR_NONE)
             continue;                                  /* out of the part's range */
-        if (r->radio->startReceive() != RADIOLIB_ERR_NONE) continue;
+        if (radioStartRx(r) != RADIOLIB_ERR_NONE) continue;
         r->hal->delayMicroseconds(LORA_RSSI_SETTLE_US);
         float dbm = channelRssi(r);
         /* Below the thermal noise of any bandwidth this part can receive, so
@@ -347,10 +365,14 @@ static void rssiSweepAgile(LoraRadio* r, IfMsg* m, const RegimeChan* ch, int n) 
      * do. */
     r->radio->standby();
     r->radio->setFrequency((float)r->cfgFreqHz / 1.0e6f);
-    r->radio->startReceive();
+    /* The tracked noise floor is left alone: the sweep reads each channel
+     * directly and never feeds the floor, and the radio returns to the channel
+     * whose floor it already holds. */
+    radioStartRx(r);
 }
 
 void rssiSamplePoll(LoraRadio* r) {
+    if (!s_monWatched) return;
     if (!r->running || !r->enabled) return;
     if ((int32_t)(xTaskGetTickCount() - r->mon.rssiNext) < 0) return;
     if (r->txActive || r->splitPending || supeHoldsRadio(r) ||
@@ -444,15 +466,24 @@ static void loraIfTaskMain(void*) {
     info("[%s-if] task up", TAG);
     bool       prevWatch = false;
     TickType_t lastBeat  = 0;
+    TickType_t lastShift = 0;
     uint64_t   statsSig   = 0;
+    const TickType_t shiftTicks =
+        pdMS_TO_TICKS(Rolling1h::kBucketMinutes * 60u * 1000u);
     for (;;) {
         while (!s_stop) {
-            /* Block until the next record OR the next maintenance beat,
-             * whichever is sooner — so an idle interface wakes once a second,
-             * not on a poll timer. The radio task's own 1 Hz RSSI sample lands
-             * in the queue anyway, so this rarely times out in practice. */
-            TickType_t now  = xTaskGetTickCount();
-            TickType_t due  = lastBeat + pdMS_TO_TICKS(LORA_STATS_MIN_MS);
+            /* Block until the next record or the next standing duty. With a
+             * viewer open (or any UI pulling stats) the maintenance beat is
+             * 1 Hz; with neither, the only duty left is aging the one-hour
+             * rollups, one bucket per kBucketMinutes — so a dark idle node
+             * wakes this task a few times an hour, not once a second. A watch
+             * transition posts an IFM_KICK, so opening a viewer never waits
+             * out the long block. */
+            TickType_t now = xTaskGetTickCount();
+            if (lastShift == 0) lastShift = now;
+            bool active = s_monWatched || uiTelemetryWanted();
+            TickType_t due = active ? lastBeat + pdMS_TO_TICKS(LORA_STATS_MIN_MS)
+                                    : lastShift + shiftTicks;
             int32_t    rem  = (int32_t)(due - now);
             TickType_t wait = rem > 0 ? (TickType_t)rem : 0;
 
@@ -468,6 +499,15 @@ static void loraIfTaskMain(void*) {
                 if (uxQueueMessagesWaiting(s_ifq) == 0) monFlushPending();
             }
 
+            /* A close acts on the wake that carried it, not on the next beat —
+             * unwatched, the next beat may be minutes out, and the packets
+             * subtree would sit there the whole wait. */
+            if (prevWatch && !s_monWatched) {
+                monFlushPending();
+                for (int i = 0; i < kNumRadios; i++) loraMonClear(&s_radios[i]);
+            }
+            prevWatch = s_monWatched;
+
             /* Checked whether or not a record arrived: a steady stream of them
              * must not be able to starve expiry and the stats flush. */
             now = xTaskGetTickCount();
@@ -477,21 +517,22 @@ static void loraIfTaskMain(void*) {
 
             /* Age every one-hour running total in the system, ours included.
              * One call covers them all; they linked themselves up at
-             * construction. */
-            {
-                static TickType_t lastShift = 0;
-                if (lastShift == 0) lastShift = now;
-                if ((int32_t)(now - lastShift) >=
-                        (int32_t)pdMS_TO_TICKS(Rolling1h::kBucketMinutes * 60u * 1000u)) {
-                    lastShift = now;
-                    Rolling1h::shiftAll();
-                }
+             * construction. shiftAll ages exactly one bucket, so a wake that
+             * arrives late (never by much — the idle block above is set to
+             * this very cadence) catches up bucket by bucket. */
+            while ((int32_t)(now - lastShift) >= (int32_t)shiftTicks) {
+                lastShift += shiftTicks;
+                Rolling1h::shiftAll();
             }
 
-            /* Cached for the radio task, which gates recording on it rather
-             * than reading storage itself. */
+            /* Belt for the cached watch flag — the change subscription is the
+             * prompt path. A transition it reveals is handled like any other:
+             * a close drops the published subtree. */
             bool w = loraMonWatched();
             s_monWatched = w;
+            if (prevWatch && !w)
+                for (int i = 0; i < kNumRadios; i++) loraMonClear(&s_radios[i]);
+            prevWatch = w;
 
             /* Stats: counters only move on a tx/rx event, so publish only when
              * the sum of them has changed since the last beat. */
@@ -508,18 +549,14 @@ static void loraIfTaskMain(void*) {
             }
 
             /* LoRaMon expiry — 1 Hz while a viewer is open, so nodes age out of
-             * the 1 h window even on an idle channel. When the last viewer
-             * closes, drop each radio's whole packets subtree. */
+             * the 1 h window even on an idle channel. */
             if (w) {
                 uint32_t nowMs = millis();
                 for (int i = 0; i < kNumRadios; i++) {
                     loraMonExpire(&s_radios[i], nowMs);
                     loraPublishAirtime(&s_radios[i], nowMs);
                 }
-            } else if (prevWatch) {
-                for (int i = 0; i < kNumRadios; i++) loraMonClear(&s_radios[i]);
             }
-            prevWatch = w;
         }
 
         /* rns stop: the radio task parks too, so nothing more will be queued.
@@ -532,6 +569,20 @@ static void loraIfTaskMain(void*) {
     }
 }
 
+/* A viewer opened or closed (or WiFi came up, putting a stats-pulling UI in
+ * reach): update the cached flag now and wake both tasks, because each may be
+ * blocked on the long idle cadence the OLD state allowed — the radio task
+ * resumes (or stops holding) the RSSI beat, the interface task re-blocks on
+ * the cadence the new state calls for. */
+static void onWatchChange(const char* /*key*/, const char* /*val*/) {
+    s_monWatched = loraMonWatched();
+    IfMsg m = {};
+    m.kind  = IFM_KICK;
+    m.radio = 0xFF;              /* matches no radio: wake, dispatch nothing */
+    ifPost(&m);
+    loraNudge();
+}
+
 /* Record queue + interface task, created once; both outlive a stop/start
  * cycle. The interface task sits one priority below the radio task: a storage
  * op that stalls must never be able to delay a channel-access decision. Its
@@ -539,9 +590,14 @@ static void loraIfTaskMain(void*) {
  * record it popped and the key/value it formats. */
 void loraMonStart(void) {
     if (!s_ifq) s_ifq = xQueueCreate(LORA_IFQ_DEPTH, sizeof(IfMsg));
-    if (!s_ifTask)
+    if (!s_ifTask) {
         s_ifTask = spawnTask(loraIfTaskMain, "lora-if", 4096, nullptr, 1,
                              CORE_SECONDARY_NO_LCD, STACK_PSRAM);
+        storageSubscribeChanges("sys.stats.web_loramon", onWatchChange);
+        storageSubscribeChanges("sys.stats.lcd_loramon", onWatchChange);
+        storageSubscribeChanges("wifi.sta.up",           onWatchChange);
+        storageSubscribeChanges("wifi.ap.up",            onWatchChange);
+    }
 }
 
 bool loraMonParked(void) { return s_ifParked; }

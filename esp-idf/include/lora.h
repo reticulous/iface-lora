@@ -21,3 +21,18 @@ public:
  * `lora.<n>.packets.<ms>` = a packed string ("r|rssi|snr|dur|bytes" for rx,
  * "t|txp|dur|bytes" for tx; snr is deci-dB). Viewers (browser + LCD) read that
  * subtree directly — no accessor surface here. */
+
+/** Point-in-time neighbour summary for a small status surface (e.g. a tinylcd
+ *  page). Counts the in-memory neighbour table the way the `lora` CLI does —
+ *  the same unsynchronised cross-radio-task read; values are advisory display
+ *  data, not state to act on. rssi/snr10 are the last received frame's. */
+struct lora_peer_summary {
+    int peers;      /* other nodes heard (not us, not our rnode) */
+    int links;      /* link rows observed open */
+    int rssi;       /* dBm, last rx frame (0 when nothing received yet) */
+    int snr10;      /* deci-dB, last rx frame */
+};
+
+/** Fill `out` for radio slot `radio`. False when the slot is invalid, no
+ *  radios are configured, or the radio has never been up (no observations). */
+bool loraPeerSummary(int radio, lora_peer_summary* out);

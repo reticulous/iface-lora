@@ -180,9 +180,17 @@ static void cliPrintSlot(int i) {
     cliPrintf("        freq=%.3f MHz  bw=%.0f kHz  sf=%d  cr=4/%d  txp=%d dBm  preamble=%d\n",
               freq_hz / 1.0e6, bw_hz / 1.0e3, sf, cr, txp, pre);
     cliPrintf("        sync=%s  mode=%s  bitrate=%u bit/s\n", sync, mode, (unsigned)r->curBitrate);
-    if (chipFamily(s->chip) == FAM_SX126X)
-        cliPrintf("        rx_boosted_gain=%d\n",
-                  storageGetInt(sk(kb, sizeof kb, i, "rx_boosted_gain"), 1) != 0);
+    if (chipFamily(s->chip) == FAM_SX126X) {
+        /* The chip is not asked: a register read from the CLI task can land in
+         * the middle of a RadioLib transaction the radio task is holding CS
+         * across. These are the values that were applied to it. */
+        int agc = storageGetInt(sk(kb, sizeof kb, i, "agc_reset"), LORA_AGC_RESET_DEF_S);
+        cliPrintf("        rx_boosted_gain=%d  ocp=%.0f mA  agc_reset=",
+                  storageGetInt(sk(kb, sizeof kb, i, "rx_boosted_gain"), 1) != 0,
+                  (double)radioOcpMilliamps(s->chip));
+        if (agc > 0) cliPrintf("%ds\n", agc);
+        else         cliPrintf("off\n");
+    }
     if (!r->lbt) {
         cliPrintf("        lbt=off (blind tx)\n");
     } else if (!r->appc) {
@@ -198,6 +206,21 @@ static void cliPrintSlot(int i) {
                   (int)(appcAirtime(r) * 100.0f), (unsigned)band, APPC_CW_BANDS,
                   (band - 1) * APPC_CW_PER_BAND_WINDOWS,
                   band * APPC_CW_PER_BAND_WINDOWS - 2);
+    }
+    if (r->lbt) {
+        /* Every wait this radio serves is decided against these two numbers, and
+         * a floor sitting below where the channel actually rests reads as a busy
+         * medium for as long as it takes to creep back — a wait nothing on the
+         * air explains. Printed per channel, since each is contended separately
+         * and only the one in force answers for the wait happening now. */
+        cliPrintf("        noise floor %+.0f dBm on ch%u (busy above %+.0f)",
+                  (double)r->noiseFloor, (unsigned)r->chNow,
+                  (double)(r->noiseFloor + CSMA_RSSI_MARGIN_DB));
+        int n = 0;
+        regimeChans(r->afa, &n);
+        for (int c = 1; c <= n && c < LORA_CH_MAX; c++)
+            cliPrintf("  ch%d %+.0f", c, (double)r->chFloor[c]);
+        cliPrintf("\n");
     }
     cliPrintf("        rx %u/%uB  tx %u/%uB  rssi %d dBm  snr %d dB  crc_err %u  split_to %u\n",
               (unsigned)r->rxFrames, (unsigned)r->rxBytes,
@@ -437,8 +460,8 @@ static void cliAnnounce(int idx) {
         return;
     }
     if (s_task) xTaskNotifyGive(s_task);
-    cliPrintf("lora/%d repeating %d announce%s, then this node's own SUPE announcement\n",
-              idx, n, n == 1 ? "" : "s");
+    cliPrintf("lora/%d repeating %d announce%s%s\n", idx, n, n == 1 ? "" : "s",
+              supeReady(r) ? ", then this node's own SUPE announcement" : "");
 }
 
 /* `lora <n> supe` — everything a field report asks first, in one screen: which
@@ -784,7 +807,7 @@ void cliLora(const char* args) {
         return;
     }
 
-    if (nt < 3) { cliPrintf("usage: lora %ld <freq|bw|sf|cr|txp|preamble|sync|mode|lbt|appc|rx_boosted_gain> <value>\n", idx); return; }
+    if (nt < 3) { cliPrintf("usage: lora %ld <freq|bw|sf|cr|txp|preamble|sync|mode|lbt|appc|rx_boosted_gain|agc_reset> <value>\n", idx); return; }
     const char* val = tok[2];
 
     /* Human units in: frequency MHz, bandwidth kHz. Storage stays in Hz. */
@@ -831,8 +854,14 @@ void cliLora(const char* args) {
         storageSet(sk(kb, sizeof kb, idx, "rx_boosted_gain"), on);
         cliPrintf("lora/%ld rx_boosted_gain = %s (SX126x only)\n", idx,
                   on ? "on (boosted, +~0.4 mA RX)" : "off (power saving)");
+    } else if (strcmp(cmd, "agc_reset") == 0) {
+        int secs = atoi(val);
+        if (secs < 0) secs = 0;
+        storageSet(sk(kb, sizeof kb, idx, "agc_reset"), secs);
+        if (secs) cliPrintf("lora/%ld agc_reset = %d s (SX126x only)\n", idx, secs);
+        else      cliPrintf("lora/%ld agc_reset = off\n", idx);
     } else {
-        cliPrintf("unknown: lora %ld %s (try freq|bw|sf|cr|txp|preamble|sync|mode|lbt|appc|rx_boosted_gain)\n", idx, cmd);
+        cliPrintf("unknown: lora %ld %s (try freq|bw|sf|cr|txp|preamble|sync|mode|lbt|appc|rx_boosted_gain|agc_reset)\n", idx, cmd);
     }
 }
 

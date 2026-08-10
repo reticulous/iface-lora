@@ -13,6 +13,13 @@
  * while a multi-frame reception is being reassembled (half-duplex). */
 static bool channelBusy(LoraRadio* r) {
     if (r->splitPending) return true;
+    /* Ask the demodulator before measuring power. It is the only party that can
+     * see a frame arriving below the noise floor, which LoRa routinely does, and
+     * the answer is one register read — the same order of cost as the sense
+     * itself. This is the prospective half of what csmaMediumHeld corrects after
+     * the fact: together they mean a neighbour's frame is neither transmitted
+     * over nor credited to us as free medium. */
+    if (radioRxInProgress(r)) return true;
     float rssi = channelRssi(r);
     /* `GetRssiInst` asked before the receiver is actually running answers
      * 0xFF, which decodes to −127.5 dBm — below the thermal noise of any
@@ -42,6 +49,43 @@ static bool channelBusy(LoraRadio* r) {
         if (fresh) return true;
     }
     return rssi > r->noiseFloor + CSMA_RSSI_MARGIN_DB;
+}
+
+/* Forget the tracked floor and start again from the seed.
+ *
+ * The floor describes one channel measured through one receiver, so it survives
+ * neither a retune nor a recalibration of the front end that measured it. It is
+ * cheap to re-learn: the tracker snaps down to the first sample below it, so a
+ * seed above the real floor is corrected on the very next sense, while the slow
+ * creep upward is what stops an occupied channel from inflating its own
+ * reference. Carrying a floor across a channel change is the expensive mistake —
+ * a quiet band's floor makes a busy one read as permanently free, and a busy
+ * band's makes a quiet one read as permanently busy. */
+void csmaNoiseFloorReset(LoraRadio* r) {
+    r->noiseFloor = CSMA_NOISE_FLOOR_DBM;
+    for (int i = 0; i < LORA_CH_MAX; i++) r->chFloor[i] = CSMA_NOISE_FLOOR_DBM;
+}
+
+/* Change channel: park the floor the radio just learned and take up the one it
+ * left on the channel it is moving to.
+ *
+ * The reasoning above says a floor must not be carried ACROSS channels, and it
+ * still holds — this carries each channel's own floor forward instead, which is
+ * the opposite operation. What made a plain reseed expensive is the asymmetry
+ * the tracker is built on: a seed above the real floor is corrected by the next
+ * sample, a seed below it is only walked off at 2% of the gap per sense. A node
+ * that detours every second reseeds the hailing channel twice a second, and if
+ * the channel rests above the seed — mid −90s against a −105 dBm seed is an
+ * ordinary bench — every sense in between reads busy, the contention window
+ * accrues nothing, and a transmit that was ready waits a few hundred ms for a
+ * medium that was free the whole time.
+ *
+ * A channel never visited starts from the seed, which is what the reset leaves
+ * behind for it. */
+void csmaFloorSwitch(LoraRadio* r, uint8_t from, uint8_t to) {
+    if (from < LORA_CH_MAX) r->chFloor[from] = r->noiseFloor;
+    if (from == to) return;
+    r->noiseFloor = to < LORA_CH_MAX ? r->chFloor[to] : CSMA_NOISE_FLOOR_DBM;
 }
 
 /* End of a reception — the channel-state half of receiving a frame.
@@ -173,7 +217,7 @@ static void appcDrawWindow(LoraRadio* r) {
  * keeps its progress and cannot be starved indefinitely by neighbours. The
  * window is redrawn only after a grant, never widened on a busy encounter: all
  * adaptation lives in the band. */
-static bool csmaClearAppc(LoraRadio* r) {
+static bool csmaClearAppc(LoraRadio* r, bool prime) {
     TickType_t now = xTaskGetTickCount();
     if (now == 0) now = 1;                          /* 0 is the "not started" sentinel */
     bool free_ = !channelBusy(r);
@@ -199,6 +243,12 @@ static bool csmaClearAppc(LoraRadio* r) {
     r->appcCwStart   = now;
     if (r->appcCwPassed < r->appcCwTarget) return false;
 
+    /* Ready, but the caller is priming rather than transmitting: leave the
+     * window drained and the phase where it is, so the sense goes on running
+     * (a busy medium still restarts the DIFS below) and the first real call
+     * after the wait lifts grants on its own first pass. */
+    if (prime) return false;
+
     r->appcCwPassed  = 0;                           /* granted → next frame redraws */
     r->appcCw        = -1;
     r->appcDifsStart = 0;
@@ -213,14 +263,14 @@ static bool csmaClearAppc(LoraRadio* r) {
  * caller leaves the frame queued and nextDeadline() re-wakes at the next slot.
  * cw grows on every busy encounter (exponential backoff) and resets after a
  * grant; with appc set, the window comes from the airtime band instead. */
-bool csmaClear(LoraRadio* r) {
+static bool csmaAdvance(LoraRadio* r, bool prime) {
     if (!r->lbt) return true;                       /* LBT off → blind transmit */
 
     if (r->appc) {
         /* csmaStart drives the shared stall warning and lbt_timeout valve, so
          * it is stamped here for both regimes. */
         if (r->csmaPhase == CSMA_IDLE) r->csmaStart = xTaskGetTickCount();
-        return csmaClearAppc(r);
+        return csmaClearAppc(r, prime);
     }
 
     TickType_t now = xTaskGetTickCount();
@@ -241,8 +291,8 @@ bool csmaClear(LoraRadio* r) {
             if ((TickType_t)(now - r->csmaDifsStart) < r->difsTicks) return false;
             /* DIFS observed idle → draw a backoff in [0, 2^cw) slots. */
             r->csmaBackoff = (int)(esp_random() & ((1u << r->csmaCw) - 1));
-            if (r->csmaBackoff == 0) { r->csmaPhase = CSMA_IDLE; return true; }
             r->csmaPhase = CSMA_BACKOFF;
+            if (r->csmaBackoff == 0 && !prime) { r->csmaPhase = CSMA_IDLE; return true; }
             r->csmaSlotDeadline = now + r->slotTicks;
             return false;
 
@@ -253,12 +303,37 @@ bool csmaClear(LoraRadio* r) {
                 r->csmaDifsStart = 0;
                 return false;
             }
+            if (r->csmaBackoff <= 0) {             /* drained while priming */
+                if (prime) return false;
+                r->csmaPhase = CSMA_IDLE;
+                return true;
+            }
             if ((int32_t)(now - r->csmaSlotDeadline) < 0) return false;  /* slot not up */
             r->csmaSlotDeadline = now + r->slotTicks;
-            if (--r->csmaBackoff <= 0) { r->csmaPhase = CSMA_IDLE; return true; }
+            if (--r->csmaBackoff <= 0 && !prime) { r->csmaPhase = CSMA_IDLE; return true; }
             return false;
     }
     return true;
+}
+
+/* Advance the machine on behalf of a frame that is queued but not yet allowed
+ * to fly — held by our own timing rather than by anyone's reservation. Sensing
+ * is a read, and the radio is listening anyway, so the inter-frame space and
+ * the contention window are served during the wait instead of after it. The
+ * grant itself is withheld: the state stops one step short, keeps sensing (a
+ * medium that goes busy still restarts the DIFS, exactly as it would for a
+ * frame about to fly), and the first csmaClear after the wait lifts takes it.
+ *
+ * Never call this for a SUPE_V_HOLD: that medium is reserved by somebody else's
+ * GRANT, and contending underneath a reservation is the one thing the
+ * reservation exists to stop. */
+void csmaPrime(LoraRadio* r) {
+    if (!r->lbt) return;
+    (void)csmaAdvance(r, /*prime=*/true);
+}
+
+bool csmaClear(LoraRadio* r) {
+    return csmaAdvance(r, /*prime=*/false);
 }
 
 /* Abandon any channel-access attempt in progress: the next frame contends from

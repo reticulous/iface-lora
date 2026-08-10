@@ -4,6 +4,7 @@
  * the 0x04 power request, and SUPE's derived-power control loop (§15).
  */
 #include "lora_priv.h"
+#include "lora_fem.h"
 
 #if defined(CONFIG_LORA0_CS_PIN)
 
@@ -93,7 +94,7 @@ int8_t apTxPower(LoraRadio* r, const uint8_t* pkt, size_t len) {
  * being recorded at another. */
 void apApplyPower(LoraRadio* r, int8_t txp) {
     if (txp == r->txPwrNow) return;
-    int16_t st = r->radio->setOutputPower(txp);
+    int16_t st = r->radio->setOutputPower(femChipDbm(r, txp));
     if (st != RADIOLIB_ERR_NONE) {
         warn("lora/%d setOutputPower(%d): %s (%d)",
              r->idx, (int)txp, rlErrName(st), (int)st);
@@ -148,7 +149,7 @@ bool apPwrReqFor(LoraRadio* r, const uint8_t* pkt, size_t len, int8_t* out) {
     int want = 0;
     if (!why) {
         want = (cliff10 >= 0 ? cliff10 / 10 : (cliff10 - 9) / 10) + AP_EST_MARGIN_DB;
-        if (want >= AP_PWR_MAX_DBM)      { why = "would ask for max anyway"; val = want; }
+        if (want >= r->maxTxDbm)         { why = "would ask for max anyway"; val = want; }
         if (want < AP_FLOOR_DBM) want = AP_FLOOR_DBM;
     }
 

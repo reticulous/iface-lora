@@ -63,6 +63,9 @@ enum CsmaPhase : uint8_t { CSMA_IDLE, CSMA_DIFS, CSMA_BACKOFF };
 
 /* ─────────────── lora_csma: medium access on the hailing channel ────────── */
 void     csmaMediumHeld(LoraRadio* r, uint32_t durMs);
+void     csmaNoiseFloorReset(LoraRadio* r);
+void     csmaFloorSwitch(LoraRadio* r, uint8_t from, uint8_t to);
+void     csmaPrime(LoraRadio* r);
 bool     csmaClear(LoraRadio* r);
 void     csmaResetAccess(LoraRadio* r);
 uint16_t csmaGrantWaitMs(const LoraRadio* r);
