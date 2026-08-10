@@ -38,8 +38,16 @@ const uint8_t* apNextHop4(LoraRadio* r, const uint8_t* pkt, size_t len) {
          * a link they opened to us resolves to nothing. A delivery proof is
          * addressed to a packet hash and simply misses the link table. */
         NeiLink* L = peersLinkFind(st, h.dest);
-        if (!L || !L->haveDest || peersDestIsLocal(st, L->dest)) return nullptr;
-        return L->dest;
+        if (L && L->haveDest && !peersDestIsLocal(st, L->dest)) return L->dest;
+        /* A link dialled TO us carries no hash for its initiator, so there is no
+         * destination to name the far end with — but the identifier itself is
+         * filed on that node's row once a transaction has named who dialled
+         * (peersAddLink4), so hand back the identifier and let the table
+         * resolve it. Both directions of a session then reach the same peer,
+         * which is what the per-peer cap, the power controller and the reverse
+         * leg's scan all key on. A delivery proof addressed to a packet hash
+         * falls through here too and simply matches nothing, as before. */
+        return h.dest;
     }
     if (h.dtype == NEI_DT_SINGLE) return h.dest;
     return nullptr;

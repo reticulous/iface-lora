@@ -339,6 +339,12 @@ static void observeAnnounce(LoraRadio* r, const RnsHdr* h, bool isTx,
     if (!peersIsLocal(e)) {
         Neighbor* c = peersFindClaim4(st, h->dest);
         if (c && c != e && !peersIsLocal(c)) peersMergeInto(e, c);
+        /* And the same by identity: a SUPE announcement heard before this one
+         * files what it knows — four bytes of an identity and the radio's
+         * capabilities — against a claim row, and this is the frame that
+         * supplies the identity itself. */
+        c = peersFindClaim4(st, idh);
+        if (c && c != e && !peersIsLocal(c)) peersMergeInto(e, c);
     }
 
     NeiDest* nd = peersAddDest(e, h->dest, now);

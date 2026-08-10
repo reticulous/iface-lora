@@ -485,6 +485,18 @@ static void annIngest(LoraRadio* r, const uint8_t* f, size_t len, int16_t rssi) 
     for (int i = 0; i < a.count; i++) {
         Neighbor* e = peersFindByIdent4(r->nei, a.ids[i]);
         if (!e) e = peersFindBy4(r->nei, a.ids[i]);
+        if (!e) e = peersFindClaim4(r->nei, a.ids[i]);
+        /* Never met: this frame IS the introduction — it carries the identities
+         * and the capabilities together — so keep it rather than wait out an
+         * announce interval for the next one. Only four bytes of each identity
+         * are on the air, which is exactly what a claim row holds; the node's
+         * own Reticulum announce supplies the hash and folds the two together
+         * (observeAnnounce). Until then the row has no destination, so nothing
+         * routes to it and the claim can only ever answer for SUPE. */
+        if (!e && i == 0) {
+            e = peersAlloc(r->nei, now);
+            if (e) { memcpy(e->node4, a.ids[i], 4); e->haveNode4 = true; }
+        }
         if (!e || peersIsLocal(e)) continue;
         matched++;
         bool first = !e->supeSeen;

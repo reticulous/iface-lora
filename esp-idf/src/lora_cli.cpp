@@ -440,13 +440,6 @@ static void cliPrintNeighbors(int i, bool verbose) {
 
 
 
-/* `tok` abbreviates `full` when it is a prefix of it and at least `minLen`
- * long — so `lora n` / `lora neigh` / `lora neighbours` and `lora a` /
- * `lora announce` all reach the same place. */
-static bool cliVerb(const char* tok, const char* full, size_t minLen) {
-    size_t n = strlen(tok);
-    return n >= minLen && n <= strlen(full) && strncmp(tok, full, n) == 0;
-}
 /* `lora [<n>] a[nnounce]` — replay every buffered announce, then the radio
  * check, now rather than at the next beat. The beat restarts from the run's
  * end, so this also reschedules. */
@@ -464,12 +457,12 @@ static void cliAnnounce(int idx) {
               supeReady(r) ? ", then this node's own SUPE announcement" : "");
 }
 
-/* `lora <n> supe` — everything a field report asks first, in one screen: which
+/* `lora [<n>] supe` — everything a field report asks first, in one screen: which
  * dialect this build speaks and until when, what the interface resolved the
  * regime to, what the tag set has learned, what is being held, and the counters
  * that say whether anyone is answering.
  *
- * `lora <n> supe rx <hex>` injects a frame into the receive path exactly as if
+ * `lora [<n>] supe rx <hex>` injects a frame into the receive path exactly as if
  * the radio had decoded it. The hex is meant to come from the golden vectors
  * the host tests emit (esp-idf/test/golden.txt), never hand-written: that is
  * what keeps a one-device test and the codec from disagreeing. */
@@ -638,7 +631,7 @@ static void cliSupe(int idx, const char* sub, const char* arg) {
 }
 
 static bool cliIsNeighbors(const char* t) {
-    return cliVerb(t, "neighbors", 1) || cliVerb(t, "neighbours", 1);
+    return cliVerbIs(t, "neighbors", 1) || cliVerbIs(t, "neighbours", 1);
 }
 
 /* Pointer into `orig` just past the first `skip` whitespace-separated tokens,
@@ -752,8 +745,8 @@ void cliLora(const char* args) {
         cliPrintf("%-*s blind-transmit a payload (0x<hex> = raw bytes)\n", CLI_HELP_COL, "lora <n> tx <string>");
         cliPrintf("%-*s carrier-sense (as normal tx), then transmit\n", CLI_HELP_COL, "lora <n> tx_psa <string>");
         cliPrintf("%-*s emit a header committing receivers for <ms> (4/8)\n", CLI_HELP_COL, "lora <n> tx_prot <ms>");
-        cliPrintf("%-*s SUPE state: regime, expiry, tag set, holds, counters\n", CLI_HELP_COL, "lora <n> supe");
-        cliPrintf("%-*s inject a golden-vector frame into the receive path\n", CLI_HELP_COL, "lora <n> supe rx 0x<hex>");
+        cliPrintf("%-*s SUPE state: regime, expiry, tag set, holds, counters\n", CLI_HELP_COL, "lora [<n>] supe");
+        cliPrintf("%-*s inject a golden-vector frame into the receive path\n", CLI_HELP_COL, "lora [<n>] supe rx 0x<hex>");
         return;
     }
     if (cliIsNeighbors(tok[0])) {                           /* all radios */
@@ -761,7 +754,11 @@ void cliLora(const char* args) {
         for (int i = 0; i < kNumRadios; i++) cliPrintNeighbors(i, v);
         return;
     }
-    if (cliVerb(tok[0], "announce", 1)) { cliAnnounce(0); return; }   /* no index → radio 0 */
+    if (cliVerbIs(tok[0], "announce", 1)) { cliAnnounce(0); return; }   /* no index → radio 0 */
+    if (cliVerbIs(tok[0], "supe", 4)) {                       /* likewise */
+        cliSupe(0, nt > 1 ? tok[1] : nullptr, cliRest(args, 2));
+        return;
+    }
 
     char kb[48];
     /* `lora up|down` → all radios. */
@@ -792,7 +789,7 @@ void cliLora(const char* args) {
     }
     /* `lora [<n>] a[nnounce]` — replay every buffered announce, then the radio
      * check, now rather than at the next beat. The beat restarts from here. */
-    if (cliVerb(cmd, "announce", 1)) { cliAnnounce((int)idx); return; }
+    if (cliVerbIs(cmd, "announce", 1)) { cliAnnounce((int)idx); return; }
 
     if (strcmp(cmd, "tx") == 0 || strcmp(cmd, "tx_psa") == 0 || strcmp(cmd, "tx_prot") == 0) {
         cliManualTx(idx, cmd, cliRest(args, 2));
@@ -802,7 +799,7 @@ void cliLora(const char* args) {
     /* The hex comes off the original line rather than the token array: the
      * tokeniser holds four and truncates at 80 characters, and a bundled
      * ANNOUNCE2 vector is longer than that. */
-    if (cliVerb(cmd, "supe", 4)) {
+    if (cliVerbIs(cmd, "supe", 4)) {
         cliSupe((int)idx, nt > 2 ? tok[2] : nullptr, cliRest(args, 3));
         return;
     }

@@ -1067,11 +1067,37 @@ radio, `gp_alloc`'d at first `radioStart` and kept across config cycles and
   need no privileged source. A tx announce that came from the RNode client marks
   the entry `rnode` instead, giving the table a **second local row**. The two
   fold separately: our identities merge into `us`, the client's into `rnode`.
+- **Claim rows, and what folds them in.** A row can exist on four bytes alone:
+  `node4`, the first-4 of a hash asserted by a frame that never carried the hash
+  itself. A SUPE announcement is exactly that case — it carries four bytes of
+  each identity plus the radio's capabilities, and arrives whenever that node's
+  beat says so, which may be long before any Reticulum announce of its own. It
+  files against a claim row rather than being discarded, so the capabilities
+  survive the gap; the row holds no destination, so nothing routes to it and the
+  claim can only ever answer for SUPE. `observeAnnounce` reconciles it on the
+  first verified announce, by destination *and* by identity — the identity being
+  the key a SUPE claim is filed under — and `peersMergeInto` folds the two.
+  Claims never cross the us/them boundary: an unauthenticated assertion must not
+  reach our own row.
+- **Two lookups, deliberately different.** `peersFindBy4` answers "which node is
+  this next hop", searching `node4`, destinations and link identifiers — the
+  three things a packet is ever addressed to. `tagNode` (in `lora_supe`) answers
+  that *and* "which node does this sender identity name", so it searches stored
+  identities too. No packet is ever addressed to an identity, so widening
+  `peersFindBy4` to match them would only ever fire on a four-byte collision;
+  the asymmetry is the point.
 - **Links.** An LR at hops 0 yields `link_id = H([flags&0x0F] ‖ raw[2:])[:16]`
   with LR data trimmed to the 64 ephemeral-key bytes (MTU signalling excluded),
   mapped to its dest; the LRPROOF (context 0xFF, dest = link_id) marks it
   established and — at hops 0 — attributes its signal to the dest, which is
-  thereby proven a direct neighbour. Mid-link traffic on an unseen link_id
+  thereby proven a direct neighbour. A link dialled *to* us records no hash for
+  its initiator, so `apNextHop4` cannot name the far end from the link's
+  destination — that destination is ours. It hands back the link identifier
+  instead, which resolves once a transaction has named who dialled and filed the
+  identifier on that node's row (`peersAddLink4`). Without that, our own traffic
+  on such a link carries `LORAQ_PEER_NONE` into the queue, and everything keyed
+  on the queued peer — the per-peer cap, the power controller, and the reverse
+  leg's scan — silently finds nothing. Mid-link traffic on an unseen link_id
   creates an *unresolved* entry. `ours` = we transmit on it at hops 0, or its
   LR dest is one of our hashes.
 - **Link quality (one byte).** Proof packets are addressed to the proved
