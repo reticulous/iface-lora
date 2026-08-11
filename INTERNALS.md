@@ -45,7 +45,8 @@ contributes:
   became nothing cannot block transmit.
 - **SX126x hardware corrections** (§4, §4a) — the PA over-current trip RadioLib
   leaves at 60 mA, the 0x8B5 RX-sensitivity register bit, a TCXO-off retry that
-  distinguishes a mis-set reference voltage from absent hardware, and the
+  distinguishes a mis-set reference voltage from absent hardware, a check that
+  the configured frequency is one the part has an image calibration for, and the
   periodic front-end recalibration that keeps a latched gain control from
   deafening the receiver.
 - **IFAC plumbing** — reading `s.lora.<n>.ifac_netname` / `ifac_size` and the
@@ -294,6 +295,20 @@ answers the next command with an error. `radioBegin` retries the whole call with
 the voltage at zero, and on success warns naming `CONFIG_LORAn_TCXO_MV`. Without
 it that board reads as **absent** — a wrong Kconfig value and missing hardware
 are indistinguishable in the boot log, and the wrong one is far more likely.
+
+**The image-calibration band check (SX126x only).** `SX126x::calibrateImage()`
+has factory calibrations for five bands — **430-440, 470-510, 779-787, 863-870,
+902-928 MHz** — and falls back to `calibrateImageRejection(freq ± 4 MHz)` for
+anything else, which RadioLib itself calls "may or may not work". A frequency
+outside all five is legal (the part tunes 150-960 MHz) but is far more often a
+typo, and a typo is invisible from the device: the radio comes up, publishes
+`state=up`, reports a **quiet** noise floor because the band really is empty, and
+simply hears nothing. Every other setting still matches its neighbours, so `lora
+<n>` reads healthy on both sides of a link that does not exist. `radioBegin`
+therefore checks `freq` against the same table — with the same truncation to
+whole MHz RadioLib uses, so the check cannot disagree with the call it describes
+— and warns naming the bands. It is a warning, not a refusal: out-of-band
+operation is a legitimate thing to ask a part for.
 
 ## 4a. Analog front-end recalibration (`s.lora.<n>.agc_reset`)
 

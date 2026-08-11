@@ -111,6 +111,29 @@ static void sx126xRxSensPatch(LoraRadio* r) {
         warn("lora/%d SX126x RX-sensitivity register patch failed", r->idx);
 }
 
+/* The bands SX126x::calibrateImage() has a factory image calibration for,
+ * mirroring RadioLib's own table — including its truncation of the frequency to
+ * a whole MHz, because a check that disagrees with the call it is describing is
+ * worse than no check. A frequency outside every one of them falls back to
+ * calibrateImageRejection(freq ± 4 MHz), which the library itself describes as
+ * "may or may not work".
+ *
+ * Landing outside is legal — the part tunes 150-960 MHz — but the common cause
+ * is a mistyped frequency, and on the air the two are indistinguishable: the
+ * radio comes up, calls itself healthy, reports a quiet noise floor because the
+ * band really is empty, and hears nothing anyone says. A digit lost from an
+ * 869.475 puts a node on 469.475 with every other setting still matching its
+ * neighbours. So the frequency is checked against the same table and named. */
+static bool sx126xImageBandKnown(float freqMhz) {
+    static const struct { int lo, hi; } bands[] = {
+        { 902, 928 }, { 863, 870 }, { 779, 787 }, { 470, 510 }, { 430, 440 },
+    };
+    int f = (int)freqMhz;
+    for (size_t i = 0; i < sizeof bands / sizeof bands[0]; i++)
+        if (f >= bands[i].lo && f <= bands[i].hi) return true;
+    return false;
+}
+
 /* The family's begin(), with nothing applied after it. Split out of radioBegin so
  * the TCXO fallback can run the whole call again with a different argument. */
 static int16_t radioBeginOnce(LoraRadio* r, float freq, float bw, uint8_t sf, uint8_t cr,
@@ -153,7 +176,8 @@ static int16_t radioBeginOnce(LoraRadio* r, float freq, float bw, uint8_t sf, ui
  * SX126x parts then take the extras their family needs: DIO2 as the antenna RF
  * switch when the slot asks for it, the LNA boosted-RX-gain option
  * (r->rxBoostedGain, ~+3 dB sensitivity for ~0.4 mA more RX current), the PA
- * over-current trip, and the RX-sensitivity register patch. */
+ * over-current trip, and the RX-sensitivity register patch — and the frequency
+ * is checked against the image-calibration bands (sx126xImageBandKnown). */
 int16_t radioBegin(LoraRadio* r, float freq, float bw, uint8_t sf, uint8_t cr,
                           uint8_t sync, int8_t power, uint16_t preamble, float tcxoV) {
     PhysicalLayer* p = r->radio;
@@ -179,6 +203,12 @@ int16_t radioBegin(LoraRadio* r, float freq, float bw, uint8_t sf, uint8_t cr,
     }
     if (st != RADIOLIB_ERR_NONE) return st;
     if (chipFamily(r->slot->chip) != FAM_SX126X) return st;
+
+    if (!sx126xImageBandKnown(freq))
+        warn("lora/%d %.3f MHz is outside every band this part has an image "
+             "calibration for (430-440, 470-510, 779-787, 863-870, 902-928 MHz) "
+             "— the radio will come up and hear very little. Check the frequency "
+             "is the one you meant", r->idx, (double)freq);
 
     SX126x* sx = static_cast<SX126x*>(p);
     if (r->slot->dio2_rf_switch) st = sx->setDio2AsRfSwitch(true);
