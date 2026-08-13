@@ -127,6 +127,19 @@ settings:
           min: 1
           max: 100
           default: 2
+      # Transit policy. Auto is what this build always did: the policy is
+      # inferred from Mode above, and Route for is not read at all. Off auto,
+      # you are stating what this node IS to the nodes on this radio — a
+      # gateway that answers and searches for them, or a bare endpoint.
+      - switch:
+          label: "Set policy manually"
+          key: "s.lora.0.policy_manual"
+          default: 0
+      - caption: "Off = auto: the mode decides and the row below is ignored."
+      - switch:
+          label: "Route for"
+          key: "s.lora.0.route_for"
+          default: 0
       # SUPE — unicast traffic leaves the shared channel for short private
       # high-rate detours, negotiated in one seven-byte frame, with rnsd
       # unmodified and unaware (plans/SUPE.md).

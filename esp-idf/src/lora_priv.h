@@ -211,6 +211,9 @@ struct LoraRadio {
     char            curIfacNetkey[64];    /* IFAC passphrase (secrets.) */
     uint8_t         curIfacSize;          /* IFAC access-code length */
     uint8_t         curAnnounceCap;       /* % bandwidth cap for announces (s.) */
+    uint8_t         curRetainAnnounces;   /* keep announces heard here, not just forward */
+    uint8_t         curPolicyManual;      /* 0 = auto: policy inferred, curRouteFor unread */
+    uint8_t         curRouteFor;          /* manual only: do we do transit work for this radio */
 
     /* Split-RX reassembly — one in-flight split at a time per radio. */
     uint8_t         splitBuf[RNS_MTU + 16];

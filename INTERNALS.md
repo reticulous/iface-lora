@@ -87,7 +87,7 @@ contributes:
 
 ## 2. The task
 
-One FreeRTOS task — **priority 2, 10 KB PSRAM stack** (larger than other
+One FreeRTOS task — **priority 1, 10 KB PSRAM stack** (larger than other
 interfaces for the LoRa frame buffers, RadioLib state, and the neighbour
 table's inline Ed25519 announce verification, §13). It services *all*
 radios; per-radio state lives in `s_radios[]` (`LoraRadio`). Its **core** is
@@ -747,6 +747,12 @@ The two deadlines are computed in `radioStart` from the live modem parameters
   announces may use; `point_to_point` is left 0 (LoRa is a shared radio medium
   with hidden nodes, so announces are still re-broadcast for peers out of range
   of the origin — see `rns/INTERNALS.md` §1.1.1);
+- `retain_announces` from `s.lora.<n>.retain_announces` (default 1) — an
+  announce heard here is worth *keeping*, not merely forwarding: this node is
+  the sole custodian of the mesh on the other side of the radio, re-acquiring a
+  neighbour costs ~1.5 s of airtime, and a path response is a signed announce
+  that only a node still holding the original bytes can emit (see
+  `rns/INTERNALS.md` §1.1.2);
 - IFAC fields from `s.lora.<n>.ifac_netname` / `ifac_size` and
   `secrets.lora.<n>.ifac_netkey`.
 

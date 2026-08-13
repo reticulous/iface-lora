@@ -387,6 +387,15 @@ static bool radioStart(LoraRadio* r) {
     }
     r->curIfacSize = (uint8_t)storageGetInt(sk(kb, sizeof kb, r->idx, "ifac_size"), 0);
     r->curAnnounceCap = (uint8_t)storageGetInt(sk(kb, sizeof kb, r->idx, "announce_cap"), RNS_IFACE_ANNOUNCE_CAP_DEFAULT);
+    /* On by default. This is the expensive edge: we are the sole custodian of
+     * the mesh on the other side of this radio, re-acquiring a neighbour costs
+     * ~1.5 s of airtime, and a path response is a signed announce only a node
+     * still holding the original bytes can emit. */
+    r->curRetainAnnounces = (uint8_t)storageGetInt(sk(kb, sizeof kb, r->idx, "retain_announces"), 1);
+    /* Transit policy — auto by default, so a radio behaves exactly as before
+     * until its operator says what this node is to the nodes on it. */
+    r->curPolicyManual = (uint8_t)storageGetInt(sk(kb, sizeof kb, r->idx, "policy_manual"), 0);
+    r->curRouteFor     = (uint8_t)storageGetInt(sk(kb, sizeof kb, r->idx, "route_for"), 0);
 
     storageBegin();
     storageSet(rk(kb, sizeof kb, r->idx, "chip"), chipName(r->slot->chip));
@@ -908,7 +917,7 @@ static void loraStart(void) {
     if (!s_task)
         /* 10 KB PSRAM stack: LoRa frame buffers + RadioLib state, plus the
          * inline Ed25519 announce verification of the neighbour table. */
-        s_task = spawnTask(loraTaskMain, TAG, 10240, nullptr, 2, CORE_SECONDARY_NO_LCD, STACK_PSRAM);
+        s_task = spawnTask(loraTaskMain, TAG, 10240, nullptr, 1, CORE_SECONDARY_NO_LCD, STACK_PSRAM);
     else
         xTaskNotifyGive(s_task);   /* un-park the resident task */
 }

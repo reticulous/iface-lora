@@ -58,6 +58,9 @@ bool registerWithRnsd(LoraRadio* r) {
     reg.ifac_size = r->curIfacSize;
     reg.announce_cap = r->curAnnounceCap;
     reg.rx_signal = 1;   /* inbound data frames carry the 4-byte RSSI/SNR prefix */
+    reg.retain_announces = r->curRetainAnnounces;
+    reg.policy_manual = r->curPolicyManual;
+    reg.route_for     = r->curRouteFor;
     safeStrncpy(reg.ifac_netname, r->curIfacNetname, sizeof(reg.ifac_netname));
     safeStrncpy(reg.ifac_netkey,  r->curIfacNetkey,  sizeof(reg.ifac_netkey));
     /* ref = radio index — onRnsdDisconnect uses it to find the radio. */
