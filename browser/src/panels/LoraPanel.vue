@@ -34,22 +34,24 @@
     <SettingSelect label="Mode" k="s.lora.0.mode" :options="modeOptions" />
     <SettingSlider label="Announce cap (%)" k="s.lora.0.announce_cap" :min="1" :max="100" />
 
-    <div class="section-heading">SUPE</div>
+    <template v-if="hasSupe">
+      <div class="section-heading">SUPE</div>
 
-    <div class="text-caption" style="opacity:0.7">
-      Moves unicast traffic off the shared channel onto short private high-rate
-      detours, negotiated in one seven-byte frame. Everything here is on by
-      default and this switch is the only thing that isn't — with it off the
-      radio behaves exactly as it did. Traffic to a peer that hasn't announced
-      itself over SUPE is untouched, so a mixed segment needs no fallback.
-      Inert on an interface with an access code.
-    </div>
+      <div class="text-caption" style="opacity:0.7">
+        Moves unicast traffic off the shared channel onto short private high-rate
+        detours, negotiated in one seven-byte frame. Everything here is on by
+        default and this switch is the only thing that isn't — with it off the
+        radio behaves exactly as it did. Traffic to a peer that hasn't announced
+        itself over SUPE is untouched, so a mixed segment needs no fallback.
+        Inert on an interface with an access code.
+      </div>
 
-    <SettingToggle label="Enabled" k="s.lora.0.SUPE.enable" />
-    <SettingSelect label="Regime" k="s.lora.0.SUPE.afa" :options="regimeOptions" />
-    <SettingToggle label="Adaptive TX power" k="s.lora.0.SUPE.adaptive_txpower" />
-    <SettingSlider label="Announce interval (min)"
-                   k="s.lora.0.SUPE.announce_interval" :min="0" :max="240" />
+      <SettingToggle label="Enabled" k="s.lora.0.SUPE.enable" />
+      <SettingSelect label="Regime" k="s.lora.0.SUPE.afa" :options="regimeOptions" />
+      <SettingToggle label="Adaptive TX power" k="s.lora.0.SUPE.adaptive_txpower" />
+      <SettingSlider label="Announce interval (min)"
+                     k="s.lora.0.SUPE.announce_interval" :min="0" :max="240" />
+    </template>
 
     <q-expansion-item dense dense-toggle label="Advanced" header-class="text-caption" class="q-mt-xs">
       <div class="q-pl-sm q-gutter-y-sm q-pt-sm">
@@ -115,6 +117,12 @@ function setIfacKey(val: string | number | null) {
   device.set('secrets.lora.0.ifac_netkey', ifacKey.value)
   device.save()
 }
+
+/* A firmware built with CONFIG_LORA_NO_SUPE has no SUPE and no keys under the
+ * prefix, so the device publishes none and the whole section is absent rather
+ * than present-but-inert. The panel is one bundle serving either firmware — it
+ * cannot read a Kconfig, so it asks the device what it has. */
+const hasSupe   = computed(() => device.get('s.lora.0.SUPE.enable') !== undefined)
 
 const state     = computed(() => String(device.get('lora.0.state') ?? ''))
 const chip      = computed(() => String(device.get('lora.0.chip') ?? ''))

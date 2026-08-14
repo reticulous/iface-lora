@@ -86,6 +86,7 @@ struct Neighbor {
     int8_t   apPwr;
     bool     apFromEst;             /* derived from reciprocity, not measured */
 
+#if !defined(CONFIG_LORA_NO_SUPE)
     /* ── SUPE ──
      * A node becomes a SUPE peer by its SUPE_ANNOUNCE2 being heard and by
      * nothing else, which is the whole of the mixed-segment story: traffic to
@@ -95,6 +96,7 @@ struct Neighbor {
     SupeCaps supeCaps;
     uint32_t supeHeardMs;           /* last ANNOUNCE2 or answered offer — the
                                      * five-minute staleness gate reads this */
+#endif
     /* Path loss, never a bare level (SUPE.md §10). Every reading is a pair: a
      * level measured here, and the transmit power the other side states for it
      * one frame later. One pair per configuration — the hailing one, which an
@@ -157,9 +159,11 @@ struct NeiLink {
      * carries the sender's capabilities unconditionally. That is enough to
      * offer a detour back, which is what SUPE.md §10's "links inherit" asks
      * for and what otherwise leaves reverse traffic on the shared channel. */
+#if !defined(CONFIG_LORA_NO_SUPE)
     bool     supeSeen;
     SupeCaps supeCaps;
     uint32_t supeHeardMs;
+#endif
     bool     havePair;
     int16_t  pairRssi;
     int8_t   pairTxp;

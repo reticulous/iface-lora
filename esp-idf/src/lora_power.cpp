@@ -141,7 +141,11 @@ bool apPwrReqFor(LoraRadio* r, const uint8_t* pkt, size_t len, int8_t* out) {
     int      cliff10 = 0;
     uint32_t samples = 0;
     Neighbor* e = peersFindBy4(r->nei, h.dest);
+#if !defined(CONFIG_LORA_NO_SUPE)
     if (!r->adaptive)                     why = "SUPE.adaptive_txpower off";
+#else
+    if (!r->adaptive)                     why = "adaptive tx power is off";
+#endif
     else if (!e || peersIsLocal(e))         why = "dest hash is on no node row";
     /* Only a node that has spoken our air protocol to us will parse the frame;
      * to anyone else it is 35 ms of unparseable noise on a shared channel. That
@@ -236,18 +240,19 @@ static void apSettle(LoraRadio* r, Neighbor* e) {
  * the floor below remembers where it broke, and decays. Never above the
  * configured tx_power, under any failure, for any reason. */
 int8_t apOpenPower(LoraRadio* r, Neighbor* e) {
-    if (!r->supeAdaptive || !e) return r->cfgTxp;
+    if (!r->adaptive || !e) return r->cfgTxp;
     int want = (int)r->cfgTxp - (int)e->apOffsetDb;
     if (e->haveApFloor && want < e->apFloorDbm) want = e->apFloorDbm;
     return apClamp(r, want);
 }
 
+#if !defined(CONFIG_LORA_NO_SUPE)
 /* A miss raises the offset fast — being wrong downward costs connectivity, so
  * recovery is immediate and large — and remembers where it broke, on a floor
  * that decays, so the loop settles above the cliff instead of oscillating
  * across it. */
 void supeApFailed(LoraRadio* r, Neighbor* e, int8_t triedDbm) {
-    if (!r->supeAdaptive || !e) return;
+    if (!r->adaptive || !e) return;
     e->apOffsetDb = e->apOffsetDb > 6 ? (int8_t)(e->apOffsetDb - 6) : 0;
     e->apFloorDbm = (int8_t)(triedDbm + 3);
     e->haveApFloor = true;
@@ -263,7 +268,7 @@ void supeApFailed(LoraRadio* r, Neighbor* e, int8_t triedDbm) {
  * on time, because "nothing went wrong lately" means nothing if nothing was
  * sent. */
 void supeApSucceeded(LoraRadio* r, Neighbor* e) {
-    if (!r->supeAdaptive || !e) return;
+    if (!r->adaptive || !e) return;
     if (++e->apSuccess < AP_MIN_SAMPLES) return;
     e->apSuccess = 0;
     if (e->apOffsetDb < 40) {
@@ -297,5 +302,7 @@ void supeFilePair(LoraRadio* r, Neighbor* e, int16_t rssi, int8_t peerTxp,
         dbg("lora/%d supe: path-loss pair filed (%s): %d dBm heard, %d dBm sent",
             r->idx, step == 0 ? "hailing" : "detour", (int)rssi, (int)peerTxp);
 }
+
+#endif  /* CONFIG_LORA_NO_SUPE */
 
 #endif  /* CONFIG_LORA0_CS_PIN */

@@ -110,8 +110,11 @@ void manualTxPoll(LoraRadio* r) {
          * the other end is timing against, and it may be tuned off the hailing
          * channel entirely. Refuse rather than transmit into the middle of one;
          * the standoff has to run both ways or it is not one. */
-        if (r->splitPending || r->txActive || supeHoldsRadio(r))
-            { manualTxFinish(r, false, "radio busy"); return; }
+        if (r->splitPending || r->txActive
+#if !defined(CONFIG_LORA_NO_SUPE)
+            || supeHoldsRadio(r)
+#endif
+           ) { manualTxFinish(r, false, "radio busy"); return; }
 
         if (r->mtxKind == MTX_PROT) { manualTxProt(r); return; }
 
@@ -216,10 +219,12 @@ static void cliPrintSlot(int i) {
         cliPrintf("        noise floor %+.0f dBm on ch%u (busy above %+.0f)",
                   (double)r->noiseFloor, (unsigned)r->chNow,
                   (double)(r->noiseFloor + CSMA_RSSI_MARGIN_DB));
+#if !defined(CONFIG_LORA_NO_SUPE)
         int n = 0;
         regimeChans(r->afa, &n);
         for (int c = 1; c <= n && c < LORA_CH_MAX; c++)
             cliPrintf("  ch%d %+.0f", c, (double)r->chFloor[c]);
+#endif
         cliPrintf("\n");
     }
     cliPrintf("        rx %u/%uB  tx %u/%uB  rssi %d dBm  snr %d dB  crc_err %u  split_to %u\n",
@@ -314,6 +319,7 @@ static void cliPrintNode(Neighbor* e, int num, void* ud) {
          * widest channel — so the tag names the budget rather than merely the
          * protocol once one is known. BUDGET 0 is a real answer: the pair has
          * no rung above hailing. */
+#if !defined(CONFIG_LORA_NO_SUPE)
         if (e->supeSeen) {
             char t[24];
             uint32_t maxBw = (uint32_t)c->r->cfgBwHz;
@@ -332,6 +338,7 @@ static void cliPrintNode(Neighbor* e, int num, void* ud) {
             snprintf(t, sizeof t, RF_PROTO_NAME " BUDGET %u", (unsigned)top);
             add(t);
         } else if (e->ourProto) add(RF_PROTO_NAME);
+#endif
         int est10;
         if (peersEstimateCliff10(c->r, e, c->now, &est10, nullptr)) {
             char t[24];
@@ -453,10 +460,15 @@ static void cliAnnounce(int idx) {
         return;
     }
     if (s_task) xTaskNotifyGive(s_task);
+#if !defined(CONFIG_LORA_NO_SUPE)
     cliPrintf("lora/%d repeating %d announce%s%s\n", idx, n, n == 1 ? "" : "s",
               supeReady(r) ? ", then this node's own SUPE announcement" : "");
+#else
+    cliPrintf("lora/%d repeating %d announce%s\n", idx, n, n == 1 ? "" : "s");
+#endif
 }
 
+#if !defined(CONFIG_LORA_NO_SUPE)
 /* `lora [<n>] supe` — everything a field report asks first, in one screen: which
  * dialect this build speaks and until when, what the interface resolved the
  * regime to, what the tag set has learned, what is being held, and the counters
@@ -629,6 +641,8 @@ static void cliSupe(int idx, const char* sub, const char* arg) {
     if (r->q.n) cliPrintf("  queued      %u packet%s\n",
                           (unsigned)r->q.n, r->q.n == 1 ? "" : "s");
 }
+#endif  /* CONFIG_LORA_NO_SUPE */
+
 
 static bool cliIsNeighbors(const char* t) {
     return cliVerbIs(t, "neighbors", 1) || cliVerbIs(t, "neighbours", 1);
@@ -738,15 +752,21 @@ void cliLora(const char* args) {
         cliPrintf("%-*s status for one radio\n",            CLI_HELP_COL, "lora <n>");
         cliPrintf("%-*s enable/disable (no <n> = all)\n",   CLI_HELP_COL, "lora [<n>] up|down");
         cliPrintf("%-*s observed direct neighbours (-v for detail)\n", CLI_HELP_COL, "lora [<n>] n[eighbors]");
+#if !defined(CONFIG_LORA_NO_SUPE)
         cliPrintf("%-*s repeat every announce, then our SUPE announcement\n", CLI_HELP_COL, "lora [<n>] a[nnounce]");
+#else
+        cliPrintf("%-*s repeat every announce this node has originated\n", CLI_HELP_COL, "lora [<n>] a[nnounce]");
+#endif
         cliPrintf("%-*s freq MHz / bw kHz / sf / cr /\n",   CLI_HELP_COL, "lora <n> <param> <val>");
         cliPrintf("%-*s   txp dBm / preamble / sync / mode / lbt 0|1 / appc 0|1 /\n", CLI_HELP_COL, "");
         cliPrintf("%-*s   rx_boosted_gain 0|1\n", CLI_HELP_COL, "");
         cliPrintf("%-*s blind-transmit a payload (0x<hex> = raw bytes)\n", CLI_HELP_COL, "lora <n> tx <string>");
         cliPrintf("%-*s carrier-sense (as normal tx), then transmit\n", CLI_HELP_COL, "lora <n> tx_psa <string>");
         cliPrintf("%-*s emit a header committing receivers for <ms> (4/8)\n", CLI_HELP_COL, "lora <n> tx_prot <ms>");
+#if !defined(CONFIG_LORA_NO_SUPE)
         cliPrintf("%-*s SUPE state: regime, expiry, tag set, holds, counters\n", CLI_HELP_COL, "lora [<n>] supe");
         cliPrintf("%-*s inject a golden-vector frame into the receive path\n", CLI_HELP_COL, "lora [<n>] supe rx 0x<hex>");
+#endif
         return;
     }
     if (cliIsNeighbors(tok[0])) {                           /* all radios */
@@ -755,10 +775,12 @@ void cliLora(const char* args) {
         return;
     }
     if (cliVerbIs(tok[0], "announce", 1)) { cliAnnounce(0); return; }   /* no index → radio 0 */
+#if !defined(CONFIG_LORA_NO_SUPE)
     if (cliVerbIs(tok[0], "supe", 4)) {                       /* likewise */
         cliSupe(0, nt > 1 ? tok[1] : nullptr, cliRest(args, 2));
         return;
     }
+#endif  /* CONFIG_LORA_NO_SUPE */
 
     char kb[48];
     /* `lora up|down` → all radios. */
@@ -799,10 +821,12 @@ void cliLora(const char* args) {
     /* The hex comes off the original line rather than the token array: the
      * tokeniser holds four and truncates at 80 characters, and a bundled
      * ANNOUNCE2 vector is longer than that. */
+#if !defined(CONFIG_LORA_NO_SUPE)
     if (cliVerbIs(cmd, "supe", 4)) {
         cliSupe((int)idx, nt > 2 ? tok[2] : nullptr, cliRest(args, 3));
         return;
     }
+#endif  /* CONFIG_LORA_NO_SUPE */
 
     if (nt < 3) { cliPrintf("usage: lora %ld <freq|bw|sf|cr|txp|preamble|sync|mode|lbt|appc|rx_boosted_gain|agc_reset> <value>\n", idx); return; }
     const char* val = tok[2];

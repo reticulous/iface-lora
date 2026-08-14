@@ -285,14 +285,18 @@ static void loraMonClear(LoraRadio* r) {
  * With no agility in force it is just the hailing channel, so a viewer can tell
  * the two cases apart by the entry count alone and needs no separate flag. */
 void publishChannels(LoraRadio* r) {
-    int n = 0;
-    const RegimeChan* ch = regimeChans(r->afa, &n);
     char val[24 * LORA_CH_MAX];
     int  w = snprintf(val, sizeof val, "%u,%u",
                       (unsigned)r->cfgFreqHz, (unsigned)r->cfgBwHz);
+#if !defined(CONFIG_LORA_NO_SUPE)
+    int n = 0;
+    const RegimeChan* ch = regimeChans(r->afa, &n);
     for (int i = 0; i < n && i + 1 < LORA_CH_MAX && w > 0 && w < (int)sizeof val; i++)
         w += snprintf(val + w, sizeof val - w, "|%u,%u",
                       (unsigned)ch[i].freqHz, (unsigned)ch[i].bwHz);
+#else
+    (void)w;    /* no agility: the hailing channel is the whole list */
+#endif
     char kb[48];
     storageSet(rk(kb, sizeof kb, r->idx, "chans"), val);
 }
@@ -345,6 +349,7 @@ void publishState(LoraRadio* r, const char* state) {
  * regulatory Clear Channel Assessment is the opposite case and would have to
  * match the channel's occupied bandwidth; that is a different measurement for a
  * different purpose, and not this one. */
+#if !defined(CONFIG_LORA_NO_SUPE)
 static void rssiSweepAgile(LoraRadio* r, IfMsg* m, const RegimeChan* ch, int n) {
     for (int i = 0; i < n && i + 1 < LORA_CH_MAX; i++) {
         r->radio->standby();
@@ -370,12 +375,16 @@ static void rssiSweepAgile(LoraRadio* r, IfMsg* m, const RegimeChan* ch, int n) 
      * whose floor it already holds. */
     radioStartRx(r);
 }
+#endif  /* CONFIG_LORA_NO_SUPE */
 
 void rssiSamplePoll(LoraRadio* r) {
     if (!s_monWatched) return;
     if (!r->running || !r->enabled) return;
     if ((int32_t)(xTaskGetTickCount() - r->mon.rssiNext) < 0) return;
-    if (r->txActive || r->splitPending || supeHoldsRadio(r) ||
+    if (r->txActive || r->splitPending ||
+#if !defined(CONFIG_LORA_NO_SUPE)
+        supeHoldsRadio(r) ||
+#endif
         r->csmaPhase != CSMA_IDLE || r->mtxPhase == MTXP_LBT) {
         /* Due, but the radio is spoken for. The deadline must move anyway:
          * nextDeadline() turns an overdue beat into a zero-length sleep, so
@@ -395,12 +404,16 @@ void rssiSamplePoll(LoraRadio* r) {
     m.t_ms  = millis();
     for (int i = 0; i < LORA_CH_MAX; i++) m.chRssi[i] = LORA_RSSI_NONE;
 
+#if !defined(CONFIG_LORA_NO_SUPE)
     int n = 0;
     const RegimeChan* ch = regimeChans(r->afa, &n);
     /* The field count is the regime's channel count whether or not every one of
      * them answered, so a viewer reads a stable set of columns and a channel
      * that failed to measure is an empty field rather than a shifted one. */
     m.nch = (uint8_t)((1 + n > LORA_CH_MAX) ? LORA_CH_MAX : 1 + n);
+#else
+    m.nch = 1;                       /* the hailing channel, and nothing else */
+#endif
 
     /* The hailing channel first and in place — the radio is already on it and
      * settled, so this reading costs one transaction and no retune. */
@@ -419,7 +432,11 @@ void rssiSamplePoll(LoraRadio* r) {
      * Closing that needs the preamble-detect and header-valid interrupts armed
      * during receive, which the receive path does not currently ask for. */
     bool quiet = hail <= r->noiseFloor + CSMA_RSSI_MARGIN_DB;
+#if !defined(CONFIG_LORA_NO_SUPE)
     if (ch && n > 0 && quiet) rssiSweepAgile(r, &m, ch, n);
+#else
+    (void)quiet;
+#endif
 
     if (!ifPost(&m)) r->mon.rssiDropped++;
 }

@@ -5,6 +5,7 @@
  */
 #include "lora_priv.h"
 #include "lora_fem.h"
+#include "lora_toa.h"
 
 #if defined(CONFIG_LORA0_CS_PIN)
 
@@ -416,7 +417,11 @@ bool radioAgcReset(LoraRadio* r) {
     }
     if (st == RADIOLIB_ERR_NONE) {
         step = "image";
+#if !defined(CONFIG_LORA_NO_SUPE)
         st = sx->calibrateImage((float)supeChanFreq(r, r->chNow) / 1.0e6f);
+#else
+        st = sx->calibrateImage((float)r->cfgFreqHz / 1.0e6f);
+#endif
     }
     if (st != RADIOLIB_ERR_NONE) {
         warn("lora/%d AGC reset failed at %s: %s (%d) — recovering",
@@ -453,7 +458,10 @@ void agcResetPoll(LoraRadio* r) {
     if (!r->agcResetMs || !r->running || !r->enabled) return;
     TickType_t now = xTaskGetTickCount();
     if ((int32_t)(now - r->agcNext) < 0) return;
-    if (r->txActive || r->splitPending || supeHoldsRadio(r) ||
+    if (r->txActive || r->splitPending ||
+#if !defined(CONFIG_LORA_NO_SUPE)
+        supeHoldsRadio(r) ||
+#endif
         r->chNow != LORA_CH_HAIL || r->csmaPhase != CSMA_IDLE ||
         r->mtxPhase != MTXP_OFF || r->annReplay ||
         loraqDepth(&r->q) > 0 || radioRxInProgress(r)) {
@@ -463,22 +471,22 @@ void agcResetPoll(LoraRadio* r) {
     /* The chip goes down and comes back up here, so take SUPE's lock for the
      * same reason radioStop does: a transaction step runs on the esp_timer task
      * and would otherwise drive a radio that is mid-sleep. */
+#if !defined(CONFIG_LORA_NO_SUPE)
     supeLock(r);
     radioAgcReset(r);
     supeUnlock(r);
+#else
+    radioAgcReset(r);
+#endif
     r->agcNext = xTaskGetTickCount() + pdMS_TO_TICKS(r->agcResetMs);
 }
 
 /* ─────────────── helpers ─────────────── */
 
-/* Time-on-air (seconds) for a `payload`-byte LoRa frame, per Semtech
- * AN1200.13. Symbol time Tsym = 2^SF / BW; the preamble runs (n+4.25)
- * symbols and the payload rounds up into whole symbols, with low-data-rate
- * optimisation (DE) engaged once a symbol exceeds 16 ms. CRC on — every frame
- * this overload is asked about carries one. The CRC-off form a SUPE frame flies
- * with is the same formula with the parameter cleared, which is why the formula
- * lives in supe.cpp and this is a call rather than a copy: two copies of it are
- * exactly how the sweep's airtime came to be over-stated by half.
+/* Time-on-air (seconds) for a `payload`-byte LoRa frame. The formula itself is
+ * in lora_toa.h — one copy, shared with SUPE's portable core, because two copies
+ * are exactly how the sweep's airtime came to be over-stated by half. CRC on:
+ * every frame this overload is asked about carries one.
  *
  * `implicitHeader` is NOT optional bookkeeping: a headerless frame drops the
  * 20-bit header from the payload term, and the radio-check sweep also runs a
@@ -488,8 +496,8 @@ void agcResetPoll(LoraRadio* r) {
  * and the airtime rollups. */
 double loraAirtimeSeconds(int sf, int bw_hz, int cr_denom,
                                         int preamble, int payload, bool implicitHeader) {
-    return supeAirtimeSeconds(sf, bw_hz, cr_denom, preamble, payload,
-                              implicitHeader, /*crc=*/true);
+    return loraToaSeconds(sf, bw_hz, cr_denom, preamble, payload,
+                          implicitHeader, /*crc=*/true);
 }
 
 /* Total on-air time (ms) for the frame(s) that carry one RNS packet, at the

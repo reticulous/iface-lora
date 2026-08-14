@@ -157,8 +157,13 @@ settings:
       #
       # Inert on an interface with an access code: IFAC masks the frame end to
       # end, so the modem cannot read an address to match.
-      - section: "SUPE"
+      #
+      # Every row here is gated on CONFIG_LORA_NO_SUPE: a build without SUPE has
+      # no engine to configure, so it gets no rows, no pane section and no keys
+      # in storage — the same gate the code carries, from the same symbol.
+      - { section: "SUPE", when_kconfig: "!CONFIG_LORA_NO_SUPE" }
       - switch: { label: "Enable", key: "s.lora.0.SUPE.enable", default: 0 }
+        when_kconfig: "!CONFIG_LORA_NO_SUPE"
       - dropdown:
           label: "Regime"
           key: "s.lora.0.SUPE.afa"
@@ -166,7 +171,9 @@ settings:
           options:
             - { v: 0, l: "0 — Single channel" }
             - { v: 1, l: "1 — EU 863-870, nine channels" }
+        when_kconfig: "!CONFIG_LORA_NO_SUPE"
       - switch: { label: "Adaptive TX power", key: "s.lora.0.SUPE.adaptive_txpower", default: 1 }
+        when_kconfig: "!CONFIG_LORA_NO_SUPE"
       # Paces everything this node says about itself on its own schedule: the
       # buffered-announce replay, the radio check behind it, and SUPE's own
       # ANNOUNCE2. All three are this straddle's air protocol, which is why the
@@ -182,6 +189,7 @@ settings:
           min: 0
           max: 240
           default: 30
+        when_kconfig: "!CONFIG_LORA_NO_SUPE"
       # RNode endpoint: an RNS RNodeInterface client attaches over USB serial
       # and/or TCP 7633 and shares this radio segment. The rest of the group
       # (.radio / .serial / .tcp) is seeded in lora.cpp — one switch is what a

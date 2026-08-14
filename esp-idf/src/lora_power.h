@@ -80,7 +80,9 @@ int8_t apTxPower(LoraRadio* r, const uint8_t* pkt, size_t len);
 void   apApplyPower(LoraRadio* r, int8_t txp);
 bool   apPwrReqFor(LoraRadio* r, const uint8_t* pkt, size_t len, int8_t* out);
 int8_t apOpenPower(LoraRadio* r, Neighbor* e);
+#if !defined(CONFIG_LORA_NO_SUPE)
 void   supeApFailed(LoraRadio* r, Neighbor* e, int8_t triedDbm);
 void   supeApSucceeded(LoraRadio* r, Neighbor* e);
 void   supeFilePair(LoraRadio* r, Neighbor* e, int16_t rssi, int8_t peerTxp,
                     uint8_t step);
+#endif  /* CONFIG_LORA_NO_SUPE */

@@ -5,6 +5,7 @@
  * test in test/ compiles this file directly.
  */
 #include "supe.h"
+#include "lora_toa.h"   /* the shared time-on-air formula */
 
 #include <string.h>
 #include <math.h>
@@ -169,16 +170,7 @@ int16_t supeSensitivityDeci(const SupeCfg* c) {
 
 double supeAirtimeSeconds(int sf, int bw_hz, int cr_denom, int preamble,
                           int payload, bool implicitHeader, bool crc) {
-    if (sf <= 0 || bw_hz <= 0 || cr_denom < 5 || cr_denom > 8) return 0.0;
-    double tSym = (double)((uint32_t)1 << sf) / (double)bw_hz;
-    int    de   = (tSym > 0.016) ? 1 : 0;
-    int    cr   = cr_denom - 4;
-    double num  = 8.0 * payload - 4.0 * sf + 28.0
-                  + (crc ? 16.0 : 0.0)
-                  - (implicitHeader ? 20.0 : 0.0);
-    double den  = 4.0 * (sf - 2 * de);
-    double payloadSym = 8.0 + fmax(ceil(num / den) * (cr + 4), 0.0);
-    return (preamble + 4.25) * tSym + payloadSym * tSym;
+    return loraToaSeconds(sf, bw_hz, cr_denom, preamble, payload, implicitHeader, crc);
 }
 
 /* ─────────────── deadlines ─────────────── */

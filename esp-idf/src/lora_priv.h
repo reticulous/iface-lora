@@ -17,7 +17,9 @@
 #include "spangap.h"
 #include "mem.h"       /* gp_alloc (PSRAM) for the LoRaMon ring/history buffers */
 #include "rolling.h"   /* one-hour running totals in ten-minute buckets */
+#if !defined(CONFIG_LORA_NO_SUPE)
 #include "supe.h"      /* SUPE's pure core: regimes, ladder, codec, deadlines */
+#endif
 #include "ports.h"
 #if CONFIG_SPANGAP_NET
 /* Only the RNode endpoint's TCP door needs net; the radio itself is bare, and
@@ -124,10 +126,12 @@ enum : uint8_t { MTXP_OFF = 0, MTXP_LBT = 1, MTXP_TX = 2 };
 
 static const char* TAG __attribute__((unused)) = "lora";
 
+#if !defined(CONFIG_LORA_NO_SUPE)
 /* Our mesh radio layer, shown as a node tag in `lora n`: Spectrum Utilization
  * and Performance Enhancements, designed in plans/iface-lora/SUPE.md. The same
  * name both LoRaMon viewers give the protocol in their legends. */
 #define RF_PROTO_NAME         "SUPE"
+#endif
 
 /* Radio count from the per-slot Kconfig CS pins — the kSlots table (lora.cpp)
  * static_asserts against it. */
@@ -145,8 +149,10 @@ static constexpr int kNumRadios = LORA_NUM_RADIOS;
 /* Owned elsewhere; LoraRadio holds pointers. */
 struct NeiState;
 struct AnnBuf;
+#if !defined(CONFIG_LORA_NO_SUPE)
 struct SupeState;
 struct ChanLedger;
+#endif
 struct Neighbor;
 
 /* ─────────────── storage key helpers (per radio) ─────────────── */
@@ -329,10 +335,12 @@ struct LoraRadio {
     TickType_t      rxHeldTick;
 
     uint32_t        cfgFreqHz;       /* configured carrier — the hailing channel */
+#if !defined(CONFIG_LORA_NO_SUPE)
     uint8_t         afa;             /* s.lora.<i>.afa: the regime number, 0 = no agility */
     uint16_t        annIntervalMin;  /* s.lora.<i>.SUPE.announce_interval, minutes;
                                       * 0 = manual only. Paces the whole announce
                                       * beat: SUPE's own ANNOUNCE2 */
+#endif
     /* The channel the radio is tuned to right now, so a record and its airtime
      * credit both land where the frame actually flew. Held here rather than
      * passed to loraMonPush because every caller would otherwise have to know,
@@ -345,9 +353,11 @@ struct LoraRadio {
      * beat. Owned by lora_mon; nothing else reads or writes inside it. */
     LoraMonState    mon;
 
+#if !defined(CONFIG_LORA_NO_SUPE)
     /* Per-channel airtime ledger (ring, verdict, reuse gap). Owned by
      * lora_airtime; allocated with SUPE's state and null until then. */
     ChanLedger*     chans;
+#endif
 
 
     /* Passive neighbour table (gp_alloc'd at radioStart, kept across cycles). */
@@ -365,6 +375,7 @@ struct LoraRadio {
     bool            annReplay;       /* a replay run is in progress */
     uint8_t         annIdx;          /* next buffer slot it will emit */
 
+#if !defined(CONFIG_LORA_NO_SUPE)
     /* SUPE (overview at SUPE_TAGS_MAX). State is gp_alloc'd beside the
      * neighbour table and kept across config cycles, so toggling a key does not
      * throw away a tag set that took real traffic to learn. */
@@ -372,11 +383,11 @@ struct LoraRadio {
     bool            supeOn;          /* s.lora.<i>.SUPE.enable, AND no access code */
     bool            supeAdaptive;    /* s.lora.<i>.SUPE.adaptive_txpower */
     bool            supeNameSender;  /* s.lora.<i>.SUPE.sender_ident */
+#endif
 
     /* Adaptive TX power (overview at AP_EST_MARGIN_DB). */
-    bool            adaptive;        /* = supeAdaptive; the reciprocity
-                                      * determination and the 0x04 request read
-                                      * the same key the detour does */
+    bool            adaptive;        /* the reciprocity determination and the
+                                      * 0x04 request read the same key */
     /* A 0x04 power request just received, awaiting the frame it prefixes. The
      * frame carries no binding field — it binds by adjacency alone — so this is
      * consumed or discarded by the very next rx frame, never held. */
@@ -414,14 +425,20 @@ void cfgArm(uint32_t delayMs);
 void loraNudge(void);
 
 /* The module interfaces, in dependency order. */
+#if !defined(CONFIG_LORA_NO_SUPE)
 #include "lora_chanplan.h"
+#endif
 #include "lora_peers.h"
 #include "lora_observe.h"
 #include "lora_power.h"
+#if !defined(CONFIG_LORA_NO_SUPE)
 #include "lora_airtime.h"
+#endif
 #include "lora_bridge.h"
 #include "lora_rnode.h"
+#if !defined(CONFIG_LORA_NO_SUPE)
 #include "lora_supe.h"
+#endif
 #include "lora_cli.h"
 
 #endif  /* CONFIG_LORA0_CS_PIN */

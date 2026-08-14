@@ -147,6 +147,7 @@ static IRAM_ATTR void loraRadioIsr(void) {
 /* ─────────────── radio control ─────────────── */
 
 static void radioStop(LoraRadio* r) {
+#if !defined(CONFIG_LORA_NO_SUPE)
     /* Take SUPE's lock before touching the chip, not after. Every `s.lora.*`
      * write arrives here on its way to a restart, and a SUPE transaction step
      * runs on the esp_timer task — so without this a config edit sleeps the
@@ -155,6 +156,7 @@ static void radioStop(LoraRadio* r) {
      * timeout), and it is a leaf lock, so there is nothing to deadlock against. */
     bool supeHeldHere = r->supe != nullptr;
     if (supeHeldHere) supeLock(r);
+#endif
 
     pmGpioWakeDisable(r->slot->dio1);
     r->radio->clearPacketReceivedAction();
@@ -166,14 +168,18 @@ static void radioStop(LoraRadio* r) {
     r->splitLen = 0;
     r->txActive = false;   /* any in-flight transmit is abandoned with the radio */
     r->txFromRnode = false;
+#if !defined(CONFIG_LORA_NO_SUPE)
     /* A SUPE transaction dies with the radio too, and for the same reason: no
      * RF restore is owed when the chip is going down and the whole modem regime
      * is re-applied on the way up. Queued packets go with it — they were never
      * transmitted, and the layers above deal with that as they always do. */
     supeOnRadioStop(r);
+#endif
     loraqFlush(&r->q);   /* queued packets die with the radio */
     r->chNow = LORA_CH_HAIL;
+#if !defined(CONFIG_LORA_NO_SUPE)
     if (supeHeldHere) supeUnlock(r);
+#endif
     peersAbandonPends(r);  /* proofs can't return while RF is down — drop, uncounted */
     deregisterFromRnsd(r);
     publishState(r, "down");
@@ -319,6 +325,7 @@ static bool radioStart(LoraRadio* r) {
     r->cfgSync = (uint8_t)syncWord;
     r->txPwrNow = (int8_t)txp;
 
+#if !defined(CONFIG_LORA_NO_SUPE)
     /* The regime in force. The key's value IS the regime number — SUPE's as
      * well as the channel table's, since they are the same quantity. 0 names a
      * regime with no channel plan, which is the same thing as no agility: see
@@ -331,11 +338,13 @@ static bool radioStart(LoraRadio* r) {
     r->annIntervalMin = (uint16_t)storageGetInt(
         sk(kb, sizeof kb, r->idx, "SUPE.announce_interval"), ANN_INTERVAL_DEF);
     publishChannels(r);
+#endif
 
     /* Adaptive TX power. Determinations already made live in the neighbour
      * table, which survives a config cycle, so turning the key back on resumes
      * with what was measured rather than re-probing the mesh. */
 
+#if !defined(CONFIG_LORA_NO_SUPE)
     /* ── SUPE ──
      * The regime is `afa` above; these are the rest. The access-code gate is
      * absolute and comes last: IFAC masks the frame from the flags byte on, so
@@ -372,6 +381,11 @@ static bool radioStart(LoraRadio* r) {
     if (r->supeOn && supeExpired((uint32_t)time(nullptr)))
         warn("lora/%d SUPE dialect expired — this build stopped speaking it; reflash", r->idx);
     if (r->supeOn && !supeInit(r)) r->supeOn = false;
+#else
+    /* The adaptive-power determination and the 0x04 request are configured by a
+     * key this build does not have, so they stay off with it. */
+    r->adaptive = false;
+#endif
 
     /* Each store allocates once and keeps its history across config cycles. */
     loraMonInit(r);
@@ -625,6 +639,7 @@ static TickType_t nextDeadline(void) {
          * pending without any rnsd handle, so folding the two together would
          * leave it unable to wake the loop. Undecoded client bytes count too —
          * the pump runs on this task. */
+#if !defined(CONFIG_LORA_NO_SUPE)
         /* SUPE's own beats: the announce interval, the pre-offer delay and the
          * airtime verdict. Transaction deadlines are the esp_timer's, so
          * nothing here has to hold one. */
@@ -639,6 +654,7 @@ static TickType_t nextDeadline(void) {
                 if (t < soonest) soonest = t;
             }
         }
+#endif
         bool outReady = r->running && !r->splitPending && !r->txActive;
         bool outAvail = (r->rnsdHandle >= 0 && itsBytesAvailable(r->rnsdHandle) > 0) ||
                         loraqDepth(&r->q) > 0 ||
@@ -736,9 +752,6 @@ static void loraTaskMain(void*) {
      * it (e.g. hw-lilygo-tdeck's tdeckPowerInit), not this interface. */
     for (int i = 0; i < kNumRadios; i++) {
         LoraRadio* r = &s_radios[i];
-        r->idx        = i;
-        r->slot       = &kSlots[i];
-        r->rnsdHandle = -1;
 
         /* CONFIG_LORA_SPI_HOST is the peripheral *name* (1=SPI1 2=SPI2/FSPI
          * 3=SPI3), matching the Kconfig prompt and the BOARD_*_SPI_HOST headers.
@@ -848,7 +861,9 @@ static void loraTaskMain(void*) {
             peersExpire(r, millis());
             manualTxPoll(r);    /* CLI tx/tx_psa/tx_prot; holds the radio while active */
             agcResetPoll(r);    /* front-end recalibration; skips a busy radio */
+#if !defined(CONFIG_LORA_NO_SUPE)
             supePoll(r);        /* the SUPE beat and the offer's channel access */
+#endif
             drainOneOutbound(r);
             /* Last, so every claim on the radio above has already been staked:
              * the sample is only taken if nothing else wanted the chip. */
@@ -872,6 +887,7 @@ static void loraTaskMain(void*) {
                         nowMs - lastWarnMs > 5000) {
                         lastWarnMs = nowMs;
                         LoraRadio* r = &s_radios[0];
+#if !defined(CONFIG_LORA_NO_SUPE)
                         warn("lora hot loop: 500 zero-deadline passes in %lu ms: "
                              "supeD=%lu airD=%lu offer=%d ann=%d csma=%d q=%u "
                              "txA=%d split=%d mtx=%d its=%u",
@@ -885,6 +901,16 @@ static void loraTaskMain(void*) {
                              (int)r->mtxReq,
                              (unsigned)(r->rnsdHandle >= 0
                                         ? itsBytesAvailable(r->rnsdHandle) : 0));
+#else
+                        warn("lora hot loop: 500 zero-deadline passes in %lu ms: "
+                             "csma=%d q=%u txA=%d split=%d mtx=%d its=%u",
+                             (unsigned long)(nowMs - winStartMs),
+                             (int)r->csmaPhase, (unsigned)loraqDepth(&r->q),
+                             (int)r->txActive, (int)r->splitPending,
+                             (int)r->mtxReq,
+                             (unsigned)(r->rnsdHandle >= 0
+                                        ? itsBytesAvailable(r->rnsdHandle) : 0));
+#endif
                     }
                     zeros = 0;
                 }
@@ -946,12 +972,15 @@ void LoraService::onInit() {
          * radios 1.. on multi-radio boards. */
         storageBegin();
         storageDefault(sk(kb, sizeof kb, 0, "bandwidth"), 125000);         /* 125 kHz */
+#if !defined(CONFIG_LORA_NO_SUPE)
         /* Frequency agility: the regime number, 0 = none. Radio 0's copy comes
          * from the pane row; radios 1.. are seeded in the loop below. */
         for (int i = 1; i < kNumRadios; i++) {
             storageDefault(sk(kb, sizeof kb, i, "SUPE.afa"), 0);
             storageDefault(sk(kb, sizeof kb, i, "SUPE.announce_interval"), ANN_INTERVAL_DEF);
         }
+#endif
+#if !defined(CONFIG_LORA_NO_SUPE)
         /* SUPE. Everything under the prefix defaults **on**, and `enable` is the
          * single thing that is off: a feature nobody can find the switch for is
          * a feature nobody uses, so the only decision to make is whether to
@@ -995,6 +1024,7 @@ void LoraService::onInit() {
                 storageDeleteTree(sk(kb, sizeof kb, i, "announce_interval"));
             }
         }
+#endif  /* CONFIG_LORA_NO_SUPE */
         /* RNode endpoint. One endpoint for the device, so the group is global
          * rather than per radio; `.enable` is seeded by the pane row in
          * straddle.yaml. Both doors default shut — enabling the endpoint must
@@ -1015,6 +1045,17 @@ void LoraService::onInit() {
         }
         storageSet("s.lora.version", LORA_VERSION);
         storageEnd();
+    }
+
+    /* Bind each radio to its board slot here, not at task start: the CLI and
+     * the settings pane read `s_radios[]` from init onwards, while the task
+     * that constructs the hardware only spawns when the RNS orchestrator
+     * reaches the interface phase. Pure board data — no hardware is touched.
+     * rnsdHandle likewise, since a zeroed one reads as a live handle 0. */
+    for (int i = 0; i < kNumRadios; i++) {
+        s_radios[i].idx        = i;
+        s_radios[i].slot       = &kSlots[i];
+        s_radios[i].rnsdHandle = -1;
     }
 
     /* Seed the ephemeral MHz/kHz display keys up front, so the settings pane

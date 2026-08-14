@@ -440,9 +440,16 @@ void drawAll() {
          * a truncated recolor string shows as a silently missing legend, not
          * as an error. */
         char b[128];
+#if !defined(CONFIG_LORA_NO_SUPE)
         snprintf(b, sizeof b,
                  "tx %d.%d%%  busy %d.%d%%  #E8D040 rnsd# #E89040 rnode# #E84040 SUPE#",
                  tx / 10, tx % 10, busy / 10, busy % 10);
+#else
+        /* No third protocol to colour: nothing here transmits one. */
+        snprintf(b, sizeof b,
+                 "tx %d.%d%%  busy %d.%d%%  #E8D040 rnsd# #E89040 rnode#",
+                 tx / 10, tx % 10, busy / 10, busy % 10);
+#endif
         lv_label_set_text(s.cap, b);
     }
     lv_obj_invalidate(s.canvas);

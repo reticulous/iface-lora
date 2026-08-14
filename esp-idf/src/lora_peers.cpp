@@ -142,8 +142,10 @@ void peersQuality(LoraRadio* r, Neighbor* e, bool hit) {
     uint8_t s = hit ? 255 : 0;
     if (!e->haveQuality) { e->quality = s; e->haveQuality = true; }
     else e->quality = (uint8_t)((3 * (int)e->quality + s + 2) / 4);
+#if !defined(CONFIG_LORA_NO_SUPE)
     if (hit) supeApSucceeded(r, e);
     else if (e->haveApLastTxp) supeApFailed(r, e, e->apLastTxp);
+#endif
 }
 
 NeiLink* peersLinkFind(NeiState* st, const uint8_t linkId[16]) {

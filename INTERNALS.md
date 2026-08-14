@@ -772,7 +772,12 @@ computes availability across both software sources before deciding anything.
 `loraAirtimeSeconds` computes the LoRa time-on-air of a frame per Semtech
 AN1200.13 (symbol time `2^SF / BW`, preamble `(n + 4.25)` symbols, payload
 rounded into whole symbols, low-data-rate optimisation engaged once a symbol
-exceeds 16 ms, explicit header + CRC on). `computeBitrate` registers
+exceeds 16 ms, explicit header + CRC on). The formula itself is `loraToaSeconds`
+in `lora_toa.h` — header-only and free of ESP-IDF, because both halves of the
+straddle need it and neither can reach the other: SUPE's portable core compiles
+with a plain g++ (test/), and the driver has to time a frame in a build with no
+SUPE in it at all (§19.1.1). One copy on purpose — two are how the radio-check
+sweep's airtime came to be over-stated by half. `computeBitrate` registers
 `bitrate_eff = (500 × 8) / ceil(ToA of one 500-byte frame) = 4000 / ceil(ToA_s)`.
 
 This is deliberate: RNS derives its first-hop link-establishment timeout as
@@ -1812,12 +1817,48 @@ channel it names in the same byte.
 
 | Gate | Meaning |
 |---|---|
+| `CONFIG_LORA_NO_SUPE` | build-time. Set, SUPE is not in the image at all — see §19.1.1 |
 | `s.lora.<n>.SUPE.enable` | off by default. Off means the interface's on-air behaviour is exactly what it was |
 | `s.lora.<n>.SUPE.afa` | the regime number (§18). The regime IS the statement of what is permissible on which channels, so SUPE names the interface's own frequency-agility key |
 | no access code | IFAC masks the frame from the flags byte on, so the modem cannot read an address and has nothing to match; `radioStart` says so once |
 
 Each regime version expires fourteen days after the build (`supeExpired`); past
 it the node neither sends nor accepts frames naming it and says so once.
+
+#### 19.1.1 Building without SUPE (`CONFIG_LORA_NO_SUPE`)
+
+A build flavour, not a setting: `spangap build --kconfig CONFIG_LORA_NO_SUPE=y`
+leaves SUPE out of the image entirely, so what ships is a plain LoRa interface
+carrying Reticulum on the configured channel. A node built this way neither
+speaks nor answers SUPE, and its neighbours are unaffected — the protocol is
+designed to leave non-participants unmodified and unaware, so a mixed segment
+needs nothing.
+
+Five sources leave the build (`esp-idf/CMakeLists.txt`): `supe.cpp`,
+`supe_engine.cpp`, `lora_supe.cpp`, and with them `lora_chanplan.cpp` and
+`lora_airtime.cpp`, which exist only to serve the schedule SUPE negotiates. Every
+call site in the sources that stay is gated on the same symbol, so nothing that
+remains references them. What that removes along the way:
+
+- **The channel plan.** One channel — the configured carrier — so the RSSI beat
+  reports one, `publishChannels` lists one, and every transmission's airtime
+  feeds the APPC band directly instead of a per-channel ledger.
+- **The adaptive TX power determination.** `LoraRadio::adaptive` is the
+  reciprocity determination's own flag now rather than an alias of
+  `supeAdaptive`; with no `SUPE.adaptive_txpower` key to read it stays off, and
+  `apOpenPower` returns the configured power.
+- **The settings.** Every SUPE row in `straddle.yaml` carries
+  `when_kconfig: "!CONFIG_LORA_NO_SUPE"`, which gates the LCD pane row, the
+  browser row and the `storageDefault()` at once — so the keys are **absent**
+  from storage rather than present and inert.
+- **The console.** No `lora [<n>] supe`, no SUPE line in `lora n`, and the help
+  text and `lora a` wording say only what this build does.
+
+The browser panel is one bundle serving either firmware and cannot read a
+Kconfig, so it asks the device: `hasSupe` tests whether
+`s.lora.0.SUPE.enable` came back at all, and hides the section and the LoRaMon
+legend's third colour when it did not. The LCD legend takes the `#if` directly,
+being compiled here.
 
 ### 19.2 Where it lives
 

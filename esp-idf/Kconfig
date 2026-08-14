@@ -14,6 +14,19 @@ config LORA_COUNT
         a build can override with `spangap build --lora-count N` and the
         matching --loraN-* switches, or interactively via `spangap menuconfig`.
 
+config LORA_NO_SUPE
+    bool "Build without SUPE"
+    default n
+    help
+        Leaves SUPE out entirely: no engine, no frames, no console command, no
+        settings, no keys in storage, no mention of it anywhere the user can
+        see. What remains is a plain LoRa interface carrying Reticulum on the
+        configured channel.
+
+        A node built this way neither speaks nor answers SUPE. Its neighbours
+        are unaffected — SUPE is designed to leave non-participants unmodified
+        and unaware.
+
 # ─── shared SPI bus ───────────────────────────────────────────────────
 # One SPI host carries every radio (and, on boards like the T-Deck, the
 # display and SD card too). spi_helper makes bus bring-up idempotent, so

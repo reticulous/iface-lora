@@ -50,6 +50,16 @@ and the matching `--loraN-*` switches, or interactively via `spangap
 menuconfig`.
 
 - **`CONFIG_LORA_COUNT`** (0–4) — how many radios to drive. `0` = inert.
+- **`CONFIG_LORA_NO_SUPE`** — build without **SUPE**. A build flavour rather than
+  a board fact, so it is given per build: `spangap build --kconfig
+  CONFIG_LORA_NO_SUPE=y`. The engine, its frames, its console command, its
+  settings and its keys in storage all go, and what ships is a plain LoRa
+  interface carrying Reticulum on the configured channel. The frequency-agility
+  channel plan and the airtime ledger go with it — they exist to serve the
+  schedule SUPE negotiates — leaving the configured carrier as the only channel.
+  A node built this way neither speaks nor answers SUPE and its neighbours are
+  unaffected, since SUPE leaves non-participants unmodified and unaware. See
+  INTERNALS §19.1.1.
 - **Shared SPI bus** — `CONFIG_LORA_SPI_HOST` (1 = SPI1, 2 = SPI2/FSPI,
   3 = SPI3), `_SCK_PIN`, `_MOSI_PIN`, `_MISO_PIN`. One bus carries every radio
   (and, on boards like the T-Deck, the display and SD card too).
@@ -89,7 +99,7 @@ defaults come from this straddle's `settings:` block; radios 1.. are seeded by
 | `s.lora.<n>.bandwidth` | `125000` | Bandwidth in **Hz** (125/250/500 kHz; SX128x also 203/406/812/1625 kHz). |
 | `s.lora.<n>.spreading_factor` | `7` | Spreading factor, 5–12. |
 | `s.lora.<n>.coding_rate` | `5` | Coding-rate denominator, 5–8 (`5` = 4/5). |
-| `s.lora.<n>.tx_power` | *(none)* | TX power in dBm at the **antenna**, −9 to `lora.<n>.tx_power_max` (22 on a bare chip, higher through a front-end module — 27 on the Heltec V4). No default — antenna dependent. A value above the ceiling is clamped with a warning. |
+| `s.lora.<n>.tx_power` | *(none)* | TX power in dBm at the **antenna**, −9 to `lora.<n>.tx_power_max` (22 on a bare chip, higher through a front-end module — 27 on the Heltec V4). No default — antenna dependent. A value above the ceiling is clamped with a warning. The radio also states this figure to rnsd at registration, so a reticulous peer's rx report can quote it back and turn a bare RSSI into a path loss; the configured value goes out, not the adaptive per-peer one, because that is a readout and not a term in any loop. |
 | `s.lora.<n>.preamble` | `12` | Preamble length in symbols, 6–32. |
 | `s.lora.<n>.sync_word` | `"0x42"` | Sync word, a string parsed as hex or decimal (`0x42` is the Reticulum-on-LoRa convention). |
 | `s.lora.<n>.mode` | `"gateway"` | RNS interface mode: `full`, `gateway`, `access_point`, `roaming`, `boundary`. |

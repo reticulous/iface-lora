@@ -34,7 +34,7 @@
                   :class="{ active: w.key === winKey }"
                   @click="winKey = w.key">{{ w.label }}</button>
           <span class="lm-legend">
-            <span class="c-rns">rnsd</span> / <span class="c-rnode">rnode</span> / <span class="c-ours">SUPE</span> / <span class="c-bad">CRC</span>
+            <span class="c-rns">rnsd</span> / <span class="c-rnode">rnode</span><template v-if="hasSupe"> / <span class="c-ours">SUPE</span></template> / <span class="c-bad">CRC</span>
           </span>
           <span class="lm-axis lm-axis-rx">rx</span>
         </div>
@@ -82,6 +82,12 @@ const props = defineProps<{ visible: boolean; title: string; focusToken?: number
 const emit = defineEmits<{ 'update:visible': [value: boolean] }>()
 
 const device = useDeviceStore()
+
+/* No SUPE in this firmware means no third protocol on the air, so the legend
+ * names two. The device publishes no keys under the prefix in that build (see
+ * LoraPanel's hasSupe) — the graph itself needs no change, since the colour is
+ * only ever drawn for a frame that was actually seen. */
+const hasSupe = computed(() => device.get('s.lora.0.SUPE.enable') !== undefined)
 
 const isPhoneInit = window.matchMedia?.('(max-width: 599px)').matches ?? false
 const defaultGeom = isPhoneInit

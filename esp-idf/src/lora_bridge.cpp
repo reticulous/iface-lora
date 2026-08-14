@@ -58,6 +58,12 @@ bool registerWithRnsd(LoraRadio* r) {
     reg.ifac_size = r->curIfacSize;
     reg.announce_cap = r->curAnnounceCap;
     reg.rx_signal = 1;   /* inbound data frames carry the 4-byte RSSI/SNR prefix */
+    /* Configured antenna power, for the rx-report proof to quote back to a peer
+     * so it can read the path loss off our signal. The configured figure, not the
+     * adaptive per-peer one: this is a readout, and re-registration on the config
+     * cycle is what keeps it current. */
+    reg.tx_power_known = 1;
+    reg.tx_power_dbm   = r->cfgTxp;
     reg.retain_announces = r->curRetainAnnounces;
     reg.policy_manual = r->curPolicyManual;
     reg.route_for     = r->curRouteFor;
@@ -123,10 +129,15 @@ static void deliverInbound(LoraRadio* r, const uint8_t* data, size_t len,
      * node and this arrived under it, so the tap can attribute what the packet
      * establishes — a link identifier above all — to that peer instead of
      * waiting to overhear the association in the clear. */
+#if !defined(CONFIG_LORA_NO_SUPE)
     peersObserve(r, data, len, false, rssi, snr, LORA_ORIG_RNSD, supeCargoPeer(r));
     /* A whole packet, which is what a train is counted in: a split packet
      * counts once, when both halves are in, which is exactly here. */
     supeOnPacketRx(r, rssi, snr);
+#else
+    /* No transaction to attribute it to: every packet is overheard in the clear. */
+    peersObserve(r, data, len, false, rssi, snr, LORA_ORIG_RNSD, 0);
+#endif
     /* One segment, two other endpoints. Only reassembled packets that are not
      * our own air protocol reach here, so the client sees exactly the Reticulum
      * traffic — with the signal this radio measured for it. */
@@ -149,7 +160,11 @@ void rearmRx(LoraRadio* r) {
      * stop again. A transaction still in flight is not idle — its next frame is
      * as close behind as a split's second half — so it keeps the hold. Before
      * the receiver is armed, since arming takes the standby this governs. */
+#if !defined(CONFIG_LORA_NO_SUPE)
     if (!supeBusy(r)) radioHoldOsc(r, false);
+#else
+    radioHoldOsc(r, false);
+#endif
     radioStartRx(r);
     /* A fresh receiver has no reception in progress; the evidence radioRxInProgress
      * tracks was cleared with the chip's flags. */
@@ -250,6 +265,7 @@ static void handleRxDone(LoraRadio* r) {
      * arrived on, so that is captured first. */
     uint8_t rxCh = r->chNow;
     bool foreign = false;
+#if !defined(CONFIG_LORA_NO_SUPE)
     if (!ours && !supeIsFramingByte(header)) {
         if (supeIsTypeByte(header)) {
             supeOnFrame(r, frame, pktLen, (int16_t)lround(r->rssiLast),
@@ -259,6 +275,11 @@ static void handleRxDone(LoraRadio* r) {
             foreign = true;
         }
     }
+#else
+    /* Nothing on the air is ours but Reticulum: anything else is somebody
+     * else's traffic, counted and left alone. */
+    if (!ours) foreign = true;
+#endif
 
     /* Record this on-air frame (RX_DONE marks end-of-air, so start = end − ToA),
      * against the channel it arrived on — chNow may already be the detour's. */
@@ -277,8 +298,13 @@ static void handleRxDone(LoraRadio* r) {
 
     if (ours || foreign) {
         if (foreign && logIsVerbose(TAG))
+#if !defined(CONFIG_LORA_NO_SUPE)
             verb("lora/%d rx discarded: byte 0 0x%02x is neither framing nor SUPE",
                  r->idx, header);
+#else
+            verb("lora/%d rx discarded: byte 0 0x%02x is not a framing byte",
+                 r->idx, header);
+#endif
         return;
     }
 
@@ -333,12 +359,14 @@ static void txRearmRx(LoraRadio* r) {
      * rather than from the outbound drain. When the count or the announced
      * duration runs out the sender returns, which is one of the two ways a
      * train ends; the peer's is the count or the stated length. */
+#if !defined(CONFIG_LORA_NO_SUPE)
     if (r->supe) {
         supeLock(r);
         bool handled = supeAfterTx(r);
         supeUnlock(r);
         if (handled) return;          /* it re-armed, or fired the next frame */
     }
+#endif
     rearmRx(r);
 }
 
@@ -353,7 +381,11 @@ void startTxFrame(LoraRadio* r, int idx) {
      * several ms of dead air in a gap nothing else may use. Decided here, before
      * the frame flies, because the fallback it sets is what the chip acts on the
      * moment TxDone arrives. */
+#if !defined(CONFIG_LORA_NO_SUPE)
     radioHoldOsc(r, idx + 1 < (int)r->txFrameCount || supeBusy(r));
+#else
+    radioHoldOsc(r, idx + 1 < (int)r->txFrameCount);
+#endif
     int16_t st = r->radio->startTransmit(r->txFrame[idx], r->txFrameLen[idx]);
     if (st != RADIOLIB_ERR_NONE) {
         warn("lora/%d startTransmit %u B failed: %s (%d)",
@@ -607,9 +639,11 @@ int annReplayStart(LoraRadio* r) {
     if (n == 0) return 0;
     r->annReplay = true;
     r->annIdx    = 0;
+#if !defined(CONFIG_LORA_NO_SUPE)
     /* A beat already waiting for the channel would otherwise duplicate the
      * announcement the replay ends with. The replay re-arms it at the end. */
     supeAnnCancel(r);
+#endif
     return n;
 }
 
@@ -632,7 +666,9 @@ static void annReplayFill(LoraRadio* r) {
             if (p && (p->flags & LORAQ_F_REPLAY)) return;
         }
         r->annReplay = false;
+#if !defined(CONFIG_LORA_NO_SUPE)
         supeAnnArm(r);
+#endif
         return;
     }
     AnnRec* e = &r->ann->e[r->annIdx++];
@@ -778,10 +814,16 @@ void drainOneOutbound(LoraRadio* r) {
      * That wait is hundreds of milliseconds, so it is where most of the chances
      * to coalesce live. */
     if (!r->running || r->splitPending) return;
+#if !defined(CONFIG_LORA_NO_SUPE)
     if (supeXactLive(r)) return;
+#endif
     queueFill(r);
     annReplayFill(r);
+#if !defined(CONFIG_LORA_NO_SUPE)
     if (supeHoldsRadio(r) || r->txActive) return;
+#else
+    if (r->txActive) return;
+#endif
 
     if (loraqDepth(&r->q) == 0) {
         csmaResetAccess(r);         /* nothing queued → reset channel-access state */
@@ -792,6 +834,7 @@ void drainOneOutbound(LoraRadio* r) {
      * hold and absence are decided before the channel is asked for, because a
      * packet that must not go out this pass has no business contending for
      * the medium. With SUPE off it answers PLAIN and the head simply flies. */
+#if !defined(CONFIG_LORA_NO_SUPE)
     uint8_t sv = supeHeadVerdict(r);
     if (sv == SUPE_V_HOLD) return;      /* the line behind it waits too */
     /* Our own wait, not a reservation: nobody has claimed the medium, so serve
@@ -803,6 +846,7 @@ void drainOneOutbound(LoraRadio* r) {
      * medium now and holding it through a delay. If the transaction will
      * not set up, the packet simply flies. */
     if (sv == SUPE_V_OFFER) return;   /* the glue launches it after the jitter */
+#endif
 
     if (!csmaClear(r)) {            /* listen-before-talk not yet satisfied */
         TickType_t waited = xTaskGetTickCount() - r->csmaStart;
@@ -881,9 +925,13 @@ static void serviceRadioLocked(LoraRadio* r);
  * register writes and a return — which is exactly why this was not affordable
  * before. */
 void serviceRadio(LoraRadio* r) {
+#if !defined(CONFIG_LORA_NO_SUPE)
     supeLock(r);
     serviceRadioLocked(r);
     supeUnlock(r);
+#else
+    serviceRadioLocked(r);
+#endif
 }
 
 static void serviceRadioLocked(LoraRadio* r) {
@@ -928,8 +976,12 @@ static void serviceRadioLocked(LoraRadio* r) {
          * would make the node contend as though it had spent the shared channel
          * it deliberately did not, and would leave the ring defending a budget
          * it never saw most of. */
+#if !defined(CONFIG_LORA_NO_SUPE)
         if (r->chNow == LORA_CH_HAIL) appcAddAirtime(r, dur);
         else                          airtimeRecord(r, r->chNow, dur);
+#else
+        appcAddAirtime(r, dur);   /* one channel, so every frame feeds the band */
+#endif
         if (++r->txFrameSent < r->txFrameCount) {   /* split: send the second half */
             startTxFrame(r, r->txFrameSent);
             return;
@@ -956,8 +1008,12 @@ static void serviceRadioLocked(LoraRadio* r) {
             uint32_t dur = (uint32_t)lround(1000.0 * loraAirtimeSeconds(
                                r->airSf, r->airBwHz, r->cfgCr, r->airPreamble,
                                (int)r->txFrameLen[r->txFrameSent], r->airImplicit));
+#if !defined(CONFIG_LORA_NO_SUPE)
             if (r->chNow == LORA_CH_HAIL) appcAddAirtime(r, dur);
             else                          airtimeRecord(r, r->chNow, dur);
+#else
+            appcAddAirtime(r, dur);
+#endif
         }
         /* The frame did not air, so nothing that was waiting on it may proceed
          * as though it had. */

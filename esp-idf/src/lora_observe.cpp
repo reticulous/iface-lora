@@ -431,7 +431,9 @@ void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
              * destinations — the first and largest class of addresses that mean
              * us, and the one that is effectively never retired because every
              * re-announcement refreshes it. */
+#if !defined(CONFIG_LORA_NO_SUPE)
             if (isTx) supeTagAdd(r, h.dest, /*perm=*/true, 0);
+#endif
             observeAnnounce(r, &h, isTx, rssi, snr10, now, txOrigin);
         } else if (!isTx && h.hdr2) {
             /* A rebroadcast announce is the one hops>0 frame whose transmitter
@@ -476,7 +478,9 @@ void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
              * address field. That identity is the address every neighbour
              * relaying through us sends to, so it is the single most valuable
              * entry in the set — and, like our destinations, never retired. */
+#if !defined(CONFIG_LORA_NO_SUPE)
             supeTagAdd(r, h.transportId, /*perm=*/true, 0);
+#endif
         }
         break;
 
@@ -498,7 +502,9 @@ void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
             peersPendAdd(st, lid, h.dest, true, e && !e->isUs, now);
             /* A link identifier we terminate. Held for as long as the link
              * plausibly lives; a link that goes quiet takes its entry with it. */
+#if !defined(CONFIG_LORA_NO_SUPE)
             supeTagAdd(r, lid, /*perm=*/false, SUPE_LINK_TTL_MS);
+#endif
         } else {
             bool toUs = peersDestIsLocal(st, h.dest);
             if (toUs) {
@@ -514,7 +520,9 @@ void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
                  * LRPROOF we send back, because the peer may offer a detour for
                  * the link the moment it is established, which is before our
                  * proof has necessarily left. */
+#if !defined(CONFIG_LORA_NO_SUPE)
                 supeTagAdd(r, lid, /*perm=*/false, SUPE_LINK_TTL_MS);
+#endif
                 /* And, when the request came out of a transaction, whose link
                  * it is. A link request carries no sender, so a link dialled to
                  * us is normally anonymous and our whole side of the session —
@@ -560,7 +568,9 @@ void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
              * an address that means us from here on. Belt to the inbound
              * request's brace — a link whose LR we somehow missed still gets
              * its identifier learned here. */
+#if !defined(CONFIG_LORA_NO_SUPE)
             if (isTx) supeTagAdd(r, h.dest, /*perm=*/false, SUPE_LINK_TTL_MS);
+#endif
             if (!isTx) {
                 NeiPend* pd = peersPendTake(st, h.dest);
                 if (h.hops == 0) {
@@ -584,7 +594,9 @@ void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
              * hash — match it against what we elicited. The proof arriving is
              * also what retires that hash from the set of addresses that mean
              * us; anything else still holding it keeps it alive. */
+#if !defined(CONFIG_LORA_NO_SUPE)
             supeTagRelease(r, h.dest);
+#endif
             NeiPend* pd = peersPendTake(st, h.dest);
             if (pd && !pd->isLR && h.hops == 0 && !peersDestIsLocal(st, pd->dest)) {
                 Neighbor* e = peersEnsureDest(st, pd->dest, now);
@@ -613,7 +625,9 @@ void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
              * link arrives addressed to the link identifier rather than to our
              * transport identity, so a relay that skips this sleeps through it
              * and the link dies. */
+#if !defined(CONFIG_LORA_NO_SUPE)
             if (isTx) supeTagAdd(r, h.dest, /*perm=*/false, SUPE_LINK_TTL_MS);
+#endif
             L->lastMs = now;
             L->frames++;
             if (!isTx) {
@@ -636,7 +650,9 @@ void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
              * anywhere else. */
             uint8_t ph[16];
             rnsPacketHash(&h, p, len, false, ph);
+#if !defined(CONFIG_LORA_NO_SUPE)
             supeTagAdd(r, ph, /*perm=*/false, SUPE_PROOF_TTL_MS);
+#endif
             /* Our own origination (probes included): if the dest is a known
              * direct neighbour, expect a proof back — the quality elicitor. A
              * miss counts only once the dest has proven before. */
@@ -652,7 +668,9 @@ void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
              * the proof has a next hop when it goes out. */
             uint8_t ph[16];
             rnsPacketHash(&h, p, len, false, ph);
+#if !defined(CONFIG_LORA_NO_SUPE)
             supeProofRetFile(r, ph, h.transportId);
+#endif
         }
         break;
     }

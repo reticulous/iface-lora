@@ -9,6 +9,8 @@
 #include "log.h"
 #include "lora_priv.h"
 
+#if defined(CONFIG_LORA0_CS_PIN)
+
 /* Per-dBm TX gain of each FEM, indexed by chip drive 0..21 dBm: gain
  * compresses as the PA saturates. Ported from Meshtastic's LoRaFEMInterface
  * (their measured values for these parts). antenna = chip + gain[chip]. */
@@ -119,3 +121,5 @@ int8_t femChipDbm(LoraRadio* r, int8_t antennaDbm)
     }
     return antennaDbm;   /* unreachable */
 }
+
+#endif  /* CONFIG_LORA0_CS_PIN */
