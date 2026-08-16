@@ -42,7 +42,7 @@ browser_register:
 # Frequency + TX power carry no default (region/antenna — the user must pick).
 settings:
   - at:
-      - { id: mesh, label: "Mesh Network", short: "Mesh", order: 3 }
+      - { id: reticulum }
       - { id: interfaces, label: "RNS Interfaces", short: "Ifaces", order: 2 }
       - { id: lora, label: "LoRa", short: "LoRa" }
     rows:
@@ -203,9 +203,11 @@ settings:
       # Every row here shows a string the radio publishes finished — the state
       # in words, the bitrate with its unit, the last reception's quality and
       # the frame counters as one line each.
-      - value: { label: "State", key: "lora.0.state_text" }
-      - value: { label: "Chip", key: "lora.0.chip" }
-        when_key: lora.0.chip
-      - value: { label: "Bitrate", key: "lora.0.bitrate_text" }
-      - value: { label: "Last RX", key: "lora.0.rx_text" }
-      - value: { label: "Frames", key: "lora.0.traffic" }
+      - info:
+          rows:
+            - value: { label: "State", key: "lora.0.state_text" }
+            - value: { label: "Chip", key: "lora.0.chip" }
+              when_key: lora.0.chip
+            - value: { label: "Bitrate", key: "lora.0.bitrate_text" }
+            - value: { label: "Last RX", key: "lora.0.rx_text" }
+            - value: { label: "Frames", key: "lora.0.traffic" }
