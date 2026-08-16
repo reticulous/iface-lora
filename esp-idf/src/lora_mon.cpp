@@ -110,6 +110,15 @@ void publishStats(LoraRadio* r) {
                    (int)(appcAirtime(r) * 100.0f));
         storageSet(rk(b, sizeof b, r->idx, "stats.cw_band"), (int)appcLiveBand(r));
     }
+    /* The composed lines a settings row shows: the last reception's quality and
+     * the frame counters. Units and separators belong with the numbers, here,
+     * not re-assembled by each surface that displays them. */
+    char txt[64];
+    snprintf(txt, sizeof(txt), "RSSI %d dBm \xC2\xB7 SNR %d dB", (int)r->rssiLast, (int)r->snrLast);
+    storageSet(rk(b, sizeof b, r->idx, "rx_text"), txt);
+    snprintf(txt, sizeof(txt), "rx %u \xC2\xB7 tx %u",
+             (unsigned)(r->rxFrames & 0x7fffffff), (unsigned)(r->txFrames & 0x7fffffff));
+    storageSet(rk(b, sizeof b, r->idx, "traffic"), txt);
     storageEnd();
 }
 
@@ -301,10 +310,21 @@ void publishChannels(LoraRadio* r) {
     storageSet(rk(kb, sizeof kb, r->idx, "chans"), val);
 }
 
+/* The words a settings row shows for each state. Published beside the state
+ * itself so neither UI carries a state->wording table; they render the string. */
+static const char* stateWords(const char* state) {
+    if (strcmp(state, "up") == 0)           return "up";
+    if (strcmp(state, "starting") == 0)     return "starting";
+    if (strcmp(state, "error") == 0)        return "error";
+    if (strcmp(state, "unconfigured") == 0) return "unconfigured";
+    return *state ? state : "down";
+}
+
 void publishState(LoraRadio* r, const char* state) {
     char b[48];
     storageBegin();
     storageSet(rk(b, sizeof b, r->idx, "state"), state);
+    storageSet(rk(b, sizeof b, r->idx, "state_text"), stateWords(state));
     storageSet(rk(b, sizeof b, r->idx, "up"), r->running ? 1 : 0);
     storageEnd();
 }

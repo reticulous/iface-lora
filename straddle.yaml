@@ -37,19 +37,18 @@ browser_register:
   - call: registerLora
     module: modules/lora
 
-# Declarative settings: LCD pane + radio-0 storage defaults generated from this
-# block. web: false — LoraPanel.vue keeps the web leaf (IFAC secret, descriptive
-# option labels, status badges). Radio 0 only; radios 1.. seeded by the loop in
-# lora.cpp. Frequency + TX power carry no default (region/antenna — user must pick).
+# Declarative settings: both surfaces + radio-0 storage defaults generated from
+# this block. Radio 0 only; radios 1.. are seeded by the loop in lora.cpp.
+# Frequency + TX power carry no default (region/antenna — the user must pick).
 settings:
-  - menu:
-      - { id: mesh, label: "Mesh Network", placement: 3 }
-      - { id: interfaces, label: "RNS Interfaces", placement: 2 }
-      - { id: lora, label: "LoRa" }
-    web: false
+  - at:
+      - { id: mesh, label: "Mesh Network", short: "Mesh", order: 3 }
+      - { id: interfaces, label: "RNS Interfaces", short: "Ifaces", order: 2 }
+      - { id: lora, label: "LoRa", short: "LoRa" }
     rows:
       - section: "LoRa"
-      - switch: { label: "Enable", key: "s.lora.0.enable", default: 0 }
+      - caption: "Set frequency and bandwidth directly, pick a spreading factor and coding rate; the radio stays disabled until you enable it."
+      - switch: { label: "Enabled", key: "s.lora.0.enable", default: 0 }
       - section: "Radio"
       # Frequency/bandwidth are stored in Hz but entered here in MHz/kHz. These
       # rows bind ephemeral display keys, not s.lora.0.*; lora.cpp mirrors the Hz
@@ -62,12 +61,12 @@ settings:
           key: "s.lora.0.spreading_factor"
           default: 7
           options:
-            - { v: 7,  l: "SF7" }
+            - { v: 7,  l: "SF7 (fast, short range)" }
             - { v: 8,  l: "SF8" }
             - { v: 9,  l: "SF9" }
             - { v: 10, l: "SF10" }
             - { v: 11, l: "SF11" }
-            - { v: 12, l: "SF12" }
+            - { v: 12, l: "SF12 (slow, long range)" }
       - dropdown:
           label: "Coding rate"
           key: "s.lora.0.coding_rate"
@@ -196,8 +195,17 @@ settings:
       # pane needs, the ports are a considered choice typed once.
       - section: "RNode endpoint"
       - switch: { label: "Enable", key: "s.lora.rnode.enable", default: 0 }
+      - section: "Access code"
+      - caption: "IFAC: a network name + passphrase every peer on this interface must match, or traffic is dropped. Leave both blank for an open interface."
+      - text: { label: "IFAC network", key: "s.lora.0.ifac_netname" }
+      - text: { label: "IFAC passphrase", key: "secrets.lora.0.ifac_netkey", secret: true }
       - section: "Status"
-      - value: { label: "State", key: "lora.0.state" }
+      # Every row here shows a string the radio publishes finished — the state
+      # in words, the bitrate with its unit, the last reception's quality and
+      # the frame counters as one line each.
+      - value: { label: "State", key: "lora.0.state_text" }
       - value: { label: "Chip", key: "lora.0.chip" }
-      - value: { label: "Bitrate", key: "lora.0.bitrate_eff" }
-      - value: { label: "RSSI", key: "lora.0.stats.rssi_last" }
+        when_key: lora.0.chip
+      - value: { label: "Bitrate", key: "lora.0.bitrate_text" }
+      - value: { label: "Last RX", key: "lora.0.rx_text" }
+      - value: { label: "Frames", key: "lora.0.traffic" }

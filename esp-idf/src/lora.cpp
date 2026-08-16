@@ -414,6 +414,10 @@ static bool radioStart(LoraRadio* r) {
     storageBegin();
     storageSet(rk(kb, sizeof kb, r->idx, "chip"), chipName(r->slot->chip));
     storageSet(rk(kb, sizeof kb, r->idx, "bitrate_eff"), (int)r->curBitrate);
+    /* The same number with its unit, for the settings row that shows it. */
+    char bt[32];
+    snprintf(bt, sizeof(bt), "%d bit/s", (int)r->curBitrate);
+    storageSet(rk(kb, sizeof kb, r->idx, "bitrate_text"), bt);
     storageEnd();
 
     /* Arm RX and hook the chip's IRQ line (unified API maps to the right DIO). */
