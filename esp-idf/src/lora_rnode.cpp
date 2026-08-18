@@ -413,14 +413,38 @@ void rnodeApplyTransports(void) {
 
 /* ── ITS server callbacks (lora task, via itsPoll) ── */
 
-int onRnodeConnect(int handle, const void* /*data*/, size_t len) {
+/* The three doors are told apart by the connect payload's length and nothing
+ * else — the endpoint has no other channel to learn which transport handed it a
+ * client. The sizes must therefore stay pairwise distinct; rnode_door_connect_t
+ * is padded to 12 for exactly that reason, because net_connect_t is 8 bytes in
+ * an IPv6-off build and the natural Bluetooth struct is 8 too. */
+static_assert(sizeof(serial_handler_connect_t) != sizeof(rnode_door_connect_t),
+              "serial and ble door payloads must differ in size");
+#if CONFIG_SPANGAP_NET
+static_assert(sizeof(net_connect_t) != sizeof(rnode_door_connect_t),
+              "tcp and ble door payloads must differ in size");
+static_assert(sizeof(net_connect_t) != sizeof(serial_handler_connect_t),
+              "tcp and serial door payloads must differ in size");
+#endif
+
+int onRnodeConnect(int handle, const void* data, size_t len) {
     /* One session at a time, across every transport. Enforced here as well as
      * by the port's single handle, because the refusal is what keeps a serial
      * takeover from disturbing the console while a TCP client is attached. */
     if (s_rnode.handle >= 0 || !rnodeEnabled() || s_stop) return -1;
-    /* Serial or network is readable only from the connect payload's length —
-     * the serial machinery sends its own one-byte struct, net a net_connect_t. */
-    bool serial = (len == sizeof(serial_handler_connect_t));
+
+    const char* via = "tcp";
+    if (len == sizeof(serial_handler_connect_t)) {
+        via = "serial";
+    } else if (len == sizeof(rnode_door_connect_t)) {
+        auto* d = (const rnode_door_connect_t*)data;
+        if (d->magic != RNODE_DOOR_MAGIC) {
+            warn("lora rnode: 12-byte connect payload without the door magic, refused");
+            return -1;
+        }
+        via = "ble";
+    }
+
     /* Fresh decoder for a fresh stream. Field by field rather than assigning a
      * RnodeState{} — the temporary would be over a kilobyte of task stack. */
     RnodeState& S = s_rnode;
@@ -431,7 +455,7 @@ int onRnodeConnect(int handle, const void* /*data*/, size_t len) {
     S.echoPend = S.offPend = S.wantOn = S.txAlternate = false;
     S.handle = handle;
     S.radio  = rnodeRadioIdx();
-    info("lora/%d rnode: client attached over %s", S.radio, serial ? "serial" : "tcp");
+    info("lora/%d rnode: client attached over %s", S.radio, via);
     return 0;
 }
 

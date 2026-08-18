@@ -43,8 +43,7 @@ browser_register:
 settings:
   - at:
       - { id: reticulum }
-      - { id: interfaces, label: "RNS Interfaces", short: "Ifaces", order: 2 }
-      - { id: lora, label: "LoRa", short: "LoRa" }
+      - { id: lora, label: "LoRa", short: "LoRa", order: 4 }
     rows:
       - section: "LoRa"
       - caption: "Set frequency and bandwidth directly, pick a spreading factor and coding rate; the radio stays disabled until you enable it."

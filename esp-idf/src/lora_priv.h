@@ -13,6 +13,7 @@
 #include "sdkconfig.h"
 #include "rnsd.h"
 #include "lora.h"
+#include "rnode_door.h"   /* the endpoint's public door: ITS port + BLE payload */
 #include "esp_idf_hal.h"
 #include "spangap.h"
 #include "mem.h"       /* gp_alloc (PSRAM) for the LoRaMon ring/history buffers */

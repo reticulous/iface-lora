@@ -304,7 +304,9 @@ band edges, and where this build knowingly departs from upstream are in
 ## Using the device as an RNode
 
 With `s.lora.rnode.enable = 1` a stock Reticulum `RNodeInterface` client attaches
-to this device as if it were RNode hardware — over USB serial, over TCP, or both.
+to this device as if it were RNode hardware — over USB serial, over TCP, over
+Bluetooth if `reticulous/rnode-ble` is in the build, or any combination. One
+client at a time, whichever gets there first.
 The client becomes a **third endpoint on the same radio segment**: it, the radio,
 and this node's own `rnsd` all see the same traffic, and a packet arriving from
 any one of them is presented to the other two. So a laptop can run its own

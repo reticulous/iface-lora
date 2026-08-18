@@ -79,9 +79,10 @@ contributes:
   `esp-idf/test/` (`supe_core_test`, `supe_engine_test`, and the
   `supe-ladder-vectors.txt` conformance file).
 - **The RNode endpoint** (§17) — a stock RNS `RNodeInterface` client attaches
-  over USB serial and/or TCP 7633 and becomes the third endpoint of the radio
-  segment, executing radio commands by writing the ordinary `s.lora.<n>.*`
-  keys.
+  over USB serial, TCP 7633 or Bluetooth (the last through
+  `reticulous/rnode-ble`) and becomes the third endpoint of the radio segment,
+  executing radio commands by writing the ordinary `s.lora.<n>.*` keys. Its
+  public door contract is `include/rnode_door.h`.
 - **The browser panel and generated LCD/web settings** (`browser/`, the
   `settings:` block in `straddle.yaml`).
 
@@ -879,7 +880,7 @@ deleted. Frequency and TX power carry no default
 (region/antenna — the user must pick); everything else defaults so an
 enable-toggle alone gets a radio up. The **RNode group is global, not per radio**
 — there is one endpoint for the device — and is seeded under the same gate with
-**both doors shut**: `s.lora.rnode.radio` (0), `.serial` (−1 = claim no serial
+**every door shut**: `s.lora.rnode.radio` (0), `.serial` (−1 = claim no serial
 port) and `.tcp` (0 = open no socket; 7633 is the only port a stock client can
 dial, so it is the only other useful value). `s.lora.rnode.enable` comes from its
 pane row in `straddle.yaml`. The existing
@@ -1378,15 +1379,19 @@ everyone, so it always goes out at the configured `tx_power`.
 ## 17. RNode endpoint (`s.lora.rnode.*`)
 
 A stock Reticulum `RNodeInterface` client attaches to this device as if it were
-RNode hardware, over USB serial (how RNodes are normally used) and/or
-RNode-over-TCP, and becomes the **third endpoint of the radio segment**. All
+RNode hardware — over USB serial (how RNodes are normally used), RNode-over-TCP,
+or Bluetooth — and becomes the **third endpoint of the radio segment**. All
 three — the radio, rnsd, and the client — see the same traffic; a packet
 entering from any one is presented to the other two.
 
-Everything here lives in `lora.cpp`'s RNode section. The serial transport rests
-on a spangap-core mechanism, the serial-port handler registry
+Everything here lives in `lora_rnode.cpp`. The public half of it — the ITS port
+and the Bluetooth door's connect payload — is `include/rnode_door.h`, which is
+what a transport straddle includes; the KISS opcodes stay private. The serial
+transport rests on a spangap-core mechanism, the serial-port handler registry
 ([cli-internals §3](../spangap-core/docs/cli-internals.md)); core knows only
-"this port has a handler", never that it is RNode.
+"this port has a handler", never that it is RNode. The Bluetooth door is a
+separate straddle, `reticulous/rnode-ble`, which dials the same ITS port and
+knows nothing about KISS or the radio.
 
 Protocol reference:
 `RNS/Interfaces/RNodeInterface.py`.
@@ -1400,11 +1405,12 @@ Protocol reference:
 | `s.lora.rnode.serial` | −1 | serial port to claim; −1 = no serial |
 | `s.lora.rnode.tcp`    | 0 | TCP listen port; 0 or −1 = no TCP. 7633 is the only useful value |
 
-Global, not per radio: there is one endpoint for the device. **Both doors default
-shut**: `.enable` alone opens neither, and each transport is opted into by
+Global, not per radio: there is one endpoint for the device. **Every door
+defaults shut**: `.enable` alone opens none, and each transport is opted into by
 naming it. Enabling the endpoint must not put a listener on the network nobody
 asked for — a LoRa segment reachable from any host on the LAN is a decision, not
-a side effect of flipping a switch.
+a side effect of flipping a switch. The Bluetooth door is the same story under
+its own switch, `s.ble.rnode.enable`, owned by `reticulous/rnode-ble`.
 
 `.tcp` is therefore a two-value key in practice: **0, or 7633**. The client dials
 7633 and nothing else — its `TCPConnection.TARGET_PORT` is hardcoded, and a
@@ -1415,9 +1421,10 @@ opens a socket no stock client can reach.
 `rnodeApplyTransports()` runs from the coalesced apply pass (§9) and does three
 things: drops the session if the endpoint was switched off or rebound to another
 radio; registers the TCP endpoint with net **once** and then drives the listener
-by writing `s.net.rnode_port` (net's own `s.net.*` subscriber opens and closes
-the socket — the two-step shape sshd uses); and claims or releases the serial
-port. A refused serial claim — port 1 while the console presents only one — is
+by writing `s.net.rnode_port` (net polls its `s.net.*` keys from `epOpenAll` and
+opens or closes the socket from there — the two-step shape sshd uses); and
+claims or releases the serial port. The Bluetooth door needs nothing here: it
+dials in from its own straddle like any other client. A refused serial claim — port 1 while the console presents only one — is
 warned once and retried when `sys.usb.serial_ports` changes, which is why the
 task also subscribes to that key.
 
@@ -1427,19 +1434,33 @@ radio itself needs no network stack, so on a net-less build the door compiles
 away and the serial one still works. `straddle.yaml` therefore does not `require:`
 spangap-net — an optional door must not make a whole network stack mandatory.
 
-### 17.2 One session, two doors
+### 17.2 One session, three doors
 
 `RNODE_ITS_PORT` (0x524E, `'RN'`) is a stream-mode ITS server port on the lora
-task, `maxHandles = 1`, 4 KB each way. Both net (a TCP client) and the core
-serial machinery (a serial client) connect to it, and `onRnodeConnect`
-discriminates by the **connect payload's length** — the serial machinery sends a
-one-byte `serial_handler_connect_t`, net a `net_connect_t`. That length is the
-only discriminator available, and nothing else needs one.
+task, `maxHandles = 1`, 4 KB each way. Three transports connect to it — net (a
+TCP client), the core serial machinery (a serial client), and `rnode-ble` (a
+Bluetooth client) — and `onRnodeConnect` discriminates by the **connect
+payload's length**, which is the only discriminator the port offers:
+
+| transport | payload | size |
+|---|---|---|
+| serial | `serial_handler_connect_t` (cli.h) | 1 |
+| Bluetooth | `rnode_door_connect_t` (rnode_door.h) | 12 |
+| TCP | `net_connect_t` (net.h) | 28 with `CONFIG_LWIP_IPV6`, 8 without |
+
+The Bluetooth payload is padded to **12** bytes rather than the 8 that
+`{ magic, addr[6], type }` would naturally be: 8 is exactly what `net_connect_t`
+collapses to in an IPv6-off build, and a collision there would route a Bluetooth
+client down the TCP branch. A `static_assert` in `lora_rnode.cpp` keeps the three
+sizes pairwise distinct as any of them changes, and the payload's `magic`
+(`0xB7`) is checked on the Bluetooth branch as a second line.
 
 `maxHandles = 1` plus an explicit reject in `onRnodeConnect` is what enforces the
 single-session policy across transports: a serial takeover attempted while a TCP
 client is attached is refused, and because the refusal happens before any
-takeover, **the console is not disturbed by it**. `onRnodeConnect` also rejects
+takeover, **the console is not disturbed by it**. The same refusal is what a
+Bluetooth client meets; `rnode-ble` drops the BLE connection on it, and the RNS
+client re-dials every 2.5 s until the endpoint frees. `onRnodeConnect` also rejects
 while the endpoint is disabled or `s_stop` is set; `rns stop` drops an existing
 session before parking.
 

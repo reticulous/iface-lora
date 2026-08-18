@@ -26,7 +26,9 @@ struct LoraRadio;
  * calls ord() on an int and takes the interface offline), CMD_ERROR 0x03 / 0x04
  * (unhandled → "Unknown hardware failure"), and any spontaneous CMD_RESET. */
 
-#define RNODE_ITS_PORT   0x524E   /* 'RN'; both net and the serial machinery dial it */
+/* RNODE_ITS_PORT and the Bluetooth door's connect payload are the public half
+ * of this endpoint — a transport needs them, the KISS opcodes below it does
+ * not. They live in include/rnode_door.h, pulled in by lora_priv.h. */
 
 /* KISS framing. */
 #define KISS_FEND   0xC0
