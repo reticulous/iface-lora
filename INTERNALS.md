@@ -258,6 +258,36 @@ The RF switch is uniform and handled at the call site, not in dispatch:
 `Module` before `begin()`, so it covers every family), or — SX126x only —
 `setDio2AsRfSwitch(true)` applied inside `radioBegin` when the slot asks for it.
 
+**External front-end module (`lora_fem`).** Some boards put a FEM — TX PA, RX
+LNA, antenna switch — between the radio and the antenna, and from there every
+user-facing power number is **antenna dBm**, converted to chip drive at the
+last moment (`femChipDbm`, called on the `begin()` path, in `apApplyPower` and
+on a SUPE detour's way home). Two forms:
+
+- **Detected** (Heltec V4: GC1109 on rev ≤ 4.2, KCT8103L on 4.3, same enable
+  net): `femInit` senses the net at boot, installs the part's RF-switch table
+  on the `Module` (superseding the two-pin form — a board wires one or the
+  other), and applies `CONFIG_LORA_TX_POWER_MAX` as `r->maxTxDbm`. The
+  conversion walks the part's measured per-dBm gain table, since the gain
+  compresses toward the top. A FEM that does not answer falls back to
+  `FEM_NONE` and the bare chip's 22.
+- **Declared** (fixed — the B&Q Station G2 class): a 35 dBm PA and an 18.5 dB
+  LNA always in the path, rails up with the board, the switch on the SX1262's
+  own DIO2 — no pin to sense, none to drive. `CONFIG_LORAn_FEM_FIXED_GAIN_DB`
+  declares the PA's flat TX gain and `femInit` believes it: type + ceiling
+  only, no GPIO work, no RF-switch table. The conversion subtracts the gain
+  and clamps the chip drive to `CONFIG_LORAn_FEM_MAX_CHIP_DBM` — the safety
+  line, because the G2's PA input leaves its P1dB region at chip 16 dBm and
+  absolutely caps at 19, far below the chip's own 22.
+
+`femInit` runs in the task's construction loop, after the `Module` exists and
+before both `probeRadio` and the first config apply — which is what lets
+`radioStart` bound `tx_power` against `r->maxTxDbm` (§9). The **RX side is not
+modeled** in either form: an always-on LNA reads RSSI/SNR hot by its gain
+(~18.5 dB on the G2). Adaptive TX power sees the same bias from both ends of a
+like-for-like link, so it partially cancels; correcting the published readings
+is future work.
+
 **RX gain (SX126x only).** SX126x/LR `begin()` sets the regulator to **DC-DC**
 (passing `useRegulatorLDO = false`). The LNA gain mode is a per-radio setting
 `s.lora.<n>.rx_boosted_gain` (default **on**, live via `lora <n> rx_boosted_gain
@@ -825,9 +855,12 @@ and every `rns start` resume.
 field changed).
 
 **`radioStart`** reads the radio config, validates it (`freq > 0`, `bw > 0`,
-`sf ∈ [5,12]`, `cr ∈ [5,8]`, `txp ∈ [−9,22]`; sync word parsed with
-`strtol(base=0)` and falling back to `0x42` outside `(0,0xFF]`), and refuses to
-bring an unconfigured radio up (`state = unconfigured`). RadioLib wants frequency
+`sf ∈ [5,12]`, `cr ∈ [5,8]`, `txp ≥ −9` — the top end is not a refusal but a
+clamp to `r->maxTxDbm`, this board's real antenna ceiling as `femInit` resolved
+it, applied before the gate and before `begin()`; a fixed 22 here is what once
+refused the 23..27 dBm a Heltec V4's front end legitimately reaches; sync word
+parsed with `strtol(base=0)` and falling back to `0x42` outside `(0,0xFF]`),
+and refuses to bring an unconfigured radio up (`state = unconfigured`). RadioLib wants frequency
 in MHz, bandwidth in kHz, TCXO in volts — the task converts from the Hz/mV
 stored values. On a `begin()` error it logs the decoded `RADIOLIB_ERR_*` name
 (`rlErrName`) plus the raw code and sets `state = error`. On success it computes

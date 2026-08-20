@@ -315,7 +315,9 @@ struct LoraRadio {
     uint8_t         cfgSync;         /* configured sync word (restored after a sweep) */
     int8_t          txPwrNow;        /* power of the frame on-air, stamped into tx records */
     uint8_t         femType;         /* LoraFemType — external front-end module, set by femInit */
-    int8_t          maxTxDbm;        /* antenna-dBm ceiling: 22 bare chip, 27 through a FEM */
+    int8_t          maxTxDbm;        /* antenna-dBm ceiling: 22 bare chip, the board's
+                                      * declared figure through a FEM (27 Heltec V4,
+                                      * 35 Station G2) */
     uint8_t         txType[2];       /* per frame: LORA_PKT_*. A 0x04 power request
                                       * and the RNS packet it prefixes share one
                                       * channel access but not one protocol. */

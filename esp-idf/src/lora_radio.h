@@ -35,6 +35,9 @@ struct LoraSlot {
     int      fem_en;               /* FEM chip-enable GPIO (-1 = no FEM); also the detect sense */
     int      fem_txsel_a;          /* TX-select when a GC1109-style FEM is detected */
     int      fem_txsel_b;          /* TX-select when a KCT8103L-style FEM is detected */
+    int      fem_fixed_gain_db;    /* fixed always-in-path FEM (Station G2 class): its
+                                    * declared TX gain, dB (0 = none) — see lora_fem.h */
+    int      fem_max_chip_dbm;     /* fixed FEM: the most chip drive its input tolerates */
     LoraChip chip;
 };
 

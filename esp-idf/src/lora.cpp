@@ -65,12 +65,14 @@ static const LoraSlot kSlots[] = {
       CONFIG_LORA0_TCXO_MV, LORA0_DIO2, CONFIG_LORA0_RFSW_RX_PIN, CONFIG_LORA0_RFSW_TX_PIN,
       CONFIG_LORA0_FEM_PWR_PIN, CONFIG_LORA0_FEM_EN_PIN,
       CONFIG_LORA0_FEM_TXSEL_A_PIN, CONFIG_LORA0_FEM_TXSEL_B_PIN,
+      CONFIG_LORA0_FEM_FIXED_GAIN_DB, CONFIG_LORA0_FEM_MAX_CHIP_DBM,
       (LoraChip)CONFIG_LORA0_CHIP_ID },
 #if defined(CONFIG_LORA1_CS_PIN)
     { CONFIG_LORA1_CS_PIN, CONFIG_LORA1_DIO1_PIN, CONFIG_LORA1_BUSY_PIN, CONFIG_LORA1_RST_PIN,
       CONFIG_LORA1_TCXO_MV, LORA1_DIO2, CONFIG_LORA1_RFSW_RX_PIN, CONFIG_LORA1_RFSW_TX_PIN,
       CONFIG_LORA1_FEM_PWR_PIN, CONFIG_LORA1_FEM_EN_PIN,
       CONFIG_LORA1_FEM_TXSEL_A_PIN, CONFIG_LORA1_FEM_TXSEL_B_PIN,
+      CONFIG_LORA1_FEM_FIXED_GAIN_DB, CONFIG_LORA1_FEM_MAX_CHIP_DBM,
       (LoraChip)CONFIG_LORA1_CHIP_ID },
 #endif
 #if defined(CONFIG_LORA2_CS_PIN)
@@ -78,6 +80,7 @@ static const LoraSlot kSlots[] = {
       CONFIG_LORA2_TCXO_MV, LORA2_DIO2, CONFIG_LORA2_RFSW_RX_PIN, CONFIG_LORA2_RFSW_TX_PIN,
       CONFIG_LORA2_FEM_PWR_PIN, CONFIG_LORA2_FEM_EN_PIN,
       CONFIG_LORA2_FEM_TXSEL_A_PIN, CONFIG_LORA2_FEM_TXSEL_B_PIN,
+      CONFIG_LORA2_FEM_FIXED_GAIN_DB, CONFIG_LORA2_FEM_MAX_CHIP_DBM,
       (LoraChip)CONFIG_LORA2_CHIP_ID },
 #endif
 #if defined(CONFIG_LORA3_CS_PIN)
@@ -85,6 +88,7 @@ static const LoraSlot kSlots[] = {
       CONFIG_LORA3_TCXO_MV, LORA3_DIO2, CONFIG_LORA3_RFSW_RX_PIN, CONFIG_LORA3_RFSW_TX_PIN,
       CONFIG_LORA3_FEM_PWR_PIN, CONFIG_LORA3_FEM_EN_PIN,
       CONFIG_LORA3_FEM_TXSEL_A_PIN, CONFIG_LORA3_FEM_TXSEL_B_PIN,
+      CONFIG_LORA3_FEM_FIXED_GAIN_DB, CONFIG_LORA3_FEM_MAX_CHIP_DBM,
       (LoraChip)CONFIG_LORA3_CHIP_ID },
 #endif
 };
@@ -201,8 +205,25 @@ static bool radioStart(LoraRadio* r) {
     int syncWord = (int)strtol(syncBuf, nullptr, 0);
     if (syncWord <= 0 || syncWord > 0xFF) syncWord = 0x42;
 
+    /* The config slider ranges to this radio's published ceiling, but the CLI
+     * and an RNode client write the key unchecked — so the validity gate below
+     * bounds it against the ceiling femInit resolved (22 on a bare chip, the
+     * declared CONFIG_LORA_TX_POWER_MAX once a FEM is detected or declared
+     * fixed). That ceiling is always settled by now: the task constructs every
+     * radio (femInit included) before its first config apply, and radioStart
+     * runs only from that apply pass. Over-ceiling values are REFUSED, not
+     * clamped: tx_power ships with no default and the radio does not start
+     * until the stored figure is one this hardware can honestly radiate — a
+     * fat-fingered 270 must leave the radio down, not come up transmitting at
+     * the board's maximum. The per-board bound is what un-breaks the 23..27
+     * dBm a Heltec V4's detected front end legitimately reaches (the old
+     * fixed 22 here refused those). */
+    if (txp > r->maxTxDbm)
+        warn("lora/%d tx_power %d dBm exceeds this board's %d dBm max — not started",
+             r->idx, txp, r->maxTxDbm);
+
     if (freq_hz <= 0 || bw_hz <= 0 || sf < 5 || sf > 12 ||
-        cr < 5 || cr > 8 || txp < -9 || txp > 22) {
+        cr < 5 || cr > 8 || txp < -9 || txp > r->maxTxDbm) {
         info("lora/%d not started: configure freq/bw/sf/cr/txp first", r->idx);
         publishState(r, "unconfigured");
         return false;
@@ -314,13 +335,8 @@ static bool radioStart(LoraRadio* r) {
     r->airPreamble = preamble; r->airImplicit = false; r->airSf = (uint8_t)sf;
     r->airBwHz = bw_hz;
     r->chNow   = LORA_CH_HAIL;
-    /* The config slider ranges to the FEM ceiling (27 dBm); on a bare-chip
-     * board the capability is 22, so clamp what the user asked for. */
-    if (txp > r->maxTxDbm) {
-        warn("lora/%d tx_power %d dBm exceeds this board's %d dBm max — clamped",
-             r->idx, txp, r->maxTxDbm);
-        txp = r->maxTxDbm;
-    }
+    /* txp passed the validity gate above (bounded by r->maxTxDbm) before
+     * begin() applied it. */
     r->cfgTxp = (int8_t)txp;
     r->cfgSync = (uint8_t)syncWord;
     r->txPwrNow = (int8_t)txp;
@@ -784,12 +800,14 @@ static void loraTaskMain(void*) {
         /* External FEM (PA/LNA/switch), if the board wires one: detect the
          * part, install its RF-switch table (supersedes the two-pin form
          * above — a board wires one or the other) and set the antenna-dBm
-         * ceiling. Before begin(), like setRfSwitchPins. */
+         * ceiling. A fixed FEM (declared, pinless — Station G2) takes the
+         * short path inside: type + ceiling only, the chip's DIO2 keeps the
+         * switch. Before begin(), like setRfSwitchPins. */
         femInit(r);
         /* What this radio can actually reach at the antenna, published so a UI
          * can size its power control to the hardware in front of it rather than
          * to a build-time constant: the bare chip's 22 dBm unless femInit found
-         * a front-end, and that part's rating when it did. */
+         * — or the board declared — a front-end, and that part's rating then. */
         {
             char b[48];
             storageSet(rk(b, sizeof b, r->idx, "tx_power_max"), (int)r->maxTxDbm);
