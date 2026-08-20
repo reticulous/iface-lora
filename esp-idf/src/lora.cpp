@@ -1123,6 +1123,12 @@ bool loraTrafficSummary(int radio, lora_traffic_summary* out) {
     out->tx_frames   = r->txFrames;
     out->rx_frames   = r->rxFrames;
     out->airtime_pct = (int)(appcAirtime(r) * 100.0f);
+    /* Rolling-hour TX duty: the measuring structure (lora_mon's per-channel
+     * Rolling1h of transmit seconds), summed across channels. /3600 s *1000
+     * = /3.6 to deci-percent. */
+    float dutySecs = 0;
+    for (int c = 0; c < LORA_CH_MAX; c++) dutySecs += r->mon.txAir[c].total(60);
+    out->duty_pct10  = (int)(dutySecs / 3.6f);
     out->noise_dbm   = (int)r->noiseFloor;
     out->txp_dbm     = r->cfgTxp;
     return true;

@@ -51,6 +51,8 @@ struct lora_traffic_summary {
     uint64_t tx_bytes, rx_bytes;
     uint64_t tx_frames, rx_frames;
     int      airtime_pct;   /* own TX airtime over the appc window, percent */
+    int      duty_pct10;    /* own TX duty over the rolling hour, deci-percent
+                             * (10 = 1.0%) — summed across SUPE channels */
     int      noise_dbm;     /* tracked channel noise floor, dBm */
     int      txp_dbm;       /* configured TX power, antenna dBm */
 };

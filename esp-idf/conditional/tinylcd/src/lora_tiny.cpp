@@ -108,8 +108,9 @@ static bool drawTrafficPage(tinylcd_page_t, u8g2_t* g, tinylcd_ev_t)
     u8g2_SetFont(g, u8g2_font_6x10_tf);
     snprintf(line, sizeof line, "tx %uB/s rx %uB/s", txr, rxr);
     u8g2_DrawStr(g, 0, 8, line);
-    snprintf(line, sizeof line, "air %d%%  nf %d  txp %d",
-             t.airtime_pct, t.noise_dbm, t.txp_dbm);
+    snprintf(line, sizeof line, "air %d%% d %d.%d%% nf %d t%d",
+             t.airtime_pct, t.duty_pct10 / 10, t.duty_pct10 % 10,
+             t.noise_dbm, t.txp_dbm);
     u8g2_DrawStr(g, 0, 18, line);
 
     /* Chart: 60 bars x 2 px, newest at the right edge, baseline at y=63.
