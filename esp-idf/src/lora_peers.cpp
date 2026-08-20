@@ -380,7 +380,9 @@ int peersKnownHashes(const Neighbor* e) {
  * power, not at 22, and the estimate would be off by the difference. */
 static int peersAssumedPeerTxp(void) {
     int v = storageGetInt("s.lora.assumed_peer_txp", 22);
-    if (v < -30 || v > 30) v = 22;
+    /* Garbage filter, not a capability claim: the top allows what fielded
+     * FEM boards really reach (Station G2: 36-37 dBm at the antenna). */
+    if (v < -30 || v > 40) v = 22;
     return v;
 }
 

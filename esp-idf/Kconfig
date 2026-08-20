@@ -103,9 +103,14 @@ config LORA_TX_POWER_MAX
     help
         The board's real RF capability at the antenna. 22 (the bare SX126x
         max) unless the board routes the radio through a FEM — then the board
-        sets the FEM ceiling here (e.g. 27) alongside the FEM pins below. The
-        TX-power slider's max is sized from this at build time, and femInit
-        applies it as the runtime ceiling when the FEM is actually detected.
+        sets the FEM ceiling here (e.g. 27 on the Heltec V4; 35 on the
+        Station G2, which declares its P1dB rather than the 36 its chip cap
+        plus gain could theoretically reach) alongside the FEM declaration
+        below. The TX-power
+        slider's max is sized from this at build time, and femInit applies it
+        as the runtime ceiling when the FEM is actually detected — or, for a
+        fixed FEM (FEM_FIXED_GAIN_DB), on the declaration alone, there being
+        nothing to detect.
 
 config LORA0_FEM_PWR_PIN
     int "Radio 0 — FEM rail-enable GPIO (-1 if none)"
@@ -117,9 +122,10 @@ config LORA0_FEM_PWR_PIN
         or KCT8103L (rev 4.3). EN is the FEM chip-enable and doubles as the
         boot-time detect sense (the KCT8103L board design pulls it up); the
         two TXSEL values name the direction pin of each candidate FEM, and
-        detection picks which one is driven. -1 on EN = no FEM: user-facing
-        TX power then caps at the bare chip's 22 dBm instead of 27. See
-        lora_fem.h.
+        detection picks which one is driven. -1 on EN = no detectable FEM:
+        user-facing TX power then caps at the bare chip's 22 dBm instead of
+        27. A front end with no pins at all is the FEM_FIXED_GAIN_DB
+        declaration below, not this detect path. See lora_fem.h.
 config LORA0_FEM_EN_PIN
     int "Radio 0 — FEM chip-enable / detect GPIO (-1 = no FEM)"
     default -1
@@ -132,6 +138,35 @@ config LORA0_FEM_TXSEL_B_PIN
     int "Radio 0 — FEM TX-select GPIO, KCT8103L-style part (-1 if none)"
     default -1
     depends on LORA_COUNT > 0
+config LORA0_FEM_FIXED_GAIN_DB
+    int "Radio 0 — fixed FEM TX gain in dB (0 = no fixed FEM)"
+    default 0
+    depends on LORA_COUNT > 0
+    help
+        A FEM that is always in the TX path and gives the firmware no control
+        or detect pins — the B&Q Station G2's 35 dBm PA is the reference
+        hardware: its RF switch hangs off the SX1262's own DIO2 and its rails
+        come up with the board, so there is nothing to sense and nothing to
+        drive. Declared, not detected: a non-zero value here says the FEM is
+        there, femInit believes it, and LORA_TX_POWER_MAX above states the
+        antenna ceiling exactly as it does for the detected parts. The value
+        is the PA's TX gain below compression (Station G2 declares 20, the
+        EU868 mid-table figure from B&Q's conduction test), which femChipDbm
+        subtracts to turn the user's antenna dBm into chip drive.
+        Mutually exclusive with the FEM_EN_PIN detect path — a slot declaring
+        both gets the fixed FEM and an error in the boot log, since a detect
+        sense on hardware that cannot answer it would read garbage.
+config LORA0_FEM_MAX_CHIP_DBM
+    int "Radio 0 — fixed FEM max chip drive in dBm"
+    default 22
+    depends on LORA_COUNT > 0
+    help
+        The most the fixed FEM's input tolerates from the chip, in dBm. This
+        is the safety line for an always-in-path PA: the Station G2's input
+        P1dB region ends at chip 16 dBm and its absolute cap is 19 — driving
+        the chip's full 22 into it is out of spec however the request came
+        about, so femChipDbm clamps every chip drive to this. Unread without
+        FEM_FIXED_GAIN_DB above.
 choice
     prompt "Radio 0 — chip"
     default LORA0_RADIO_SX1262
@@ -254,6 +289,14 @@ config LORA1_FEM_TXSEL_B_PIN
     int "Radio 1 — FEM TX-select GPIO, KCT8103L-style part (-1 if none)"
     default -1
     depends on LORA_COUNT > 1
+config LORA1_FEM_FIXED_GAIN_DB
+    int "Radio 1 — fixed FEM TX gain in dB (0 = no fixed FEM)"
+    default 0
+    depends on LORA_COUNT > 1
+config LORA1_FEM_MAX_CHIP_DBM
+    int "Radio 1 — fixed FEM max chip drive in dBm"
+    default 22
+    depends on LORA_COUNT > 1
 choice
     prompt "Radio 1 — chip"
     default LORA1_RADIO_SX1262
@@ -370,6 +413,14 @@ config LORA2_FEM_TXSEL_B_PIN
     int "Radio 2 — FEM TX-select GPIO, KCT8103L-style part (-1 if none)"
     default -1
     depends on LORA_COUNT > 2
+config LORA2_FEM_FIXED_GAIN_DB
+    int "Radio 2 — fixed FEM TX gain in dB (0 = no fixed FEM)"
+    default 0
+    depends on LORA_COUNT > 2
+config LORA2_FEM_MAX_CHIP_DBM
+    int "Radio 2 — fixed FEM max chip drive in dBm"
+    default 22
+    depends on LORA_COUNT > 2
 choice
     prompt "Radio 2 — chip"
     default LORA2_RADIO_SX1262
@@ -485,6 +536,14 @@ config LORA3_FEM_TXSEL_A_PIN
 config LORA3_FEM_TXSEL_B_PIN
     int "Radio 3 — FEM TX-select GPIO, KCT8103L-style part (-1 if none)"
     default -1
+    depends on LORA_COUNT > 3
+config LORA3_FEM_FIXED_GAIN_DB
+    int "Radio 3 — fixed FEM TX gain in dB (0 = no fixed FEM)"
+    default 0
+    depends on LORA_COUNT > 3
+config LORA3_FEM_MAX_CHIP_DBM
+    int "Radio 3 — fixed FEM max chip drive in dBm"
+    default 22
     depends on LORA_COUNT > 3
 choice
     prompt "Radio 3 — chip"
