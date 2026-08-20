@@ -73,6 +73,16 @@ static uint64_t s_prevTx, s_prevRx;
 static uint32_t s_prevMs;
 static bool     s_haveBase;                    /* first sample = baseline only */
 
+/* Draw a line that MUST stay inside the panel: measured, and truncated a
+ * character at a time until it fits — 24 characters of 6x10 are 144 px, and
+ * a loud second or a three-digit noise floor can get the stats there. */
+static void drawFit(u8g2_t* g, int y, char* s)
+{
+    size_t len = strlen(s);
+    while (len && u8g2_GetStrWidth(g, s) > 128) s[--len] = 0;
+    u8g2_DrawStr(g, 0, y, s);
+}
+
 static uint16_t rateOf(uint64_t now, uint64_t prev, uint32_t dtMs)
 {
     if (now <= prev || dtMs == 0) return 0;
@@ -109,12 +119,12 @@ static bool drawTrafficPage(tinylcd_page_t, u8g2_t* g, tinylcd_ev_t)
      * dots along the top edge, and rows 0-10 belong to them — a baseline-8
      * line here overlapped the dots on carousel boards. */
     u8g2_SetFont(g, u8g2_font_6x10_tf);
-    snprintf(line, sizeof line, "tx %uB/s rx %uB/s", txr, rxr);
-    u8g2_DrawStr(g, 0, 15, line);
-    snprintf(line, sizeof line, "air %d%% d %d.%d%% nf %d t%d",
+    snprintf(line, sizeof line, "tx %u rx %u B/s", txr, rxr);
+    drawFit(g, 15, line);
+    snprintf(line, sizeof line, "a%d%% d%d.%d%% nf%d t%d",
              t.airtime_pct, t.duty_pct10 / 10, t.duty_pct10 % 10,
              t.noise_dbm, t.txp_dbm);
-    u8g2_DrawStr(g, 0, 25, line);
+    drawFit(g, 25, line);
 
     /* Chart: 60 bars x 2 px, newest at the right edge, baseline at y=63.
      * Height = sqrt scale to TRAFFIC_FULL_BPS over 34 px — the chart top at
