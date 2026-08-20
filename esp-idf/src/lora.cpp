@@ -34,6 +34,7 @@
  * reassembled (splitPending) or another transmit is on-air (txActive).
  */
 #include "lora_priv.h"
+#include "lora_csma.h"   /* appcAirtime — the traffic summary's airtime figure */
 
 #include "lora_fem.h"
 
@@ -1113,6 +1114,20 @@ bool loraPeerSummary(int radio, lora_peer_summary* out) {
     return true;
 }
 
+bool loraTrafficSummary(int radio, lora_traffic_summary* out) {
+    if (radio < 0 || radio >= kNumRadios) return false;
+    LoraRadio* r = &s_radios[radio];
+    out->up          = r->running;
+    out->tx_bytes    = r->txBytes;
+    out->rx_bytes    = r->rxBytes;
+    out->tx_frames   = r->txFrames;
+    out->rx_frames   = r->rxFrames;
+    out->airtime_pct = (int)(appcAirtime(r) * 100.0f);
+    out->noise_dbm   = (int)r->noiseFloor;
+    out->txp_dbm     = r->cfgTxp;
+    return true;
+}
+
 #else  /* ── no radios configured (CONFIG_LORA_COUNT = 0) ── */
 
 void LoraService::onInit() {
@@ -1121,5 +1136,6 @@ void LoraService::onInit() {
 }
 
 bool loraPeerSummary(int, lora_peer_summary*) { return false; }
+bool loraTrafficSummary(int, lora_traffic_summary*) { return false; }
 
 #endif

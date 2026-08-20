@@ -10,6 +10,8 @@
  */
 #pragma once
 
+#include <stdint.h>
+
 #include "service.h"
 
 class LoraService : public Service {
@@ -36,3 +38,23 @@ struct lora_peer_summary {
 /** Fill `out` for radio slot `radio`. False when the slot is invalid, no
  *  radios are configured, or the radio has never been up (no observations). */
 bool loraPeerSummary(int radio, lora_peer_summary* out);
+
+/** Point-in-time traffic snapshot for a small status surface, read straight
+ *  off the radio's in-memory counters — deliberately NOT the storage stats
+ *  keys, which publish only while a monitor UI holds them open
+ *  (`uiTelemetryWanted`). Same advisory-display contract as
+ *  lora_peer_summary: an unsynchronised cross-task read, not state to act
+ *  on. A caller charting rates keeps its own previous sample and divides by
+ *  its own wall-clock delta. */
+struct lora_traffic_summary {
+    bool     up;            /* radio on-air right now */
+    uint64_t tx_bytes, rx_bytes;
+    uint64_t tx_frames, rx_frames;
+    int      airtime_pct;   /* own TX airtime over the appc window, percent */
+    int      noise_dbm;     /* tracked channel noise floor, dBm */
+    int      txp_dbm;       /* configured TX power, antenna dBm */
+};
+
+/** Fill `out` for radio slot `radio`. False when the slot is invalid or no
+ *  radios are configured (counters read zero before the radio first runs). */
+bool loraTrafficSummary(int radio, lora_traffic_summary* out);
