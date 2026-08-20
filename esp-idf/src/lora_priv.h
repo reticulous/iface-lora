@@ -48,7 +48,7 @@
 
 #if defined(CONFIG_LORA0_CS_PIN)
 
-#define LORA_VERSION         6
+#define LORA_VERSION         8
 #define RNS_MTU              500
 #define RNODE_MAX_PAYLOAD    254
 #define RNODE_FLAG_SPLIT     0x01
@@ -232,7 +232,8 @@ struct LoraRadio {
     /* CSMA / listen-before-talk. slotTicks/difsTicks derive from the LoRa
      * symbol time at config; the phase machine is driven from the task loop. */
     bool            lbt;             /* carrier-sense enabled (s.lora.<i>.lbt) */
-    bool            rxBoostedGain;   /* SX126x LNA boosted RX gain (s.lora.<i>.rx_boosted_gain) */
+    bool            rxBoostedGain;   /* boosted RX gain (s.lora.<i>.rx_boosted_gain): a
+                                      * flag on SX126x, the top gain level on LR2021 */
     TickType_t      slotTicks;       /* CSMA slot time */
     TickType_t      difsTicks;       /* inter-frame listen before backoff */
     CsmaPhase       csmaPhase;
@@ -315,7 +316,10 @@ struct LoraRadio {
     uint8_t         cfgSync;         /* configured sync word (restored after a sweep) */
     int8_t          txPwrNow;        /* power of the frame on-air, stamped into tx records */
     uint8_t         femType;         /* LoraFemType — external front-end module, set by femInit */
-    int8_t          maxTxDbm;        /* antenna-dBm ceiling: 22 bare chip, 27 through a FEM */
+    int8_t          maxTxDbm;        /* antenna-dBm ceiling for the band in use: the bare
+                                      * chip's own max, or the front end's rating */
+    bool            highBand;        /* the carrier is on the chip's 2.4 GHz port, which
+                                      * has its own amplifier, ceiling and drive range */
     uint8_t         txType[2];       /* per frame: LORA_PKT_*. A 0x04 power request
                                       * and the RNS packet it prefixes share one
                                       * channel access but not one protocol. */

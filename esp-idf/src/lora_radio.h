@@ -35,6 +35,14 @@ struct LoraSlot {
     int      fem_en;               /* FEM chip-enable GPIO (-1 = no FEM); also the detect sense */
     int      fem_txsel_a;          /* TX-select when a GC1109-style FEM is detected */
     int      fem_txsel_b;          /* TX-select when a KCT8103L-style FEM is detected */
+    int      fem_gain_db;          /* declared-FEM TX gain, dB (0 = no declared FEM) */
+    int      fem_hf_pwr;           /* 2.4 GHz front end's supply GPIO (-1 = single band) */
+    int      fem_hf_gain_db;       /* declared-FEM TX gain on the 2.4 GHz path, dB */
+    int      lr_irq_dio;           /* LR2021: which chip DIO carries the IRQ line (5..11) */
+    uint8_t  lr_rfsw[5];           /* LR2021: DIOs driven high per mode, in the order the
+                                    * chip numbers them — idle, rx, tx, rx_hf, tx_hf; bit 0
+                                    * = DIO5 … bit 6 = DIO11. All zero = no radio-driven
+                                    * front end (see lora_radio.cpp's lr2021ApplyDio) */
     LoraChip chip;
 };
 
@@ -60,6 +68,13 @@ const char*    rlErrName(int16_t st);
 int16_t radioBegin(LoraRadio* r, float freq, float bw, uint8_t sf, uint8_t cr,
                    uint8_t sync, int8_t power, uint16_t preamble, float tcxoV);
 float   radioOcpMilliamps(LoraChip c);
+
+/* Above this the dual-band parts (LR2021, SX128x) are on their high-frequency
+ * port: a different amplifier, a different chip drive range and a different
+ * antenna ceiling. RadioLib's own LR2021 cutoff, spelled here because the FEM
+ * and power paths have to agree with it. */
+#define LORA_HF_CUTOFF_MHZ  1500.0f
+static inline bool loraFreqIsHighBand(float freqMhz) { return freqMhz > LORA_HF_CUTOFF_MHZ; }
 void    radioIrqCache(LoraRadio* r);
 int16_t radioStartRx(LoraRadio* r);
 bool    radioRxInProgress(LoraRadio* r);

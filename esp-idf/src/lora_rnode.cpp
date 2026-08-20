@@ -14,7 +14,27 @@ RnodeState s_rnode;
 /* ─────────────── RNode endpoint: implementation ───────────────
  * (protocol overview and the client-side traps at RNODE_ITS_PORT, top of file) */
 
-static bool rnodeEnabled(void) { return storageGetInt("s.lora.rnode.enable", 0) != 0; }
+/* The only TCP port a stock client can dial: TCPConnection.TARGET_PORT is
+ * hardcoded client-side, so the setting is a switch, not a number. */
+#define RNODE_TCP_PORT 7633
+
+/* One switch per door. Serial and Bluetooth default ON — a dormant in-band-
+ * triggered claim and an unadvertised GATT service cost nothing until a
+ * client speaks — TCP defaults OFF: a listener on the network is a decision,
+ * not a side effect. There is no master switch: an open door is what
+ * "enabled" means, and a client can only arrive through an open one.
+ * (`s.lora.rnode.ble` is read by rnode-ble, which owns that door.) */
+static bool rnodeSerialOn(void) { return storageGetInt("s.lora.rnode.serial", 1) != 0; }
+static bool rnodeTcpOn(void)    { return storageGetInt("s.lora.rnode.tcp",    0) != 0; }
+
+static bool rnodeDoorOn(uint8_t door) {
+    switch (door) {
+    case RNODE_VIA_SERIAL: return rnodeSerialOn();
+    case RNODE_VIA_TCP:    return rnodeTcpOn();
+    case RNODE_VIA_BLE:    return storageGetInt("s.lora.rnode.ble", 1) != 0;
+    }
+    return false;
+}
 
 static int rnodeRadioIdx(void) {
     int i = storageGetInt("s.lora.rnode.radio", 0);
@@ -363,13 +383,13 @@ void rnodePump(void) {
  * coalesced apply pass, which is also what puts the net registration on this
  * task — where net requires it to originate. */
 void rnodeApplyTransports(void) {
-    bool en    = rnodeEnabled();
-    int  radio = rnodeRadioIdx();
+    int radio = rnodeRadioIdx();
 
-    /* A client bound to a radio the settings no longer point at — or to an
-     * endpoint that has just been switched off — is holding a session that no
-     * longer means anything. */
-    if (s_rnode.handle >= 0 && (!en || s_rnode.radio != radio)) rnodeDropSession();
+    /* A client bound to a radio the settings no longer point at — or whose
+     * own door has just been switched off — is holding a session that no
+     * longer means anything. A session on another door rides through. */
+    if (s_rnode.handle >= 0 && (s_rnode.radio != radio || !rnodeDoorOn(s_rnode.door)))
+        rnodeDropSession();
 
 #if CONFIG_SPANGAP_NET
     /* TCP, in the two steps net's endpoint model asks for: register once, then
@@ -391,23 +411,26 @@ void rnodeApplyTransports(void) {
             warn("lora rnode: net endpoint registration failed");
     }
     if (registered) {
-        int tcp  = storageGetInt("s.lora.rnode.tcp", 0);
-        int want = (en && tcp > 0) ? tcp : 0;
+        int want = rnodeTcpOn() ? RNODE_TCP_PORT : 0;
         if (storageGetInt("s.net.rnode_port", -1) != want) storageSet("s.net.rnode_port", want);
     }
 #endif
 
-    /* Serial. A claim is dormant until a client actually attaches, so holding
-     * one costs nothing; what it does cost is esptool auto-reset on that port.
-     * A refused claim (port 1 while the console presents only one port) is
-     * warned once and retried when the port count changes. */
-    static int have = -1, triedPort = -2, triedCount = -1;
+    /* Serial: the door rides the highest serial port that exists right now —
+     * the console port on a one-port build (shared: the console keeps working
+     * until a client's first KISS FEND takes it over), the spare CDC port
+     * while `usb cdc` presents two. The claim is in-band triggered on that
+     * FEND, so holding it costs nothing: no keystroke produces 0xC0, and
+     * esptool auto-reset stays armed until a client actually attaches — which
+     * is why this door can default on. The port count is republished on every
+     * transport switch and re-arms this apply pass, which moves the claim. */
+    static int have = -1;
     int ports = storageGetInt("sys.usb.serial_ports", 1);
-    int want  = en ? storageGetInt("s.lora.rnode.serial", -1) : -1;
+    int want  = rnodeSerialOn() ? ports - 1 : -1;
     if (have >= 0 && have != want) { serialPortRelease(have); have = -1; }
-    if (want >= 0 && have < 0 && !(triedPort == want && triedCount == ports)) {
-        if (serialPortClaim(want, TAG, RNODE_ITS_PORT)) { have = want; triedPort = -2; }
-        else { triedPort = want; triedCount = ports; }
+    if (want >= 0 && have < 0) {
+        static const uint8_t kissFend = 0xC0;
+        if (serialPortClaim(want, TAG, RNODE_ITS_PORT, &kissFend, 1)) have = want;
     }
 }
 
@@ -431,19 +454,26 @@ int onRnodeConnect(int handle, const void* data, size_t len) {
     /* One session at a time, across every transport. Enforced here as well as
      * by the port's single handle, because the refusal is what keeps a serial
      * takeover from disturbing the console while a TCP client is attached. */
-    if (s_rnode.handle >= 0 || !rnodeEnabled() || s_stop) return -1;
+    if (s_rnode.handle >= 0 || s_stop) return -1;
 
     const char* via = "tcp";
+    uint8_t door = RNODE_VIA_TCP;
     if (len == sizeof(serial_handler_connect_t)) {
-        via = "serial";
+        via  = "serial";
+        door = RNODE_VIA_SERIAL;
     } else if (len == sizeof(rnode_door_connect_t)) {
         auto* d = (const rnode_door_connect_t*)data;
         if (d->magic != RNODE_DOOR_MAGIC) {
             warn("lora rnode: 12-byte connect payload without the door magic, refused");
             return -1;
         }
-        via = "ble";
+        via  = "ble";
+        door = RNODE_VIA_BLE;
     }
+    /* A client can only arrive through an open door (a closed one has no
+     * listener, no claim, no advertisement) — this covers the race with a
+     * door closing while the connect was in flight. */
+    if (!rnodeDoorOn(door)) return -1;
 
     /* Fresh decoder for a fresh stream. Field by field rather than assigning a
      * RnodeState{} — the temporary would be over a kilobyte of task stack. */
@@ -455,6 +485,7 @@ int onRnodeConnect(int handle, const void* data, size_t len) {
     S.echoPend = S.offPend = S.wantOn = S.txAlternate = false;
     S.handle = handle;
     S.radio  = rnodeRadioIdx();
+    S.door   = door;
     info("lora/%d rnode: client attached over %s", S.radio, via);
     return 0;
 }

@@ -4,6 +4,7 @@
  * transmit machinery (tx / tx_psa / tx_prot) it drives on the radio task.
  */
 #include "lora_priv.h"
+#include "lora_fem.h"   /* femName, for the front-end line in the slot dump */
 
 #if defined(CONFIG_LORA0_CS_PIN)
 
@@ -170,6 +171,19 @@ static void cliPrintSlot(int i) {
     cliPrintf("        pins cs=%d irq=%d busy=%d rst=%d  tcxo=%dmV  dio2_rf=%d  rfsw=%d/%d\n",
               s->cs, s->dio1, s->busy, s->rst, s->tcxo_mv, s->dio2_rf_switch ? 1 : 0,
               s->rfsw_rx, s->rfsw_tx);
+    /* The front end, when there is one: which part answered (or that the board
+     * simply declared one), the antenna ceiling it sets, and — on a chip that
+     * switches its own front end — the DIO map that does it. On a board with no
+     * FEM there is nothing here to read, so the line is skipped. */
+    if (r->femType != FEM_NONE)
+        cliPrintf("        fem=%s  band=%s  max=%d dBm at antenna\n",
+                  femName((LoraFemType)r->femType),
+                  r->highBand ? "2.4GHz" : "sub-GHz", r->maxTxDbm);
+    if (chipFamily(s->chip) == FAM_LR2021)
+        cliPrintf("        lr2021 irq=DIO%d  rfsw idle/rx/tx/rx_hf/tx_hf="
+                  "%02x/%02x/%02x/%02x/%02x (bit 0 = DIO5)\n",
+                  s->lr_irq_dio, s->lr_rfsw[0], s->lr_rfsw[1], s->lr_rfsw[2],
+                  s->lr_rfsw[3], s->lr_rfsw[4]);
 
     char kb[48];
     int  freq_hz = storageGetInt(sk(kb, sizeof kb, i, "frequency"), 0);

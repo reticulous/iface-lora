@@ -75,12 +75,51 @@ menuconfig`.
     RF switch from its own DIO2.
   - `CONFIG_LORAn_RFSW_RX_PIN` / `_RFSW_TX_PIN` — an external antenna RF switch
     driven by two MCU GPIOs (`-1`/`-1` if none). Any chip family.
+  - `CONFIG_LORAn_FEM_PWR_PIN` / `_FEM_EN_PIN` / `_FEM_TXSEL_A_PIN` /
+    `_FEM_TXSEL_B_PIN` — a front-end module on MCU GPIOs, **detected** at boot:
+    `_FEM_EN_PIN` doubles as the sense that picks between the two supported
+    parts. `-1` on the enable pin means no such FEM.
+  - `CONFIG_LORAn_FEM_GAIN_DB` — a front-end module the board **declares**
+    instead, in dB of TX gain (`0` = none). For a part the MCU cannot reach
+    because its control lines hang off the radio's own DIOs: there is nothing to
+    sense, so the board states the gain and `CONFIG_LORA_TX_POWER_MAX` states
+    the ceiling, and the driver never asks the chip for more than the difference.
+  - `CONFIG_LORAn_FEM_HF_PWR_PIN` / `_FEM_HF_GAIN_DB` — the same for a
+    **dual-band** board's 2.4 GHz front end. `CONFIG_LORAn_FEM_PWR_PIN` is then
+    the sub-GHz one's supply gate, and the driver raises whichever the
+    configured carrier needs (see the ceiling note below).
+  - `CONFIG_LORAn_LR_IRQ_DIO` — **LR2021 only**: which of the chip's DIO5..DIO11
+    is wired to `_DIO1_PIN` (default 5, RadioLib's assumption). A board that
+    bonded a different one and does not say so gets a radio that comes up, calls
+    itself healthy and never reports a frame.
+  - `CONFIG_LORAn_LR_RFSW_IDLE` / `_RX` / `_TX` / `_RX_HF` / `_TX_HF` —
+    **LR2021 only**: the chip's internal RF-switch table, one bitmask per mode
+    over its own DIOs (bit 0 = DIO5 … bit 6 = DIO11). A DIO named by any of the
+    five is programmed as an RF-switch output and driven high in exactly the
+    modes whose mask holds it; all five zero means no radio-driven front end.
+    The chip applies the row itself on every mode change, so nothing on the host
+    follows a transmit.
   - **chip** — the radio part on the slot (`SX1262` default); the choice covers
     all 15 supported parts.
 
-A complex chip-DIO RF-switch *table* (some LR11x0/LR2021 boards) isn't
-expressible as two pins and needs board-supplied support; the two-GPIO and
-SX126x-DIO2 forms cover the common cases.
+- **Antenna ceiling** — `CONFIG_LORA_TX_POWER_MAX` (default 22) and
+  `CONFIG_LORA_TX_POWER_MAX_HF` (default 12): what the board can actually reach
+  at the antenna, below and above 1500 MHz. They size the TX-power slider and
+  cap the runtime power path.
+
+  The pair is separate because the two paths are: different amplifiers,
+  different gains, different antenna ceilings, and a different drive range on
+  the chip itself (the LR2021 accepts −9…+22 dBm on its sub-GHz port and
+  −19…+12 on its 2.4 GHz one). **Everything follows the carrier**: tuning a
+  dual-band radio across 1500 MHz moves the supply gate, the ceiling, the gain
+  and the clamp together, re-clamps `tx_power` to the new ceiling with a warning,
+  and republishes `lora.<n>.tx_power_max` so the power control re-sizes itself.
+  A single-band board never sees any of it.
+
+Between them these forms cover every antenna path seen so far: nothing (the chip
+drives its own switch), SX126x's DIO2, two MCU GPIOs, a detected MCU-driven
+front-end module, and — on the LR2021 — a table the radio applies to its own
+DIOs on the board's behalf.
 
 ## Storage variables
 
@@ -99,7 +138,7 @@ defaults come from this straddle's `settings:` block; radios 1.. are seeded by
 | `s.lora.<n>.bandwidth` | `125000` | Bandwidth in **Hz** (125/250/500 kHz; SX128x also 203/406/812/1625 kHz). |
 | `s.lora.<n>.spreading_factor` | `7` | Spreading factor, 5–12. |
 | `s.lora.<n>.coding_rate` | `5` | Coding-rate denominator, 5–8 (`5` = 4/5). |
-| `s.lora.<n>.tx_power` | *(none)* | TX power in dBm at the **antenna**, −9 to `lora.<n>.tx_power_max` (22 on a bare chip, higher through a front-end module — 27 on the Heltec V4). No default — antenna dependent. A value above the ceiling is clamped with a warning. The radio also states this figure to rnsd at registration, so a reticulous peer's rx report can quote it back and turn a bare RSSI into a path loss; the configured value goes out, not the adaptive per-peer one, because that is a readout and not a term in any loop. |
+| `s.lora.<n>.tx_power` | *(none)* | TX power in dBm at the **antenna**, up to `lora.<n>.tx_power_max` (22 on a bare chip sub-GHz, 12 at 2.4 GHz, higher through a front-end module — 27 on the Heltec V4, 30 sub-GHz / 20 at 2.4 GHz on the Meshnology W12). No default — antenna dependent. A value above the ceiling is clamped with a warning. The radio also states this figure to rnsd at registration, so a reticulous peer's rx report can quote it back and turn a bare RSSI into a path loss; the configured value goes out, not the adaptive per-peer one, because that is a readout and not a term in any loop. |
 | `s.lora.<n>.preamble` | `12` | Preamble length in symbols, 6–32. |
 | `s.lora.<n>.sync_word` | `"0x42"` | Sync word, a string parsed as hex or decimal (`0x42` is the Reticulum-on-LoRa convention). |
 | `s.lora.<n>.mode` | `"gateway"` | RNS interface mode: `full`, `gateway`, `access_point`, `roaming`, `boundary`. |
@@ -118,10 +157,10 @@ defaults come from this straddle's `settings:` block; radios 1.. are seeded by
 | `s.lora.<n>.SUPE.sender_ident` | `1` | Name this node in every SUPE START. Three bytes and one symbol group, and it gives up the protocol's default anonymity — a listener in radio earshot learns who is talking to whom, which no Reticulum header discloses. It is on because the **reverse leg depends on it**: the tag a START carries is the *answerer's* address, so an unnamed requester's traffic queued at the far end is indistinguishable from a stranger's, the GRANT's reverse flag is never set, and every reply buys its own detour instead of riding the one already running. It also lets neighbours hold traffic for us while we are off on a detour, and lets the far end file a link identifier our cargo creates against us rather than against nobody. `0` restores the anonymity and gives those up; either way this node still understands the longer frame from peers that send it. See `plans/SUPE.md` §4. Live. |
 | `s.lora.<n>.SUPE.announce_interval` | `30` | Minutes between this node's own SUPE announcements — the frame publishing its identity hashes, what its radio can do, and the power the frame went out at, so a listener turns its own reading into a path loss. It governs nothing a Reticulum announce does: those air when `rnsd` hands them over (INTERNALS §14). `0` turns the beat off entirely, so the node announces only when `lora a` says so; it is not a longer interval, it is none. Relayed announces are somebody else's traffic and are unaffected. **This replaced `announce_interval`**; an existing setting is carried across on upgrade. Live. |
 | `s.lora.assumed_peer_txp` | `22` | TX power (dBm) credited to a peer whose own power we don't know, for the reciprocity estimate shown as `EST` in `lora n`. Assuming high errs safe (we over-estimate path loss and transmit higher than needed). Set it to match a bench node parked at a low `tx_power`, whose announces go out at *that* power — otherwise the estimate is off by the difference. |
-| `s.lora.rnode.enable` | `0` | Expose this device to an RNS `RNodeInterface` client — see [Using the device as an RNode](#using-the-device-as-an-rnode). Live. |
-| `s.lora.rnode.radio` | `0` | Which radio the RNode endpoint exposes. Changing it while a client is attached disconnects it. |
-| `s.lora.rnode.serial` | `-1` | Serial port the endpoint claims: `0` = the console port, `1` = the second CDC port (only exists after `usb cdc`). `-1` = no serial. |
-| `s.lora.rnode.tcp` | `0` | TCP port the endpoint listens on; `0` (the default) or `-1` = no TCP. **Set it to 7633 or leave it off** — an RNS client dials 7633 and nothing else, so any other value opens a port nothing can reach. |
+| `s.lora.rnode.radio` | `0` | Which radio the RNode endpoint exposes — see [Using the device as an RNode](#using-the-device-as-an-rnode). Changing it while a client is attached disconnects it. |
+| `s.lora.rnode.serial` | `1` | The serial door: the endpoint rides the highest serial port that exists — the console port normally, the second CDC port after `usb cdc`. On by default because it costs nothing until a client speaks (see below). Live. |
+| `s.lora.rnode.tcp` | `0` | The TCP door, on port 7633 — a switch, not a port number: an RNS client dials 7633 and nothing else. Off by default: a listener on the network is a decision, not a side effect. Live. |
+| `s.lora.rnode.ble` | `1` | The Bluetooth door, when `reticulous/rnode-ble` is in the build (which owns it — see its README). Live. |
 | `s.lora.version` | — | Internal defaults-seeding gate; not a user setting. |
 
 A radio refuses to come up until `frequency`, `tx_power`, and a valid
@@ -134,7 +173,7 @@ SF/BW/CR/preamble are set; `lora.<n>.state` reads `unconfigured` until then.
 | `lora.<n>.up` | `1` when the radio is on-air, else `0`. |
 | `lora.<n>.state` | `unconfigured` / `error` / `up` / `down` / `rnsd_unavailable`. |
 | `lora.<n>.chip` | Detected chip name, e.g. `SX1262`. |
-| `lora.<n>.tx_power_max` | Antenna-dBm ceiling this radio can actually reach: `22` on a bare chip, the front-end module's rating on a board with one that was detected at boot. `tx_power` is clamped to it, and **both** the browser panel and the LCD settings pane size their power slider from it — so a FEM board whose part did not answer offers 22 rather than a figure it cannot deliver. |
+| `lora.<n>.tx_power_max` | Antenna-dBm ceiling this radio can actually reach **on the band it is tuned to**: the bare chip's own maximum for that port (`22` sub-GHz, `12` at 2.4 GHz), or the front-end module's rating on a board with one that was detected at boot or one the board declared. Republished on every begin, so it follows a carrier across 1500 MHz. `tx_power` is clamped to it, and **both** the browser panel and the LCD settings pane size their power slider from it — so a FEM board whose part did not answer offers 22 rather than a figure it cannot deliver. |
 | `lora.<n>.bitrate_eff` | Effective bitrate registered with `rnsd`, bits/s (airtime-derived). |
 | `lora.<n>.stats.{tx_bytes,rx_bytes,tx_frames,rx_frames,crc_err,split_rx_timeout,tx_dropped,rssi_last,snr_last}` | Traffic counters (`tx_dropped` = frames shed by the LBT timeout) and last-RX RSSI/SNR. Published only when a UI can read them — see `uiTelemetryWanted()`. |
 | `lora.<n>.stats.{airtime_pct,cw_band}` | With `appc` on: percentage of the last ~15 s this radio spent transmitting, and the contention band (1–4) that percentage currently selects. Absent when `appc` is off. |
@@ -210,7 +249,7 @@ lora <n> sync <word>          sync word (hex or decimal)
 lora <n> mode <name>          interface mode
 lora <n> lbt <0|1>            listen-before-talk on/off (carrier-sense before TX)
 lora <n> appc <0|1>           adaptive contention window on/off (needs lbt on)
-lora <n> rx_boosted_gain <0|1>  SX126x RX gain boost on/off
+lora <n> rx_boosted_gain <0|1>  RX gain boost on/off (SX126x, LR2021)
 lora <n> tx <string>          blind-transmit <string> as one explicit-header
                               frame at the radio's configured params. `0x<hex>`
                               inserts raw bytes (`0x0a`, `0x48656c6c6f`);
@@ -303,24 +342,23 @@ band edges, and where this build knowingly departs from upstream are in
 
 ## Using the device as an RNode
 
-With `s.lora.rnode.enable = 1` a stock Reticulum `RNodeInterface` client attaches
-to this device as if it were RNode hardware — over USB serial, over TCP, over
-Bluetooth if `reticulous/rnode-ble` is in the build, or any combination. One
-client at a time, whichever gets there first.
+A stock Reticulum `RNodeInterface` client attaches to this device as if it were
+RNode hardware — over USB serial, over TCP, over Bluetooth if
+`reticulous/rnode-ble` is in the build, or any combination. One client at a
+time, whichever gets there first.
 The client becomes a **third endpoint on the same radio segment**: it, the radio,
 and this node's own `rnsd` all see the same traffic, and a packet arriving from
 any one of them is presented to the other two. So a laptop can run its own
 Reticulum stack over this radio while the device keeps running its own.
 
-Pick which radio it exposes with `s.lora.rnode.radio` (default 0).
-
-Both transports default to **off**, so enabling the endpoint on its own does
-nothing until you name one — in particular it does not start listening on the
-network.
+Pick which radio it exposes with `s.lora.rnode.radio` (default 0). Each door is
+its own switch: serial and Bluetooth are on by default (a dormant door costs
+nothing until a client speaks), TCP is off — nothing listens on the network
+unless asked.
 
 **Over TCP** (on a build with the `spangap-net` straddle staged; without it there
-is no network stack and only the serial door exists). Set `s.lora.rnode.tcp =
-7633` (that exact number — see the table above) and put this in the client's
+is no network stack and only the serial door exists). Set `s.lora.rnode.tcp = 1`
+(the port is 7633, fixed on both ends) and put this in the client's
 `~/.reticulum/config`:
 
 ```ini
@@ -338,9 +376,28 @@ is no network stack and only the serial door exists). Set `s.lora.rnode.tcp =
 The port number is not configurable on the client side — it dials 7633
 regardless of what you write after the host — so give the host only.
 
-**Over USB serial.** Set `s.lora.rnode.serial` to `0` (the console port) or `1`
-(the second CDC port, which only exists after `usb cdc`), and point the client at
-the device node:
+From inside the build container the door is reachable at
+`host.docker.internal:7633` — the workspace bridge fronts the port because the
+buildable's straddle.yaml lists it in `bridge_ports:`. That is what
+[`esp-idf/test/rnode_test.py`](esp-idf/test/rnode_test.py) uses: an
+unattended integration test that opens the TCP door over `spangap cli`, runs
+the raw KISS detect handshake on the door, then attaches the reference Python
+RNS stack as a real `RNodeInterface` client and proves a probe round trip in
+each direction (client → device `rnstransport.probe`, then device `rnprobe` →
+the reference node). It mirrors the device's own radio parameters into the
+client config, so a run does not move the radio's channel. With the console on
+CDC and the host monitor fronting the spare CDC port (`spangap monitor
+<cdc0-dev> --aux <cdc1-dev>`), the same test also exercises the **serial
+door** — the raw detect and a serial `RNodeInterface` probe through the aux
+relay, attaching via the in-band trigger since a relay carries no line state.
+
+**Over USB serial.** On by default (`s.lora.rnode.serial`): the endpoint
+listens on the highest
+serial port the device presents — the console port normally, the spare CDC port
+after `usb cdc`. The port stays a fully ordinary console until a client's first
+KISS FEND byte (`0xC0`, which no keystroke produces) arrives in the stream; that
+in-band trigger takes the port over, and the console returns when the client
+leaves. Point the client at the device node:
 
 ```ini
 [[Device RNode]]
@@ -354,18 +411,19 @@ the device node:
   codingrate = 5
 ```
 
-Claiming port 0 does not cost you the console straight away: on
-USB-Serial-JTAG the port stays an ordinary console until a client actually
-speaks, and the console comes back when the client leaves. Two things to know
-about a claimed port, though:
+The in-band trigger is what makes the standing claim free: opening the port in
+a terminal changes nothing, typing changes nothing, and esptool auto-reset stays
+armed — the console only leaves once a client actually speaks KISS, and it comes
+back when the client detaches. Two things to know about an **attached** session,
+though:
 
-- **esptool auto-reset stops working on it.** A host closing a serial port drops
-  the same lines, in the same order, that esptool's reset sequence uses — so the
-  arming is disabled while the port is claimed, or every clean client exit would
-  reboot the device. Use the button, or release the port, to flash.
-- **On a CDC port, any terminal that opens it is treated as a client.** DTR is
-  the only attach signal CDC gives us. Claim port 1 (after `usb cdc`) if you want
-  to keep a usable console alongside.
+- **esptool auto-reset is suspended while a client is attached.** A host closing
+  a serial port drops the same lines, in the same order, that esptool's reset
+  sequence uses — so the arming pauses for the session, or every clean client
+  exit would reboot the device. It returns the moment the session ends.
+- **On USB-Serial-JTAG there is no line state**, so the device cannot see a
+  client close the port: the session ends on the handler's own disconnect or
+  `usb down`. On CDC the client's DTR drop releases it.
 
 **One client at a time**, across both transports. A second one is refused; a
 serial client cannot take a port over while a TCP client is attached.

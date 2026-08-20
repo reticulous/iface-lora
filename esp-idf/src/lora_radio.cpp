@@ -90,6 +90,74 @@ static int16_t lr11x0Begin(LoraRadio* r, float freq, float bw, uint8_t sf, uint8
     return st;
 }
 
+/* ─────────────── LR2021 DIO wiring ───────────────
+ *
+ * The LR2021 bonds out DIO5..DIO11 and lets the board decide what each one is:
+ * the interrupt line, an RF-switch output, or nothing. Two board facts follow
+ * from that, and both are programmed over SPI right after begin(), because a
+ * reset returns every DIO to "nothing".
+ *
+ *   IRQ    — LORAn_LR_IRQ_DIO says which DIO is wired to LORAn_DIO1_PIN.
+ *            RadioLib's default is DIO5, and a board that bonded a different
+ *            one gets a radio that works and never interrupts.
+ *   RFSW   — LORAn_LR_RFSW_* say which DIOs drive the front end, per mode. The
+ *            chip applies the row itself as it changes mode, so nothing on the
+ *            host has to follow a transmit.
+ *
+ * The commands are sent through the Module rather than through RadioLib's own
+ * LR2021::setRfSwitchTable, whose pin array holds five entries against this
+ * chip's seven DIOs — a board using six of them cannot be described to it at
+ * all. A write command is one SPIwriteStream of the 16-bit opcode plus its
+ * payload, which is exactly what the library does underneath.
+ */
+static void lr2021Cmd(LoraRadio* r, uint16_t cmd, const uint8_t* d, size_t n,
+                      const char* what)
+{
+    int16_t st = r->mod->SPIwriteStream(cmd, d, n);
+    if (st != RADIOLIB_ERR_NONE)
+        warn("lora/%d LR2021 %s refused: %s (%d)", r->idx, what, rlErrName(st), (int)st);
+}
+
+/* DIO5 accepts only the pull-up in sleep; every other DIO takes "auto". Getting
+ * this wrong is not cosmetic — the chip fails the SetDioFunction outright. */
+static uint8_t lr2021DioPull(int dio)
+{
+    return dio == 5 ? RADIOLIB_LR2021_DIO_SLEEP_PULL_UP
+                    : RADIOLIB_LR2021_DIO_SLEEP_PULL_AUTO;
+}
+
+static void lr2021ApplyDio(LoraRadio* r)
+{
+    const LoraSlot* s = r->slot;
+    for (int dio = 5; dio <= 11; dio++) {
+        uint8_t bit = (uint8_t)(1u << (dio - 5));
+        uint8_t cfg = 0;
+        /* The chip's own mode numbering, which is also RadioLib's: bit 0 is
+         * standby, then rx, tx, rx_hf, tx_hf — the order lr_rfsw is written in. */
+        for (int mode = 0; mode < 5; mode++)
+            if (s->lr_rfsw[mode] & bit) cfg |= (uint8_t)(1u << mode);
+        if (!cfg) continue;
+        if (dio == s->lr_irq_dio) {
+            warn("lora/%d LR2021 DIO%d carries the IRQ line and cannot also drive "
+                 "the RF switch — check CONFIG_LORA%d_LR_RFSW_*", r->idx, dio, r->idx);
+            continue;
+        }
+        uint8_t fn[2] = { (uint8_t)dio,
+                          (uint8_t)(RADIOLIB_LR2021_DIO_FUNCTION_RF_SWITCH |
+                                    lr2021DioPull(dio)) };
+        lr2021Cmd(r, RADIOLIB_LR2021_CMD_SET_DIO_FUNCTION, fn, sizeof fn, "DIO function");
+        uint8_t sw[2] = { (uint8_t)dio, cfg };
+        lr2021Cmd(r, RADIOLIB_LR2021_CMD_SET_DIO_RF_SWITCH_CONFIG, sw, sizeof sw,
+                  "DIO RF-switch config");
+    }
+}
+
+/* The LR2021's RX gain is a level, 0 (power-saving) to 7 (most sensitive), not
+ * the boolean SX126x offers. s.lora.<i>.rx_boosted_gain is still the one switch
+ * a user sees, so "on" picks the top of the range — the setting exists to buy
+ * sensitivity, and a middle rung would be a number nobody asked for. */
+#define LORA_LR2021_RX_BOOST_LEVEL  7
+
 /* The PA over-current trip, in mA. RadioLib's SX126x::begin() sets this to 60 mA
  * for every part and setOutputPower() then reads the register and writes it back
  * unchanged, so nothing else ever raises it — an SX1262 asked for +22 dBm draws
@@ -174,11 +242,20 @@ static int16_t radioBeginOnce(LoraRadio* r, float freq, float bw, uint8_t sf, ui
  * retry on a bare crystal turns that from "radio absent" into a working radio and
  * a warning naming the wrong setting.
  *
- * SX126x parts then take the extras their family needs: DIO2 as the antenna RF
- * switch when the slot asks for it, the LNA boosted-RX-gain option
- * (r->rxBoostedGain, ~+3 dB sensitivity for ~0.4 mA more RX current), the PA
- * over-current trip, and the RX-sensitivity register patch — and the frequency
- * is checked against the image-calibration bands (sx126xImageBandKnown). */
+ * Each family then takes the extras it needs, all of them AFTER begin(), because
+ * begin() resets the part and takes every one of them with it:
+ *
+ *   SX126x — DIO2 as the antenna RF switch when the slot asks for it, the LNA
+ *     boosted-RX-gain option (r->rxBoostedGain, ~+3 dB sensitivity for ~0.4 mA
+ *     more RX current), the PA over-current trip, and the RX-sensitivity
+ *     register patch. The frequency is also checked against the part's
+ *     image-calibration bands (sx126xImageBandKnown).
+ *   LR2021 — the board's DIO map (lr2021ApplyDio) and the RX gain level.
+ *
+ * Which is also why a frequency change goes through a full stop/start rather
+ * than a setFrequency: crossing this part's LF/HF boundary re-points the whole
+ * front end, and the incremental setters answer a live cross-band move with an
+ * error rather than a retune. */
 int16_t radioBegin(LoraRadio* r, float freq, float bw, uint8_t sf, uint8_t cr,
                           uint8_t sync, int8_t power, uint16_t preamble, float tcxoV) {
     PhysicalLayer* p = r->radio;
@@ -189,7 +266,16 @@ int16_t radioBegin(LoraRadio* r, float freq, float bw, uint8_t sf, uint8_t cr,
     if (chipFamily(r->slot->chip) == FAM_SX126X)
         static_cast<SX126x*>(p)->standbyXOSC = false;
     r->oscHeld = false;
-    power = femChipDbm(r, power);   /* antenna dBm → chip drive (identity, no FEM) */
+    /* Which DIO the interrupt comes out of is a board fact RadioLib cannot
+     * guess, and begin() is what programs it — so it has to be set first, on
+     * every begin, not once at construction. */
+    if (chipFamily(r->slot->chip) == FAM_LR2021)
+        static_cast<LR2021*>(p)->irqDioNum = (uint32_t)r->slot->lr_irq_dio;
+    /* The carrier decides the band, and the band decides the front end, the
+     * ceiling and the conversion below — so this has to come first, and it has
+     * to come on every begin, because the frequency is the thing that changed. */
+    femBandSelect(r, loraFreqIsHighBand(freq));
+    power = femChipDbm(r, power);   /* antenna dBm → chip drive for the port in use */
     int16_t st = radioBeginOnce(r, freq, bw, sf, cr, sync, power, preamble, tcxoV);
     if (tcxoV > 0.0f &&
         (st == RADIOLIB_ERR_SPI_CMD_TIMEOUT || st == RADIOLIB_ERR_SPI_CMD_INVALID ||
@@ -203,6 +289,18 @@ int16_t radioBegin(LoraRadio* r, float freq, float bw, uint8_t sf, uint8_t cr,
         }
     }
     if (st != RADIOLIB_ERR_NONE) return st;
+    if (chipFamily(r->slot->chip) == FAM_LR2021) {
+        lr2021ApplyDio(r);   /* the board's front end, re-armed after the reset begin() did */
+        /* Boosted RX gain, which on this part is a LEVEL rather than the on/off
+         * flag SX126x takes, and is only accepted from standby — which is where
+         * begin() leaves the chip, so this is the moment to ask. */
+        int16_t g = static_cast<LR2021*>(p)->setRxBoostedGainMode(
+            r->rxBoostedGain ? LORA_LR2021_RX_BOOST_LEVEL : 0);
+        if (g != RADIOLIB_ERR_NONE)
+            warn("lora/%d LR2021 RX gain level refused: %s (%d)",
+                 r->idx, rlErrName(g), (int)g);
+        return st;
+    }
     if (chipFamily(r->slot->chip) != FAM_SX126X) return st;
 
     if (!sx126xImageBandKnown(freq))

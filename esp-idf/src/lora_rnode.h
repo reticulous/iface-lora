@@ -76,10 +76,16 @@ struct LoraRadio;
 #define RNODE_INJ_RSSI    (-10)
 #define RNODE_INJ_SNR10   100
 
+/* Which door a session came in through — each is its own switch
+ * (s.lora.rnode.serial / .tcp / .ble), and a session whose door is switched
+ * off is dropped by the apply pass. */
+enum : uint8_t { RNODE_VIA_TCP, RNODE_VIA_SERIAL, RNODE_VIA_BLE };
+
 /* One session at a time, across every transport. */
 struct RnodeState {
     int      handle = -1;       /* ITS handle of the attached client; -1 = none */
     int      radio;             /* radio index this session is bound to */
+    uint8_t  door;              /* RNODE_VIA_*: the transport it attached over */
 
     /* KISS decoder. */
     bool     inFrame, haveCmd, escape, overflow;

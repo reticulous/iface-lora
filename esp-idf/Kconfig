@@ -98,14 +98,28 @@ config LORA0_RFSW_TX_PIN
     default -1
     depends on LORA_COUNT > 0
 config LORA_TX_POWER_MAX
-    int "Antenna TX power ceiling (dBm)"
+    int "Antenna TX power ceiling, sub-GHz (dBm)"
     default 22
     help
-        The board's real RF capability at the antenna. 22 (the bare SX126x
-        max) unless the board routes the radio through a FEM — then the board
-        sets the FEM ceiling here (e.g. 27) alongside the FEM pins below. The
-        TX-power slider's max is sized from this at build time, and femInit
-        applies it as the runtime ceiling when the FEM is actually detected.
+        The board's real RF capability at the antenna below 1500 MHz. 22 (the
+        bare SX126x max) unless the board routes the radio through a FEM — then
+        the board sets the FEM ceiling here (e.g. 27) alongside the FEM pins
+        below. The TX-power slider's max is sized from this at build time, and
+        the runtime ceiling follows the band the radio is actually on.
+
+config LORA_TX_POWER_MAX_HF
+    int "Antenna TX power ceiling, 2.4 GHz (dBm)"
+    default 12
+    help
+        The same, for a dual-band part tuned above 1500 MHz (LR2021, SX128x).
+        12 is the bare chip's own 2.4 GHz maximum; a board with a 2.4 GHz front
+        end sets what that part reaches at the antenna, alongside
+        LORAn_FEM_HF_GAIN_DB.
+
+        The two ceilings are separate because the paths are: they have
+        different amplifiers, different chip drive ranges (the LR2021 takes
+        -9..+22 on its sub-GHz port and -19..+12 on its 2.4 GHz one) and
+        nothing in common but the pin the operator types a number into.
 
 config LORA0_FEM_PWR_PIN
     int "Radio 0 — FEM rail-enable GPIO (-1 if none)"
@@ -131,6 +145,95 @@ config LORA0_FEM_TXSEL_A_PIN
 config LORA0_FEM_TXSEL_B_PIN
     int "Radio 0 — FEM TX-select GPIO, KCT8103L-style part (-1 if none)"
     default -1
+    depends on LORA_COUNT > 0
+config LORA0_FEM_GAIN_DB
+    int "Radio 0 — declared FEM gain in dB (0 = no declared FEM)"
+    default 0
+    depends on LORA_COUNT > 0
+    help
+        A front end the board DECLARES instead of one the driver detects. The
+        FEM_*_PIN group above describes a part on an MCU-driven enable net,
+        which is what makes it sensible; this describes a part whose control
+        lines hang off the RADIO's own DIOs (the LR_RFSW group below), where
+        there is nothing to sense and no GPIO to switch. One number states it:
+        the gain the part adds on TX.
+
+        Antenna dBm minus this gain is the chip drive, so the chip is never
+        asked for more than LORA_TX_POWER_MAX minus this — which is what keeps
+        a front end whose TX input tops out at a few dBm from being handed the
+        chip's full +22.
+
+config LORA0_FEM_HF_PWR_PIN
+    int "Radio 0 — 2.4 GHz front-end supply GPIO (-1 if none)"
+    default -1
+    depends on LORA_COUNT > 0
+    help
+        A dual-band board carries one front end per port, each with its own
+        supply gate: LORA0_FEM_PWR_PIN feeds the sub-GHz one and this feeds
+        the 2.4 GHz one. Both are active high, and the driver raises exactly
+        the one the configured frequency needs — so tuning across 1500 MHz
+        moves the supply with the carrier, and the amplifier for the band
+        nobody is using draws nothing.
+
+        Leave at -1 on a single-band board; LORA0_FEM_PWR_PIN is then simply
+        the front end's supply and stays up.
+
+config LORA0_FEM_HF_GAIN_DB
+    int "Radio 0 — declared 2.4 GHz FEM gain in dB (0 = none)"
+    default 0
+    depends on LORA_COUNT > 0
+    help
+        LORA0_FEM_GAIN_DB for the 2.4 GHz path. Paired with
+        LORA_TX_POWER_MAX_HF the same way, and for the same reason: the
+        operator's antenna dBm minus this is the chip drive, and the drive is
+        what the part in front of it has to survive.
+
+config LORA0_LR_IRQ_DIO
+    int "Radio 0 — LR2021 chip DIO carrying the IRQ line (5-11)"
+    range 5 11
+    default 5
+    depends on LORA_COUNT > 0
+    help
+        Which of the chip's DIO5..DIO11 is bonded out to LORA0_DIO1_PIN.
+        LR2021 only; RadioLib assumes DIO5. A board that wired a different one
+        must say so, or every interrupt is pointed at a pin that is not there:
+        the radio comes up, calls itself healthy, and never reports a frame.
+
+config LORA0_LR_RFSW_IDLE
+    hex "Radio 0 — LR2021 DIOs driven high in standby"
+    default 0
+    depends on LORA_COUNT > 0
+    help
+        The radio's INTERNAL RF-switch table: five bitmasks, one per operating
+        mode, over the chip's own DIOs — bit 0 = DIO5, bit 1 = DIO6, … bit 6 =
+        DIO11. A DIO named by any of the five is programmed as an RF-switch
+        output and driven high in exactly the modes whose mask holds it; a DIO
+        no mask names is left alone. All five zero (the default) means the
+        board has no radio-driven front end, and nothing is programmed.
+
+        This is how a board states a FEM the MCU cannot reach: the chip drives
+        the part directly as it changes mode, so the switching costs no GPIO
+        and no host round-trip. Pair it with LORA0_FEM_GAIN_DB, which is what
+        converts the user's antenna dBm to a drive level the part survives.
+
+config LORA0_LR_RFSW_RX
+    hex "Radio 0 — LR2021 DIOs driven high in sub-GHz receive"
+    default 0
+    depends on LORA_COUNT > 0
+
+config LORA0_LR_RFSW_TX
+    hex "Radio 0 — LR2021 DIOs driven high in sub-GHz transmit"
+    default 0
+    depends on LORA_COUNT > 0
+
+config LORA0_LR_RFSW_RX_HF
+    hex "Radio 0 — LR2021 DIOs driven high in 2.4 GHz receive"
+    default 0
+    depends on LORA_COUNT > 0
+
+config LORA0_LR_RFSW_TX_HF
+    hex "Radio 0 — LR2021 DIOs driven high in 2.4 GHz transmit"
+    default 0
     depends on LORA_COUNT > 0
 choice
     prompt "Radio 0 — chip"
@@ -254,6 +357,95 @@ config LORA1_FEM_TXSEL_B_PIN
     int "Radio 1 — FEM TX-select GPIO, KCT8103L-style part (-1 if none)"
     default -1
     depends on LORA_COUNT > 1
+config LORA1_FEM_GAIN_DB
+    int "Radio 1 — declared FEM gain in dB (0 = no declared FEM)"
+    default 0
+    depends on LORA_COUNT > 1
+    help
+        A front end the board DECLARES instead of one the driver detects. The
+        FEM_*_PIN group above describes a part on an MCU-driven enable net,
+        which is what makes it sensible; this describes a part whose control
+        lines hang off the RADIO's own DIOs (the LR_RFSW group below), where
+        there is nothing to sense and no GPIO to switch. One number states it:
+        the gain the part adds on TX.
+
+        Antenna dBm minus this gain is the chip drive, so the chip is never
+        asked for more than LORA_TX_POWER_MAX minus this — which is what keeps
+        a front end whose TX input tops out at a few dBm from being handed the
+        chip's full +22.
+
+config LORA1_FEM_HF_PWR_PIN
+    int "Radio 1 — 2.4 GHz front-end supply GPIO (-1 if none)"
+    default -1
+    depends on LORA_COUNT > 1
+    help
+        A dual-band board carries one front end per port, each with its own
+        supply gate: LORA1_FEM_PWR_PIN feeds the sub-GHz one and this feeds
+        the 2.4 GHz one. Both are active high, and the driver raises exactly
+        the one the configured frequency needs — so tuning across 1500 MHz
+        moves the supply with the carrier, and the amplifier for the band
+        nobody is using draws nothing.
+
+        Leave at -1 on a single-band board; LORA1_FEM_PWR_PIN is then simply
+        the front end's supply and stays up.
+
+config LORA1_FEM_HF_GAIN_DB
+    int "Radio 1 — declared 2.4 GHz FEM gain in dB (0 = none)"
+    default 0
+    depends on LORA_COUNT > 1
+    help
+        LORA1_FEM_GAIN_DB for the 2.4 GHz path. Paired with
+        LORA_TX_POWER_MAX_HF the same way, and for the same reason: the
+        operator's antenna dBm minus this is the chip drive, and the drive is
+        what the part in front of it has to survive.
+
+config LORA1_LR_IRQ_DIO
+    int "Radio 1 — LR2021 chip DIO carrying the IRQ line (5-11)"
+    range 5 11
+    default 5
+    depends on LORA_COUNT > 1
+    help
+        Which of the chip's DIO5..DIO11 is bonded out to LORA1_DIO1_PIN.
+        LR2021 only; RadioLib assumes DIO5. A board that wired a different one
+        must say so, or every interrupt is pointed at a pin that is not there:
+        the radio comes up, calls itself healthy, and never reports a frame.
+
+config LORA1_LR_RFSW_IDLE
+    hex "Radio 1 — LR2021 DIOs driven high in standby"
+    default 0
+    depends on LORA_COUNT > 1
+    help
+        The radio's INTERNAL RF-switch table: five bitmasks, one per operating
+        mode, over the chip's own DIOs — bit 0 = DIO5, bit 1 = DIO6, … bit 6 =
+        DIO11. A DIO named by any of the five is programmed as an RF-switch
+        output and driven high in exactly the modes whose mask holds it; a DIO
+        no mask names is left alone. All five zero (the default) means the
+        board has no radio-driven front end, and nothing is programmed.
+
+        This is how a board states a FEM the MCU cannot reach: the chip drives
+        the part directly as it changes mode, so the switching costs no GPIO
+        and no host round-trip. Pair it with LORA1_FEM_GAIN_DB, which is what
+        converts the user's antenna dBm to a drive level the part survives.
+
+config LORA1_LR_RFSW_RX
+    hex "Radio 1 — LR2021 DIOs driven high in sub-GHz receive"
+    default 0
+    depends on LORA_COUNT > 1
+
+config LORA1_LR_RFSW_TX
+    hex "Radio 1 — LR2021 DIOs driven high in sub-GHz transmit"
+    default 0
+    depends on LORA_COUNT > 1
+
+config LORA1_LR_RFSW_RX_HF
+    hex "Radio 1 — LR2021 DIOs driven high in 2.4 GHz receive"
+    default 0
+    depends on LORA_COUNT > 1
+
+config LORA1_LR_RFSW_TX_HF
+    hex "Radio 1 — LR2021 DIOs driven high in 2.4 GHz transmit"
+    default 0
+    depends on LORA_COUNT > 1
 choice
     prompt "Radio 1 — chip"
     default LORA1_RADIO_SX1262
@@ -370,6 +562,95 @@ config LORA2_FEM_TXSEL_B_PIN
     int "Radio 2 — FEM TX-select GPIO, KCT8103L-style part (-1 if none)"
     default -1
     depends on LORA_COUNT > 2
+config LORA2_FEM_GAIN_DB
+    int "Radio 2 — declared FEM gain in dB (0 = no declared FEM)"
+    default 0
+    depends on LORA_COUNT > 2
+    help
+        A front end the board DECLARES instead of one the driver detects. The
+        FEM_*_PIN group above describes a part on an MCU-driven enable net,
+        which is what makes it sensible; this describes a part whose control
+        lines hang off the RADIO's own DIOs (the LR_RFSW group below), where
+        there is nothing to sense and no GPIO to switch. One number states it:
+        the gain the part adds on TX.
+
+        Antenna dBm minus this gain is the chip drive, so the chip is never
+        asked for more than LORA_TX_POWER_MAX minus this — which is what keeps
+        a front end whose TX input tops out at a few dBm from being handed the
+        chip's full +22.
+
+config LORA2_FEM_HF_PWR_PIN
+    int "Radio 2 — 2.4 GHz front-end supply GPIO (-1 if none)"
+    default -1
+    depends on LORA_COUNT > 2
+    help
+        A dual-band board carries one front end per port, each with its own
+        supply gate: LORA2_FEM_PWR_PIN feeds the sub-GHz one and this feeds
+        the 2.4 GHz one. Both are active high, and the driver raises exactly
+        the one the configured frequency needs — so tuning across 1500 MHz
+        moves the supply with the carrier, and the amplifier for the band
+        nobody is using draws nothing.
+
+        Leave at -1 on a single-band board; LORA2_FEM_PWR_PIN is then simply
+        the front end's supply and stays up.
+
+config LORA2_FEM_HF_GAIN_DB
+    int "Radio 2 — declared 2.4 GHz FEM gain in dB (0 = none)"
+    default 0
+    depends on LORA_COUNT > 2
+    help
+        LORA2_FEM_GAIN_DB for the 2.4 GHz path. Paired with
+        LORA_TX_POWER_MAX_HF the same way, and for the same reason: the
+        operator's antenna dBm minus this is the chip drive, and the drive is
+        what the part in front of it has to survive.
+
+config LORA2_LR_IRQ_DIO
+    int "Radio 2 — LR2021 chip DIO carrying the IRQ line (5-11)"
+    range 5 11
+    default 5
+    depends on LORA_COUNT > 2
+    help
+        Which of the chip's DIO5..DIO11 is bonded out to LORA2_DIO1_PIN.
+        LR2021 only; RadioLib assumes DIO5. A board that wired a different one
+        must say so, or every interrupt is pointed at a pin that is not there:
+        the radio comes up, calls itself healthy, and never reports a frame.
+
+config LORA2_LR_RFSW_IDLE
+    hex "Radio 2 — LR2021 DIOs driven high in standby"
+    default 0
+    depends on LORA_COUNT > 2
+    help
+        The radio's INTERNAL RF-switch table: five bitmasks, one per operating
+        mode, over the chip's own DIOs — bit 0 = DIO5, bit 1 = DIO6, … bit 6 =
+        DIO11. A DIO named by any of the five is programmed as an RF-switch
+        output and driven high in exactly the modes whose mask holds it; a DIO
+        no mask names is left alone. All five zero (the default) means the
+        board has no radio-driven front end, and nothing is programmed.
+
+        This is how a board states a FEM the MCU cannot reach: the chip drives
+        the part directly as it changes mode, so the switching costs no GPIO
+        and no host round-trip. Pair it with LORA2_FEM_GAIN_DB, which is what
+        converts the user's antenna dBm to a drive level the part survives.
+
+config LORA2_LR_RFSW_RX
+    hex "Radio 2 — LR2021 DIOs driven high in sub-GHz receive"
+    default 0
+    depends on LORA_COUNT > 2
+
+config LORA2_LR_RFSW_TX
+    hex "Radio 2 — LR2021 DIOs driven high in sub-GHz transmit"
+    default 0
+    depends on LORA_COUNT > 2
+
+config LORA2_LR_RFSW_RX_HF
+    hex "Radio 2 — LR2021 DIOs driven high in 2.4 GHz receive"
+    default 0
+    depends on LORA_COUNT > 2
+
+config LORA2_LR_RFSW_TX_HF
+    hex "Radio 2 — LR2021 DIOs driven high in 2.4 GHz transmit"
+    default 0
+    depends on LORA_COUNT > 2
 choice
     prompt "Radio 2 — chip"
     default LORA2_RADIO_SX1262
@@ -485,6 +766,95 @@ config LORA3_FEM_TXSEL_A_PIN
 config LORA3_FEM_TXSEL_B_PIN
     int "Radio 3 — FEM TX-select GPIO, KCT8103L-style part (-1 if none)"
     default -1
+    depends on LORA_COUNT > 3
+config LORA3_FEM_GAIN_DB
+    int "Radio 3 — declared FEM gain in dB (0 = no declared FEM)"
+    default 0
+    depends on LORA_COUNT > 3
+    help
+        A front end the board DECLARES instead of one the driver detects. The
+        FEM_*_PIN group above describes a part on an MCU-driven enable net,
+        which is what makes it sensible; this describes a part whose control
+        lines hang off the RADIO's own DIOs (the LR_RFSW group below), where
+        there is nothing to sense and no GPIO to switch. One number states it:
+        the gain the part adds on TX.
+
+        Antenna dBm minus this gain is the chip drive, so the chip is never
+        asked for more than LORA_TX_POWER_MAX minus this — which is what keeps
+        a front end whose TX input tops out at a few dBm from being handed the
+        chip's full +22.
+
+config LORA3_FEM_HF_PWR_PIN
+    int "Radio 3 — 2.4 GHz front-end supply GPIO (-1 if none)"
+    default -1
+    depends on LORA_COUNT > 3
+    help
+        A dual-band board carries one front end per port, each with its own
+        supply gate: LORA3_FEM_PWR_PIN feeds the sub-GHz one and this feeds
+        the 2.4 GHz one. Both are active high, and the driver raises exactly
+        the one the configured frequency needs — so tuning across 1500 MHz
+        moves the supply with the carrier, and the amplifier for the band
+        nobody is using draws nothing.
+
+        Leave at -1 on a single-band board; LORA3_FEM_PWR_PIN is then simply
+        the front end's supply and stays up.
+
+config LORA3_FEM_HF_GAIN_DB
+    int "Radio 3 — declared 2.4 GHz FEM gain in dB (0 = none)"
+    default 0
+    depends on LORA_COUNT > 3
+    help
+        LORA3_FEM_GAIN_DB for the 2.4 GHz path. Paired with
+        LORA_TX_POWER_MAX_HF the same way, and for the same reason: the
+        operator's antenna dBm minus this is the chip drive, and the drive is
+        what the part in front of it has to survive.
+
+config LORA3_LR_IRQ_DIO
+    int "Radio 3 — LR2021 chip DIO carrying the IRQ line (5-11)"
+    range 5 11
+    default 5
+    depends on LORA_COUNT > 3
+    help
+        Which of the chip's DIO5..DIO11 is bonded out to LORA3_DIO1_PIN.
+        LR2021 only; RadioLib assumes DIO5. A board that wired a different one
+        must say so, or every interrupt is pointed at a pin that is not there:
+        the radio comes up, calls itself healthy, and never reports a frame.
+
+config LORA3_LR_RFSW_IDLE
+    hex "Radio 3 — LR2021 DIOs driven high in standby"
+    default 0
+    depends on LORA_COUNT > 3
+    help
+        The radio's INTERNAL RF-switch table: five bitmasks, one per operating
+        mode, over the chip's own DIOs — bit 0 = DIO5, bit 1 = DIO6, … bit 6 =
+        DIO11. A DIO named by any of the five is programmed as an RF-switch
+        output and driven high in exactly the modes whose mask holds it; a DIO
+        no mask names is left alone. All five zero (the default) means the
+        board has no radio-driven front end, and nothing is programmed.
+
+        This is how a board states a FEM the MCU cannot reach: the chip drives
+        the part directly as it changes mode, so the switching costs no GPIO
+        and no host round-trip. Pair it with LORA3_FEM_GAIN_DB, which is what
+        converts the user's antenna dBm to a drive level the part survives.
+
+config LORA3_LR_RFSW_RX
+    hex "Radio 3 — LR2021 DIOs driven high in sub-GHz receive"
+    default 0
+    depends on LORA_COUNT > 3
+
+config LORA3_LR_RFSW_TX
+    hex "Radio 3 — LR2021 DIOs driven high in sub-GHz transmit"
+    default 0
+    depends on LORA_COUNT > 3
+
+config LORA3_LR_RFSW_RX_HF
+    hex "Radio 3 — LR2021 DIOs driven high in 2.4 GHz receive"
+    default 0
+    depends on LORA_COUNT > 3
+
+config LORA3_LR_RFSW_TX_HF
+    hex "Radio 3 — LR2021 DIOs driven high in 2.4 GHz transmit"
+    default 0
     depends on LORA_COUNT > 3
 choice
     prompt "Radio 3 — chip"

@@ -24,7 +24,7 @@ static bool drawLoraPage(tinylcd_page_t, u8g2_t* g, tinylcd_ev_t)
     u8g2_SetFont(g, u8g2_font_7x13B_tr);
     std::string freq = storageGetStr("lora.0.freq_mhz", "");
     snprintf(line, sizeof line, "LoRa %s", freq.c_str());
-    u8g2_DrawStr(g, 0, 18, line);
+    u8g2_DrawStr(g, 0, TINYLCD_TITLE_Y, line);
 
     u8g2_SetFont(g, u8g2_font_6x10_tf);
     std::string state = storageGetStr("lora.0.state", "off");

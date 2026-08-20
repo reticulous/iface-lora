@@ -88,8 +88,9 @@ settings:
           max: { key: "lora.0.tx_power_max", default: 22 }
       - slider: { label: "Preamble", key: "s.lora.0.preamble", min: 6, max: 32, default: 12 }
       - text:   { label: "Sync word", key: "s.lora.0.sync_word", default: "0x42" }
-      # SX126x LNA boosted RX gain: ~+3 dB sensitivity for ~0.4 mA more RX
-      # current. On by default; inert on non-SX126x radios.
+      # LNA boosted RX gain: ~+3 dB sensitivity for ~0.4 mA more RX
+      # current. On by default; a flag on SX126x, the top gain level on
+      # LR2021, inert on the families that offer neither.
       - switch: { label: "RX boosted gain", key: "s.lora.0.rx_boosted_gain", default: 1 }
       # Analog front-end recalibration. An SX126x that has heard a strong signal
       # can leave its gain control latched and go deaf, and only powering the
@@ -188,12 +189,14 @@ settings:
           max: 240
           default: 30
         when_kconfig: "!CONFIG_LORA_NO_SUPE"
-      # RNode endpoint: an RNS RNodeInterface client attaches over USB serial
-      # and/or TCP 7633 and shares this radio segment. The rest of the group
-      # (.radio / .serial / .tcp) is seeded in lora.cpp — one switch is what a
-      # pane needs, the ports are a considered choice typed once.
+      # RNode endpoint: an RNS RNodeInterface client attaches over USB serial,
+      # TCP 7633 and/or Bluetooth (rnode-ble contributes that row into this
+      # same section) and shares this radio segment. One switch per door;
+      # `.radio` is seeded in lora.cpp. TCP is a switch, not a port number —
+      # the client dials 7633 and nothing else.
       - section: "RNode endpoint"
-      - switch: { label: "Enable", key: "s.lora.rnode.enable", default: 0 }
+      - switch: { label: "USB serial", key: "s.lora.rnode.serial", default: 1 }
+      - switch: { label: "TCP (port 7633)", key: "s.lora.rnode.tcp", default: 0 }
       - section: "Access code"
       - caption: "IFAC: a network name + passphrase every peer on this interface must match, or traffic is dropped. Leave both blank for an open interface."
       - text: { label: "IFAC network", key: "s.lora.0.ifac_netname" }

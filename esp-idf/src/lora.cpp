@@ -65,12 +65,22 @@ static const LoraSlot kSlots[] = {
       CONFIG_LORA0_TCXO_MV, LORA0_DIO2, CONFIG_LORA0_RFSW_RX_PIN, CONFIG_LORA0_RFSW_TX_PIN,
       CONFIG_LORA0_FEM_PWR_PIN, CONFIG_LORA0_FEM_EN_PIN,
       CONFIG_LORA0_FEM_TXSEL_A_PIN, CONFIG_LORA0_FEM_TXSEL_B_PIN,
+      CONFIG_LORA0_FEM_GAIN_DB, CONFIG_LORA0_FEM_HF_PWR_PIN,
+      CONFIG_LORA0_FEM_HF_GAIN_DB, CONFIG_LORA0_LR_IRQ_DIO,
+      { CONFIG_LORA0_LR_RFSW_IDLE, CONFIG_LORA0_LR_RFSW_RX,
+        CONFIG_LORA0_LR_RFSW_TX, CONFIG_LORA0_LR_RFSW_RX_HF,
+        CONFIG_LORA0_LR_RFSW_TX_HF },
       (LoraChip)CONFIG_LORA0_CHIP_ID },
 #if defined(CONFIG_LORA1_CS_PIN)
     { CONFIG_LORA1_CS_PIN, CONFIG_LORA1_DIO1_PIN, CONFIG_LORA1_BUSY_PIN, CONFIG_LORA1_RST_PIN,
       CONFIG_LORA1_TCXO_MV, LORA1_DIO2, CONFIG_LORA1_RFSW_RX_PIN, CONFIG_LORA1_RFSW_TX_PIN,
       CONFIG_LORA1_FEM_PWR_PIN, CONFIG_LORA1_FEM_EN_PIN,
       CONFIG_LORA1_FEM_TXSEL_A_PIN, CONFIG_LORA1_FEM_TXSEL_B_PIN,
+      CONFIG_LORA1_FEM_GAIN_DB, CONFIG_LORA1_FEM_HF_PWR_PIN,
+      CONFIG_LORA1_FEM_HF_GAIN_DB, CONFIG_LORA1_LR_IRQ_DIO,
+      { CONFIG_LORA1_LR_RFSW_IDLE, CONFIG_LORA1_LR_RFSW_RX,
+        CONFIG_LORA1_LR_RFSW_TX, CONFIG_LORA1_LR_RFSW_RX_HF,
+        CONFIG_LORA1_LR_RFSW_TX_HF },
       (LoraChip)CONFIG_LORA1_CHIP_ID },
 #endif
 #if defined(CONFIG_LORA2_CS_PIN)
@@ -78,6 +88,11 @@ static const LoraSlot kSlots[] = {
       CONFIG_LORA2_TCXO_MV, LORA2_DIO2, CONFIG_LORA2_RFSW_RX_PIN, CONFIG_LORA2_RFSW_TX_PIN,
       CONFIG_LORA2_FEM_PWR_PIN, CONFIG_LORA2_FEM_EN_PIN,
       CONFIG_LORA2_FEM_TXSEL_A_PIN, CONFIG_LORA2_FEM_TXSEL_B_PIN,
+      CONFIG_LORA2_FEM_GAIN_DB, CONFIG_LORA2_FEM_HF_PWR_PIN,
+      CONFIG_LORA2_FEM_HF_GAIN_DB, CONFIG_LORA2_LR_IRQ_DIO,
+      { CONFIG_LORA2_LR_RFSW_IDLE, CONFIG_LORA2_LR_RFSW_RX,
+        CONFIG_LORA2_LR_RFSW_TX, CONFIG_LORA2_LR_RFSW_RX_HF,
+        CONFIG_LORA2_LR_RFSW_TX_HF },
       (LoraChip)CONFIG_LORA2_CHIP_ID },
 #endif
 #if defined(CONFIG_LORA3_CS_PIN)
@@ -85,6 +100,11 @@ static const LoraSlot kSlots[] = {
       CONFIG_LORA3_TCXO_MV, LORA3_DIO2, CONFIG_LORA3_RFSW_RX_PIN, CONFIG_LORA3_RFSW_TX_PIN,
       CONFIG_LORA3_FEM_PWR_PIN, CONFIG_LORA3_FEM_EN_PIN,
       CONFIG_LORA3_FEM_TXSEL_A_PIN, CONFIG_LORA3_FEM_TXSEL_B_PIN,
+      CONFIG_LORA3_FEM_GAIN_DB, CONFIG_LORA3_FEM_HF_PWR_PIN,
+      CONFIG_LORA3_FEM_HF_GAIN_DB, CONFIG_LORA3_LR_IRQ_DIO,
+      { CONFIG_LORA3_LR_RFSW_IDLE, CONFIG_LORA3_LR_RFSW_RX,
+        CONFIG_LORA3_LR_RFSW_TX, CONFIG_LORA3_LR_RFSW_RX_HF,
+        CONFIG_LORA3_LR_RFSW_TX_HF },
       (LoraChip)CONFIG_LORA3_CHIP_ID },
 #endif
 };
@@ -201,8 +221,13 @@ static bool radioStart(LoraRadio* r) {
     int syncWord = (int)strtol(syncBuf, nullptr, 0);
     if (syncWord <= 0 || syncWord > 0xFF) syncWord = 0x42;
 
+    /* No upper bound on txp here: what a board can reach at the antenna is a
+     * board fact (a front end takes it past the chip's own maximum) and it also
+     * depends on the band, which is settled a few lines down. A number above
+     * the ceiling is clamped with a warning below, not a reason to refuse to
+     * start. The floor is the lowest drive any supported part accepts. */
     if (freq_hz <= 0 || bw_hz <= 0 || sf < 5 || sf > 12 ||
-        cr < 5 || cr > 8 || txp < -9 || txp > 22) {
+        cr < 5 || cr > 8 || txp < -19) {
         info("lora/%d not started: configure freq/bw/sf/cr/txp first", r->idx);
         publishState(r, "unconfigured");
         return false;
@@ -213,9 +238,15 @@ static bool radioStart(LoraRadio* r) {
     float bw_khz   = (float)bw_hz   / 1.0e3f;
     float tcxo_v   = (float)r->slot->tcxo_mv / 1000.0f;
 
-    /* SX126x LNA boosted RX gain: ~+3 dB sensitivity for ~0.4 mA more RX current.
-     * On by default; radioBegin applies it. Read before begin so it takes effect
-     * in the same bring-up. */
+    /* Point the front end at the band this carrier is on before anything is
+     * measured against it: on a dual-band part the ceiling below, and the
+     * conversion radioBegin does, are both the band's. radioBegin repeats this
+     * for its own callers; it is idempotent. */
+    femBandSelect(r, loraFreqIsHighBand(freq_mhz));
+
+    /* LNA boosted RX gain: ~+3 dB sensitivity for ~0.4 mA more RX current. On by
+     * default; radioBegin applies it. Read before begin so it takes effect in
+     * the same bring-up. */
     r->rxBoostedGain = storageGetInt(sk(kb, sizeof kb, r->idx, "rx_boosted_gain"), 1) != 0;
 
     int16_t st = radioBegin(r, freq_mhz, bw_khz, (uint8_t)sf, (uint8_t)cr,
@@ -314,8 +345,9 @@ static bool radioStart(LoraRadio* r) {
     r->airPreamble = preamble; r->airImplicit = false; r->airSf = (uint8_t)sf;
     r->airBwHz = bw_hz;
     r->chNow   = LORA_CH_HAIL;
-    /* The config slider ranges to the FEM ceiling (27 dBm); on a bare-chip
-     * board the capability is 22, so clamp what the user asked for. */
+    /* The config slider ranges to whatever this board reaches at the antenna on
+     * the band in use — a front end's rating, or the bare chip's own maximum
+     * for the port. Clamp what the user asked for to it. */
     if (txp > r->maxTxDbm) {
         warn("lora/%d tx_power %d dBm exceeds this board's %d dBm max — clamped",
              r->idx, txp, r->maxTxDbm);
@@ -785,15 +817,12 @@ static void loraTaskMain(void*) {
          * part, install its RF-switch table (supersedes the two-pin form
          * above — a board wires one or the other) and set the antenna-dBm
          * ceiling. Before begin(), like setRfSwitchPins. */
+        /* External FEM: detect the part or take the board's declared word for
+         * it, and publish what this radio reaches at the antenna so a UI sizes
+         * its power control to the hardware rather than to a build-time
+         * constant. femBandSelect does the publishing, here and on every begin
+         * — the figure follows the carrier across the band boundary. */
         femInit(r);
-        /* What this radio can actually reach at the antenna, published so a UI
-         * can size its power control to the hardware in front of it rather than
-         * to a build-time constant: the bare chip's 22 dBm unless femInit found
-         * a front-end, and that part's rating when it did. */
-        {
-            char b[48];
-            storageSet(rk(b, sizeof b, r->idx, "tx_power_max"), (int)r->maxTxDbm);
-        }
         r->radio = radioNew(r->slot->chip, r->mod);
         probeRadio(r);
     }
@@ -1030,14 +1059,28 @@ void LoraService::onInit() {
         }
 #endif  /* CONFIG_LORA_NO_SUPE */
         /* RNode endpoint. One endpoint for the device, so the group is global
-         * rather than per radio; `.enable` is seeded by the pane row in
-         * straddle.yaml. Both doors default shut — enabling the endpoint must
-         * not put a listener on the network nobody asked for: -1 serial claims
-         * no port, 0 tcp opens no socket. 7633 is the only TCP port a stock
-         * client can dial, so it is the only useful value for that key. */
+         * rather than per radio. One switch per door (see lora_rnode.cpp):
+         * serial and Bluetooth default on — dormant doors cost nothing — TCP
+         * defaults off, since a network listener is a decision. There is no
+         * master switch, and `.tcp` is a switch rather than a port number:
+         * 7633 is hardcoded in every stock client, so the number carried no
+         * information. Values from the earlier shapes of these keys are
+         * folded in: a port number in `.tcp` (with the endpoint enabled)
+         * becomes the switch, a port number in `.serial` is discarded, and
+         * the master `.enable` is deleted. */
+        {
+            int oldEn  = storageGetInt("s.lora.rnode.enable", -1);
+            int oldTcp = storageGetInt("s.lora.rnode.tcp", -1);
+            if (oldTcp > 1) storageSet("s.lora.rnode.tcp",
+                                       (oldEn != 0 && oldTcp == 7633) ? 1 : 0);
+            storageDeleteTree("s.lora.rnode.enable");
+            int oldSer = storageGetInt("s.lora.rnode.serial", -1);
+            if (oldSer < 0 || oldSer > 1) storageDeleteTree("s.lora.rnode.serial");
+        }
         storageDefault("s.lora.rnode.radio",  0);
-        storageDefault("s.lora.rnode.serial", -1);
+        storageDefault("s.lora.rnode.serial", 1);
         storageDefault("s.lora.rnode.tcp",    0);
+        storageDefault("s.lora.rnode.ble",    1);
         for (int i = 1; i < kNumRadios; i++) {
             storageDefault(sk(kb, sizeof kb, i, "enable"), 0);
             storageDefault(sk(kb, sizeof kb, i, "mode"), "access_point");

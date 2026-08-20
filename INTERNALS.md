@@ -21,7 +21,8 @@ contributes:
   drain; `lora_peers` the peer table and `lora_observe` the Reticulum
   inspection that fills it; `lora_csma` medium access; `lora_airtime` the
   per-channel budget ledger; `lora_chanplan` the regime channel tables;
-  `lora_power` adaptive transmit power; `lora_mon` telemetry; `lora_rnode` the
+  `lora_power` adaptive transmit power; `lora_fem` the external front-end module
+  between chip and antenna; `lora_mon` telemetry; `lora_rnode` the
   RNode endpoint; `lora_cli` the CLI; and `supe_engine` + `lora_supe` the SUPE
   state machine and its platform boundary. `lora_priv.h` carries the shared
   types. `supe.{h,cpp}`, `lora_queue.{h,cpp}` and `supe_engine.{h,cpp}` are
@@ -253,17 +254,24 @@ The X-macro order **fixes the numeric `CONFIG_LORAn_CHIP_ID`** the Kconfig
 `choice` resolves to (id = position from 0). The Kconfig `LORAn_CHIP_ID` defaults
 mirror this list — keep the two in lockstep.
 
-The RF switch is uniform and handled at the call site, not in dispatch:
-`Module::setRfSwitchPins(rx, tx)` for a two-GPIO external switch (set on the
-`Module` before `begin()`, so it covers every family), or — SX126x only —
-`setDio2AsRfSwitch(true)` applied inside `radioBegin` when the slot asks for it.
+The RF switch is handled at the call site, not in dispatch, in one of four
+forms: `Module::setRfSwitchPins(rx, tx)` for a two-GPIO external switch (set on
+the `Module` before `begin()`, so it covers every family); `setDio2AsRfSwitch(true)`
+inside `radioBegin` when the slot asks for it (SX126x only); a detected
+front-end module's table installed by `femInit` (§4b); or the LR2021's own DIOs
+programmed after `begin()` (§4c).
 
-**RX gain (SX126x only).** SX126x/LR `begin()` sets the regulator to **DC-DC**
-(passing `useRegulatorLDO = false`). The LNA gain mode is a per-radio setting
+**RX gain.** SX126x/LR `begin()` sets the regulator to **DC-DC** (passing
+`useRegulatorLDO = false`). The LNA gain mode is a per-radio setting
 `s.lora.<n>.rx_boosted_gain` (default **on**, live via `lora <n> rx_boosted_gain
-0|1`): `radioBegin` calls `setRxBoostedGainMode` for the SX126x family — boosted
-buys ~+3 dB sensitivity for ~0.4 mA more RX current (~4.2 → ~4.6 mA typ.), worth
-it for a receiver that idles in RX. The key is inert on non-SX126x families.
+0|1`), applied by `radioBegin` — boosted buys ~+3 dB sensitivity for ~0.4 mA more
+RX current (~4.2 → ~4.6 mA typ.), worth it for a receiver that idles in RX. Two
+families take it and they take it differently: SX126x's `setRxBoostedGainMode`
+is a **bool**, the LR2021's is a **level 0..7** that is only accepted from
+standby. One switch to the operator either way, with "on" meaning the top of the
+LR2021's range — the setting exists to buy sensitivity, so a middle rung would be
+a number nobody asked for. `begin()` leaves the chip in standby, which is why the
+call sits there rather than anywhere later. Inert on the other families.
 
 **PA over-current trip (SX126x only).** RadioLib's `SX126x::begin()` writes a
 60 mA limit into the OCP register for every part, and its `setOutputPower()`
@@ -351,6 +359,118 @@ in progress (§6b). A beat that arrives at a busy radio is **deferred by a full
 second**, never left past-due — an overdue deadline makes `nextDeadline()` return
 zero and spins the task for as long as the radio stays busy, which is the same
 trap `rssiSamplePoll` documents.
+
+## 4b. Front-end modules (`lora_fem`)
+
+Some boards put a PA + LNA + antenna switch between the radio and the antenna.
+The radio's own dBm range then stops being the antenna's, so **every
+user-facing power number is antenna dBm** and converts to chip drive at the last
+moment (`femChipDbm`); `lora.<n>.tx_power_max` publishes the ceiling so a UI
+sizes its slider to the hardware rather than to a build-time constant.
+
+Two wirings, told apart by whether the MCU can reach the part at all.
+
+**Detected** — the part is on MCU GPIOs (`CONFIG_LORAn_FEM_PWR_PIN`,
+`_FEM_EN_PIN`, `_FEM_TXSEL_A_PIN`, `_FEM_TXSEL_B_PIN`). Two candidates are
+supported, because boards ship both across revisions on the same enable net
+(Heltec V4: GC1109 on ≤ 4.2, KCT8103L on 4.3): the KCT8103L design pulls the
+enable line up and the GC1109 one leaves it floating, so `femInit` powers the
+rail, reads the enable pin as an **input**, and picks the part from what it
+finds. The rail has to come up first — the pull-up that is the signal is powered
+from the FEM side, so the sense reads garbage on a dead rail. Mode switching
+then rides on RadioLib's RF-switch table, which is what keeps every
+`standby()`/`startReceive()`/`startTransmit()` call site in the driver ignorant
+of the front end. Each part carries a measured per-dBm gain table (ported from
+Meshtastic's), because gain compresses as the PA saturates.
+
+**Declared** — `CONFIG_LORAn_FEM_GAIN_DB`, non-zero. The control lines hang off
+the **radio's** DIOs (§4c), so there is no pin to sense and no table to install
+here: nothing identifies the part at runtime, the board states its gain and
+`CONFIG_LORA_TX_POWER_MAX` states its ceiling, and that pair is the whole model.
+The gain applies flat — nobody has measured this one per rung — with the clamp
+to the chip's own range doing the work at the bottom, where asking for less than
+the chip's floor plus the gain simply lands on the floor. It wins over the pin
+group above; a board states one or the other, never both.
+
+The pair is a **guard** as much as a conversion. A front end whose TX input is
+rated for a few dBm sits behind a chip that will deliver +22 to anything that
+asks, and the only thing standing between them is the subtraction. Raising
+`CONFIG_LORA_TX_POWER_MAX` without raising the gain raises the chip drive by the
+same amount.
+
+### 4b.1 Two bands, and what follows the carrier
+
+A dual-band part (LR2021, SX128x) has two RF ports, and a board that uses both
+has a separate amplifier on each. They share **nothing** — not the supply gate,
+not the gain, not the antenna ceiling, and not even the drive range the chip
+itself accepts (the LR2021 takes −9…+22 dBm on its sub-GHz port and −19…+12 on
+its 2.4 GHz one, so a figure legal on one is refused outright on the other).
+The only thing in common is the number the operator types.
+
+**`femBandSelect(r, highBand)`** is where all of it is settled, from one fact:
+whether the carrier is above `LORA_HF_CUTOFF_MHZ` (1500 MHz, RadioLib's own
+LR2021 cutoff, spelled in `lora_radio.h` so the FEM and power paths cannot
+disagree with the library). It raises that port's supply gate, drops the other's,
+records the band on the radio, sets `maxTxDbm` from the band's ceiling, and
+republishes `lora.<n>.tx_power_max`.
+
+It runs from **two** places, and both are needed:
+
+- `radioBegin`, before `femChipDbm` converts the power — the conversion and its
+  clamp are the band's, so the band has to be known first. This is also what
+  covers `probeRadio` and any other direct caller.
+- `radioStart`, as soon as the configured frequency is in hand — because the
+  ceiling it publishes is what the operator's `tx_power` is checked and clamped
+  against, and that happens before `begin()`. Without it the clamp would be one
+  band behind on every crossing.
+
+It is idempotent, which is what lets both call it.
+
+A single-band board names no HF supply pin and no HF gain, so nothing is
+switched and only the sub-GHz numbers are ever used. A board with **no** front
+end at all still gets a band-correct ceiling: the bare chip's own maximum for
+the port in use, which is not the same number on the two ports.
+
+The user-facing consequence is that tuning across 1500 MHz re-clamps `tx_power`
+to the new ceiling with a warning and re-sizes every power control bound to
+`lora.<n>.tx_power_max` — the web slider reactively, the LCD one when the pane
+is next built.
+
+## 4c. LR2021 DIO wiring (`lr2021ApplyDio`)
+
+The LR2021 bonds out DIO5..DIO11 and lets the board decide what each one is: the
+interrupt line, an RF-switch output, or nothing. Both facts are the board's
+(`CONFIG_LORAn_LR_IRQ_DIO`, `CONFIG_LORAn_LR_RFSW_*`) and both are programmed
+around `begin()`, on **every** begin, because `begin()` resets the part and a
+reset returns every DIO to "no function".
+
+- **`irqDioNum` goes in before `begin()`**, because `begin()` is what programs
+  the IRQ DIO's function. RadioLib assumes DIO5. A board that bonded a different
+  one and does not say so gets a radio that initialises cleanly, reports itself
+  found, transmits — and never signals a reception, because the interrupt is
+  aimed at a pad that is not connected.
+- **The RF-switch table goes in after**, as `SetDioFunction` (0x0112) +
+  `SetDioRfSwitchConfig` (0x0113) per DIO, sent through
+  `Module::SPIwriteStream` — which is exactly what the library does underneath.
+  The board's five per-mode masks are transposed into one mask per DIO on the
+  way: the chip is configured per DIO, the board describes itself per mode, and
+  those are opposite orderings.
+
+`LR2021::setRfSwitchTable` is deliberately **not** used. Its pin array is
+`Module::RFSWITCH_MAX_PINS` — **5** — against this chip's seven DIOs, so a board
+using six cannot be described to it at all; and RadioLib 7.7.1 indexes the
+per-DIO configuration it builds by the caller's array position rather than by the
+DIO number, which silently programs a zero mask into every DIO past the fifth.
+The index fix is on the library's master branch and in no release. One datasheet
+constraint survives either way and is honoured here: **DIO5 accepts only the
+pull-up in sleep**, and any other pull makes the chip refuse the command.
+
+**A frequency change must go through a full `begin()`** on this family.
+Crossing the part's LF/HF boundary re-points the whole front end, and the
+incremental setters answer a live cross-band move with an error rather than a
+retune. §9's config lifecycle already stops and restarts the radio on any
+change, so this costs nothing — but it is why that path must not be "optimised"
+into a `setFrequency` for the LR2021.
 
 ## 5. On-air split framing
 
@@ -880,10 +1000,11 @@ deleted. Frequency and TX power carry no default
 (region/antenna — the user must pick); everything else defaults so an
 enable-toggle alone gets a radio up. The **RNode group is global, not per radio**
 — there is one endpoint for the device — and is seeded under the same gate with
-**every door shut**: `s.lora.rnode.radio` (0), `.serial` (−1 = claim no serial
-port) and `.tcp` (0 = open no socket; 7633 is the only port a stock client can
-dial, so it is the only other useful value). `s.lora.rnode.enable` comes from its
-pane row in `straddle.yaml`. The existing
+one switch per door: `s.lora.rnode.radio` (0), `.serial` (1), `.tcp` (0) and
+`.ble` (1) — there is no master enable, and `.tcp` is a switch rather than a
+port number, since 7633 is hardcoded in every stock client. The serial and TCP
+rows come from this straddle's pane block; rnode-ble contributes the Bluetooth
+row into the same section. The existing
 `storageSubscribeChanges("s.lora", …)` prefix subscription already covers the
 group, so its edits land in the coalesced apply pass like any other. `loraInit`
 does **not** touch any power pin — the board owns the LoRa rail.
@@ -1400,33 +1521,39 @@ Protocol reference:
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `s.lora.rnode.enable` | 0 | master switch (pane row) |
 | `s.lora.rnode.radio`  | 0 | which radio the endpoint exposes |
-| `s.lora.rnode.serial` | −1 | serial port to claim; −1 = no serial |
-| `s.lora.rnode.tcp`    | 0 | TCP listen port; 0 or −1 = no TCP. 7633 is the only useful value |
+| `s.lora.rnode.serial` | 1 | the serial door (highest existing port, in-band trigger) |
+| `s.lora.rnode.tcp`    | 0 | the TCP door on port 7633 — a switch, not a port number |
+| `s.lora.rnode.ble`    | 1 | the Bluetooth door, read by `reticulous/rnode-ble` |
 
-Global, not per radio: there is one endpoint for the device. **Every door
-defaults shut**: `.enable` alone opens none, and each transport is opted into by
-naming it. Enabling the endpoint must not put a listener on the network nobody
-asked for — a LoRa segment reachable from any host on the LAN is a decision, not
-a side effect of flipping a switch. The Bluetooth door is the same story under
-its own switch, `s.ble.rnode.enable`, owned by `reticulous/rnode-ble`.
+Global, not per radio: there is one endpoint for the device, and **one switch
+per door — no master enable**: an open door is what "enabled" means, and a
+client can only arrive through an open one. TCP is the one door that defaults
+shut, because a LoRa segment reachable from any host on the LAN is a decision,
+not a default. Serial and Bluetooth default open because dormant they cost
+nothing: the serial claim is in-band-triggered — the port is a full console,
+esptool auto-reset included, until a client's first KISS FEND takes it over —
+and both reach nobody a USB cable or a Bluetooth pairing didn't already admit.
+A session records which door it entered through (`RnodeState.door`), so
+switching one door off drops its own session and leaves another door's alone.
 
-`.tcp` is therefore a two-value key in practice: **0, or 7633**. The client dials
-7633 and nothing else — its `TCPConnection.TARGET_PORT` is hardcoded, and a
+`.tcp` is a switch because the port is not a choice: the client dials 7633 and
+nothing else — its `TCPConnection.TARGET_PORT` is hardcoded, and a
 `tcp://host:port` config URI does not override it: the whole suffix is handed to
-`getaddrinfo` as a hostname and resolution simply fails. Any other number here
-opens a socket no stock client can reach.
+`getaddrinfo` as a hostname and resolution simply fails. The number lives in
+`RNODE_TCP_PORT` on this side.
 
 `rnodeApplyTransports()` runs from the coalesced apply pass (§9) and does three
-things: drops the session if the endpoint was switched off or rebound to another
-radio; registers the TCP endpoint with net **once** and then drives the listener
+things: drops the session if its own door was switched off or the endpoint
+rebound to another radio; registers the TCP endpoint with net **once** and then drives the listener
 by writing `s.net.rnode_port` (net polls its `s.net.*` keys from `epOpenAll` and
 opens or closes the socket from there — the two-step shape sshd uses); and
-claims or releases the serial port. The Bluetooth door needs nothing here: it
-dials in from its own straddle like any other client. A refused serial claim — port 1 while the console presents only one — is
-warned once and retried when `sys.usb.serial_ports` changes, which is why the
-task also subscribes to that key.
+claims or releases the serial port — the highest one `sys.usb.serial_ports`
+reports, with the KISS FEND (`0xC0`) as the claim's in-band trigger, so the
+claim is dormant until a client speaks. The Bluetooth door needs nothing here:
+it dials in from its own straddle like any other client. The task subscribes to
+`sys.usb.serial_ports` so a transport switch (`usb cdc` / `usb jtag`) re-runs
+this pass and moves the claim to the port that is now highest.
 
 The TCP door is compiled behind `CONFIG_SPANGAP_NET`, which is also what pulls
 spangap-net into this component's `REQUIRES` when that straddle is staged: the
