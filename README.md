@@ -75,12 +75,49 @@ menuconfig`.
     RF switch from its own DIO2.
   - `CONFIG_LORAn_RFSW_RX_PIN` / `_RFSW_TX_PIN` — an external antenna RF switch
     driven by two MCU GPIOs (`-1`/`-1` if none). Any chip family.
+  - `CONFIG_LORAn_FEM_PWR_PIN` / `_FEM_EN_PIN` / `_FEM_TXSEL_A_PIN` /
+    `_FEM_TXSEL_B_PIN` — a **detectable** front-end module (PA + LNA + switch)
+    between the radio and the antenna, e.g. the Heltec V4's GC1109 (rev ≤ 4.2)
+    or KCT8103L (rev 4.3). `femInit` senses the enable net at boot to tell the
+    two apart and installs the FEM's RF-switch table; `CONFIG_LORA_TX_POWER_MAX`
+    states the antenna ceiling the detected part reaches.
+  - `CONFIG_LORAn_FEM_FIXED_GAIN_DB` / `_FEM_MAX_CHIP_DBM` — a **fixed** front
+    end: always in the path, powered with the board, no control or detect pins
+    (the B&Q Station G2 class). See below.
   - **chip** — the radio part on the slot (`SX1262` default); the choice covers
     all 15 supported parts.
 
 A complex chip-DIO RF-switch *table* (some LR11x0/LR2021 boards) isn't
 expressible as two pins and needs board-supplied support; the two-GPIO and
 SX126x-DIO2 forms cover the common cases.
+
+**Fixed front ends: declaration vs detection.** The Heltec-style FEM is
+*detected* — its enable net answers a boot-time sense, so a board whose part
+did not answer honestly falls back to the bare chip's 22 dBm. The Station G2's
+front end can't be: its 35 dBm PA and 18.5 dB RX LNA are always in the RF path,
+its rails come up with the board, and its switch hangs off the SX1262's own
+DIO2 — the firmware has no pin to sense and none to drive. So it is *declared*:
+`FEM_FIXED_GAIN_DB` states the PA's TX gain (19–21 dB below compression on the
+G2, band-dependent; the board straddle picks its figure) and `femChipDbm`
+subtracts it, so the user's antenna dBm becomes chip drive as with the detected
+parts — with a declared 20 dB gain, asking for 35 dBm at the antenna drives the
+chip at 15. `FEM_MAX_CHIP_DBM` is the safety line: an always-in-path PA's
+input tolerance (chip 16 dBm ends the G2's P1dB region, 19 is its absolute cap)
+sits far below the chip's own 22, and every conversion clamps to it.
+`CONFIG_LORA_TX_POWER_MAX` carries the antenna ceiling (35 on the G2 — its
+P1dB; the chip cap plus gain could theoretically reach 36, which the board
+deliberately undershoots), exactly as for a detected FEM. The **RX side is not modeled**: the always-on LNA means
+RSSI/SNR publish ~18.5 dB hot on such boards. Adaptive TX power sees the same
+bias from both directions of a G2↔G2 link, so it partially cancels there;
+correcting the published readings is future work. The **TX floor rises with
+the gain**, and that is not modeled either: chip −9 plus an always-in-path
++20 dB means such a board cannot emit below ~+11 dBm at the antenna, yet the
+slider still offers −9 — femChipDbm pins the chip at −9 and the frame flies
+up to 20 dB hotter than every stated figure (SUPE announces, the rnsd
+registration power, LoRaMon stamps), which corrupts a peer's absolute
+path-loss math at the bottom of the adaptive range. Same distortion class as
+the detected FEMs' 11–13 dB, widened; a stated-power floor correction is
+future work alongside the RX one.
 
 ## Storage variables
 
@@ -99,7 +136,7 @@ defaults come from this straddle's `settings:` block; radios 1.. are seeded by
 | `s.lora.<n>.bandwidth` | `125000` | Bandwidth in **Hz** (125/250/500 kHz; SX128x also 203/406/812/1625 kHz). |
 | `s.lora.<n>.spreading_factor` | `7` | Spreading factor, 5–12. |
 | `s.lora.<n>.coding_rate` | `5` | Coding-rate denominator, 5–8 (`5` = 4/5). |
-| `s.lora.<n>.tx_power` | *(none)* | TX power in dBm at the **antenna**, −9 to `lora.<n>.tx_power_max` (22 on a bare chip, higher through a front-end module — 27 on the Heltec V4). No default — antenna dependent. A value above the ceiling is clamped with a warning. The radio also states this figure to rnsd at registration, so a reticulous peer's rx report can quote it back and turn a bare RSSI into a path loss; the configured value goes out, not the adaptive per-peer one, because that is a readout and not a term in any loop. |
+| `s.lora.<n>.tx_power` | *(none)* | TX power in dBm at the **antenna**, −9 to `lora.<n>.tx_power_max` (22 on a bare chip, higher through a front-end module — 27 on the Heltec V4, 35 on the Station G2). No default — antenna dependent. A value above the ceiling is refused: the radio stays `unconfigured` with a warning, same as any other invalid figure. The radio also states this figure to rnsd at registration, so a reticulous peer's rx report can quote it back and turn a bare RSSI into a path loss; the configured value goes out, not the adaptive per-peer one, because that is a readout and not a term in any loop. |
 | `s.lora.<n>.preamble` | `12` | Preamble length in symbols, 6–32. |
 | `s.lora.<n>.sync_word` | `"0x42"` | Sync word, a string parsed as hex or decimal (`0x42` is the Reticulum-on-LoRa convention). |
 | `s.lora.<n>.mode` | `"gateway"` | RNS interface mode: `full`, `gateway`, `access_point`, `roaming`, `boundary`. |
@@ -134,7 +171,7 @@ SF/BW/CR/preamble are set; `lora.<n>.state` reads `unconfigured` until then.
 | `lora.<n>.up` | `1` when the radio is on-air, else `0`. |
 | `lora.<n>.state` | `unconfigured` / `error` / `up` / `down` / `rnsd_unavailable`. |
 | `lora.<n>.chip` | Detected chip name, e.g. `SX1262`. |
-| `lora.<n>.tx_power_max` | Antenna-dBm ceiling this radio can actually reach: `22` on a bare chip, the front-end module's rating on a board with one that was detected at boot. `tx_power` is clamped to it, and **both** the browser panel and the LCD settings pane size their power slider from it — so a FEM board whose part did not answer offers 22 rather than a figure it cannot deliver. |
+| `lora.<n>.tx_power_max` | Antenna-dBm ceiling this radio can actually reach: `22` on a bare chip, the front-end module's rating on a board with one that was detected at boot — or, for a fixed pinless FEM (Station G2), declared at build time, there being nothing to detect. `tx_power` above it is refused (the radio stays down), and **both** the browser panel and the LCD settings pane size their power slider from it — so a FEM board whose part did not answer offers 22 rather than a figure it cannot deliver. |
 | `lora.<n>.bitrate_eff` | Effective bitrate registered with `rnsd`, bits/s (airtime-derived). |
 | `lora.<n>.stats.{tx_bytes,rx_bytes,tx_frames,rx_frames,crc_err,split_rx_timeout,tx_dropped,rssi_last,snr_last}` | Traffic counters (`tx_dropped` = frames shed by the LBT timeout) and last-RX RSSI/SNR. Published only when a UI can read them — see `uiTelemetryWanted()`. |
 | `lora.<n>.stats.{airtime_pct,cw_band}` | With `appc` on: percentage of the last ~15 s this radio spent transmitting, and the contention band (1–4) that percentage currently selects. Absent when `appc` is off. |

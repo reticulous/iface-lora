@@ -192,7 +192,13 @@ static int8_t apClamp(LoraRadio* r, int want) {
     if (want > r->cfgTxp)    want = r->cfgTxp;
     if (want < AP_FLOOR_DBM) want = AP_FLOOR_DBM;
     int8_t clipped = (int8_t)want;
-    r->radio->checkOutputPower((int8_t)want, &clipped);
+    /* The chip's own range check applies only when the antenna figure IS the
+     * chip figure. Through a FEM the two differ by the gain: asking the chip
+     * about an antenna 27 (Heltec) or 36 (Station G2) would clip a value the
+     * front end exists to deliver, and femChipDbm already clamps the chip
+     * drive on conversion. */
+    if (r->femType == FEM_NONE)
+        r->radio->checkOutputPower((int8_t)want, &clipped);
     return clipped;
 }
 

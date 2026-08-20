@@ -80,7 +80,10 @@ settings:
       # module is really there and publishes the answer — the part's rating
       # (e.g. 27 on the Heltec V4) when it is, the bare SX126x's 22 when it is
       # not. A board that declares a FEM it cannot talk to therefore offers 22
-      # rather than a figure nothing will deliver.
+      # rather than a figure nothing will deliver. A FIXED front end (Station
+      # G2 — always in path, no pins to sense) is declared rather than
+      # detected, so its ceiling (35 there — the board declares its P1dB) is
+      # offered on the declaration alone.
       - slider:
           label: "TX power"
           key: "s.lora.0.tx_power"

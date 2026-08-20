@@ -67,7 +67,11 @@ struct LoraRadio;
 #define RN_FW_MAJ           1
 #define RN_FW_MIN           78
 #define RN_RSSI_OFFSET      157    /* the client subtracts this from CMD_STAT_RSSI */
-#define RNODE_TXP_MAX       22     /* chip ceiling; a higher request is clamped */
+#define RNODE_TXP_MAX       22     /* chip ceiling; a higher request is clamped.
+                                    * Deliberately NOT r->maxTxDbm: a stock RNode
+                                    * client refuses to ask above 22 itself, so a
+                                    * FEM board loses nothing here, and this
+                                    * surface's numbers stay the protocol's. */
 
 /* Signal stamped onto a packet injected into rnsd from the client. It never
  * crossed the air, so any real-looking reading would be a fiction: -10 dBm at
