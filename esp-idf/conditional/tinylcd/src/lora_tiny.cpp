@@ -104,19 +104,22 @@ static bool drawTrafficPage(tinylcd_page_t, u8g2_t* g, tinylcd_ev_t)
     s_prevTx = t.tx_bytes; s_prevRx = t.rx_bytes;
     s_prevMs = now; s_haveBase = true;
 
-    /* Numbers: instantaneous rates, then the radio's own channel figures. */
+    /* Numbers: instantaneous rates, then the radio's own channel figures.
+     * First baseline at 15, like the net page: the engine draws the page
+     * dots along the top edge, and rows 0-10 belong to them — a baseline-8
+     * line here overlapped the dots on carousel boards. */
     u8g2_SetFont(g, u8g2_font_6x10_tf);
     snprintf(line, sizeof line, "tx %uB/s rx %uB/s", txr, rxr);
-    u8g2_DrawStr(g, 0, 8, line);
+    u8g2_DrawStr(g, 0, 15, line);
     snprintf(line, sizeof line, "air %d%% d %d.%d%% nf %d t%d",
              t.airtime_pct, t.duty_pct10 / 10, t.duty_pct10 % 10,
              t.noise_dbm, t.txp_dbm);
-    u8g2_DrawStr(g, 0, 18, line);
+    u8g2_DrawStr(g, 0, 25, line);
 
     /* Chart: 60 bars x 2 px, newest at the right edge, baseline at y=63.
-     * Height = sqrt scale to TRAFFIC_FULL_BPS over 40 px. The chart region
-     * starts at y=22, leaving 2 px air under the text. */
-    const int base = 63, hMax = 40;
+     * Height = sqrt scale to TRAFFIC_FULL_BPS over 34 px — the chart top at
+     * y=29 keeps clear air under the baseline-25 text row. */
+    const int base = 63, hMax = 34;
     u8g2_DrawHLine(g, 0, base, 122);
     if (s_slot >= 0) {
         for (int i = 0; i < TRAFFIC_SLOTS; i++) {
