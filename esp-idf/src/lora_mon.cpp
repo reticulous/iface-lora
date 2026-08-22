@@ -143,22 +143,63 @@ static void loraMonExpire(LoraRadio* r, uint32_t now) {
         char key[40];
         snprintf(key, sizeof key, "lora.%d.packets.%u", r->idx, (unsigned)oldest);
         storageDeleteTree(key);
+        /* Aged out from under the run being extended: stop extending it, or the
+         * next span would recreate a node the window has already dropped. */
+        if (r->mon.dwellKeyMs == oldest) r->mon.dwellKeyMs = 0;
         r->mon.pktHead = (uint16_t)((r->mon.pktHead + 1) % r->mon.pktCap);
         r->mon.pktCount--;
     }
 }
 
 /* Publish one packet node `lora.<n>.packets.<ms>` holding a packed string:
- * "r|rssi|snr|dur|bytes|type|ch" (rx) or "t|txp|dur|bytes|type|wait|ch" (tx).
- * The leading token is the direction; snr is deci-dB; ch is the channel the
- * frame flew on, 0 being the reticulum hailing channel. Then age old nodes out.
+ * "r|rssi|snr|dur|bytes|type|ch" (rx), "t|txp|dur|bytes|type|wait|ch" (tx), or
+ * "a|ch|dur" — a DWELL: the radio was tuned to that channel and listening for
+ * that long, ending where the next one begins. The leading token is the
+ * direction; snr is deci-dB; ch is the channel, 0 being the reticulum hailing
+ * channel. Then age old nodes out.
+ *
+ * The dwell is what makes a viewer able to say where the radio *was*, which no
+ * frame record can: a slot attended in silence, a meeting's channel held open,
+ * the hailing channel between them. Without it a lane can only show what
+ * arrived, and a lane with nothing in it means both "nobody spoke" and "we were
+ * not listening" — the two answers a channel view exists to separate.
  *
  * INTERFACE TASK ONLY — this is the storage half of a record. */
 static void loraMonRecordOne(LoraRadio* r, const IfMsg* m) {
     if (!r->mon.pktMs || !r->mon.pktCap) return;
     char key[40], val[56];
+
+    /* A stay on one channel is ONE record that grows, not one per beat. The
+     * radio sits on the hailing channel whenever it is doing nothing, so a node
+     * per beat would be a permanent write every second and — worse — would push
+     * real frames out of the capped ring, emptying the very history the graph
+     * exists to show. Extending in place costs one rewrite of a node already
+     * there and keeps a whole idle hour as a single record. */
+    if (m->dir == 2) {
+        LoraMonState& mo = r->mon;
+        if (mo.dwellKeyMs && mo.dwellCh == m->ch && mo.dwellEndMs == m->t_ms &&
+            (uint32_t)mo.dwellDur + m->dur_ms <= 0xFFFF) {
+            mo.dwellDur = (uint16_t)(mo.dwellDur + m->dur_ms);
+            mo.dwellEndMs = m->t_ms + m->dur_ms;
+            snprintf(key, sizeof key, "lora.%d.packets.%u", r->idx, (unsigned)mo.dwellKeyMs);
+            snprintf(val, sizeof val, "a|%u|%u", (unsigned)mo.dwellCh, (unsigned)mo.dwellDur);
+            storageSet(key, val);
+            return;                      /* the FIFO already holds this node */
+        }
+        mo.dwellKeyMs = m->t_ms ? m->t_ms : 1;
+        mo.dwellCh    = m->ch;
+        mo.dwellDur   = m->dur_ms;
+        mo.dwellEndMs = m->t_ms + m->dur_ms;
+    } else {
+        /* Any frame ends the run: the next dwell starts a record of its own, so
+         * a span never reads as covering traffic that happened inside it. */
+        r->mon.dwellKeyMs = 0;
+    }
+
     snprintf(key, sizeof key, "lora.%d.packets.%u", r->idx, (unsigned)m->t_ms);
-    if (m->dir) snprintf(val, sizeof val, "t|%d|%u|%u|%u|%u|%u|%u",
+    if (m->dir == 2) snprintf(val, sizeof val, "a|%u|%u",
+                              (unsigned)m->ch, (unsigned)m->dur_ms);
+    else if (m->dir) snprintf(val, sizeof val, "t|%d|%u|%u|%u|%u|%u|%u",
                          (int)m->txp, (unsigned)m->dur_ms, (unsigned)m->bytes,
                          (unsigned)m->type, (unsigned)m->wait_ms, (unsigned)m->ch,
                          (unsigned)m->own_ms);
@@ -258,6 +299,29 @@ void loraMonPush(LoraRadio* r, uint8_t dir, uint32_t t_ms, uint16_t dur_ms,
     if (!ifPost(&m)) r->mon.monDropped++;
 }
 
+/* The radio has left a channel (or is about to): record how long it listened
+ * there. Called from the radio task on every retune, and once per maintenance
+ * beat so a long stay on one channel is drawn as it accrues rather than only
+ * when it ends.
+ *
+ * A dwell shorter than a millisecond is not a listening window, it is a
+ * retune passing through — those would out-number the frames and say nothing. */
+void loraMonDwell(LoraRadio* r, uint32_t now) {
+    uint8_t ch = r->chNow < LORA_CH_MAX ? r->chNow : LORA_CH_HAIL;
+    if (r->mon.dwellSince == 0) { r->mon.dwellSince = now ? now : 1; return; }
+    uint32_t span = now - r->mon.dwellSince;
+    if ((int32_t)span <= 0) return;
+    uint32_t start = r->mon.dwellSince;
+    r->mon.dwellSince = now ? now : 1;
+    if (!s_monWatched || span == 0) return;
+    if (span > 0xFFFF) span = 0xFFFF;
+    IfMsg m = {};
+    m.kind = IFM_MON;  m.radio = (uint8_t)r->idx;
+    m.dir  = 2;        m.ch    = ch;
+    m.t_ms = start;    m.dur_ms = (uint16_t)span;
+    if (!ifPost(&m)) r->mon.monDropped++;
+}
+
 /* Publish the rolling one-hour airtime, per mille, per direction. The apps
  * compute every shorter window from the frame records; the hour needs more
  * history than a viewer holds, so it is the one figure the device publishes. */
@@ -292,7 +356,15 @@ static void loraMonClear(LoraRadio* r) {
  * One key rather than a subtree: it is a handful of numbers that only change on
  * a config apply, and the viewers want all of it at once to label their graphs.
  * With no agility in force it is just the hailing channel, so a viewer can tell
- * the two cases apart by the entry count alone and needs no separate flag. */
+ * the two cases apart by the entry count alone and needs no separate flag.
+ *
+ * **The list is the regime's channels, not the measured ones.** What a viewer
+ * draws per channel is the TRAFFIC on it — the frames a detour put there, with
+ * their airtime — and those records exist whether or not anything ever took a
+ * noise reading there. The RSSI series is only a backdrop under that traffic,
+ * and this radio publishes one (rssiSamplePoll), so the agile lanes draw their
+ * frames against a plain background. Trimming this list to what is measured
+ * would take the detour traffic off the screen with it. */
 void publishChannels(LoraRadio* r) {
     char val[24 * LORA_CH_MAX];
     int  w = snprintf(val, sizeof val, "%u,%u",
@@ -334,6 +406,16 @@ void publishState(LoraRadio* r, const char* state) {
  * the interface task to publish. Radio task; the reading is the same
  * getRSSI(false) carrier sense uses, so it costs one SPI transaction.
  *
+ * **The radio never leaves the hailing channel to take a reading.** A frame
+ * arriving during the retune is lost with nothing to show it existed, the cost
+ * of the trip is per part (an LR2021's retune and receive restart is not an
+ * SX126x's) and the window it must fit inside is per configuration, and no
+ * consumer would read the result: channel access samples for itself, SUPE's
+ * channel choice reads the airtime ledger, and the power controller works from
+ * stated powers. The agile channels keep their graphs — those draw the traffic
+ * a detour put there, which is recorded regardless — and simply have no noise
+ * backdrop under it. See INTERNALS §18.3.
+ *
  * **Only while a viewer is open.** The series is live-only decoration for the
  * LoRaMon graphs; nothing in channel access or SUPE reads it (carrier sense
  * takes its own samples and tracks its own floor). Unwatched, the beat is
@@ -352,51 +434,6 @@ void publishState(LoraRadio* r, const char* state) {
  *
  * The beat is not advanced when a sample is skipped, so sampling resumes as
  * soon as the radio is idle again rather than waiting out the rest of a second. */
-/* Measure the agile channels of the regime in force, as one excursion off the
- * hailing channel and back.
- *
- * Retune, read, retune home: standby → setFrequency → startReceive → getRSSI
- * per channel, then the same to come home. Nine channels is roughly 2–3 ms away
- * from the hailing channel — inside the ~4 ms an 8-symbol SF7/BW125 preamble
- * allows before a frame could be missed (plans/psa.md §3.5). The caller has
- * already established that nothing else wants the radio.
- *
- * **Bandwidth is deliberately not retuned.** Every channel is measured with the
- * receiver the hailing channel is configured for, so the readings share one
- * noise reference and are directly comparable — which is what a graph of nine
- * channels needs. Measuring each at its own width would make a 500 kHz channel
- * read ~6 dB hotter than a 125 kHz one from thermal noise alone, for no gain. A
- * regulatory Clear Channel Assessment is the opposite case and would have to
- * match the channel's occupied bandwidth; that is a different measurement for a
- * different purpose, and not this one. */
-#if !defined(CONFIG_LORA_NO_SUPE)
-static void rssiSweepAgile(LoraRadio* r, IfMsg* m, const RegimeChan* ch, int n) {
-    for (int i = 0; i < n && i + 1 < LORA_CH_MAX; i++) {
-        r->radio->standby();
-        if (r->radio->setFrequency((float)ch[i].freqHz / 1.0e6f) != RADIOLIB_ERR_NONE)
-            continue;                                  /* out of the part's range */
-        if (radioStartRx(r) != RADIOLIB_ERR_NONE) continue;
-        r->hal->delayMicroseconds(LORA_RSSI_SETTLE_US);
-        float dbm = channelRssi(r);
-        /* Below the thermal noise of any bandwidth this part can receive, so
-         * not a measurement — it is the receiver answering before it is
-         * listening. Leave the channel unreported rather than draw a floor
-         * that isn't one. */
-        if (dbm <= LORA_RSSI_INVALID_DBM) continue;
-        m->chRssi[i + 1] = (int16_t)lround(dbm);
-    }
-    /* Home. Unconditional and unchecked: a failed retune above must not strand
-     * the radio off the hailing channel, which is the one thing this must never
-     * do. */
-    r->radio->standby();
-    r->radio->setFrequency((float)r->cfgFreqHz / 1.0e6f);
-    /* The tracked noise floor is left alone: the sweep reads each channel
-     * directly and never feeds the floor, and the radio returns to the channel
-     * whose floor it already holds. */
-    radioStartRx(r);
-}
-#endif  /* CONFIG_LORA_NO_SUPE */
-
 void rssiSamplePoll(LoraRadio* r) {
     if (!s_monWatched) return;
     if (!r->running || !r->enabled) return;
@@ -423,40 +460,13 @@ void rssiSamplePoll(LoraRadio* r) {
     m.ch    = LORA_CH_HAIL;
     m.t_ms  = millis();
     for (int i = 0; i < LORA_CH_MAX; i++) m.chRssi[i] = LORA_RSSI_NONE;
+    m.nch = 1;
 
-#if !defined(CONFIG_LORA_NO_SUPE)
-    int n = 0;
-    const RegimeChan* ch = regimeChans(r->afa, &n);
-    /* The field count is the regime's channel count whether or not every one of
-     * them answered, so a viewer reads a stable set of columns and a channel
-     * that failed to measure is an empty field rather than a shifted one. */
-    m.nch = (uint8_t)((1 + n > LORA_CH_MAX) ? LORA_CH_MAX : 1 + n);
-#else
-    m.nch = 1;                       /* the hailing channel, and nothing else */
-#endif
-
-    /* The hailing channel first and in place — the radio is already on it and
-     * settled, so this reading costs one transaction and no retune. */
-    float hail = channelRssi(r);
-    m.chRssi[LORA_CH_HAIL] = (int16_t)lround(hail);
+    /* The hailing channel, in place: the radio is already on it and settled, so
+     * the reading costs one transaction and no retune. **The radio does not
+     * leave this channel to measure anything.** */
+    m.chRssi[LORA_CH_HAIL] = (int16_t)lround(channelRssi(r));
     m.rssi = m.chRssi[LORA_CH_HAIL];
-
-    /* Leaving the hailing channel mid-reception destroys the frame, and unlike
-     * a preamble there is no partial-recovery argument. The reading just taken
-     * is the cheapest available evidence that something is on air, so energy
-     * above the tracked floor cancels this beat's excursion — the agile
-     * channels simply go unreported and the viewers draw the gap.
-     *
-     * It is the same evidence carrier sense uses and carries the same blind
-     * spot: a frame below the floor is invisible to it (§4.2 of plans/psa.md).
-     * Closing that needs the preamble-detect and header-valid interrupts armed
-     * during receive, which the receive path does not currently ask for. */
-    bool quiet = hail <= r->noiseFloor + CSMA_RSSI_MARGIN_DB;
-#if !defined(CONFIG_LORA_NO_SUPE)
-    if (ch && n > 0 && quiet) rssiSweepAgile(r, &m, ch, n);
-#else
-    (void)quiet;
-#endif
 
     if (!ifPost(&m)) r->mon.rssiDropped++;
 }

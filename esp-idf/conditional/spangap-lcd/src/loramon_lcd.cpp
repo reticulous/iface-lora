@@ -56,6 +56,16 @@ constexpr int PILLH = 16;         /* window-selector strip height */
 constexpr int PAD_PILLS = 6;      /* breathing room under the pill row */
 constexpr int GUT_L = 26;         /* left scale gutter (tx dBm), px */
 constexpr int GUT_R = 30;         /* right scale gutter (rx dBm) — four digits */
+
+/* The agile-channel strips under the hailing plot. Small by design: on this
+ * screen a lane's job is to say *when* the radio was there and whether anything
+ * landed, not to be read for dBm — the main plot carries the scale. Below
+ * LORAMON_MAIN_MIN_H the hailing bands stop being legible, so strips are
+ * dropped from the bottom until it fits rather than squeezing everything. */
+constexpr int LORAMON_LANE_H     = 7;    /* one agile strip, px */
+constexpr int LORAMON_MAIN_MIN_H = 60;   /* the hailing plot never shrinks past this */
+constexpr int LORAMON_MAX_LANES  = 9;    /* the largest regime's agile set */
+constexpr int LORAMON_LANE_PX    = 400;  /* widest plot the attendance mask covers */
 constexpr int MON_MAX = 4096;     /* max packets held for a redraw (matches fw cap) */
 constexpr int ZOOM_MAX = 8;       /* zoom-stack depth */
 /* Narrowest timescale division, px. Divisions come off the 1-2-5-10 ladder,
@@ -76,16 +86,25 @@ constexpr Win WINS[6] = {
 constexpr int NWINS = (int)(sizeof(WINS) / sizeof(WINS[0]));
 
 /* One plot, two dBm axes reading the same four bands: transmit power down the
- * left gutter in 10 dB steps, received strength down the right in 25 dB. RX
- * needs the wider step because its range is 100 dB against TX's 40, and both
+ * left gutter in 10 dB steps, received strength down the right in 32 dB. RX
+ * needs the wider step because its range is 128 dB against TX's 40, and both
  * have to land on the same band edges for one grid to serve them. Which axis a
- * bar is on is its direction — a transmit also tints the air behind it. */
+ * bar is on is its direction — a transmit also tints the air behind it.
+ *
+ * The RX axis is the reportable range itself, not a guess at a comfortable one:
+ * the packet-strength register is a byte read as −value/2 dBm, so 0 is the
+ * strongest level a receiver can state and −127.5 the weakest. A bench pair a
+ * hand apart reads well above −30, and an axis that stopped there put every one
+ * of those in the top band with nothing to tell them apart. */
 constexpr int NBANDS = 4;
 struct Axis { int lo, hi; };
 constexpr Axis AX_TX = { -10, 30 };
-constexpr Axis AX_RX = { -130, -30 };
+constexpr Axis AX_RX = { -128, 0 };
 
-struct Rec { uint32_t t; uint8_t dir; uint32_t dur; uint32_t bytes; int rssi; int txp; uint8_t type; uint32_t wait; };
+/* dir: 0 rx, 1 tx, 2 a DWELL — the radio was tuned to `ch` and listening for
+ * `dur`. A dwell carries no level and is never drawn as a bar; it is what tells
+ * a lane the radio was watching from a lane it had left. */
+struct Rec { uint32_t t; uint8_t dir; uint32_t dur; uint32_t bytes; int rssi; int txp; uint8_t type; uint32_t wait; uint8_t ch; };
 
 /* A record's protocol class, as the firmware writes it into the packed string
  * (lora.cpp's LORA_PKT_*). Colour is the protocol, not the direction —
@@ -128,6 +147,7 @@ struct State {
     int       plotY = 0, plotH = 0; /* the single plot's band area */
     int       graphTop = 0;         /* first pixel row belonging to the plot */
     int       radio = 0;
+    int       nChans = 1;           /* hailing + the regime's agile channels */
     int       win = 1;              /* index into WINS */
     /* Zoom stack — each level an absolute [t0,t1] device-time span. */
     Zoom      zoom[ZOOM_MAX];
@@ -271,30 +291,50 @@ void rebuildCb(const char* key, const char* val) {
     r = Rec{};
     r.t = (uint32_t)strtoul(dot + 1, nullptr, 10);
     if (val[0] == 'r') {
-        int rssi, snr, dur, bytes, type = 0;
-        if (sscanf(val + 2, "%d|%d|%d|%d|%d", &rssi, &snr, &dur, &bytes, &type) < 4) return;
+        int rssi, snr, dur, bytes, type = 0, ch = 0;
+        if (sscanf(val + 2, "%d|%d|%d|%d|%d|%d", &rssi, &snr, &dur, &bytes, &type, &ch) < 4) return;
         r.dir = 0; r.rssi = rssi; r.dur = (uint32_t)dur; r.bytes = (uint32_t)bytes;
-        r.txp = 0; r.type = (uint8_t)type;
+        r.txp = 0; r.type = (uint8_t)type; r.ch = (uint8_t)ch;
     } else if (val[0] == 't') {
-        int txp, dur, bytes, type = 0, wait = 0;
-        if (sscanf(val + 2, "%d|%d|%d|%d|%d", &txp, &dur, &bytes, &type, &wait) < 3) return;
+        int txp, dur, bytes, type = 0, wait = 0, ch = 0;
+        if (sscanf(val + 2, "%d|%d|%d|%d|%d|%d", &txp, &dur, &bytes, &type, &wait, &ch) < 3) return;
         r.dir = 1; r.txp = txp; r.dur = (uint32_t)dur; r.bytes = (uint32_t)bytes;
         r.wait = (uint32_t)wait;
-        r.rssi = 0; r.type = (uint8_t)type;
+        r.rssi = 0; r.type = (uint8_t)type; r.ch = (uint8_t)ch;
+    } else if (val[0] == 'a') {
+        int ch = 0, dur = 0;
+        if (sscanf(val + 2, "%d|%d", &ch, &dur) < 2) return;
+        r.dir = 2; r.ch = (uint8_t)ch; r.dur = (uint32_t)dur;
     } else return;
     s.n++;
 }
 
+/* How many channels the regime in force puts up, from `lora.<n>.chans` —
+ * "<hail freq>,<bw>|<agile freq>,<bw>|…". Only the count is wanted here; the
+ * frequencies belong to the settings panel. */
+void readChans() {
+    char k[32]; snprintf(k, sizeof k, "lora.%d.chans", s.radio);
+    char v[24 * 12];
+    storageGetStr(k, v, sizeof v, "");
+    int n = v[0] ? 1 : 1;
+    for (const char* p2 = v; *p2; p2++) if (*p2 == '|') n++;
+    s.nChans = n;
+}
+
 void rebuild() {
     s.n = 0;
+    readChans();
     if (!s.recs) return;
     char pfx[32];
     snprintf(pfx, sizeof pfx, "lora.%d.packets.", s.radio);
     storageForEach(pfx, rebuildCb);
 }
 
-void drawGraph(uint32_t now) {
-    int y0 = s.plotY, h = s.plotH;
+/* One lane: the hailing plot at full height, or an agile channel's strip under
+ * it. Every lane spans the same x and the same window, so a column is the same
+ * moment in all of them — which is what makes a stack of them readable at this
+ * size, and why the strips carry no scale of their own. */
+void drawLane(uint32_t now, int y0, int h, uint8_t ch, bool main) {
     drawBands(y0, h);
     if (!now || h < 2) return;
     uint32_t lo, hi;
@@ -305,10 +345,36 @@ void drawGraph(uint32_t now) {
     int plotW = plotWidth();
     if (plotW < 2) return;
     int xmax = GUT_L + plotW - 1;
+
+    /* Where the radio was not on this channel, the lane goes dark. A lane with
+     * nothing in it otherwise answers two questions the same way — nobody
+     * spoke, or we were listening elsewhere — and on a hopping radio the second
+     * is the usual one. Painted first, so traffic and the grid land on top. */
+    {
+        static uint8_t held[LORAMON_LANE_PX];
+        int npx = plotW < LORAMON_LANE_PX ? plotW : LORAMON_LANE_PX;
+        memset(held, 0, (size_t)npx);
+        for (int i = 0; i < s.n; i++) {
+            const Rec& r = s.recs[i];
+            if (r.dir != 2 || r.ch != ch) continue;
+            uint32_t st = r.t, en = r.t + r.dur;
+            if (en < lo || st > hi) continue;
+            uint32_t cs = st > lo ? st - lo : 0;
+            uint32_t ce = (en < hi ? en : hi) - lo;
+            int xa = (int)((uint64_t)cs * plotW / win);
+            int xb = (int)((uint64_t)ce * plotW / win);
+            if (xa < 0) xa = 0;
+            if (xb >= npx) xb = npx - 1;
+            for (int x = xa; x <= xb; x++) held[x] = 1;
+        }
+        for (int x = 0; x < npx; x++)
+            if (!held[x]) vseg(GUT_L + x, y0, bottom, C_BLACK);
+    }
+
     /* Our own air first, so everything else lands on top of it. */
     for (int i = 0; i < s.n; i++) {
         const Rec& r = s.recs[i];
-        if (r.dir != 1) continue;
+        if (r.dir != 1 || r.ch != ch) continue;
         uint32_t st = r.t, en = r.t + r.dur;
         if (en < lo || st > hi) continue;
         uint32_t cs = st > lo ? st - lo : 0;
@@ -329,6 +395,7 @@ void drawGraph(uint32_t now) {
     }
     for (int i = 0; i < s.n; i++) {
         const Rec& r = s.recs[i];
+        if (r.dir == 2 || r.ch != ch) continue;   /* dwells are background */
         uint32_t st = r.t, en = r.t + r.dur;
         if (en < lo || st > hi) continue;
         uint32_t cs = st > lo ? st - lo : 0;
@@ -341,7 +408,10 @@ void drawGraph(uint32_t now) {
         int hp = barHpx(r, h);
         uint16_t col = r.type == PKT_RNODE ? C_RNODE
                      : r.type == PKT_OURS  ? C_OURS : C_RNS;
-        int th = h / 20; if (th < 1) th = 1;  /* line thickness = 5% of band height */
+        /* Never thinner than two pixels: on an agile strip the proportional
+         * term falls below one, and a frame that rounds away is a frame the
+         * graph is lying about. */
+        int th = h / 20; if (th < 2) th = 2;
         int yb = bottom - hp;                 /* horizontal line at the power level */
         int yt = yb - (th - 1); if (yt < y0) yt = y0;
         if (yb > bottom) yb = bottom;
@@ -365,7 +435,8 @@ void drawGraph(uint32_t now) {
         for (int x = xs; x <= xe; x++) vseg(x, yt, yb, col);
     }
 
-    /* The live selection — the axis it picks is time. */
+    /* The live selection — the axis it picks is time. Drawn on every lane: the
+     * stack shares one axis, so the band is the same column throughout. */
     if (s.selActive) {
         uint32_t a = s.selAnchor < s.selCur ? s.selAnchor : s.selCur;
         uint32_t b = s.selAnchor < s.selCur ? s.selCur : s.selAnchor;
@@ -376,6 +447,22 @@ void drawGraph(uint32_t now) {
         vseg(xa, y0, bottom, C_SELEDGE);
         vseg(xb, y0, bottom, C_SELEDGE);
     }
+    (void)main;
+}
+
+/* The hailing plot, then one strip per agile channel of the regime in force. */
+void drawGraph(uint32_t now) {
+    int nAgile = s.nChans > 1 ? s.nChans - 1 : 0;
+    if (nAgile > LORAMON_MAX_LANES) nAgile = LORAMON_MAX_LANES;
+    /* The strips take a fixed slice each and the hailing plot keeps the rest,
+     * with a floor under it: below that the bands stop being readable and a
+     * stack of unreadable lanes is worse than no lanes. */
+    int laneH = nAgile ? LORAMON_LANE_H : 0;
+    while (nAgile && s.plotH - nAgile * laneH < LORAMON_MAIN_MIN_H) nAgile--;
+    int mainH = s.plotH - nAgile * laneH;
+    drawLane(now, s.plotY, mainH, 0, true);
+    for (int i = 0; i < nAgile; i++)
+        drawLane(now, s.plotY + mainH + i * laneH, laneH, (uint8_t)(i + 1), false);
 }
 
 void clearAll() {

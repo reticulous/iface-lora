@@ -1,12 +1,14 @@
 /**
  * supe — SUPE's pure core: regime tables, the modulation ladder, the frame
- * codec and the deadline arithmetic.
+ * codec, the schedule derivation and the deadline arithmetic.
  *
  * SUPE (Spectrum Utilization and Performance Enhancements) moves unicast
- * traffic off the shared LoRa channel onto short private high-rate detours,
- * inside the modem, with the Reticulum daemon unmodified and unaware. The
- * protocol is specified in plans/SUPE.md and that document is authoritative for
- * anything on the air; plans/SUPE-in-reticulous.md maps it onto this straddle.
+ * traffic off the shared LoRa channel onto private meetings at derived times,
+ * channels and sync words, inside the modem, with the Reticulum daemon
+ * unmodified and unaware. One frame on the shared channel (PRIVSYNC) seeds
+ * everything; every meeting's goodbye seeds the next. The protocol is
+ * specified in plans/SUPE.md and that document is authoritative for anything
+ * on the air.
  *
  * **Nothing in this file touches a radio, ESP-IDF or FreeRTOS.** It is plain
  * arithmetic over plain bytes so it can be compiled and tested on a host — see
@@ -14,19 +16,20 @@
  * on-device injection test replays. Keep it that way: a dependency here is a
  * dependency the tests cannot satisfy.
  *
- * The four things it answers:
+ * The five things it answers:
  *
  *   - **What a budget resolves to.** The family-filtered, channel-bound
  *     ladder of SUPE.md §14.3, integer-only, with supe-ladder-vectors.txt in
- *     test/ as the conformance authority — the same index means a different
- *     modulation on a different network, and nothing about the baseline is
- *     ever transmitted.
+ *     test/ as the conformance authority.
  *   - **What a frame looks like.** Encode and decode for every frame, with the
  *     permitted lengths driven by the same tables, so a length outside the
  *     enumerable set is rejected outright (SUPE.md §3).
- *   - **When to give up.** Every §14.7 deadline — the GRANT after a START,
- *     each MANIFEST, a stated train length — from regime constants and a time
- *     on air, so both ends derive the identical number with nothing exchanged.
+ *   - **Where the slots are.** The §7 schedule derivation — offsets, channels
+ *     and sync words from a seed's digests — as pure integer functions both
+ *     ends compute identically.
+ *   - **When to give up.** Every §14.7 deadline from regime constants and a
+ *     time on air, so both ends derive the identical number with nothing
+ *     exchanged.
  *   - **Whether this dialect is still current.** Each regime version carries an
  *     expiry stamped at build time; past it a node neither sends nor accepts
  *     frames naming that regime.
@@ -49,11 +52,13 @@
  * byte of a node that has never heard of SUPE. */
 #define SUPE_TYPE_MIN      0xC0
 #define SUPE_TYPE_MAX      0xDF
-#define SUPE_T_START       0xC2
-#define SUPE_T_ANNOUNCE2   0xC4
-#define SUPE_T_MANIFEST    0xC9
-/* 0xC3 was SUPE_ANNOUNCE1 and 0xC8 was HERE. Both frames are gone; both
- * values stay reserved and are never reassigned. */
+#define SUPE_T_PRIVSYNC    0xC2   /* main channel: seeds a schedule */
+#define SUPE_T_ANNOUNCE2   0xC3   /* main channel: identities + capabilities */
+#define SUPE_T_HAVEDATA    0xC4   /* traffic channel: a meeting opens / answers */
+#define SUPE_T_GIMME       0xC5   /* traffic channel: attention + budget confirmed */
+#define SUPE_T_THATSIT     0xC6   /* traffic channel: the train's power + checksums */
+#define SUPE_T_BYE         0xC7   /* traffic channel: everything accounted for */
+#define SUPE_T_RESEND      0xC8   /* traffic channel: one repair round's bitmask */
 
 /** True for a byte the split framing cannot produce — the receive path's whole
  *  basis for telling a SUPE frame from a packet's first byte. */
@@ -108,9 +113,9 @@ enum SupeFamily : uint8_t {
 /* ─────────────── regimes ───────────────
  *
  * A regime is the complete set of constants two nodes must hold identically in
- * order to meet at all. Everything an index on the wire selects lives here,
+ * order to meet at all. Everything an index or a derivation selects lives here,
  * keyed by regime and version, and none of it may be a setting: two neighbours
- * who configured differently would meet at different frequencies, steps or sync
+ * who configured differently would meet at different frequencies, times or sync
  * words and never hear each other (SUPE.md §3).
  *
  * The hailing channel is the exception and stays interface configuration — that
@@ -121,9 +126,8 @@ enum SupeFamily : uint8_t {
 #define SUPE_REGIME_EU863   1    /* ETSI EN 300 220, 863–870 MHz, nine channels */
 #define SUPE_VERSION        0
 
-/** Channel 0 is the hailing channel in every regime and is flagged never-leave:
- *  no regime may direct a detour onto it. A probe names it when it changes
- *  nothing. */
+/** Channel 0 is the hailing channel in every regime: regime 0's schedules
+ *  always resolve to it, regime 1's never do. */
 #define SUPE_CH_HAIL        0
 #define SUPE_CH_MAX         10   /* hailing channel + the largest regime's agile set */
 
@@ -140,8 +144,8 @@ struct SupeRegime {
     bool     hailBwOnly;         /* the ladder may not change bandwidth */
     /* Ceilings. 0 means the regime states none of its own — regime 0 has no band
      * plan and therefore no regulatory basis to draw one from, and a fabricated
-     * figure would be a limit nobody imposed. What still bounds a transaction
-     * there is the field widths: 5.1 s of duration byte, 1.275 s of length byte. */
+     * figure would be a limit nobody imposed. What still bounds a train there
+     * is the length byte's own reach: 1.275 s. */
     uint32_t trainCeilMs;
     uint32_t txnCeilMs;
     /* Airtime as a budget and a window rather than a percentage — that pair is
@@ -165,7 +169,7 @@ struct SupeRegime {
  *  cannot understand. */
 const SupeRegime* supeRegime(uint8_t regime);
 
-/** The agile channels a regime draws detours from. Index 0 of the returned
+/** The agile channels a regime draws meetings from. Index 0 of the returned
  *  array is channel 1: channel 0 is the hailing channel and is never in a
  *  regime's table, since it takes the operator's frequency and bandwidth. */
 const SupeChan* supeRegimeChans(uint8_t regime, int* count);
@@ -195,13 +199,7 @@ uint32_t supeExpiryUnix(void);
  *  silently disable the protocol, and the node has bigger problems anyway. */
 bool supeExpired(uint32_t nowUnix);
 
-/* ─────────────── what a budget resolves to ───────────────
- *
- * What a budget resolves to in absolute terms is what governs the radio, so
- * the sync word, the header mode and the family limits all follow the
- * *resulting* configuration rather than the index. The ladder itself —
- * membership, ordering, resolution — is further down, with the rest of the
- * revised protocol. */
+/* ─────────────── what a budget resolves to ─────────────── */
 
 struct SupeCfg {
     uint8_t  sf;
@@ -212,14 +210,6 @@ struct SupeCfg {
     int16_t  marginDeci;  /* margin cost in deci-dB against the hailing
                            * configuration */
 };
-
-/* The sync words a detour takes (SUPE.md §14.5): `0x67` sits 40 bins from
- * `0x12` and 24 from LoRaWAN's `0x34`; a budget landing on SF5 takes `0x21`,
- * the best of the nine words SF5's 32 bins admit — `0x42` is out of range
- * there entirely, its leading nibble wanting bin 32 of 32. Which one a grant
- * takes is supeSyncWordFor, below. */
-#define SUPE_SYNC_UNICAST  0x67
-#define SUPE_SYNC_SF5      0x21
 
 /** The demodulator's required signal-to-noise for a spreading factor,
  *  deci-dB — Semtech's figures, 2.5 dB per factor: SF5 −2.5 through SF12
@@ -233,7 +223,7 @@ int16_t supeSensitivityDeci(const SupeCfg* c);
 
 /* The margin a link keeps after paying for a budget. Ten decibels is two step
  * widths of the fastest part of the ladder plus change: enough that ordinary
- * fading does not take a detour out, and cheap because the alternative — the
+ * fading does not take a meeting out, and cheap because the alternative — the
  * budget below — costs 2.5 dB of rate rather than the link. */
 #define SUPE_TARGET_MARGIN_DB  10
 
@@ -242,46 +232,45 @@ int16_t supeSensitivityDeci(const SupeCfg* c);
  * Semtech AN1200.13. The CRC term is a parameter because SUPE's own frames
  * carry none: all a check would buy is the radio rejecting a corrupt frame
  * instead of our own parse rejecting it a moment later, and nothing downstream
- * ever sees these frames. What it costs is a symbol group. The Reticulum
- * packets a train carries keep theirs — same reasoning, different consumer. */
+ * ever sees these frames. What it costs is a symbol group. The LoRa frames a
+ * train carries keep the interface's — same reasoning, different consumer. */
 double supeAirtimeSeconds(int sf, int bw_hz, int cr_denom, int preamble,
                           int payload, bool implicitHeader, bool crc);
 
-/* ─────────────── deadlines ───────────────
+/* ─────────────── timing constants (SUPE.md §14.7) ─────────────── */
+#define SUPE_TURNAROUND_MS   25  /* the longest a node may take to answer */
+#define SUPE_RETUNE_GAP_MS    1  /* the synthesizer, not the software */
+#define SUPE_TRAIN_GAP_MS     2  /* the receiver-flip interval inside a train */
+#define SUPE_GUARD_MS        10  /* slop on every deadline inside a meeting */
+
+/* A slot's own slop, and it is NOT the deadline guard. Inside a meeting the
+ * task is hot — the previous frame's completion is what drives the next step —
+ * so 10 ms covers it. A slot is reached from an idle task: a timer fires, the
+ * task wakes, retunes, senses, builds. Measured on hardware, that path puts a
+ * slot's opening frame 16–20 ms past its nominal moment.
  *
- * One failure path, the same for both sides: go back to the main channel.
- * Every deadline follows from regime constants and a time on air, so both
- * sides know them without exchanging anything; the derived forms live with
- * the rest of the revised protocol below.
+ * The listener's window has to cover that lateness, and it cannot borrow the
+ * cover from the preamble, because the preamble shrinks with the budget: 16.6 ms
+ * at a hailing SF7/125k, 2.1 ms at SF5/500k. A window sized to the preamble is
+ * generous where the schedule is slow and shut before the speaker transmits
+ * where it is fast — which is exactly the wide schedule, and exactly why one
+ * never carried anything.
  *
- * The turnaround is the one term that is not arithmetic, and it is a regime
- * constant rather than a per-device figure precisely because both ends must
- * derive the same number. It is generous because it is free — it appears only
- * inside deadlines, and nothing waits out a turnaround that has already been
- * satisfied. Provisional, pending the measurement SUPE.md §16 asks
- * simulation for. */
-#define SUPE_TURNAROUND_MS   25
-/* Slop on every derived deadline: tick quantisation at each end plus the
- * preamble the receiver must still detect. */
-#define SUPE_GUARD_MS        10
+ * So the window is sized to the software's slop instead: the listener aims to
+ * be listening from SUPE_SLOT_GUARD_MS early (late by its own slop, it is still
+ * listening before the speaker transmits) and stays until the speaker's own
+ * tolerance has run out. The speaker gives up on a slot at SUPE_SLOT_LATE_MS,
+ * which is well inside that tail. */
+#define SUPE_SLOT_GUARD_MS   40  /* the listener's window, each edge */
+#define SUPE_SLOT_LATE_MS    20  /* the speaker's tolerance for its own slot */
 
 /* ─────────────── quantised fields ───────────────
- * The duration byte is 20 ms steps because its range has to reach the
- * transaction ceiling; the length byte is 5 ms steps because its range has to
- * reach the train ceiling. Both encodings round *up*, so a stated duration is
- * never shorter than the thing it describes. */
-#define SUPE_DUR_STEP_MS   20
+ * The length byte is 5 ms steps because its range has to reach the train
+ * ceiling. It rounds *up*, so a stated length is never shorter than the thing
+ * it describes. */
 #define SUPE_LEN_STEP_MS    5
-#define SUPE_DUR_MAX_MS   (255 * SUPE_DUR_STEP_MS)   /* 5.1 s */
 #define SUPE_LEN_MAX_MS   (255 * SUPE_LEN_STEP_MS)   /* 1.275 s */
 
-static inline uint8_t supeEncDur(uint32_t ms) {
-    uint32_t q = (ms + SUPE_DUR_STEP_MS - 1) / SUPE_DUR_STEP_MS;
-    if (q < 1)   q = 1;
-    if (q > 255) q = 255;
-    return (uint8_t)q;
-}
-static inline uint32_t supeDecDur(uint8_t b) { return (uint32_t)b * SUPE_DUR_STEP_MS; }
 static inline uint8_t supeEncLen(uint32_t ms) {
     uint32_t q = (ms + SUPE_LEN_STEP_MS - 1) / SUPE_LEN_STEP_MS;
     if (q < 1)   q = 1;
@@ -290,36 +279,127 @@ static inline uint8_t supeEncLen(uint32_t ms) {
 }
 static inline uint32_t supeDecLen(uint8_t b) { return (uint32_t)b * SUPE_LEN_STEP_MS; }
 
-/* ─────────────── frames ───────────────
+/* ─────────────── the frame checksum (SUPE.md §8) ───────────────
  *
- * Every frame has a length the receiver can enumerate from its regime, version
- * and type alone: one value for most, two for START depending on whether the
- * sender names itself, and a count-derived length for ANNOUNCE2. Nothing is
- * signalled by a flags byte and nothing is negotiated, so anything outside the
- * enumerated set is discarded — the test rejects outright rather than merely
- * suspecting, and it is the last cheap filter before we act on anything. */
+ * One byte per train frame, listed by THATSIT after the fact: the checksum
+ * list IS the sequence, so the frames themselves carry no numbering. CRC-8,
+ * polynomial 0x07, init 0, MSB first, over the frame's on-air bytes.
+ * Provisional per SUPE.md §16 — it cannot change inside a version. */
+uint8_t supeCrc8(const uint8_t* d, size_t n);
+
+/* ─────────────── the sync-word list (SUPE.md §14.5) ───────────────
+ *
+ * Every meeting flies under a derived word; the list is built per spreading
+ * factor from four rules — no zero nibbles (bin 0 is another preamble
+ * upchirp), nibbles inside the SF's bin space (nibble × 8 < 2^SF), a
+ * two-nibble berth in BOTH symbols around every foreign word (0x12, 0x24,
+ * LoRaWAN's 0x34, and the interface's own hailing word), and at SF5 exact
+ * exclusions only, since the berth rule would empty its nine-word space.
+ * Ordered ascending; indexed by the slot's stream byte. */
+#define SUPE_SYNC_WORDS_CAP 226
+
+/** Build the word list for a spreading factor. Returns the count (never 0). */
+int supeSyncWords(uint8_t sf, uint8_t ifaceSync, uint8_t* out, int cap);
+
+/** The word a slot's stream byte selects at a spreading factor: W_sf[s mod N].
+ *  The meeting's frames re-index the same byte against whatever SF is flying,
+ *  so both ends derive the train's word from the slot's byte identically even
+ *  where the budget's SF admits a different list than the slot's. */
+uint8_t supeSyncWordAt(uint8_t sf, uint8_t ifaceSync, uint8_t sByte);
+
+/* ─────────────── the schedule (SUPE.md §7) ───────────────
+ *
+ * A pure function of one frame both ends hold. The caller supplies the two
+ * digests — D0 = SHA-256(seed), D1 = SHA-256(seed ‖ 0x01) — because hashing is
+ * a host capability; everything after that is integer arithmetic:
+ *
+ *   hash   = D0[0..2]                     the 3 bytes HAVEDATA and GIMME quote
+ *   stream = D0[3..31] ‖ D1[0..31]        slot k consumes stream[3k..3k+2]
+ *                                         as j_k, c_k, s_k
+ *   t_0    = turnaround + retune_gap                       (tight)
+ *          = 150 + (j_0 mod 40)                            (wide)
+ *   t_k    = t_(k-1) + 40 + (j_k mod 24)                   (tight)
+ *          = t_(k-1) + min(60 + 30·k, 350) + (j_k mod 40)  (wide)
+ *   chan_k = 1 + (c_k mod nChans); always 0 with nChans 0  (regime 0)
+ *   slots exist while t_k ≤ horizon (400 tight, 3000 wide)
+ *
+ * The transmitter parity is fixed by ROLE and is deliberately not derived:
+ * a disagreed seed under fixed parity means empty slots, which the horizon
+ * already handles; parity from the stream would mean both parties transmitting
+ * at each other with nothing to detect it. */
+#define SUPE_SLOTS_MAX          16
+#define SUPE_TIGHT_HORIZON_MS  400
+#define SUPE_WIDE_HORIZON_MS  3000
+
+/* The seed's end to the first slot. Not the answer turnaround: that one measures
+ * a node already tuned to the channel, holding the exchange in hand, deciding
+ * what to say. This measures a node that has just finished demodulating a frame
+ * and must derive a schedule from it, retune to a channel the frame chose, and
+ * have its receiver open — all before the far end starts speaking.
+ *
+ * It must exceed the SLOWER of the two, because being inside a slot's window is
+ * not the same as hearing it: a listener that opens part-way through a frame
+ * has missed the preamble, and a LoRa receiver with no preamble to lock hears
+ * nothing at all, however strong the signal. Set it too short and the pair only
+ * meets when the speaker happens to be later than the listener — which works
+ * often enough to look correct and fails whenever either side is briefly
+ * busy. */
+#define SUPE_TIGHT_T0_MS      100
+
+/* Own slots a wide schedule may spend unanswered before it is abandoned for the
+ * shared channel. A schedule that meets is freed on the spot, so a live one
+ * that has spoken this often has been ignored every time — the far end derived
+ * a different schedule, or is gone. Sized to be cheaper than the horizon it
+ * replaces and no cheaper than the hail it buys. */
+#define SUPE_SCHED_GIVEUP_SPOKE  2
+
+struct SupeSlotD {
+    uint16_t tMs;      /* offset from the epoch */
+    uint8_t  chan;     /* 0 = hailing frequency (regime 0) */
+    uint8_t  sByte;    /* the stream byte the sync word derives from */
+};
+
+struct SupeSchedD {
+    uint8_t   hash3[3];             /* D0's first three bytes — the wire id */
+    uint8_t   nSlots;
+    SupeSlotD slot[SUPE_SLOTS_MAX];
+};
+
+void supeDeriveSchedule(const uint8_t d0[32], const uint8_t d1[32],
+                        bool wide, uint8_t nChans, SupeSchedD* out);
+
+/* ─────────────── frames (SUPE.md §0.1) ───────────────
+ *
+ * Every frame has a length the receiver can enumerate from its type and from
+ * state both sides already hold: one value for most, two for PRIVSYNC and
+ * GIMME, count-derived for ANNOUNCE2, THATSIT, RESEND and the answering
+ * HAVEDATA. Nothing is signalled by a flags byte and nothing is negotiated, so
+ * anything outside the enumerated set is discarded. */
 
 #define SUPE_TAG_LEN       3     /* first three bytes of a packet's first address */
-#define SUPE_HASH_LEN      3     /* first three bytes of a START's own SHA-256 */
+#define SUPE_HASH_LEN      3     /* first three bytes of a seed's SHA-256 */
 #define SUPE_ID_LEN        4     /* first four bytes of an identity hash */
 #define SUPE_ANN2_BASE     5
 /* One LoRa frame caps at 255 bytes, and a SUPE frame carries no split header,
- * so that is the whole budget. The bundling count follows from it and from
- * nothing else — it is far beyond any real identity count, and if it ever binds
- * the surplus simply waits for the next beat, which is a sender-local choice
- * needing no agreement. */
+ * so that is the whole budget. */
 #define SUPE_MAX_FRAME   255
 #define SUPE_ANN2_MAX    ((SUPE_MAX_FRAME - SUPE_ANN2_BASE) / SUPE_ID_LEN)   /* 62 */
 
-/** Capabilities — two bytes, carried by ANNOUNCE2 and MANIFEST and never by a
- *  START. The adaptive-power flag rides in the top bit of the *maximum power*
- *  byte only: free there because a transmit power never stores a negative
- *  value, where a received level routinely does. Do not generalise the trick. */
+/* One train's frame cap. A train is a RAM commitment on the receiving side
+ * (SUPE.md §8): delivery is whole and in sequence at the close, so this bounds
+ * the buffer as well as the THATSIT and the bitmask. */
+#define SUPE_TRAIN_MAX   12
+#define SUPE_MASK_MAX    ((SUPE_TRAIN_MAX + 7) / 8)
+
+static inline uint8_t supeMaskLen(uint8_t count) { return (uint8_t)((count + 7) / 8); }
+
+/** Capabilities — two bytes, carried by ANNOUNCE2 only. The top bit of the
+ *  maximum-power byte is free — a transmit power never stores a negative
+ *  value — and currently unassigned; it must never be spent on a level. */
 struct SupeCaps {
     uint8_t fam;
     uint8_t topStep;
     int8_t  maxPwrDbm;
-    bool    adaptive;
 };
 
 struct SupeAnn2 {
@@ -330,86 +410,112 @@ struct SupeAnn2 {
     uint8_t  ids[SUPE_ANN2_MAX][SUPE_ID_LEN];
 };
 
-/* Encoders return the byte count written, or 0 if the frame cannot be built
- * (a count past the bundling cap, a buffer too small). Decoders return false on
- * any length, range or type mismatch and leave `out` untouched. */
-size_t supeEncAnn2(uint8_t* out, size_t cap, const SupeAnn2* a);
-bool   supeDecAnn2(const uint8_t* f, size_t len, SupeAnn2* out);
-
-/* ═══════════════ the wire protocol ═══════════════
- *
- * The peer chooses the channel and the budget (SUPE_GRANT, 0xC5) and declares
- * with the GRANT's reverse flag whether a reverse MANIFEST will exist at all;
- * the START carries a byte load instead of a duration; a MANIFEST precedes
- * each train that exists, and nothing is waited for anywhere when things go
- * right. The `2` suffixes on the START and MANIFEST types name the current
- * layouts against earlier ones that shared their type bytes. */
-
-#define SUPE_T_GRANT       0xC5
-/* 0xC8 was HERE. The revised protocol's answer (SUPE_GRANT) lives on the main
- * channel; the value is burned and never reassigned. */
-
-#define SUPE_START2_LEN     7
-#define SUPE_START2_ID_LEN 10
-#define SUPE_GRANT_LEN     10
-#define SUPE_MANIFEST2_LEN 11
-
-/* ─────────────── the load (SUPE.md §6) ───────────────
- *
- * Stated in bytes, not milliseconds: the requester does not know the
- * modulation — the peer is about to choose it. What it counts is
- * `ceil( Σ(bytes + 16) / 32 )` over the packets queued for the peer,
- * saturating at 255 and therefore reaching 8160 bytes. The sixteen bytes
- * charged per packet stand in for its preamble and header — a figure both ends
- * must charge identically or they will size the same queue differently. */
-#define SUPE_LOAD_PKT_OVERHEAD 16
-#define SUPE_LOAD_UNIT         32
-
-/** Encode a load. `adjustedBytes` is Σ(bytes + 16) over the queued packets. */
-static inline uint8_t supeEncLoad(uint32_t adjustedBytes) {
-    uint32_t u = (adjustedBytes + SUPE_LOAD_UNIT - 1) / SUPE_LOAD_UNIT;
-    return (uint8_t)(u > 255 ? 255 : u);
-}
-static inline uint32_t supeDecLoadBytes(uint8_t units) {
-    return (uint32_t)units * SUPE_LOAD_UNIT;
-}
-
-/** Approximate time on air of a load at a resolved configuration, for the
- *  duration the GRANT announces. The per-packet overhead is already folded
- *  into the load's bytes, so the whole thing is billed at the configuration's
- *  byte rate: data bits per symbol are `(SF − 2·DE) · 4 / cr_denom`. Integer
- *  arithmetic; rounds up. */
-uint32_t supeLoadAirtimeMs(uint8_t loadUnits, const SupeCfg* c, int crDenom);
-
-/* ─────────────── refusal (SUPE.md §6, §16) ───────────────
- *
- * Budget 15 in a GRANT means refused, and the channel nibble then carries the
- * reason. The spec leaves the reason set open; these five are this
- * implementation's, chosen so each maps onto a distinct backoff. */
-#define SUPE_BUDGET_REFUSED 15
-enum SupeRefusal : uint8_t {
-    SUPE_REFUSE_BUSY     = 0,   /* busy this second — retry soon */
-    SUPE_REFUSE_NO_QUIET = 1,   /* no channel currently quiet — retry after a beat */
-    SUPE_REFUSE_AIRTIME  = 2,   /* out of airtime on every channel — back off long */
-    SUPE_REFUSE_REGIME   = 3,   /* the regime named is not one this node runs */
-    SUPE_REFUSE_CEILING  = 4,   /* the ceiling asked for is beyond this node */
+struct SupePrivsync {
+    uint8_t regime, version;
+    uint8_t tag[SUPE_TAG_LEN];
+    int8_t  pwrDbm;                     /* what this frame went out at */
+    uint8_t salt;                       /* random — the freshness of the seed.
+                                         * Without it two identical requests
+                                         * hash identically and derive the SAME
+                                         * schedule: the same channels in the
+                                         * same order, every time, and the
+                                         * derivation's diversity is void */
+    bool    haveIdent;                  /* implicit in the frame length */
+    uint8_t ident[SUPE_TAG_LEN];
 };
 
-/* ─────────────── the ladder, revised (SUPE.md §14.3) ───────────────
+struct SupeHaveData {
+    uint8_t hash[SUPE_HASH_LEN];        /* the schedule this meeting belongs to */
+    int8_t  pwrDbm;                     /* this side's meeting power, until its
+                                         * THATSIT states another */
+    uint8_t budget;                     /* opening: the proposed ceiling;
+                                         * answering: the confirmed budget */
+    uint8_t count;                      /* LoRa frames in the coming train */
+    uint8_t lenByte;                    /* the train's airtime + flip gaps */
+    bool    answering;                  /* implicit in the frame length */
+    int16_t trainRssi;                  /* answering: the received train's worst
+                                         * frame — what the power must clear */
+    int8_t  trainSnrQ;
+    uint8_t maskLen;                    /* answering: over the peer's train */
+    uint8_t mask[SUPE_MASK_MAX];        /* bit i set: frame i is missing */
+};
+
+struct SupeGimme {
+    uint8_t hash[SUPE_HASH_LEN];
+    int8_t  pwrDbm;
+    uint8_t budget;                     /* the receiver's choice, ≤ the ceiling */
+    bool    havePsHeard;                /* tight schedule: how PRIVSYNC landed */
+    int16_t psRssi;
+    int8_t  psSnrQ;
+    int16_t hdRssi;                     /* how the HAVEDATA just landed */
+    int8_t  hdSnrQ;
+};
+
+struct SupeThatsit {
+    int8_t  pwrDbm;                     /* what the train it closes went out at */
+    uint8_t salt;                       /* random — this goodbye's freshness, and
+                                         * the same requirement PRIVSYNC's salt
+                                         * meets. A one-frame train's THATSIT is
+                                         * a type, a power that rarely moves and
+                                         * one checksum: a few hundred distinct
+                                         * frames, so two ordinary meetings close
+                                         * identically and seed the SAME wide
+                                         * schedule — at two different epochs,
+                                         * with two different roles, which is
+                                         * worse than a collision. Both ends
+                                         * derive from the frame, so one byte
+                                         * chosen here is shared by both */
+    uint8_t count;                      /* implicit in the frame length */
+    uint8_t csum[SUPE_TRAIN_MAX];
+};
+
+struct SupeResendF {
+    uint8_t maskLen;                    /* caller-known: ceil(peer count / 8) */
+    uint8_t mask[SUPE_MASK_MAX];
+};
+
+#define SUPE_PRIVSYNC_LEN      7
+#define SUPE_PRIVSYNC_ID_LEN  10
+#define SUPE_HAVEDATA_LEN      8
+#define SUPE_HAVEDATA_ANS_BASE 10       /* + maskLen */
+#define SUPE_GIMME_LEN        10
+#define SUPE_GIMME_WIDE_LEN    8
+#define SUPE_THATSIT_BASE      3        /* + count */
+#define SUPE_BYE_LEN           1
+#define SUPE_RESEND_BASE       1        /* + maskLen */
+
+/* Encoders return the byte count written, or 0 if the frame cannot be built
+ * (a count past a cap, a buffer too small). Decoders return false on any
+ * length, range or type mismatch and leave `out` untouched. Where a frame's
+ * length depends on state both sides hold — the peer train's count for the
+ * answering HAVEDATA and for RESEND — the decoder takes it as an argument. */
+size_t supeEncAnn2(uint8_t* out, size_t cap, const SupeAnn2* a);
+bool   supeDecAnn2(const uint8_t* f, size_t len, SupeAnn2* out);
+size_t supeEncPrivsync(uint8_t* out, size_t cap, const SupePrivsync* p);
+bool   supeDecPrivsync(const uint8_t* f, size_t len, SupePrivsync* out);
+size_t supeEncHaveData(uint8_t* out, size_t cap, const SupeHaveData* h);
+bool   supeDecHaveData(const uint8_t* f, size_t len, uint8_t peerCount,
+                       SupeHaveData* out);
+size_t supeEncGimme(uint8_t* out, size_t cap, const SupeGimme* g);
+bool   supeDecGimme(const uint8_t* f, size_t len, SupeGimme* out);
+size_t supeEncThatsit(uint8_t* out, size_t cap, const SupeThatsit* t);
+bool   supeDecThatsit(const uint8_t* f, size_t len, SupeThatsit* out);
+size_t supeEncResend(uint8_t* out, size_t cap, const SupeResendF* m);
+bool   supeDecResend(const uint8_t* f, size_t len, uint8_t peerCount,
+                     SupeResendF* out);
+
+/* ─────────────── the ladder (SUPE.md §14.3) ───────────────
  *
  * Membership is family-filtered and channel-bound, so the *index space itself*
- * depends on both families and on the named channel's maximum bandwidth — all
- * of which both ends hold (family from the START and from the peer's
- * announcement, channel from the GRANT's own byte). Ordering is the integer
- * key `(bw × sf) >> sf` ascending, ties toward the narrower bandwidth then the
- * higher spreading factor. Index 0 is always the hailing configuration.
+ * depends on both families and on the slot channel's maximum bandwidth — all
+ * of which both ends hold. Ordering is the integer key `(bw × sf) >> sf`
+ * ascending, ties toward the narrower bandwidth then the higher spreading
+ * factor. Index 0 is always the hailing configuration.
  *
  * Conformance is `supe-ladder-vectors.txt` (test/), generated over the full
  * §14.3.4 cross-product; the file is the authority where it and a reading of
  * the prose disagree. */
 
-/* The budget nibble reaches 14 (15 is the refusal), so entries past index 14
- * are unaddressable and the ladder is truncated there. */
 #define SUPE_LADDER_MAX_ENTRIES 15
 
 struct SupeLadderEntry {
@@ -431,110 +537,5 @@ int supeLadder(uint8_t regime, uint8_t version,
 bool supeResolveBudget(uint8_t regime, uint8_t version,
                        uint8_t hailSf, uint32_t hailBwHz, uint32_t chanMaxBwHz,
                        uint8_t famA, uint8_t famB, uint8_t budget, SupeCfg* out);
-
-/** The sync word a granted (channel, budget) takes (SUPE.md §14.5): regime 0's
- *  budget 0 is the hailing configuration on the hailing channel and keeps the
- *  interface's word; every other grant is a detour — 0x67, or 0x21 at SF5 —
- *  even at budget 0 on a regime-1 channel, where the frequency moved. */
-uint8_t supeSyncWordFor(uint8_t regime, const SupeCfg* c, uint8_t budget,
-                        uint8_t ifaceSync);
-
-/* ─────────────── deadlines, revised (SUPE.md §14.7) ───────────────
- *
- * Two constants and a time on air; all derived, none transmitted.
- *
- *   waiting for GRANT      armed at end of START     turnaround + guard, then watch
- *                          — two stages. The first expires when the GRANT must
- *                          have BEGUN, and asks the receiver whether a frame is
- *                          arriving. Something on the air is the answer being
- *                          delivered, so the second stage waits it out
- *                          (toa(GRANT, hailing) + guard). Nothing on the air at
- *                          the moment the peer should have been transmitting is
- *                          silence established half a frame earlier than waiting
- *                          the airtime out would establish it, and against
- *                          evidence rather than against an estimate.
- *   first MANIFEST         armed at end of GRANT     retune + turnaround + toa(MANIFEST, budget) + guard
- *   a train                armed at its MANIFEST     the stated length + guard
- *   reverse MANIFEST       armed at end of own train turnaround + toa(MANIFEST, budget) + guard
- *                          — armed only when the GRANT's reverse flag declared
- *                          one; otherwise the requester's last frame ends the
- *                          transaction and nothing is armed at all
- */
-#define SUPE_RETUNE_GAP_MS  1    /* the synthesizer, not the software (§14.7) */
-
-/* When the GRANT must have started: the peer's turnaround and the slop. No time
- * on air in it — that is the point, since what it gates is a look at the
- * receiver rather than a decision about a frame. */
-static inline uint32_t supeGrantStartDeadlineMs(void) {
-    return SUPE_TURNAROUND_MS + SUPE_GUARD_MS;
-}
-/* And when a GRANT already on the air must have finished. */
-uint32_t supeGrantDeadlineMs(uint8_t hailSf, uint32_t hailBwHz,
-                             int crDenom, int preamble);
-uint32_t supeManifestFirstDeadlineMs(const SupeCfg* c, int crDenom, int preamble);
-uint32_t supeManifestReverseDeadlineMs(const SupeCfg* c, int crDenom, int preamble);
-static inline uint32_t supeLenDeadlineMs(uint8_t lenByte) {
-    return supeDecLen(lenByte) + SUPE_GUARD_MS;
-}
-
-/* ─────────────── revised frames (SUPE.md §0.1) ─────────────── */
-
-struct SupeStart2 {
-    uint8_t regime, version;
-    uint8_t tag[SUPE_TAG_LEN];
-    uint8_t fam;                        /* this node's radio family (§14.6) */
-    uint8_t ceiling;                    /* highest budget it will accept */
-    uint8_t load;                       /* 32-byte units, supeEncLoad */
-    bool    haveIdent;                  /* implicit in the frame length */
-    uint8_t ident[SUPE_TAG_LEN];
-};
-
-struct SupeGrant {
-    uint8_t regime, version;            /* the DETOUR's — may be lower than the
-                                         * START's (§6), never higher */
-    uint8_t chan;                       /* refusal reason when budget is 15 */
-    uint8_t budget;
-    uint8_t durByte;                    /* whole transaction, 20 ms steps */
-    bool    reverse;                    /* the answerer has traffic queued for
-                                         * the requester: a reverse MANIFEST
-                                         * will follow the requester's train.
-                                         * Clear means both sides go home the
-                                         * moment the train is done — no close
-                                         * frame, nothing waited on. Rides the
-                                         * power byte's top bit, free there
-                                         * because a transmit power never
-                                         * stores a negative value (the same
-                                         * bit the capabilities byte uses). */
-    int8_t  pwrDbm;                     /* what this frame went out at */
-    int16_t rssiDbm;                    /* what the START was heard at */
-    int8_t  snrQ;                       /* … in quarter-dB */
-    uint8_t hash[SUPE_HASH_LEN];        /* SHA-256 prefix of the START verbatim */
-};
-
-static inline bool supeGrantRefused(const SupeGrant* g) {
-    return g->budget == SUPE_BUDGET_REFUSED;
-}
-
-struct SupeManifest2 {
-    int8_t   pwrDbm;                    /* this train's power */
-    int16_t  rssiDbm;                   /* the peer's last frame as heard */
-    int8_t   snrQ;
-    SupeCaps caps;                      /* the sender's, unconditionally */
-    uint8_t  count;                     /* 0 is meaningful (§8) */
-    uint8_t  lenByte;                   /* the train's airtime plus its flip
-                                         * gaps, 5 ms steps; 0 with count 0 */
-    uint8_t  hash[SUPE_HASH_LEN];       /* the GRANT's, returned unchanged */
-};
-
-/** The revised length rule: one length for GRANT and MANIFEST, two for START,
- *  count-derived for ANNOUNCE2. */
-bool supeLenOk2(uint8_t type, uint8_t regime, uint8_t version, size_t len);
-
-size_t supeEncStart2(uint8_t* out, size_t cap, const SupeStart2* s);
-bool   supeDecStart2(const uint8_t* f, size_t len, SupeStart2* out);
-size_t supeEncGrant(uint8_t* out, size_t cap, const SupeGrant* g);
-bool   supeDecGrant(const uint8_t* f, size_t len, SupeGrant* out);
-size_t supeEncManifest2(uint8_t* out, size_t cap, const SupeManifest2* m);
-bool   supeDecManifest2(const uint8_t* f, size_t len, SupeManifest2* out);
 
 #endif /* IFACE_LORA_SUPE_H */

@@ -31,12 +31,24 @@ struct LoraMonState {
     TickType_t rssiNext;             /* tick the next channel-RSSI sample is due */
     uint32_t   rssiDropped;          /* samples lost to a full interface queue */
     uint32_t   monDropped;           /* frame records lost to a full interface queue */
+    uint32_t   dwellSince;           /* when the radio arrived on its current
+                                      * channel; 0 before the first retune */
+    /* The dwell node currently being extended, so a stay on one channel is one
+     * growing record rather than one node per beat. Interface task only, like
+     * the FIFO beside it. */
+    uint32_t   dwellKeyMs;           /* 0 = nothing to extend */
+    uint32_t   dwellEndMs;
+    uint16_t   dwellDur;
+    uint8_t    dwellCh;
 };
 
 /* ─────────────── lora_mon: telemetry ─────────────── */
 void loraMonPush(LoraRadio* r, uint8_t dir, uint32_t t_ms, uint16_t dur_ms,
                  uint16_t bytes, int16_t rssi, int16_t snr10, int8_t txp,
                  uint8_t type, uint16_t wait_ms, uint16_t own_ms);
+/* One listening span closed off: where the radio was and for how long. Called
+ * on every retune and on the maintenance beat — see the note at the record. */
+void loraMonDwell(LoraRadio* r, uint32_t now);
 void publishStats(LoraRadio* r);
 void publishChannels(LoraRadio* r);
 void publishState(LoraRadio* r, const char* state);

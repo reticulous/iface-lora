@@ -48,6 +48,15 @@ struct NeiDest {                    /* one destination hash in a node's cluster 
     uint32_t lastMs;
 };
 
+/* Where an opening power came from, best evidence first. The order is the
+ * precedence the controller resolves in, so it compares. */
+enum ApSource : uint8_t {
+    AP_SRC_NONE = 0,        /* nothing recent enough — the configured tx_power */
+    AP_SRC_EST,             /* reciprocity against an ASSUMED peer power */
+    AP_SRC_PAIR,            /* reciprocity against a STATED peer power */
+    AP_SRC_REPORT,          /* the peer stated the level our own frame landed at */
+};
+
 struct Neighbor {
     bool     used;
     bool     isUs;                  /* built from our own tx announces */
@@ -80,11 +89,11 @@ struct Neighbor {
     uint8_t  advHashes;
     bool     roaming;
     bool     ourProto;              /* has spoken our air protocol to us */
-    /* Adaptive TX power: the single power every frame to this node goes out at,
-     * and where that number came from. Settled once and kept (see AP_ below). */
-    bool     haveApPwr;
+    /* Adaptive TX power, as last resolved: what `lora <n>` prints, and nothing
+     * else. The number is derived per frame at the configuration the frame is
+     * about to fly at (lora_power.cpp), so nothing may read it back as state. */
     int8_t   apPwr;
-    bool     apFromEst;             /* derived from reciprocity, not measured */
+    ApSource apSrc;
 
 #if !defined(CONFIG_LORA_NO_SUPE)
     /* ── SUPE ──
@@ -100,14 +109,31 @@ struct Neighbor {
     /* Path loss, never a bare level (SUPE.md §10). Every reading is a pair: a
      * level measured here, and the transmit power the other side states for it
      * one frame later. One pair per configuration — the hailing one, which an
-     * ANNOUNCE2 alone supplies, and the step last used. */
+     * ANNOUNCE2 alone supplies, and the step last used.
+     *
+     * A pair measures THEM→US. The difference between its two numbers is the
+     * path loss, which is one property of the link whatever configuration read
+     * it, so either pair answers for either direction; what a configuration
+     * changes is the floor that loss has to clear, and that the power
+     * controller adds itself. The two are kept apart because the step chooser
+     * wants to know which is which, and because the fresher of them wins. */
     bool     havePair;
     int16_t  pairRssi;
     int8_t   pairTxp;
+    uint32_t pairMs;
     bool     haveStepPair;
     int16_t  stepRssi;
     int8_t   stepTxp;
     uint8_t  stepPairStep;
+    uint32_t stepPairMs;
+    /* The peer's own account of what OUR frame landed at, from the MANIFEST
+     * that closes a detour: the level it read, and the power we sent at. The
+     * only measurement of the us→them direction that exists — everything else
+     * is reciprocal — so it outranks every pair. */
+    bool     haveApRpt;
+    int16_t  apRptRssi;
+    int8_t   apRptTxp;
+    uint32_t apRptMs;
     /* Absence is a provisional verdict, not a finding: it expires, and it is
      * suppressed outright while an overheard START says the node is merely
      * busy. The counter decays so a silent peer is retried occasionally rather
@@ -118,11 +144,19 @@ struct Neighbor {
     uint32_t backoffUntilMs;        /* a refusal said how long not to ask */
     bool     detoured;              /* a detour to it has been answered at least
                                      * once — what lifts the first-offer cap */
-    /* Adaptive power over SUPE (§15). Power is derived, not stored:
-     * clamp(path loss + step margin + offset, floor, maximum). The offset is
-     * what the loop learns and measurement cannot reach — the far end's noise
-     * floor, antenna and front-end differences. */
+    /* The ratchet (§15): dB of trim below a MEASURED need. It moves one dB per
+     * AP_MIN_SAMPLES clean exchanges and returns to zero on a miss, where the
+     * floor takes over. It is what the loop learns and measurement cannot
+     * reach: the far end's noise floor, antenna and front-end differences. */
     int8_t   apOffsetDb;
+    /* The EST tier's own walk, and the frames heard toward its next dB. It is
+     * separate from the ratchet because the two are paid for in different
+     * currency: the ratchet spends clean exchanges, which a peer that does not
+     * speak our air protocol almost never provides, while this spends frames
+     * heard from that peer — which is the same evidence the estimate itself is
+     * built from, and the only evidence such a peer ever gives us. */
+    int8_t   apEstWalkDb;
+    uint8_t  apEstHeard;
     bool     haveApFloor;
     int8_t   apFloorDbm;
     uint32_t apFloorDecayMs;
@@ -259,6 +293,7 @@ void      peersExpire(LoraRadio* r, uint32_t now);
 Neighbor* peersWalk(NeiState* st, int want, PeersVisitFn fn, void* ud);
 bool      peersNodeFirst4(const Neighbor* e, uint8_t out[4]);
 bool      peersEstimateCliff10(const LoraRadio* r, const Neighbor* e,
-                             uint32_t now, int* cliff10, uint32_t* samples);
+                             uint32_t now, int* cliff10, uint32_t* samples,
+                             uint32_t* buckets);
 void      peersInit(LoraRadio* r);
 void      peersAbandonPends(LoraRadio* r);

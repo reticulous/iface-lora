@@ -55,15 +55,9 @@ static void golden(const char* name, const uint8_t* p, size_t n) {
     g_golden.push_back({ name, hex(p, n) });
 }
 
-/* The ladder itself is covered by testLadder2 below and, authoritatively, by
- * supe-ladder-vectors.txt over the full §14.3.4 cross-product. */
+/* ─────────────── quantised fields, levels ─────────────── */
 
 static void testQuantisation(void) {
-    eqi(supeEncDur(0), 1, "a zero duration still claims one step");
-    eqi(supeEncDur(20), 1, "20 ms is one duration step");
-    eqi(supeEncDur(21), 2, "the duration encoding rounds up");
-    eqi((long)supeDecDur(255), SUPE_DUR_MAX_MS, "the duration byte reaches 5.1 s");
-    eqi(supeEncDur(999999), 255, "a duration past the ceiling clamps");
     eqi(supeEncLen(5), 1, "5 ms is one length step");
     eqi(supeEncLen(6), 2, "the length encoding rounds up");
     eqi((long)supeDecLen(255), SUPE_LEN_MAX_MS, "the length byte reaches 1.275 s");
@@ -71,9 +65,6 @@ static void testQuantisation(void) {
     ok(supeDecLen(supeEncLen(supeRegime(SUPE_REGIME_EU863)->trainCeilMs))
            >= supeRegime(SUPE_REGIME_EU863)->trainCeilMs,
        "the length byte reaches regime 1's train ceiling");
-    ok(supeDecDur(supeEncDur(supeRegime(SUPE_REGIME_EU863)->txnCeilMs))
-           >= supeRegime(SUPE_REGIME_EU863)->txnCeilMs,
-       "the duration byte reaches regime 1's transaction ceiling");
 }
 
 static void testLevels(void) {
@@ -82,10 +73,6 @@ static void testLevels(void) {
     eqi(supeDecLevel(supeEncLevel(-192)), -192, "the bottom of the range round-trips");
     eqi(supeDecLevel(supeEncLevel(63)), 63, "the top of the range round-trips");
     eqi(supeDecLevel(supeEncLevel(-200)), -192, "below the range clamps");
-    /* The adaptive flag rides in the top bit of the maximum-power byte, which is
-     * free there because a transmit power never stores a negative value. */
-    ok((supeEncLevel(22) & 0x80) == 0, "a transmit power leaves the top bit free");
-    ok((supeEncLevel(-130) & 0x80) != 0, "a received level does not — hence the rule");
     eqi(supeDecSnr10(supeEncSnrQ(75)), 75, "7.5 dB of SNR round-trips");
     eqi(supeDecSnr10(supeEncSnrQ(-200)), -200, "−20 dB of SNR round-trips");
 }
@@ -99,13 +86,19 @@ static void testTypeBytes(void) {
     ok(supeIsFramingByte(0xC0) && supeIsFramingByte(0xC1), "0xC0/0xC1 are framing bytes");
     ok(supeIsFramingByte(0xD0) && supeIsFramingByte(0xD1), "0xD0/0xD1 are framing bytes");
     ok(!supeIsTypeByte(0xC0) && !supeIsTypeByte(0xD1), "framing bytes are not type bytes");
-    ok(supeIsTypeByte(SUPE_T_START) && supeIsTypeByte(SUPE_T_ANNOUNCE2) &&
-       supeIsTypeByte(SUPE_T_GRANT) && supeIsTypeByte(SUPE_T_MANIFEST),
+    ok(supeIsTypeByte(SUPE_T_PRIVSYNC) && supeIsTypeByte(SUPE_T_ANNOUNCE2) &&
+       supeIsTypeByte(SUPE_T_HAVEDATA) && supeIsTypeByte(SUPE_T_GIMME) &&
+       supeIsTypeByte(SUPE_T_THATSIT) && supeIsTypeByte(SUPE_T_BYE) &&
+       supeIsTypeByte(SUPE_T_RESEND),
        "every assigned type is a type byte");
     ok(!supeIsTypeByte(0xBF) && !supeIsTypeByte(0xE0), "the range is 0xC0–0xDF");
     for (int b = 0; b <= 0xFF; b++)
         if (supeIsTypeByte((uint8_t)b))
             ok((b & 0x0F) > 1, "no type byte is reachable by the framing");
+    /* Values assigned densely from 0xC2; nothing is held out beyond what the
+     * framing rule excludes. */
+    eqi(SUPE_T_PRIVSYNC, 0xC2, "PRIVSYNC is 0xC2");
+    eqi(SUPE_T_RESEND, 0xC8, "RESEND is 0xC8, the last assigned value");
 }
 
 static void testAnn2Codec(void) {
@@ -115,7 +108,6 @@ static void testAnn2Codec(void) {
     a.caps.fam = SUPE_FAM_SX126X;
     a.caps.topStep = 2;
     a.caps.maxPwrDbm = 22;
-    a.caps.adaptive = true;
     a.pwrDbm = 14;
     a.count = 2;
     uint8_t ids[2][4] = { { 0x6b, 0x87, 0xeb, 0x8b }, { 0x4e, 0x05, 0x21, 0x01 } };
@@ -123,40 +115,262 @@ static void testAnn2Codec(void) {
 
     uint8_t f[SUPE_MAX_FRAME];
     size_t n = supeEncAnn2(f, sizeof f, &a);
-    eqi((long)n, SUPE_ANN2_BASE + 2 * SUPE_ID_LEN, "ANNOUNCE2 is 5 + 4*count");
+    eqi((long)n, SUPE_ANN2_BASE + 2 * SUPE_ID_LEN, "two identities encode to 13 bytes");
+    eqi(f[0], SUPE_T_ANNOUNCE2, "the type byte is 0xC3");
     golden("announce2.regime0.2ids", f, n);
 
     SupeAnn2 d = {};
-    ok(supeDecAnn2(f, n, &d), "ANNOUNCE2 decodes");
-    eqi(d.count, 2, "the count is implicit in the length");
-    eqi(d.caps.fam, SUPE_FAM_SX126X, "family round-trips");
-    eqi(d.caps.topStep, 2, "the ceiling round-trips");
+    ok(supeDecAnn2(f, n, &d), "the announcement decodes");
+    eqi(d.count, 2, "both identities survive");
+    ok(memcmp(d.ids[0], ids[0], 4) == 0 && memcmp(d.ids[1], ids[1], 4) == 0,
+       "byte for byte");
     eqi(d.caps.maxPwrDbm, 22, "maximum power round-trips");
-    ok(d.caps.adaptive, "the adaptive flag round-trips");
     eqi(d.pwrDbm, 14, "the frame's own power round-trips");
-    ok(memcmp(d.ids[1], ids[1], 4) == 0, "the second identity round-trips");
+    ok(!supeDecAnn2(f, n - 1, &d), "a truncated announcement is discarded");
+    ok(!supeDecAnn2(f, n + 1, &d), "a padded one too");
 
-    /* A single identity, which is what most nodes send. */
     a.count = 1;
-    a.caps.adaptive = false;
     n = supeEncAnn2(f, sizeof f, &a);
     golden("announce2.regime0.1id", f, n);
-    ok(supeDecAnn2(f, n, &d) && d.count == 1 && !d.caps.adaptive,
-       "a one-identity ANNOUNCE2 round-trips");
+}
 
-    /* The bundling cap follows from the single-frame maximum and nothing else. */
-    a.count = SUPE_ANN2_MAX;
-    n = supeEncAnn2(f, sizeof f, &a);
-    ok(n > 0 && n <= SUPE_MAX_FRAME, "a full bundle still fits one frame");
-    a.count = SUPE_ANN2_MAX + 1;
-    eqi((long)supeEncAnn2(f, sizeof f, &a), 0, "past the cap nothing is built");
-    a.count = 0;
-    eqi((long)supeEncAnn2(f, sizeof f, &a), 0, "an empty announcement is not a frame");
+static void testPrivsyncCodec(void) {
+    SupePrivsync p = {};
+    p.regime = SUPE_REGIME_EU863;
+    p.version = 0;
+    uint8_t tag[3] = { 0xd1, 0x0d, 0x51 };
+    memcpy(p.tag, tag, 3);
+    p.pwrDbm = -9;
+    uint8_t f[SUPE_PRIVSYNC_ID_LEN];
+    size_t n = supeEncPrivsync(f, sizeof f, &p);
+    eqi((long)n, SUPE_PRIVSYNC_LEN, "the anonymous form is seven bytes");
+    eqi(f[0], SUPE_T_PRIVSYNC, "the type byte is 0xC2");
+    golden("privsync.regime1.anon", f, n);
+    SupePrivsync d = {};
+    ok(supeDecPrivsync(f, n, &d), "it decodes");
+    ok(!d.haveIdent, "…as anonymous");
+    eqi(d.pwrDbm, -9, "the stated power round-trips — the seed is a measurement");
+    ok(memcmp(d.tag, tag, 3) == 0, "the tag round-trips");
+    eqi(d.salt, p.salt, "the salt round-trips — every seed is unique");
 
-    /* Lengths that are not 5 + 4*count are discarded. */
-    ok(!supeDecAnn2(f, SUPE_ANN2_BASE, &d), "a countless ANNOUNCE2 is discarded");
-    uint8_t stub[8] = { SUPE_T_ANNOUNCE2, 0x00, 0, 0, 0, 0, 0, 0 };
-    ok(!supeDecAnn2(stub, 8, &d), "a part-identity ANNOUNCE2 is discarded");
+    p.haveIdent = true;
+    uint8_t id[3] = { 0xa1, 0xa2, 0xa3 };
+    memcpy(p.ident, id, 3);
+    n = supeEncPrivsync(f, sizeof f, &p);
+    eqi((long)n, SUPE_PRIVSYNC_ID_LEN, "the named form is ten bytes");
+    golden("privsync.regime1.ident", f, n);
+    ok(supeDecPrivsync(f, n, &d) && d.haveIdent && memcmp(d.ident, id, 3) == 0,
+       "the sender identity rides the frame length");
+    ok(!supeDecPrivsync(f, 8, &d), "a length outside the enumerated set is discarded");
+    f[1] = 0x9F;                       /* regime 9: not one this build holds */
+    ok(!supeDecPrivsync(f, n, &d), "an unknown regime is discarded");
+}
+
+static void testHaveDataCodec(void) {
+    SupeHaveData h = {};
+    uint8_t hash[3] = { 0xde, 0xad, 0x01 };
+    memcpy(h.hash, hash, 3);
+    h.pwrDbm = 2;
+    h.budget = 8;
+    h.count = 5;
+    h.lenByte = supeEncLen(200);
+    uint8_t f[SUPE_HAVEDATA_ANS_BASE + SUPE_MASK_MAX];
+    size_t n = supeEncHaveData(f, sizeof f, &h);
+    eqi((long)n, SUPE_HAVEDATA_LEN, "the opening form is eight bytes");
+    golden("havedata.open.5frames", f, n);
+    SupeHaveData d = {};
+    ok(supeDecHaveData(f, n, 0, &d), "it decodes with no peer train in hand");
+    ok(!d.answering, "…as the opening form");
+    eqi(d.budget, 8, "the proposed ceiling rides");
+    eqi(d.count, 5, "the count rides");
+    eqi(d.pwrDbm, 2, "the meeting power rides");
+
+    /* The answering form: its length is enumerable only from the peer train's
+     * count, which both sides hold. */
+    h.answering = true;
+    h.trainRssi = -88;
+    h.trainSnrQ = supeEncSnrQ(45);
+    h.maskLen = supeMaskLen(7);
+    h.mask[0] = 0x22;                  /* frames 1 and 5 of theirs are missing */
+    n = supeEncHaveData(f, sizeof f, &h);
+    eqi((long)n, SUPE_HAVEDATA_ANS_BASE + 1, "answering: 10 bytes + one mask byte");
+    golden("havedata.answer.mask22", f, n);
+    ok(supeDecHaveData(f, n, 7, &d) && d.answering, "it decodes against count 7");
+    eqi(d.trainRssi, -88, "the train's worst reading rides");
+    eqi(d.mask[0], 0x22, "the repair request rides");
+    ok(!supeDecHaveData(f, n, 0, &d),
+       "the answering form is not decodable without the peer count");
+    ok(!supeDecHaveData(f, n, 12, &d), "…or against the wrong one");
+}
+
+static void testGimmeCodec(void) {
+    SupeGimme g = {};
+    uint8_t hash[3] = { 0xde, 0xad, 0x01 };
+    memcpy(g.hash, hash, 3);
+    g.pwrDbm = 0;
+    g.budget = 6;
+    g.havePsHeard = true;
+    g.psRssi = -95;
+    g.psSnrQ = supeEncSnrQ(60);
+    g.hdRssi = -70;
+    g.hdSnrQ = supeEncSnrQ(90);
+    uint8_t f[SUPE_GIMME_LEN];
+    size_t n = supeEncGimme(f, sizeof f, &g);
+    eqi((long)n, SUPE_GIMME_LEN, "the tight form is ten bytes");
+    golden("gimme.tight.budget6", f, n);
+    SupeGimme d = {};
+    ok(supeDecGimme(f, n, &d) && d.havePsHeard, "it decodes as the tight form");
+    eqi(d.psRssi, -95, "the PRIVSYNC reading rides — the headroom the budget ran on");
+    eqi(d.hdRssi, -70, "the HAVEDATA reading rides — the freshest pair there is");
+    eqi(d.budget, 6, "the confirmed budget rides");
+
+    g.havePsHeard = false;
+    n = supeEncGimme(f, sizeof f, &g);
+    eqi((long)n, SUPE_GIMME_WIDE_LEN, "the wide form is eight bytes");
+    golden("gimme.wide.budget6", f, n);
+    ok(supeDecGimme(f, n, &d) && !d.havePsHeard,
+       "a wide schedule was seeded by a goodbye — no PRIVSYNC to report");
+    ok(!supeDecGimme(f, 9, &d), "a length outside the enumerated set is discarded");
+}
+
+static void testThatsitCodec(void) {
+    SupeThatsit t = {};
+    t.pwrDbm = 5;
+    t.count = 4;
+    t.csum[0] = 0x11; t.csum[1] = 0x22; t.csum[2] = 0x22; t.csum[3] = 0x44;
+    uint8_t f[SUPE_THATSIT_BASE + SUPE_TRAIN_MAX];
+    size_t n = supeEncThatsit(f, sizeof f, &t);
+    eqi((long)n, SUPE_THATSIT_BASE + 4, "no count byte: the length says n");
+    golden("thatsit.4frames", f, n);
+    SupeThatsit d = {};
+    ok(supeDecThatsit(f, n, &d), "it decodes");
+    eqi(d.count, 4, "the count comes from the frame's own length");
+    eqi(d.pwrDbm, 5,
+        "the train's power rides — stated after the fact, chosen on the report");
+    ok(memcmp(d.csum, t.csum, 4) == 0, "the checksum list IS the sequence");
+    t.count = SUPE_TRAIN_MAX + 1;
+    ok(supeEncThatsit(f, sizeof f, &t) == 0, "a count past the train cap refuses");
+}
+
+static void testByeResendCodec(void) {
+    uint8_t bye[1] = { SUPE_T_BYE };
+    golden("bye", bye, 1);
+
+    SupeResendF r = {};
+    r.maskLen = supeMaskLen(9);
+    r.mask[0] = 0x05;
+    r.mask[1] = 0x01;                  /* frames 0, 2 and 8 are missing */
+    uint8_t f[SUPE_RESEND_BASE + SUPE_MASK_MAX];
+    size_t n = supeEncResend(f, sizeof f, &r);
+    eqi((long)n, SUPE_RESEND_BASE + 2, "nine frames want two mask bytes");
+    golden("resend.mask0501", f, n);
+    SupeResendF d = {};
+    ok(supeDecResend(f, n, 9, &d), "it decodes against count 9");
+    ok(d.mask[0] == 0x05 && d.mask[1] == 0x01, "the bitmask rides");
+    ok(!supeDecResend(f, n, 5, &d), "…and not against a count wanting one byte");
+}
+
+/* ─────────────── the checksum ─────────────── */
+
+static void testCrc8(void) {
+    /* CRC-8 poly 0x07, init 0, MSB first: the check value for "123456789". */
+    eqi(supeCrc8((const uint8_t*)"123456789", 9), 0xF4, "the CRC-8 check value");
+    eqi(supeCrc8(nullptr, 0), 0x00, "an empty frame checks to zero");
+    uint8_t a[3] = { 1, 2, 3 }, b[3] = { 1, 2, 4 };
+    ok(supeCrc8(a, 3) != supeCrc8(b, 3), "one flipped bit separates");
+}
+
+/* ─────────────── the sync-word list (§14.5) ─────────────── */
+
+static void testSyncWords(void) {
+    uint8_t w[SUPE_SYNC_WORDS_CAP];
+    int n7 = supeSyncWords(7, 0x42, w, (int)sizeof w);
+    ok(n7 > 100, "SF7 admits a three-digit word list");
+    for (int i = 0; i < n7; i++) {
+        ok((w[i] >> 4) != 0 && (w[i] & 0x0F) != 0, "no zero nibbles");
+        if (i) ok(w[i] > w[i - 1], "the list is ascending");
+    }
+    /* The berth: two nibble-steps in BOTH symbols around every foreign word. */
+    for (int i = 0; i < n7; i++) {
+        ok(w[i] != 0x12 && w[i] != 0x24 && w[i] != 0x34 && w[i] != 0x42,
+           "no foreign word appears");
+        int d1 = (w[i] >> 4) - 1, d2 = (w[i] & 0x0F) - 2;   /* vs 0x12 */
+        if (d1 < 0) d1 = -d1;
+        if (d2 < 0) d2 = -d2;
+        ok(d1 > 2 || d2 > 2, "every word escapes 0x12's berth in one symbol");
+    }
+    /* SF6: nibbles cap at 7; still a usable list. */
+    int n6 = supeSyncWords(6, 0x42, w, (int)sizeof w);
+    ok(n6 >= 8, "SF6 keeps a usable list");
+    for (int i = 0; i < n6; i++)
+        ok((w[i] >> 4) <= 7 && (w[i] & 0x0F) <= 7, "SF6 nibbles fit 64 bins");
+    /* SF5: exact exclusions only — the berth rule would empty its nine words. */
+    int n5 = supeSyncWords(5, 0x42, w, (int)sizeof w);
+    eqi(n5, 8, "SF5 keeps eight of its nine words (0x12 excluded exactly)");
+    for (int i = 0; i < n5; i++)
+        ok((w[i] >> 4) <= 3 && (w[i] & 0x0F) <= 3, "SF5 nibbles fit 32 bins");
+
+    /* Indexing is total: every stream byte lands on a word. */
+    for (int s = 0; s <= 255; s++) {
+        uint8_t word = supeSyncWordAt(7, 0x42, (uint8_t)s);
+        ok(word != 0x00, "every stream byte resolves to a word");
+    }
+    /* The configured hailing word moves the list — both ends share it. */
+    int nAlt = supeSyncWords(7, 0x77, w, (int)sizeof w);
+    ok(nAlt != 0 && nAlt != n7, "a different hailing word reshapes the list");
+}
+
+/* ─────────────── the schedule (§7) ─────────────── */
+
+static void fillDigest(uint8_t d[32], uint8_t seed) {
+    for (int i = 0; i < 32; i++) d[i] = (uint8_t)(seed + i * 7);
+}
+
+static void testSchedule(void) {
+    uint8_t d0[32], d1[32];
+    fillDigest(d0, 0x10);
+    fillDigest(d1, 0x81);
+
+    SupeSchedD s;
+    supeDeriveSchedule(d0, d1, /*wide=*/false, /*nChans=*/9, &s);
+    ok(memcmp(s.hash3, d0, 3) == 0, "the wire id is D0's first three bytes");
+    ok(s.nSlots >= 6, "a tight schedule holds several slots");
+    eqi(s.slot[0].tMs, SUPE_TIGHT_T0_MS,
+        "the first tight slot is one turnaround + retune after the epoch");
+    for (int k = 0; k < s.nSlots; k++) {
+        ok(s.slot[k].tMs <= SUPE_TIGHT_HORIZON_MS, "slots stay inside the horizon");
+        ok(s.slot[k].chan >= 1 && s.slot[k].chan <= 9, "channels come from the raster");
+        if (k) {
+            int gap = s.slot[k].tMs - s.slot[k - 1].tMs;
+            ok(gap >= 40 && gap <= 63, "tight spacing is 40 + (j mod 24)");
+        }
+    }
+
+    SupeSchedD w;
+    supeDeriveSchedule(d0, d1, /*wide=*/true, /*nChans=*/9, &w);
+    ok(w.nSlots >= 8, "a wide schedule holds a dozen-odd slots");
+    ok(w.slot[0].tMs >= 150 && w.slot[0].tMs <= 189,
+       "the first wide slot is 150 ms + jitter after the epoch");
+    for (int k = 1; k < w.nSlots; k++) {
+        int gap = w.slot[k].tMs - w.slot[k - 1].tMs;
+        ok(gap >= 60 && gap <= 350 + 39, "wide spacing widens and caps at 350 + jitter");
+        ok(w.slot[k].tMs <= SUPE_WIDE_HORIZON_MS, "…inside the 3 s horizon");
+    }
+
+    /* Regime 0: no channel raster, every slot on the hailing frequency. */
+    SupeSchedD r0;
+    supeDeriveSchedule(d0, d1, false, 0, &r0);
+    for (int k = 0; k < r0.nSlots; k++)
+        eqi(r0.slot[k].chan, SUPE_CH_HAIL, "regime 0 slots stay on channel 0");
+
+    /* Determinism: the same digests derive the same schedule, byte for byte. */
+    SupeSchedD again;
+    supeDeriveSchedule(d0, d1, true, 9, &again);
+    ok(memcmp(&again, &w, sizeof w) == 0, "the derivation is a pure function");
+    /* And a different seed moves everything. */
+    fillDigest(d0, 0x11);
+    supeDeriveSchedule(d0, d1, true, 9, &again);
+    ok(memcmp(&again, &w, sizeof w) != 0, "a different seed derives elsewhere");
 }
 
 /* ─────────────── expiry ─────────────── */
@@ -176,25 +390,39 @@ static void testExpiry(void) {
 
 static void testAirtime(void) {
     /* SUPE.md §3's quantisation table, at SF7/BW125 preamble 8 with the check
-     * off: 1–3 bytes cost 26 ms, 4–7 cost 31, 8–10 cost 36. Each SUPE frame is
-     * sized to sit on one of those group boundaries. */
+     * off: 1–3 bytes cost 26 ms, 4–7 cost 31, 8–10 cost 36. */
     auto ms = [](int payload) {
         return (int)lround(1000.0 * supeAirtimeSeconds(7, 125000, 5, 8, payload, false, false));
     };
     eqi(ms(3), 26, "three bytes fill the first symbol group");
-    eqi(ms(7), 31, "seven bytes fill the second — START sits exactly on it");
-    eqi(ms(10), 36, "ten bytes fill the third — the identity form sits on it");
+    eqi(ms(7), 31, "seven bytes fill the second");
+    eqi(ms(10), 36, "ten bytes fill the third — GIMME's tight form sits on it");
     ok(ms(4) == ms(7), "every length inside a group costs the same");
+    ok(ms(7) == ms(4), "PRIVSYNC's seven bytes fill the second group exactly");
     ok(ms(8) > ms(7), "the byte that crosses costs the whole group");
 
-    /* The check is what a SUPE frame does not pay for: sixteen bits push a frame
-     * into the next group four times in seven. */
     int withCrc = (int)lround(1000.0 * supeAirtimeSeconds(7, 125000, 5, 8, 7, false, true));
     ok(withCrc > ms(7), "the CRC costs a symbol group at seven bytes");
+}
 
-    /* A network hailing slower moves every figure and none of the layouts. */
-    ok((int)lround(1000.0 * supeAirtimeSeconds(12, 125000, 5, 8, 7, false, false)) > 400,
-       "the same START costs the best part of half a second at SF12");
+/* Sensitivity is the yardstick every margin test measures against, so the one
+ * answer it must never give is a confident wrong one. A blank configuration —
+ * a caller that forgot to fill it — puts zero into a logarithm, and taken at
+ * face value that lands on 0 dBm: a receiver that needs a signal stronger than
+ * any transmitter can produce, against which every real link reads as too
+ * weak. */
+static void testSensitivity(void) {
+    SupeCfg hail = {}; hail.sf = 7; hail.bwHz = 125000;
+    SupeCfg fast = {}; fast.sf = 5; fast.bwHz = 500000;
+    int16_t sHail = supeSensitivityDeci(&hail);
+    int16_t sFast = supeSensitivityDeci(&fast);
+    ok(sHail < -1150 && sHail > -1350, "SF7/125k lands near -123 dBm");
+    ok(sFast > sHail, "a wider, faster regime needs a stronger signal");
+
+    SupeCfg blank = {};
+    int16_t sBlank = supeSensitivityDeci(&blank);
+    ok(sBlank < -900, "a configuration with no bandwidth reads as unknown, not 0 dBm");
+    ok(supeSensitivityDeci(nullptr) == sBlank, "…and so does no configuration at all");
 }
 
 /* ─────────────── regime tables ─────────────── */
@@ -212,14 +440,11 @@ static void testRegimeTables(void) {
     eqi(n, 9, "regime 1 names nine channels");
     ok(c && c[0].freqHz == 863350000u && c[8].freqHz == 868950000u,
        "the channel raster is the one in §14.2");
-    /* At least 200 kHz of clear spectrum between any two edges, which is what
-     * keeps each channel's airtime budget independent of its neighbours'. */
     for (int i = 1; i < n; i++) {
         uint32_t prevEdge = c[i - 1].freqHz + c[i - 1].bwHz / 2;
         uint32_t thisEdge = c[i].freqHz - c[i].bwHz / 2;
         ok(thisEdge >= prevEdge + 200000, "channels keep 200 kHz between edges");
     }
-    /* Regime 0 must not invent ceilings it has no regulatory basis for. */
     ok(g0->trainCeilMs == 0 && g0->txnCeilMs == 0 && g0->airtimeMaxMs == 0,
        "regime 0 states no ceilings of its own");
     eqi((long)g1->airtimeMaxMs, 100000, "regime 1 allows 100 s …");
@@ -228,7 +453,7 @@ static void testRegimeTables(void) {
     eqi(g0->maxTxpDbm, SUPE_TXP_IFACE, "regime 0 takes the interface's own power");
 }
 
-/* ═══════════════ the revised protocol ═══════════════ */
+/* ─────────────── the ladder ─────────────── */
 
 static void testLadder2(void) {
     /* §14.3.3's own table: SF7/BW125 hailing, 500 kHz channel, SX126x pair. */
@@ -250,11 +475,6 @@ static void testLadder2(void) {
         eqi(lad[i].marginDeci, want[i].margin, what);
     }
 
-    /* The same inputs with a 250 kHz channel maximum: the §14.3.1 rules admit
-     * six entries — the first five of the table plus SF5/BW250 on top. (The
-     * §14.3.3 prose says "five"; the rules and this file are the authority
-     * when they and a reading of the prose disagree, §14.3.4.) Index 6 is
-     * then invalid rather than meaning something else. */
     n = supeLadder(SUPE_REGIME_EU863, 0, 7, 125000, 250000,
                    SUPE_FAM_SX126X, SUPE_FAM_SX126X, lad, SUPE_LADDER_MAX_ENTRIES);
     eqi(n, 6, "a 250 kHz channel maximum gives a six-entry ladder");
@@ -264,20 +484,15 @@ static void testLadder2(void) {
                           SUPE_FAM_SX126X, SUPE_FAM_SX126X, 6, &c),
        "budget 6 is invalid there, not something else");
 
-    /* A pair including an SX127x has bandwidth entries alone: SF7/BW250 and
-     * SF7/BW500 from SF7/BW125 on a 500 kHz channel. */
     n = supeLadder(SUPE_REGIME_EU863, 0, 7, 125000, 500000,
                    SUPE_FAM_SX127X, SUPE_FAM_SX126X, lad, SUPE_LADDER_MAX_ENTRIES);
     eqi(n, 3, "an SX127x pair keeps only the bandwidth entries");
     ok(lad[1].sf == 7 && lad[1].bwHz == 250000, "…SF7/BW250 first");
     ok(lad[2].sf == 7 && lad[2].bwHz == 500000, "…then SF7/BW500");
 
-    /* Under regime 0 the same pair hailing at SF7 has index 0 and nothing
-     * else — its first step would be the barred SF6. */
     n = supeLadder(SUPE_REGIME_SINGLE, 0, 7, 125000, 125000,
                    SUPE_FAM_SX127X, SUPE_FAM_SX127X, lad, SUPE_LADDER_MAX_ENTRIES);
     eqi(n, 1, "an SX127x pair hailing SF7 has no regime-0 entries above 0");
-    /* From SF8 it has one (SF7), from SF9 two. */
     eqi(supeLadder(SUPE_REGIME_SINGLE, 0, 8, 125000, 125000,
                    SUPE_FAM_SX127X, SUPE_FAM_SX127X, lad, SUPE_LADDER_MAX_ENTRIES),
         2, "from SF8 the same pair has one entry above 0");
@@ -285,13 +500,11 @@ static void testLadder2(void) {
                    SUPE_FAM_SX127X, SUPE_FAM_SX127X, lad, SUPE_LADDER_MAX_ENTRIES),
         3, "from SF9 two");
 
-    /* Index 0 is the hailing configuration even at a width no detour uses. */
     ok(supeResolveBudget(SUPE_REGIME_SINGLE, 0, 9, 62500, 62500,
                          SUPE_FAM_SX126X, SUPE_FAM_SX126X, 0, &c)
            && c.sf == 9 && c.bwHz == 62500,
        "budget 0 is the hailing configuration at an unusual bandwidth");
 
-    /* Monotonic and undominated, over the big SX126x cross-section. */
     for (int hail = 7; hail <= 12; hail++) {
         n = supeLadder(SUPE_REGIME_EU863, 0, (uint8_t)hail, 125000, 500000,
                        SUPE_FAM_SX126X, SUPE_FAM_SX126X, lad, SUPE_LADDER_MAX_ENTRIES);
@@ -305,217 +518,17 @@ static void testLadder2(void) {
     }
 }
 
-static void testSyncWordFor(void) {
-    SupeCfg hail = { 7, 125000, false, 0 };
-    SupeCfg sf6  = { 6, 125000, false, 25 };
-    SupeCfg sf5  = { 5, 500000, false, 110 };
-    eqi(supeSyncWordFor(SUPE_REGIME_SINGLE, &hail, 0, 0x42), 0x42,
-        "regime 0 budget 0 keeps the interface's word — it never left");
-    eqi(supeSyncWordFor(SUPE_REGIME_SINGLE, &sf6, 1, 0x42), SUPE_SYNC_UNICAST,
-        "a regime-0 budget above 0 takes 0x67 though the frequency stays");
-    eqi(supeSyncWordFor(SUPE_REGIME_EU863, &hail, 0, 0x42), SUPE_SYNC_UNICAST,
-        "a regime-1 budget 0 moved frequency, so it takes 0x67");
-    eqi(supeSyncWordFor(SUPE_REGIME_EU863, &sf5, 8, 0x42), SUPE_SYNC_SF5,
-        "a budget landing on SF5 takes 0x21");
-}
+/* ─────────────── the conformance vectors (§14.3.4) ─────────────── */
 
-static void testLoad(void) {
-    /* ceil(Σ(bytes + 16) / 32), saturating at 255 → 8160 bytes. */
-    eqi(supeEncLoad(0), 0, "an empty queue is load 0");
-    eqi(supeEncLoad(1), 1, "one byte claims one unit");
-    eqi(supeEncLoad(32), 1, "32 adjusted bytes is one unit");
-    eqi(supeEncLoad(33), 2, "the encoding rounds up");
-    eqi(supeEncLoad(500 + 16), 17, "one full packet is 17 units");
-    eqi(supeEncLoad(1u << 30), 255, "past the range it saturates");
-    eqi((long)supeDecLoadBytes(255), 8160, "a saturated load reads 8160 bytes");
-
-    /* The airtime a load converts to, at the modulation the peer chose. A
-     * saturated load at SF5/BW500 is about a second of air (§6: ~7 KB/s). */
-    SupeCfg fast = { 5, 500000, false, 110 };
-    uint32_t ms = supeLoadAirtimeMs(255, &fast, 5);
-    ok(ms > 800 && ms < 1400, "a saturated load at SF5/BW500 is about a second");
-    SupeCfg hail = { 7, 125000, false, 0 };
-    ok(supeLoadAirtimeMs(255, &hail, 5) > 8 * ms,
-       "the same load at hailing rate costs an order more");
-    eqi((long)supeLoadAirtimeMs(0, &fast, 5), 0, "load 0 takes no air");
-}
-
-static void testDeadlines2(void) {
-    /* §14.7's table: every deadline from two constants and a time on air. */
-    SupeCfg fast = { 5, 500000, false, 110 };
-    uint32_t g = supeGrantDeadlineMs(7, 125000, 5, 12);
-    ok(g > SUPE_TURNAROUND_MS + SUPE_GUARD_MS, "the GRANT deadline covers its airtime");
-    ok(g < 200, "…and is well under a fifth of a second at SF7");
-    uint32_t m1 = supeManifestFirstDeadlineMs(&fast, 5, 12);
-    uint32_t m2 = supeManifestReverseDeadlineMs(&fast, 5, 12);
-    eqi((long)(m1 - m2), SUPE_RETUNE_GAP_MS,
-        "the first MANIFEST waits one retune gap longer than the reverse one");
-    eqi((long)supeLenDeadlineMs(supeEncLen(200)), 200 + SUPE_GUARD_MS,
-        "a grace deadline is the stated length plus the guard");
-}
-
-static void testGrantCodec(void) {
-    SupeGrant g = {};
-    g.regime = SUPE_REGIME_EU863;
-    g.version = 0;
-    g.chan = 4;
-    g.budget = 6;
-    g.durByte = supeEncDur(1200);
-    g.pwrDbm = 14;
-    g.rssiDbm = -97;
-    g.snrQ = supeEncSnrQ(-55);
-    g.hash[0] = 0xab; g.hash[1] = 0xcd; g.hash[2] = 0xef;
-    uint8_t f[16];
-    size_t n = supeEncGrant(f, sizeof f, &g);
-    eqi((long)n, SUPE_GRANT_LEN, "a GRANT is ten bytes");
-    golden("grant.regime1.ch4.budget6", f, n);
-
-    SupeGrant d = {};
-    ok(supeDecGrant(f, n, &d), "the GRANT decodes");
-    eqi(d.chan, 4, "channel round-trips");
-    eqi(d.budget, 6, "budget round-trips");
-    eqi((long)supeDecDur(d.durByte), 1200, "duration round-trips");
-    eqi(d.pwrDbm, 14, "the frame's own power round-trips");
-    eqi(d.rssiDbm, -97, "the START's level round-trips");
-    eqi(supeDecSnr10(d.snrQ), -55, "the START's SNR round-trips");
-    ok(memcmp(d.hash, g.hash, 3) == 0, "the START hash round-trips");
-    ok(!supeGrantRefused(&d), "budget 6 is not a refusal");
-    ok(!d.reverse, "no reverse traffic declared");
-
-    /* The reverse-pending bit rides the power byte's free top bit — a
-     * transmit power never stores a negative value. Set, it promises a
-     * reverse MANIFEST after the requester's train; clear, both sides go
-     * home on the train's end with no further frame. */
-    g.reverse = true;
-    n = supeEncGrant(f, sizeof f, &g);
-    golden("grant.regime1.reverse", f, n);
-    ok(supeDecGrant(f, n, &d) && d.reverse, "the reverse bit round-trips");
-    eqi(d.pwrDbm, 14, "…without disturbing the stated power");
-    g.reverse = false;
-
-    /* Refusal is a first-class answer: budget 15, the channel nibble carries
-     * the reason, and the measurement pair still rides it. */
-    g.budget = SUPE_BUDGET_REFUSED;
-    g.chan   = SUPE_REFUSE_AIRTIME;
-    n = supeEncGrant(f, sizeof f, &g);
-    golden("grant.refused.airtime", f, n);
-    ok(supeDecGrant(f, n, &d) && supeGrantRefused(&d) && d.chan == SUPE_REFUSE_AIRTIME,
-       "a refusal decodes with its reason");
-    eqi(d.rssiDbm, -97, "a refusal still carries the free path-loss reading");
-
-    ok(!supeDecGrant(f, 9, &d) && !supeDecGrant(f, 11, &d), "only ten bytes is a GRANT");
-    uint8_t bogus[SUPE_GRANT_LEN];
-    memcpy(bogus, f, SUPE_GRANT_LEN);
-    bogus[1] = 0x90;
-    ok(!supeDecGrant(bogus, SUPE_GRANT_LEN, &d), "an unknown regime is discarded");
-}
-
-static void testStart2Codec(void) {
-    SupeStart2 s = {};
-    s.regime = SUPE_REGIME_EU863;
-    s.version = 0;
-    s.tag[0] = 0xd1; s.tag[1] = 0x0d; s.tag[2] = 0x51;
-    s.fam = SUPE_FAM_SX126X;
-    s.ceiling = 8;
-    s.load = supeEncLoad(2 * (500 + 16));   /* two full packets queued */
-    uint8_t f[16];
-    size_t n = supeEncStart2(f, sizeof f, &s);
-    eqi((long)n, SUPE_START2_LEN, "a revised START is seven bytes");
-    golden("start2.regime1.load2pkt", f, n);
-
-    SupeStart2 d = {};
-    ok(supeDecStart2(f, n, &d), "the revised START decodes");
-    eqi(d.fam, SUPE_FAM_SX126X, "family round-trips");
-    eqi(d.ceiling, 8, "ceiling round-trips");
-    eqi((long)supeDecLoadBytes(d.load), 33 * 32, "the load round-trips in units");
-    ok(memcmp(d.tag, s.tag, 3) == 0, "tag round-trips");
-    ok(!d.haveIdent, "no identity in the short form");
-
-    /* The ten-byte form is parsed and honoured while never being sent (§4). */
-    s.haveIdent = true;
-    s.ident[0] = 0x6b; s.ident[1] = 0x87; s.ident[2] = 0xeb;
-    n = supeEncStart2(f, sizeof f, &s);
-    eqi((long)n, SUPE_START2_ID_LEN, "a START naming its sender is ten bytes");
-    golden("start2.regime1.ident", f, n);
-    ok(supeDecStart2(f, n, &d) && d.haveIdent && memcmp(d.ident, s.ident, 3) == 0,
-       "the ten-byte form decodes and carries the identity");
-    ok(!supeDecStart2(f, 8, &d) && !supeDecStart2(f, 9, &d),
-       "lengths between the two forms are discarded");
-}
-
-static void testManifest2Codec(void) {
-    SupeManifest2 m = {};
-    m.pwrDbm = 14;
-    m.rssiDbm = -88;
-    m.snrQ = supeEncSnrQ(35);
-    m.caps.fam = SUPE_FAM_SX126X;
-    m.caps.topStep = 8;
-    m.caps.maxPwrDbm = 22;
-    m.caps.adaptive = true;
-    m.count = 7;
-    m.lenByte = supeEncLen(640);
-    m.hash[0] = 0xab; m.hash[1] = 0xcd; m.hash[2] = 0xef;
-    uint8_t f[16];
-    size_t n = supeEncManifest2(f, sizeof f, &m);
-    eqi((long)n, SUPE_MANIFEST2_LEN, "a revised MANIFEST is eleven bytes");
-    golden("manifest2.count7", f, n);
-
-    SupeManifest2 d = {};
-    ok(supeDecManifest2(f, n, &d), "the revised MANIFEST decodes");
-    eqi(d.pwrDbm, 14, "the train's power round-trips");
-    eqi(d.rssiDbm, -88, "the peer's level round-trips");
-    eqi(supeDecSnr10(d.snrQ), 35, "the SNR round-trips");
-    eqi(d.caps.topStep, 8, "capabilities round-trip");
-    ok(d.caps.adaptive, "the adaptive flag round-trips");
-    eqi(d.count, 7, "the packet count round-trips");
-    eqi((long)supeDecLen(d.lenByte), 640, "the train length round-trips");
-
-    /* Count zero is meaningful: 0/0 closes, 0 with a length is the grace. */
-    m.count = 0;
-    m.lenByte = 0;
-    n = supeEncManifest2(f, sizeof f, &m);
-    golden("manifest2.close", f, n);
-    ok(supeDecManifest2(f, n, &d) && d.count == 0 && d.lenByte == 0,
-       "the count-0 close round-trips");
-    m.lenByte = supeEncLen(100);
-    n = supeEncManifest2(f, sizeof f, &m);
-    golden("manifest2.grace100ms", f, n);
-    ok(supeDecManifest2(f, n, &d) && d.count == 0 && supeDecLen(d.lenByte) == 100,
-       "the grace round-trips");
-
-    ok(!supeDecManifest2(f, 10, &d), "the legacy ten-byte layout is not a revised MANIFEST");
-}
-
-static void testLenOk2(void) {
-    ok(supeLenOk2(SUPE_T_GRANT, SUPE_REGIME_SINGLE, 0, 10), "GRANT's length is enumerable");
-    ok(!supeLenOk2(SUPE_T_GRANT, SUPE_REGIME_SINGLE, 0, 7), "…and unique");
-    ok(!supeLenOk2(0xC8, SUPE_REGIME_SINGLE, 0, 7),
-       "0xC8 is burned — discarded exactly as a wrong length is");
-    ok(!supeLenOk2(0xC3, SUPE_REGIME_SINGLE, 0, 7), "0xC3 stays reserved");
-    ok(supeLenOk2(SUPE_T_MANIFEST, SUPE_REGIME_SINGLE, 0, SUPE_MANIFEST2_LEN),
-       "the revised MANIFEST length is enumerable");
-    ok(!supeLenOk2(SUPE_T_MANIFEST, SUPE_REGIME_SINGLE, 0, 10),
-       "the legacy ten-byte MANIFEST length is not");
-}
-
-/* ─────────────── the conformance vectors (§14.3.4) ───────────────
- *
- * The full cross-product: requesting family × answering family × hailing SF
- * 5–12 × hailing bandwidth × channel maximum bandwidth × both regimes. Each
- * line gives the inputs, the ladder length, and every entry as
- * index:sf/bw/ldro/sync. `iface` marks the one entry that keeps the
- * interface's own sync word. The file is the authority when it and a reading
- * of §14.3 disagree. */
 static void writeLadderVectors(const char* path) {
     static const uint32_t kBw[] = { 125000, 250000, 500000 };
     FILE* fp = fopen(path, "w");
     if (!fp) { ok(false, "supe-ladder-vectors.txt is writable"); return; }
     fprintf(fp,
-        "# SUPE ladder conformance vectors (SUPE.md \u00a714.3.4), regenerated by\n"
+        "# SUPE ladder conformance vectors (SUPE.md §14.3.4), regenerated by\n"
         "# supe_core_test. An implementation is conformant iff it reproduces this\n"
-        "# file exactly. Entries are index:sf/bw/ldro/sync; `iface` is the\n"
-        "# interface's own sync word. The ladder is truncated at 15 entries:\n"
-        "# the budget nibble reaches 14, 15 being the refusal.\n");
+        "# file exactly. Entries are index:sf/bw/ldro. The ladder is truncated at\n"
+        "# 15 entries, the reach of the budget byte's index space.\n");
     int lines = 0;
     for (int regime = 0; regime <= 1; regime++)
     for (int famA = 0; famA <= 4; famA++)
@@ -529,20 +542,59 @@ static void writeLadderVectors(const char* path) {
                            lad, SUPE_LADDER_MAX_ENTRIES);
         fprintf(fp, "r=%d famA=%d famB=%d hail=%d/%u chmax=%u n=%d",
                 regime, famA, famB, sf, (unsigned)kBw[hb], (unsigned)kBw[cb], n);
-        for (int i = 0; i < n; i++) {
-            SupeCfg c = { lad[i].sf, lad[i].bwHz, lad[i].ldro, lad[i].marginDeci };
-            bool iface = (regime == 0 && i == 0);
-            fprintf(fp, " %d:%u/%u/%d/", i, lad[i].sf, (unsigned)lad[i].bwHz,
+        for (int i = 0; i < n; i++)
+            fprintf(fp, " %d:%u/%u/%d", i, lad[i].sf, (unsigned)lad[i].bwHz,
                     lad[i].ldro ? 1 : 0);
-            if (iface) fprintf(fp, "iface");
-            else       fprintf(fp, "0x%02x", supeSyncWordFor((uint8_t)regime, &c,
-                                                             (uint8_t)i, 0x42));
-        }
         fprintf(fp, "\n");
         lines++;
     }
     fclose(fp);
     printf("wrote %d ladder vectors to %s\n", lines, path);
+}
+
+/* ─────────────── the schedule vectors (§7, §14.3.4's discipline) ───────────
+ *
+ * The derivation is a pure function of the two digests, so the vectors run
+ * from fixed digest patterns rather than from seeds — hashing is the host's,
+ * not the core's. Word lists per spreading factor ride along, since the slot's
+ * sync word is the one derived quantity the slots themselves do not carry. */
+static void writeScheduleVectors(const char* path) {
+    FILE* fp = fopen(path, "w");
+    if (!fp) { ok(false, "supe-schedule-vectors.txt is writable"); return; }
+    fprintf(fp,
+        "# SUPE schedule conformance vectors (SUPE.md §7), regenerated by\n"
+        "# supe_core_test over fixed digest patterns d[i] = seed + 7i. An\n"
+        "# implementation is conformant iff it reproduces this file exactly.\n"
+        "# Slots are t:chan:sync(SF-of-slot).\n");
+    int lines = 0;
+    for (int seed = 0; seed < 8; seed++)
+    for (int wide = 0; wide <= 1; wide++)
+    for (int nch = 0; nch <= 9; nch += 9) {
+        uint8_t d0[32], d1[32];
+        fillDigest(d0, (uint8_t)(0x10 + seed * 13));
+        fillDigest(d1, (uint8_t)(0x81 + seed * 13));
+        SupeSchedD s;
+        supeDeriveSchedule(d0, d1, wide != 0, (uint8_t)nch, &s);
+        fprintf(fp, "seed=%d wide=%d nch=%d hash=%02x%02x%02x n=%u",
+                seed, wide, nch, s.hash3[0], s.hash3[1], s.hash3[2],
+                (unsigned)s.nSlots);
+        for (int k = 0; k < s.nSlots; k++)
+            fprintf(fp, " %u:%u:0x%02x", (unsigned)s.slot[k].tMs,
+                    (unsigned)s.slot[k].chan,
+                    supeSyncWordAt(7, 0x42, s.slot[k].sByte));
+        fprintf(fp, "\n");
+        lines++;
+    }
+    for (int sf = 5; sf <= 7; sf++) {
+        uint8_t w[SUPE_SYNC_WORDS_CAP];
+        int n = supeSyncWords((uint8_t)sf, 0x42, w, (int)sizeof w);
+        fprintf(fp, "words sf=%d iface=0x42 n=%d", sf, n);
+        for (int i = 0; i < n; i++) fprintf(fp, " 0x%02x", w[i]);
+        fprintf(fp, "\n");
+        lines++;
+    }
+    fclose(fp);
+    printf("wrote %d schedule vectors to %s\n", lines, path);
 }
 
 /* ─────────────── main ─────────────── */
@@ -553,18 +605,21 @@ int main(int argc, char** argv) {
     testLevels();
     testTypeBytes();
     testAnn2Codec();
+    testPrivsyncCodec();
+    testHaveDataCodec();
+    testGimmeCodec();
+    testThatsitCodec();
+    testByeResendCodec();
+    testCrc8();
+    testSyncWords();
+    testSchedule();
     testExpiry();
     testAirtime();
+    testSensitivity();
     testLadder2();
-    testSyncWordFor();
-    testLoad();
-    testDeadlines2();
-    testGrantCodec();
-    testStart2Codec();
-    testManifest2Codec();
-    testLenOk2();
 
     writeLadderVectors((argc > 2) ? argv[2] : "supe-ladder-vectors.txt");
+    writeScheduleVectors("supe-schedule-vectors.txt");
 
     const char* out = (argc > 1) ? argv[1] : "golden.txt";
     FILE* fp = fopen(out, "w");

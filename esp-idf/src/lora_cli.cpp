@@ -116,6 +116,13 @@ void manualTxPoll(LoraRadio* r) {
             || supeHoldsRadio(r)
 #endif
            ) { manualTxFinish(r, false, "radio busy"); return; }
+        /* Settings are still moving. Refuse rather than hold: this is a typed
+         * one-shot, and a transmit that happens ten seconds later on different
+         * parameters is not the one that was asked for. */
+        if (loraCfgQuiet()) {
+            manualTxFinish(r, false, "settings still settling — try again in a moment");
+            return;
+        }
 
         if (r->mtxKind == MTX_PROT) { manualTxProt(r); return; }
 
@@ -197,16 +204,24 @@ static void cliPrintSlot(int i) {
     cliPrintf("        freq=%.3f MHz  bw=%.0f kHz  sf=%d  cr=4/%d  txp=%d dBm  preamble=%d\n",
               freq_hz / 1.0e6, bw_hz / 1.0e3, sf, cr, txp, pre);
     cliPrintf("        sync=%s  mode=%s  bitrate=%u bit/s\n", sync, mode, (unsigned)r->curBitrate);
-    if (chipFamily(s->chip) == FAM_SX126X) {
-        /* The chip is not asked: a register read from the CLI task can land in
-         * the middle of a RadioLib transaction the radio task is holding CS
-         * across. These are the values that were applied to it. */
-        int agc = storageGetInt(sk(kb, sizeof kb, i, "agc_reset"), LORA_AGC_RESET_DEF_S);
-        cliPrintf("        rx_boosted_gain=%d  ocp=%.0f mA  agc_reset=",
-                  storageGetInt(sk(kb, sizeof kb, i, "rx_boosted_gain"), 1) != 0,
-                  (double)radioOcpMilliamps(s->chip));
-        if (agc > 0) cliPrintf("%ds\n", agc);
-        else         cliPrintf("off\n");
+    /* The chip is not asked: a register read from the CLI task can land in the
+     * middle of a RadioLib transaction the radio task is holding CS across.
+     * These are the values that were applied to it — and only the ones this
+     * part answers to, so the line never implies a control the chip ignores. */
+    LoraFamily fam = chipFamily(s->chip);
+    if (radioHasRxBoost(fam)) {
+        bool on = storageGetInt(sk(kb, sizeof kb, i, "rx_boosted_gain"), 1) != 0;
+        cliPrintf("        rx_boosted_gain=%d%s", on,
+                  fam == FAM_LR2021 ? on ? " (gain level 7 of 7)" : " (gain level 0 of 7)"
+                                    : "");
+        if (fam == FAM_SX126X)
+            cliPrintf("  ocp=%.0f mA", (double)radioOcpMilliamps(s->chip));
+        if (radioHasAgcReset(fam)) {
+            int agc = storageGetInt(sk(kb, sizeof kb, i, "agc_reset"), LORA_AGC_RESET_DEF_S);
+            if (agc > 0) cliPrintf("  agc_reset=%ds", agc);
+            else         cliPrintf("  agc_reset=off");
+        }
+        cliPrintf("\n");
     }
     if (!r->lbt) {
         cliPrintf("        lbt=off (blind tx)\n");
@@ -320,8 +335,9 @@ static void cliPrintNode(Neighbor* e, int num, void* ud) {
         /* Capability line. TRANSPORT means it forwards for others; ROAMING is
          * its node-flags bit; the mesh tag that it speaks our air protocol; TX
          * the power a probe settled on for it; EST the reciprocity estimate;
-         * USE the power we transmit to it at under SUPE.adaptive_txpower. */
-        char f[96];
+         * WALK how many dB of that estimate the EST tier has been paid for in
+         * frames heard so far; USE the power we last transmitted to it at. */
+        char f[128];
         int o = 0;
         auto add = [&](const char* t) {
             o += snprintf(f + o, sizeof f - (size_t)o, "%s%s", o ? ", " : "", t);
@@ -354,16 +370,27 @@ static void cliPrintNode(Neighbor* e, int num, void* ud) {
         } else if (e->ourProto) add(RF_PROTO_NAME);
 #endif
         int est10;
-        if (peersEstimateCliff10(c->r, e, c->now, &est10, nullptr)) {
+        if (peersEstimateCliff10(c->r, e, c->now, &est10, nullptr, nullptr)) {
             char t[24];
             snprintf(t, sizeof t, "EST %.0f", (double)est10 / 10.0);
             add(t);
         }
-        /* USE is the power frames to this node actually go out at; the `~`
-         * marks one derived from EST plus a margin rather than measured. */
-        if (e->haveApPwr) {
+        if (e->apEstWalkDb > 0) {
             char t[16];
-            snprintf(t, sizeof t, "USE %s%d", e->apFromEst ? "~" : "", (int)e->apPwr);
+            snprintf(t, sizeof t, "WALK %d", (int)e->apEstWalkDb);
+            add(t);
+        }
+        /* USE is the power the last frame to this node went out at, and the
+         * tildes say how much of it was guessed: none for the peer's own report
+         * of what it heard from us, one for a path loss measured the other way
+         * round, two for a reciprocity estimate against a power nobody stated.
+         * Absent means the node is being transmitted to at the configured
+         * power — no evidence, or none of it recent enough. */
+        if (e->apSrc != AP_SRC_NONE) {
+            char t[16];
+            const char* mark = e->apSrc == AP_SRC_REPORT ? ""
+                             : e->apSrc == AP_SRC_PAIR   ? "~" : "~~";
+            snprintf(t, sizeof t, "USE %s%d", mark, (int)e->apPwr);
             add(t);
         }
         if (o) cliPrintf("       ( %s )\n", f);
@@ -537,9 +564,8 @@ static void cliSupe(int idx, const char* sub, const char* arg) {
     }
     {
         SupeCaps c = supeOwnCaps(r);
-        cliPrintf("  we are      family %u, ceiling %u, max %d dBm%s\n",
-                  (unsigned)c.fam, (unsigned)c.topStep, (int)c.maxPwrDbm,
-                  c.adaptive ? ", adaptive power" : "");
+        cliPrintf("  we are      family %u, ceiling %u, max %d dBm\n",
+                  (unsigned)c.fam, (unsigned)c.topStep, (int)c.maxPwrDbm);
         /* The ladder as the widest channel would resolve it, family-bounded on
          * our side alone — what a symmetrical peer could be granted. */
         uint32_t maxBw = (uint32_t)r->cfgBwHz;
@@ -579,13 +605,16 @@ static void cliSupe(int idx, const char* sub, const char* arg) {
                       t->tag[0], t->tag[1], t->tag[2], (unsigned)t->refs,
                       t->refs == 1 ? "" : "s", (int)((int32_t)(t->expiryMs - now) / 1000));
     }
-    for (int i = 0; i < SUPE_HOLD_MAX; i++) {
-        SupeHold* h = &e->hold[i];
-        if (!h->used || (int32_t)(now - h->untilMs) >= 0) continue;
-        cliPrintf("  holding     %02x%02x%02x for %d ms\n",
-                  h->tag[0], h->tag[1], h->tag[2], (int)(int32_t)(h->untilMs - now));
+    for (int i = 0; i < SUPE_SCHED_MAX; i++) {
+        SupeSched* s = &e->sched[i];
+        if (!s->used) continue;
+        cliPrintf("  schedule    %02x%02x%02x %s, %u slots, next %u, we tx %s%s\n",
+                  s->d.hash3[0], s->d.hash3[1], s->d.hash3[2],
+                  s->wide ? "wide" : "tight", (unsigned)s->d.nSlots,
+                  (unsigned)s->nextSlot, s->weTx0 ? "even" : "odd",
+                  s->weSeeded ? " (our seed)" : "");
     }
-    cliPrintf("  rx          %u frames, %u discarded, %u for other exchanges\n",
+    cliPrintf("  rx          %u frames, %u discarded, %u for other meetings\n",
               (unsigned)e->rxFrames, (unsigned)e->rxDiscard, (unsigned)e->rxForeign);
     {
         int peers = 0;
@@ -611,30 +640,31 @@ static void cliSupe(int idx, const char* sub, const char* arg) {
                            (int32_t)(en->absentUntilMs - now) > 0) ? ", ABSENT" : "");
             }
     }
-    cliPrintf("  requests    %u out, %u granted, %u refused; %u strikes\n",
-              (unsigned)e->startsOut, (unsigned)e->grantsIn,
-              (unsigned)e->refusalsIn, (unsigned)e->strikes);
-    cliPrintf("  answers     %u granted, %u refused\n",
-              (unsigned)e->grantsOut, (unsigned)e->refusalsOut);
-    cliPrintf("  detours     %u completed; %u packets out, %u in\n",
-              (unsigned)e->detoursDone, (unsigned)e->trainPktsOut,
-              (unsigned)e->trainPktsIn);
-    cliPrintf("  verdicts    %u holds taken, %u packets dropped as absent\n",
-              (unsigned)e->holdsTaken, (unsigned)e->dropsAbsent);
+    cliPrintf("  seeds       %u out; %u schedules taken; %u strikes\n",
+              (unsigned)e->seedsOut, (unsigned)e->schedsIn, (unsigned)e->strikes);
+    cliPrintf("  slots       %u listened, %u spoken, %u skipped busy\n",
+              (unsigned)e->slotsListened, (unsigned)e->slotsSpoken,
+              (unsigned)e->slotsSkipped);
+    cliPrintf("  meetings    %u completed; %u frames out, %u in; repairs %u out, %u in\n",
+              (unsigned)e->meetingsDone, (unsigned)e->framesOut,
+              (unsigned)e->framesIn, (unsigned)e->repairsOut,
+              (unsigned)e->repairsIn);
+    cliPrintf("  verdicts    %u packets dropped as absent\n",
+              (unsigned)e->dropsAbsent);
     {
-        /* The last transaction ends, oldest first — the engine's own record,
-         * good even when the debug log dropped the lines. */
+        /* The last meeting ends, oldest first — the engine's own record, good
+         * even when the debug log dropped the lines. */
         uint32_t nowMs = millis();
         int nEnds = (int)(sizeof e->ends / sizeof e->ends[0]);
         bool any = false;
         for (int i = 0; i < nEnds; i++) {
             const auto* er = &e->ends[(e->endsAt + i) % nEnds];
             if (!er->why) continue;
-            if (!any) { cliPrintf("  last ends   (age role ch sent/plan got/exp outcome)\n"); any = true; }
-            cliPrintf("    %6lus %s ch%u %u/%u %u/%u %s (%s)\n",
+            if (!any) { cliPrintf("  last ends   (age role ch sent got/exp outcome)\n"); any = true; }
+            cliPrintf("    %6lus %s ch%u %u %u/%u %s (%s)\n",
                       (unsigned long)((nowMs - er->endedMs) / 1000u),
-                      er->role_b ? "B" : "A", (unsigned)er->chan,
-                      (unsigned)er->sent, (unsigned)er->plan,
+                      er->listener ? "L" : "O", (unsigned)er->chan,
+                      (unsigned)er->sent,
                       (unsigned)er->got, (unsigned)er->expect,
                       er->ok ? "ok" : "FAIL", er->why);
         }
@@ -647,11 +677,11 @@ static void cliSupe(int idx, const char* sub, const char* arg) {
             cliPrintf(" %d:%s", c, r->chans && r->chans->chanOk[c] ? "ok" : "FULL");
         cliPrintf("\n");
     }
-    if (e->x.phase != SUPE_X_IDLE)
+    if (e->m.phase != SUPE_M_IDLE)
         cliPrintf("  in flight   phase %u, tag %02x%02x%02x, ch%u budget %u (%s)\n",
-                  (unsigned)e->x.phase, e->x.tag[0], e->x.tag[1], e->x.tag[2],
-                  (unsigned)e->x.chan, (unsigned)e->x.budget,
-                  e->x.role_b ? "answering" : "requesting");
+                  (unsigned)e->m.phase, e->m.tag[0], e->m.tag[1], e->m.tag[2],
+                  (unsigned)e->m.chan, (unsigned)e->m.budget,
+                  e->m.listener ? "listening" : "opening");
     if (r->q.n) cliPrintf("  queued      %u packet%s\n",
                           (unsigned)r->q.n, r->q.n == 1 ? "" : "s");
 }
@@ -778,7 +808,7 @@ void cliLora(const char* args) {
         cliPrintf("%-*s carrier-sense (as normal tx), then transmit\n", CLI_HELP_COL, "lora <n> tx_psa <string>");
         cliPrintf("%-*s emit a header committing receivers for <ms> (4/8)\n", CLI_HELP_COL, "lora <n> tx_prot <ms>");
 #if !defined(CONFIG_LORA_NO_SUPE)
-        cliPrintf("%-*s SUPE state: regime, expiry, tag set, holds, counters\n", CLI_HELP_COL, "lora [<n>] supe");
+        cliPrintf("%-*s SUPE state: regime, expiry, tag set, schedules, counters\n", CLI_HELP_COL, "lora [<n>] supe");
         cliPrintf("%-*s inject a golden-vector frame into the receive path\n", CLI_HELP_COL, "lora [<n>] supe rx 0x<hex>");
 #endif
         return;
@@ -887,14 +917,25 @@ void cliLora(const char* args) {
     } else if (strcmp(cmd, "rx_boosted_gain") == 0) {
         int on = atoi(val) != 0;
         storageSet(sk(kb, sizeof kb, idx, "rx_boosted_gain"), on);
-        cliPrintf("lora/%ld rx_boosted_gain = %s (SX126x only)\n", idx,
+        LoraFamily fam = chipFamily(s_radios[idx].slot->chip);
+        cliPrintf("lora/%ld rx_boosted_gain = %s\n", idx,
                   on ? "on (boosted, +~0.4 mA RX)" : "off (power saving)");
+        if (!radioHasRxBoost(fam))
+            cliPrintf("        note: %s has no such control — the setting is inert here\n",
+                      chipName(s_radios[idx].slot->chip));
+        else if (fam == FAM_LR2021)
+            cliPrintf("        note: on this part it is a gain LEVEL — %s\n",
+                      on ? "7 of 7, the most sensitive" : "0, power-saving");
     } else if (strcmp(cmd, "agc_reset") == 0) {
         int secs = atoi(val);
         if (secs < 0) secs = 0;
         storageSet(sk(kb, sizeof kb, idx, "agc_reset"), secs);
-        if (secs) cliPrintf("lora/%ld agc_reset = %d s (SX126x only)\n", idx, secs);
+        if (secs) cliPrintf("lora/%ld agc_reset = %d s\n", idx, secs);
         else      cliPrintf("lora/%ld agc_reset = off\n", idx);
+        if (secs && !radioHasAgcReset(chipFamily(s_radios[idx].slot->chip)))
+            cliPrintf("        note: the latching front end this recalibrates is the "
+                      "SX126x's — %s ignores the beat\n",
+                      chipName(s_radios[idx].slot->chip));
     } else {
         cliPrintf("unknown: lora %ld %s (try freq|bw|sf|cr|txp|preamble|sync|mode|lbt|appc|rx_boosted_gain|agc_reset)\n", idx, cmd);
     }

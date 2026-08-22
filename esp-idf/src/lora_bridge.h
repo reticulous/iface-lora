@@ -44,6 +44,11 @@ bool registerWithRnsd(LoraRadio* r);
 void deregisterFromRnsd(LoraRadio* r);
 void rearmRx(LoraRadio* r);
 void startTxFrame(LoraRadio* r, int idx);
+/* The frame-level tail of the receive path — split reassembly and delivery —
+ * shared by the live path and the meeting buffer's replay at close, so a
+ * buffered train frame reaches rnsd through exactly the machinery a live one
+ * does. Caller sets rssiLast/snrLast to the frame's own reading first. */
+void bridgeFrameDeliver(LoraRadio* r, const uint8_t* frame, size_t pktLen);
 void beginTx(LoraRadio* r, const uint8_t* data, size_t len, uint8_t origin,
              bool fromBuffer = false, const int8_t* forcePwr = nullptr);
 void serviceRadio(LoraRadio* r);

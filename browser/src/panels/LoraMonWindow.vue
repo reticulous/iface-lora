@@ -57,7 +57,11 @@
                Same bands, same dBm scale, same window — only the gutter labels
                are left off, since repeating one scale ten times is noise. -->
           <div v-for="c in agileChans" :key="c" class="lm-graph lm-graph-chan">
-            <canvas :ref="el => setChanCanvas(c, el)" class="lm-canvas" />
+            <canvas :ref="el => setChanCanvas(c, el)" class="lm-canvas"
+                    @pointerdown="onDown"
+                    @pointermove="onMove"
+                    @pointerup="onUp"
+                    @pointercancel="onUp" />
             <div class="lm-caption lm-caption-chan">
               <span class="lm-chan">{{ chanLabel(c) }}</span>
               <span class="lm-air">tx {{ chanTx(c) }}</span>
@@ -125,6 +129,10 @@ const BG_LO = '#242424', BG_HI = '#313131'
  * direction is read, and at these bar widths a subtle tint is no signal at all. */
 const TX_LO = '#5e1c1c', TX_HI = '#8a2a2a'
 const C_GRID = BG_LO
+/* The veil over spans the radio spent on another channel. Nearly opaque black:
+ * the point is that an unwatched stretch should not read as a quiet one, so it
+ * has to be plainly darker than the darkest band rather than a shade of it. */
+const C_UNHELD = 'rgba(0,0,0,0.72)'
 
 const WINDOWS = [
   { key: '10s', ms: 10 * 1000,  label: '10s' },
@@ -136,12 +144,18 @@ const WINDOWS = [
 ] as const
 
 /* One plot, two dBm axes reading the same four bands: transmit power down the
- * left gutter in 10 dB steps, received strength down the right in 25 dB. RX
- * needs the wider step because its range is 100 dB against TX's 40, and both
- * have to land on the same band edges for a single grid to serve them. */
+ * left gutter in 10 dB steps, received strength down the right in 32 dB. RX
+ * needs the wider step because its range is 128 dB against TX's 40, and both
+ * have to land on the same band edges for a single grid to serve them.
+ *
+ * The RX axis is the reportable range itself, not a guess at a comfortable one:
+ * the packet-strength register is a byte read as −value/2 dBm, so 0 is the
+ * strongest level a receiver can state and −127.5 the weakest. A bench pair a
+ * hand apart reads well above −30, and an axis that stopped there put every one
+ * of those in the top band with nothing to tell them apart. */
 const NBANDS = 4
 const AX_TX = { lo: -10, hi: 30 }     // 10 dB per band
-const AX_RX = { lo: -130, hi: -30 }   // 25 dB per band
+const AX_RX = { lo: -128, hi: 0 }     // 32 dB per band
 
 /* The channel-noise floor the traffic sits on: very light grey, so a bar always
  * wins the pixels it lands on and the floor reads as background texture. */
@@ -154,10 +168,15 @@ interface Rec { t: number; dir: number; dur: number; bytes: number; rssi: number
 let recs: Rec[] = []
 
 /* Channel RSSI, accumulated live rather than mirrored as history: the firmware
- * publishes only the newest sweep (`lora.<n>.rssi` = "<ms>|<ch0>|<ch1>|…"), so
- * the series starts when the window opens — the same rule the packet nodes
+ * publishes only the newest reading (`lora.<n>.rssi` = "<ms>|<ch0>|<ch1>|…"),
+ * so the series starts when the window opens — the same rule the packet nodes
  * follow. A beat the radio skipped (carrier sense had it) republishes nothing,
- * so the key is unchanged, no point is appended, and the gap draws as a gap. */
+ * so the key is unchanged, no point is appended, and the gap draws as a gap.
+ *
+ * A device measures the channel it is camped on and never retunes away to
+ * sample another, so in practice one field arrives and the backdrop appears
+ * under the hailing graph alone. The agile lanes are not empty for it: what
+ * fills them is traffic, which is recorded per channel regardless. */
 const CH_MAX = 10
 interface Floor { t: number; dbm: number }
 let floorSeries: Floor[][] = Array.from({ length: CH_MAX }, () => [])
@@ -355,12 +374,41 @@ function drawOne(cv: HTMLCanvasElement | null, ch: number, main: boolean) {
   const xAt = (t: number) => gl + clamp01((t - lo) / ms) * span
   const bh = h / NBANDS
 
+  /* Where the radio was NOT here, the lane goes dark.
+   *
+   * A lane with nothing in it answers two different questions the same way —
+   * nobody spoke, or we were somewhere else — and on a hopping radio the second
+   * is the usual one. The dwell records say which: the plot is drawn at full
+   * strength only across the spans this channel actually held the receiver, and
+   * everything else is veiled. Read the lane as: bright means listening, and a
+   * gap in the bright means the radio was on another lane at that moment.
+   *
+   * Drawn over the bands and under everything else, so the axis still reads
+   * through it and traffic still lands on top at full contrast. */
+  {
+    const held: { x0: number; x1: number }[] = []
+    for (const rec of recsCh) {
+      if (rec.dir !== 2) continue
+      const e = rec.t + rec.dur
+      if (e < lo || rec.t > hi) continue
+      held.push({ x0: xAt(rec.t), x1: xAt(e) })
+    }
+    held.sort((a, b) => a.x0 - b.x0)
+    ctx.fillStyle = C_UNHELD
+    let x = gl
+    for (const s2 of held) {
+      if (s2.x0 > x) ctx.fillRect(x, 0, s2.x0 - x, h)
+      if (s2.x1 > x) x = s2.x1
+    }
+    if (x < w - gr) ctx.fillRect(x, 0, (w - gr) - x, h)
+  }
+
   /* Air we are holding ourselves: the same gradient cast red, over the frame's
    * time-on-air only. The wait before it is channel access, not transmission —
    * tinting that would claim airtime the radio never spent. */
   const txSpans: { x: number; w: number }[] = []
   for (const rec of recsCh) {
-    if (rec.dir !== 1) continue
+    if (rec.dir !== 1) continue                 /* dir 2 (dwell) excluded by this */
     const s = rec.t, e = rec.t + rec.dur
     if (e < lo || s > hi) continue
     const xs = xAt(s)
@@ -415,11 +463,15 @@ function drawOne(cv: HTMLCanvasElement | null, ch: number, main: boolean) {
   }
 
   for (const rec of recsCh) {
+    if (rec.dir === 2) continue                 /* a dwell is background, not a frame */
     const s = rec.t, e = rec.t + rec.dur
     if (e < lo || s > hi) continue
     const xs = xAt(s)
     const bw = Math.max(1, xAt(e) - xs)
-    const th = Math.max(1, h * 0.05)
+    /* Never thinner than two device-independent pixels. On an agile lane at a
+     * quarter height the proportional term falls under one pixel, and a frame
+     * that rounds away is a frame the graph is lying about. */
+    const th = Math.max(2 * dpr, h * 0.05)
     const ax = rec.dir === 1 ? AX_TX : AX_RX
     const dbm = rec.dir === 1 ? rec.txp : rec.rssi
     let y = h - clamp01((dbm - ax.lo) / (ax.hi - ax.lo)) * h
@@ -461,7 +513,10 @@ function drawOne(cv: HTMLCanvasElement | null, ch: number, main: boolean) {
     ctx.fillRect(xs, y, bw, th)
   }
 
-  if (main && sel.value) {
+  /* On every lane, not just the one under the pointer: the stack shares one
+   * time axis, so the band is the same column everywhere and showing it whole
+   * is what makes the selection legible. */
+  if (sel.value) {
     const a = Math.min(sel.value.anchor, sel.value.cur)
     const b = Math.max(sel.value.anchor, sel.value.cur)
     const xa = xAt(a), xb = xAt(b)
@@ -489,8 +544,13 @@ function redraw() {
 }
 
 /* ── selection → zoom ── */
+/* Geometry from the canvas the gesture landed on, not from the main graph:
+ * every lane is the same width with the same gutters and the same time axis, so
+ * a column means the same moment in all of them — which is exactly why a swipe
+ * should work wherever the pointer happens to be. Reaching for the main graph
+ * to zoom is a rule with no reason behind it. */
 function xToTime(ev: PointerEvent): number | null {
-  const cv = canvasRef.value
+  const cv = (ev.currentTarget as HTMLCanvasElement | null) ?? canvasRef.value
   if (!cv) return null
   const rect = cv.getBoundingClientRect()
   const span = rect.width - GUT_L_CSS - GUT_R_CSS
@@ -546,6 +606,10 @@ function parseRec(t: number, s: string): Rec | null {
   const p = s.split('|')
   if (p[0] === 'r') return { t, dir: 0, rssi: +p[1], snr10: +p[2], dur: +p[3], bytes: +p[4], txp: 0, type: +(p[5] ?? 0), wait: 0, own: 0, ch: +(p[6] ?? 0) }
   if (p[0] === 't') return { t, dir: 1, txp: +p[1], dur: +p[2], bytes: +p[3], rssi: 0, snr10: 0, type: +(p[4] ?? 0), wait: +(p[5] ?? 0), ch: +(p[6] ?? 0), own: +(p[7] ?? 0) }
+  /* A dwell: the radio was tuned here and listening for this long. Not a frame
+   * — it carries no level and is never drawn as one; it is what tells a lane
+   * apart from a lane nobody was watching. */
+  if (p[0] === 'a') return { t, dir: 2, ch: +p[1], dur: +p[2], bytes: 0, rssi: 0, snr10: 0, txp: 0, type: 0, wait: 0, own: 0 }
   return null
 }
 

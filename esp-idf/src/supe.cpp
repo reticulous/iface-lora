@@ -161,7 +161,16 @@ static const int kNumBandwidths = (int)(sizeof kBandwidths / sizeof kBandwidths[
 
 int16_t supeReqSnrDeci(uint8_t sf) { return reqSnrDeci((int)sf); }
 
+/* A bandwidth of zero is not a wide channel, it is an unset one — a caller that
+ * left the configuration blank. Taken at face value the logarithm runs to
+ * negative infinity and the cast lands on 0, which reads as a receiver that
+ * needs 0 dBm to hear anything: every real signal then looks hopelessly weak,
+ * and a margin test built on it can only ever answer "too little power". Say
+ * "unknown" with a floor no measurement will beat instead. */
+#define SUPE_SENS_UNKNOWN_DECI  (-1200)   /* -120 dBm: assume generous margin */
+
 int16_t supeSensitivityDeci(const SupeCfg* c) {
+    if (!c || c->bwHz == 0) return SUPE_SENS_UNKNOWN_DECI;
     double thermal = -174.0 + 10.0 * log10((double)c->bwHz);
     return (int16_t)lround(10.0 * (thermal + SUPE_NOISE_FIGURE_DB) + (double)reqSnrDeci(c->sf));
 }
@@ -173,14 +182,6 @@ double supeAirtimeSeconds(int sf, int bw_hz, int cr_denom, int preamble,
     return loraToaSeconds(sf, bw_hz, cr_denom, preamble, payload, implicitHeader, crc);
 }
 
-/* ─────────────── deadlines ─────────────── */
-
-static uint32_t toaMs(const SupeCfg* c, int crDenom, int preamble, int payload) {
-    return (uint32_t)lround(1000.0 * supeAirtimeSeconds(
-               c->sf, (int)c->bwHz, crDenom, preamble, payload,
-               /*implicitHeader=*/false, /*crc=*/false));
-}
-
 /* ─────────────── codec ─────────────── */
 
 static inline uint8_t packNibbles(uint8_t hi, uint8_t lo) {
@@ -189,14 +190,13 @@ static inline uint8_t packNibbles(uint8_t hi, uint8_t lo) {
 
 static void encCaps(uint8_t* p, const SupeCaps* c) {
     p[0] = packNibbles(c->fam, c->topStep);
-    p[1] = (uint8_t)(supeEncLevel(c->maxPwrDbm) | (c->adaptive ? 0x80 : 0x00));
+    p[1] = supeEncLevel(c->maxPwrDbm);
 }
 
 static void decCaps(const uint8_t* p, SupeCaps* c) {
     c->fam      = (uint8_t)(p[0] >> 4);
     c->topStep  = (uint8_t)(p[0] & 0x0F);
-    c->adaptive = (p[1] & 0x80) != 0;
-    c->maxPwrDbm = (int8_t)supeDecLevel((uint8_t)(p[1] & 0x7F));
+    c->maxPwrDbm = (int8_t)supeDecLevel(p[1]);
 }
 
 size_t supeEncAnn2(uint8_t* out, size_t cap, const SupeAnn2* a) {
@@ -213,11 +213,14 @@ size_t supeEncAnn2(uint8_t* out, size_t cap, const SupeAnn2* a) {
     return n;
 }
 
+static bool lenOkAnn2(size_t len);
+
 bool supeDecAnn2(const uint8_t* f, size_t len, SupeAnn2* out) {
     if (len < 2 || f[0] != SUPE_T_ANNOUNCE2) return false;
     uint8_t regime  = (uint8_t)(f[1] >> 4);
     uint8_t version = (uint8_t)(f[1] & 0x0F);
-    if (!supeLenOk2(SUPE_T_ANNOUNCE2, regime, version, len)) return false;
+    const SupeRegime* g = supeRegime(regime);
+    if (!g || g->version != version || !lenOkAnn2(len)) return false;
     out->regime  = regime;
     out->version = version;
     decCaps(f + 2, &out->caps);
@@ -339,7 +342,7 @@ int supeLadder(uint8_t regime, uint8_t version,
 bool supeResolveBudget(uint8_t regime, uint8_t version,
                        uint8_t hailSf, uint32_t hailBwHz, uint32_t chanMaxBwHz,
                        uint8_t famA, uint8_t famB, uint8_t budget, SupeCfg* out) {
-    if (budget >= SUPE_BUDGET_REFUSED) return false;
+    if (budget >= SUPE_LADDER_MAX_ENTRIES) return false;
     SupeLadderEntry lad[SUPE_LADDER_MAX_ENTRIES];
     int n = supeLadder(regime, version, hailSf, hailBwHz, chanMaxBwHz,
                        famA, famB, lad, SUPE_LADDER_MAX_ENTRIES);
@@ -351,160 +354,262 @@ bool supeResolveBudget(uint8_t regime, uint8_t version,
     return true;
 }
 
-uint8_t supeSyncWordFor(uint8_t regime, const SupeCfg* c, uint8_t budget,
-                        uint8_t ifaceSync) {
-    /* Regime 0's budget 0 is the hailing configuration on the hailing channel
-     * — not off the channel in any sense the sync word cares about. Every
-     * other grant is a detour, even at budget 0 under regime 1, where the
-     * frequency moved though the modulation did not. */
-    if (regime == SUPE_REGIME_SINGLE && budget == 0) return ifaceSync;
-    return c->sf == 5 ? SUPE_SYNC_SF5 : SUPE_SYNC_UNICAST;
-}
+/* ─────────────── the frame checksum (§8) ─────────────── */
 
-/* ─────────────── the load's airtime (§6) ─────────────── */
-
-uint32_t supeLoadAirtimeMs(uint8_t loadUnits, const SupeCfg* c, int crDenom) {
-    if (loadUnits == 0 || crDenom < 5 || crDenom > 8) return 0;
-    uint32_t bytes = supeDecLoadBytes(loadUnits);
-    int de = c->ldro ? 1 : 0;
-    /* Data bits per symbol are (SF − 2·DE)·4/cr_denom, so
-     * ms = bytes·8 / that · tSym = bytes·2·cr·2^SF·1000 / ((SF−2·DE)·BW),
-     * rounded up. 64-bit: 8160·2·8·4096·1000 ≈ 2^39. */
-    uint64_t num = (uint64_t)bytes * 2u * (uint32_t)crDenom
-                   * ((uint64_t)1 << c->sf) * 1000u;
-    uint64_t den = (uint64_t)(c->sf - 2 * de) * c->bwHz;
-    return (uint32_t)((num + den - 1) / den);
-}
-
-/* ─────────────── deadlines, revised (§14.7) ─────────────── */
-
-uint32_t supeGrantDeadlineMs(uint8_t hailSf, uint32_t hailBwHz,
-                             int crDenom, int preamble) {
-    SupeCfg hail = { hailSf, hailBwHz, ldroForInt(hailSf, hailBwHz), 0 };
-    return SUPE_TURNAROUND_MS + toaMs(&hail, crDenom, preamble, SUPE_GRANT_LEN)
-           + SUPE_GUARD_MS;
-}
-
-uint32_t supeManifestFirstDeadlineMs(const SupeCfg* c, int crDenom, int preamble) {
-    return SUPE_RETUNE_GAP_MS + SUPE_TURNAROUND_MS
-           + toaMs(c, crDenom, preamble, SUPE_MANIFEST2_LEN) + SUPE_GUARD_MS;
-}
-
-uint32_t supeManifestReverseDeadlineMs(const SupeCfg* c, int crDenom, int preamble) {
-    return SUPE_TURNAROUND_MS
-           + toaMs(c, crDenom, preamble, SUPE_MANIFEST2_LEN) + SUPE_GUARD_MS;
-}
-
-/* ─────────────── revised codec (§0.1) ─────────────── */
-
-bool supeLenOk2(uint8_t type, uint8_t regime, uint8_t version, size_t len) {
-    const SupeRegime* g = supeRegime(regime);
-    if (!g || g->version != version) return false;
-    switch (type) {
-        case SUPE_T_START:
-            return len == SUPE_START2_LEN || len == SUPE_START2_ID_LEN;
-        case SUPE_T_GRANT:
-            return len == SUPE_GRANT_LEN;
-        case SUPE_T_ANNOUNCE2: {
-            if (len < SUPE_ANN2_BASE + SUPE_ID_LEN) return false;
-            size_t idBytes = len - SUPE_ANN2_BASE;
-            if (idBytes % SUPE_ID_LEN) return false;
-            return idBytes / SUPE_ID_LEN <= SUPE_ANN2_MAX;
-        }
-        case SUPE_T_MANIFEST:
-            return len == SUPE_MANIFEST2_LEN;
-        default:
-            return false;   /* reserved — 0xC3 and 0xC8 included — is discarded
-                             * exactly as a wrong length is */
+uint8_t supeCrc8(const uint8_t* d, size_t n) {
+    uint8_t crc = 0;
+    for (size_t i = 0; i < n; i++) {
+        crc ^= d[i];
+        for (int b = 0; b < 8; b++)
+            crc = (uint8_t)((crc & 0x80) ? (crc << 1) ^ 0x07 : (crc << 1));
     }
+    return crc;
 }
 
-size_t supeEncStart2(uint8_t* out, size_t cap, const SupeStart2* s) {
-    size_t n = s->haveIdent ? SUPE_START2_ID_LEN : SUPE_START2_LEN;
+/* ─────────────── the sync-word list (§14.5) ───────────────
+ *
+ * A sync nibble is transmitted as a symbol at bin `nibble × 8` in a space of
+ * 2^SF bins. Bin 0 is another preamble upchirp, so zero nibbles detect weakly;
+ * frequency error of ~20 ppm at 868 MHz spreads energy about two nibble-steps,
+ * so foreign words get a two-nibble berth in both symbols. SF5's 32 bins admit
+ * only nibbles 1–3 — every one of its nine words sits inside 0x12's berth, so
+ * the berth rule would empty the list and SF5 takes exact exclusions only:
+ * the weak separation is spent where no other network listens. */
+
+static bool wordExcluded(uint8_t w, uint8_t foreign, bool exactOnly) {
+    if (exactOnly) return w == foreign;
+    int w1 = w >> 4, w2 = w & 0x0F;
+    int f1 = foreign >> 4, f2 = foreign & 0x0F;
+    int d1 = w1 > f1 ? w1 - f1 : f1 - w1;
+    int d2 = w2 > f2 ? w2 - f2 : f2 - w2;
+    return d1 <= 2 && d2 <= 2;      /* one distant symbol is separation enough */
+}
+
+int supeSyncWords(uint8_t sf, uint8_t ifaceSync, uint8_t* out, int cap) {
+    int nibMax = sf >= 7 ? 15 : (sf == 6 ? 7 : 3);
+    bool exactOnly = sf <= 5;
+    const uint8_t foreign[4] = { 0x12, 0x24, 0x34, ifaceSync };
+    int n = 0;
+    for (int hi = 1; hi <= nibMax; hi++) {
+        for (int lo = 1; lo <= nibMax; lo++) {
+            uint8_t w = (uint8_t)((hi << 4) | lo);
+            bool excl = false;
+            for (int i = 0; i < 4 && !excl; i++)
+                excl = wordExcluded(w, foreign[i], exactOnly);
+            if (excl) continue;
+            if (n < cap) out[n] = w;
+            n++;
+        }
+    }
+    return n < cap ? n : cap;
+}
+
+uint8_t supeSyncWordAt(uint8_t sf, uint8_t ifaceSync, uint8_t sByte) {
+    uint8_t words[SUPE_SYNC_WORDS_CAP];
+    int n = supeSyncWords(sf, ifaceSync, words, (int)(sizeof words));
+    if (n <= 0) return 0x22;            /* unreachable: every SF admits words */
+    return words[sByte % (uint8_t)n];
+}
+
+/* ─────────────── the schedule (§7) ─────────────── */
+
+void supeDeriveSchedule(const uint8_t d0[32], const uint8_t d1[32],
+                        bool wide, uint8_t nChans, SupeSchedD* out) {
+    memset(out, 0, sizeof *out);
+    memcpy(out->hash3, d0, SUPE_HASH_LEN);
+    /* stream = D0[3..31] ‖ D1[0..31]: 61 bytes, three per slot — more than
+     * SUPE_SLOTS_MAX can consume. */
+    uint8_t stream[61];
+    memcpy(stream, d0 + 3, 29);
+    memcpy(stream + 29, d1, 32);
+
+    uint32_t horizon = wide ? SUPE_WIDE_HORIZON_MS : SUPE_TIGHT_HORIZON_MS;
+    uint32_t t = 0;
+    uint8_t  n = 0;
+    for (uint8_t k = 0; k < SUPE_SLOTS_MAX; k++) {
+        uint8_t j = stream[3 * k + 0];
+        uint8_t c = stream[3 * k + 1];
+        uint8_t s = stream[3 * k + 2];
+        if (k == 0) {
+            t = wide ? 150u + (j % 40u) : (uint32_t)SUPE_TIGHT_T0_MS;
+        } else {
+            uint32_t base = wide ? (60u + 30u * k) : 40u;
+            if (wide && base > 350u) base = 350u;
+            t += base + (j % (wide ? 40u : 24u));
+        }
+        if (t > horizon) break;
+        out->slot[n].tMs   = (uint16_t)t;
+        out->slot[n].chan  = nChans ? (uint8_t)(1 + (c % nChans)) : SUPE_CH_HAIL;
+        out->slot[n].sByte = s;
+        n++;
+    }
+    out->nSlots = n;
+}
+
+/* ─────────────── codec, the meeting frames (§0.1) ─────────────── */
+
+static bool lenOkAnn2(size_t len) {
+    if (len < SUPE_ANN2_BASE + SUPE_ID_LEN) return false;
+    size_t idBytes = len - SUPE_ANN2_BASE;
+    if (idBytes % SUPE_ID_LEN) return false;
+    return idBytes / SUPE_ID_LEN <= SUPE_ANN2_MAX;
+}
+
+size_t supeEncPrivsync(uint8_t* out, size_t cap, const SupePrivsync* p) {
+    size_t n = p->haveIdent ? SUPE_PRIVSYNC_ID_LEN : SUPE_PRIVSYNC_LEN;
     if (cap < n) return 0;
-    out[0] = SUPE_T_START;
-    out[1] = packNibbles(s->regime, s->version);
-    memcpy(out + 2, s->tag, SUPE_TAG_LEN);
-    out[5] = packNibbles(s->fam, s->ceiling);
-    out[6] = s->load;
-    if (s->haveIdent) memcpy(out + 7, s->ident, SUPE_TAG_LEN);
+    out[0] = SUPE_T_PRIVSYNC;
+    out[1] = packNibbles(p->regime, p->version);
+    memcpy(out + 2, p->tag, SUPE_TAG_LEN);
+    out[5] = supeEncLevel(p->pwrDbm);
+    out[6] = p->salt;
+    if (p->haveIdent) memcpy(out + 7, p->ident, SUPE_TAG_LEN);
     return n;
 }
 
-bool supeDecStart2(const uint8_t* f, size_t len, SupeStart2* out) {
-    if (len < 2 || f[0] != SUPE_T_START) return false;
+bool supeDecPrivsync(const uint8_t* f, size_t len, SupePrivsync* out) {
+    if (len < 2 || f[0] != SUPE_T_PRIVSYNC) return false;
+    if (len != SUPE_PRIVSYNC_LEN && len != SUPE_PRIVSYNC_ID_LEN) return false;
     uint8_t regime  = (uint8_t)(f[1] >> 4);
     uint8_t version = (uint8_t)(f[1] & 0x0F);
-    if (!supeLenOk2(SUPE_T_START, regime, version, len)) return false;
+    const SupeRegime* g = supeRegime(regime);
+    if (!g || g->version != version) return false;
     out->regime  = regime;
     out->version = version;
     memcpy(out->tag, f + 2, SUPE_TAG_LEN);
-    out->fam     = (uint8_t)(f[5] >> 4);
-    out->ceiling = (uint8_t)(f[5] & 0x0F);
-    out->load    = f[6];
-    /* Presence of the sender's identity is implicit in the frame length. The
-     * ten-byte form is parsed and honoured while never being sent —
-     * `sender_ident` ships with the transmitting form and not before (§4). */
-    out->haveIdent = (len == SUPE_START2_ID_LEN);
+    out->pwrDbm  = (int8_t)supeDecLevel(f[5]);
+    out->salt    = f[6];
+    /* Presence of the sender's identity is implicit in the frame length; a
+     * node with `sender_ident` off still parses and honours the long form. */
+    out->haveIdent = (len == SUPE_PRIVSYNC_ID_LEN);
     if (out->haveIdent) memcpy(out->ident, f + 7, SUPE_TAG_LEN);
     else                memset(out->ident, 0, SUPE_TAG_LEN);
     return true;
 }
 
-size_t supeEncGrant(uint8_t* out, size_t cap, const SupeGrant* g) {
-    if (cap < SUPE_GRANT_LEN) return 0;
-    out[0] = SUPE_T_GRANT;
-    out[1] = packNibbles(g->regime, g->version);
-    out[2] = packNibbles(g->chan, g->budget);
-    out[3] = g->durByte;
-    out[4] = (uint8_t)(supeEncLevel(g->pwrDbm) | (g->reverse ? 0x80 : 0x00));
-    out[5] = supeEncLevel(g->rssiDbm);
-    out[6] = (uint8_t)g->snrQ;
-    memcpy(out + 7, g->hash, SUPE_HASH_LEN);
-    return SUPE_GRANT_LEN;
+size_t supeEncHaveData(uint8_t* out, size_t cap, const SupeHaveData* h) {
+    size_t n = h->answering ? (size_t)SUPE_HAVEDATA_ANS_BASE + h->maskLen
+                            : (size_t)SUPE_HAVEDATA_LEN;
+    if (cap < n || h->count > SUPE_TRAIN_MAX) return 0;
+    if (h->answering && h->maskLen > SUPE_MASK_MAX) return 0;
+    out[0] = SUPE_T_HAVEDATA;
+    memcpy(out + 1, h->hash, SUPE_HASH_LEN);
+    out[4] = supeEncLevel(h->pwrDbm);
+    out[5] = h->budget;
+    out[6] = h->count;
+    out[7] = h->lenByte;
+    if (h->answering) {
+        out[8] = supeEncLevel(h->trainRssi);
+        out[9] = (uint8_t)h->trainSnrQ;
+        memcpy(out + 10, h->mask, h->maskLen);
+    }
+    return n;
 }
 
-bool supeDecGrant(const uint8_t* f, size_t len, SupeGrant* out) {
-    if (len < 2 || f[0] != SUPE_T_GRANT) return false;
-    uint8_t regime  = (uint8_t)(f[1] >> 4);
-    uint8_t version = (uint8_t)(f[1] & 0x0F);
-    if (!supeLenOk2(SUPE_T_GRANT, regime, version, len)) return false;
-    out->regime  = regime;
-    out->version = version;
-    out->chan    = (uint8_t)(f[2] >> 4);
-    out->budget  = (uint8_t)(f[2] & 0x0F);
-    out->durByte = f[3];
-    out->reverse = (f[4] & 0x80) != 0;
-    out->pwrDbm  = (int8_t)supeDecLevel((uint8_t)(f[4] & 0x7F));
-    out->rssiDbm = supeDecLevel(f[5]);
-    out->snrQ    = (int8_t)f[6];
-    memcpy(out->hash, f + 7, SUPE_HASH_LEN);
+bool supeDecHaveData(const uint8_t* f, size_t len, uint8_t peerCount,
+                     SupeHaveData* out) {
+    if (len < 1 || f[0] != SUPE_T_HAVEDATA) return false;
+    size_t ansLen = (size_t)SUPE_HAVEDATA_ANS_BASE + supeMaskLen(peerCount);
+    bool answering;
+    if (len == SUPE_HAVEDATA_LEN) answering = false;
+    else if (peerCount > 0 && len == ansLen) answering = true;
+    else return false;
+    memcpy(out->hash, f + 1, SUPE_HASH_LEN);
+    out->pwrDbm  = (int8_t)supeDecLevel(f[4]);
+    out->budget  = f[5];
+    out->count   = f[6];
+    out->lenByte = f[7];
+    if (out->count > SUPE_TRAIN_MAX) return false;
+    out->answering = answering;
+    memset(out->mask, 0, sizeof out->mask);
+    if (answering) {
+        out->trainRssi = supeDecLevel(f[8]);
+        out->trainSnrQ = (int8_t)f[9];
+        out->maskLen   = supeMaskLen(peerCount);
+        memcpy(out->mask, f + 10, out->maskLen);
+    } else {
+        out->trainRssi = 0;
+        out->trainSnrQ = 0;
+        out->maskLen   = 0;
+    }
     return true;
 }
 
-size_t supeEncManifest2(uint8_t* out, size_t cap, const SupeManifest2* m) {
-    if (cap < SUPE_MANIFEST2_LEN) return 0;
-    out[0] = SUPE_T_MANIFEST;
-    out[1] = supeEncLevel(m->pwrDbm);
-    out[2] = supeEncLevel(m->rssiDbm);
-    out[3] = (uint8_t)m->snrQ;
-    encCaps(out + 4, &m->caps);
-    out[6] = m->count;
-    out[7] = m->lenByte;
-    memcpy(out + 8, m->hash, SUPE_HASH_LEN);
-    return SUPE_MANIFEST2_LEN;
+size_t supeEncGimme(uint8_t* out, size_t cap, const SupeGimme* g) {
+    size_t n = g->havePsHeard ? SUPE_GIMME_LEN : SUPE_GIMME_WIDE_LEN;
+    if (cap < n) return 0;
+    out[0] = SUPE_T_GIMME;
+    memcpy(out + 1, g->hash, SUPE_HASH_LEN);
+    out[4] = supeEncLevel(g->pwrDbm);
+    out[5] = g->budget;
+    size_t o = 6;
+    if (g->havePsHeard) {
+        out[o++] = supeEncLevel(g->psRssi);
+        out[o++] = (uint8_t)g->psSnrQ;
+    }
+    out[o++] = supeEncLevel(g->hdRssi);
+    out[o++] = (uint8_t)g->hdSnrQ;
+    return n;
 }
 
-bool supeDecManifest2(const uint8_t* f, size_t len, SupeManifest2* out) {
-    /* MANIFEST carries no regime nibble: the GRANT that opened the detour
-     * fixed the dialect for both sides, including the detour's own regime. */
-    if (len != SUPE_MANIFEST2_LEN || f[0] != SUPE_T_MANIFEST) return false;
-    out->pwrDbm  = (int8_t)supeDecLevel(f[1]);
-    out->rssiDbm = supeDecLevel(f[2]);
-    out->snrQ    = (int8_t)f[3];
-    decCaps(f + 4, &out->caps);
-    out->count   = f[6];
-    out->lenByte = f[7];
-    memcpy(out->hash, f + 8, SUPE_HASH_LEN);
+bool supeDecGimme(const uint8_t* f, size_t len, SupeGimme* out) {
+    if (len < 1 || f[0] != SUPE_T_GIMME) return false;
+    if (len != SUPE_GIMME_LEN && len != SUPE_GIMME_WIDE_LEN) return false;
+    memcpy(out->hash, f + 1, SUPE_HASH_LEN);
+    out->pwrDbm = (int8_t)supeDecLevel(f[4]);
+    out->budget = f[5];
+    out->havePsHeard = (len == SUPE_GIMME_LEN);
+    size_t o = 6;
+    if (out->havePsHeard) {
+        out->psRssi = supeDecLevel(f[o]); o++;
+        out->psSnrQ = (int8_t)f[o];       o++;
+    } else {
+        out->psRssi = 0;
+        out->psSnrQ = 0;
+    }
+    out->hdRssi = supeDecLevel(f[o]); o++;
+    out->hdSnrQ = (int8_t)f[o];
+    return true;
+}
+
+size_t supeEncThatsit(uint8_t* out, size_t cap, const SupeThatsit* t) {
+    if (t->count == 0 || t->count > SUPE_TRAIN_MAX) return 0;
+    size_t n = (size_t)SUPE_THATSIT_BASE + t->count;
+    if (cap < n) return 0;
+    out[0] = SUPE_T_THATSIT;
+    out[1] = supeEncLevel(t->pwrDbm);
+    out[2] = t->salt;
+    memcpy(out + 3, t->csum, t->count);
+    return n;
+}
+
+bool supeDecThatsit(const uint8_t* f, size_t len, SupeThatsit* out) {
+    if (len < SUPE_THATSIT_BASE + 1 || f[0] != SUPE_T_THATSIT) return false;
+    size_t count = len - SUPE_THATSIT_BASE;
+    if (count > SUPE_TRAIN_MAX) return false;
+    out->pwrDbm = (int8_t)supeDecLevel(f[1]);
+    out->salt   = f[2];
+    out->count  = (uint8_t)count;
+    memcpy(out->csum, f + 3, count);
+    return true;
+}
+
+size_t supeEncResend(uint8_t* out, size_t cap, const SupeResendF* m) {
+    if (m->maskLen == 0 || m->maskLen > SUPE_MASK_MAX) return 0;
+    size_t n = (size_t)SUPE_RESEND_BASE + m->maskLen;
+    if (cap < n) return 0;
+    out[0] = SUPE_T_RESEND;
+    memcpy(out + 1, m->mask, m->maskLen);
+    return n;
+}
+
+bool supeDecResend(const uint8_t* f, size_t len, uint8_t peerCount,
+                   SupeResendF* out) {
+    if (len < 1 || f[0] != SUPE_T_RESEND || peerCount == 0) return false;
+    uint8_t ml = supeMaskLen(peerCount);
+    if (len != (size_t)SUPE_RESEND_BASE + ml) return false;
+    out->maskLen = ml;
+    memset(out->mask, 0, sizeof out->mask);
+    memcpy(out->mask, f + 1, ml);
     return true;
 }

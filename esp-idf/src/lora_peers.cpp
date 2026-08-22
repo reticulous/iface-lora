@@ -121,6 +121,7 @@ void peersSample(Neighbor* e, int16_t rssi, int16_t snr10, uint32_t now) {
     e->haveSig = true;
     e->lastHeardMs = now;
     e->frames++;
+    apHeard(e, now);            /* the EST tier's walk is paid for in these */
     uint32_t absIdx = now / NEI_BUCKET_MS;
     NeiBucket* b = &e->buck[absIdx % NEI_BUCKETS];
     if (b->absIdx != absIdx) { b->absIdx = absIdx; b->cnt = 0; b->rssiSum = 0; b->snrSum10 = 0; }
@@ -131,21 +132,25 @@ void peersSample(Neighbor* e, int16_t rssi, int16_t snr10, uint32_t now) {
 
 /* One resolved proof expectation: ratio counters + EWMA (α = 1/4).
  *
- * This is also SUPE's adaptive-power feedback, and it is the only feedback
- * there is: a detour gives no acknowledgement, so within one transaction there
- * is no direct evidence a train landed. What a sender observes instead is
- * whether Reticulum's own delivery signals come back — slower, only for traffic
- * that is proved at all, and costing no airtime whatsoever. */
+ * This is also the adaptive-power ratchet's feedback: Reticulum's own delivery
+ * signals coming back, or not — slower than a MANIFEST, only for traffic that
+ * is proved at all, and costing no airtime whatsoever.
+ *
+ * A miss reaches the power controller only when the peer has ALSO stopped being
+ * heard (AP_MISS_QUIET_MS). A proof that never came from a node whose frames
+ * are still arriving says the medium is congested or the far end is busy, and
+ * transmitting harder makes both worse; the quality counters record it either
+ * way, because that is a statement about the link and not about the power. */
 void peersQuality(LoraRadio* r, Neighbor* e, bool hit) {
     e->qSent++;
     if (hit) e->qProved++;
     uint8_t s = hit ? 255 : 0;
     if (!e->haveQuality) { e->quality = s; e->haveQuality = true; }
     else e->quality = (uint8_t)((3 * (int)e->quality + s + 2) / 4);
-#if !defined(CONFIG_LORA_NO_SUPE)
-    if (hit) supeApSucceeded(r, e);
-    else if (e->haveApLastTxp) supeApFailed(r, e, e->apLastTxp);
-#endif
+    if (hit) { apSucceeded(r, e); return; }
+    uint32_t now = millis();
+    if (e->haveApLastTxp && (uint32_t)(now - e->lastHeardMs) > AP_MISS_QUIET_MS)
+        apFailed(r, e, e->apLastTxp, nullptr);
 }
 
 NeiLink* peersLinkFind(NeiState* st, const uint8_t linkId[16]) {
@@ -265,14 +270,43 @@ void peersMergeInto(Neighbor* dst, Neighbor* src) {
     dst->qSent   += src->qSent;
     dst->qProved += src->qProved;
     if (!dst->haveQuality && src->haveQuality) { dst->quality = src->quality; dst->haveQuality = true; }
-    /* A measured determination outranks an estimated one; otherwise first wins.
-     * Losing it across a fold would make a node forget its power the moment a
-     * 0x03 linked its rows, exactly as with txPwr above. */
-    if (src->haveApPwr && (!dst->haveApPwr || (dst->apFromEst && !src->apFromEst))) {
-        dst->apPwr     = src->apPwr;
-        dst->apFromEst = src->apFromEst;
-        dst->haveApPwr = true;
+    /* Adaptive power: the evidence folds, the derived number does not — it is
+     * recomputed on the next frame anyway. Each measurement keeps whichever
+     * copy is more recent, because a fold joins two views of ONE node and the
+     * newer reading is the truer one. Losing them here would make a node forget
+     * what it had learnt the moment a 0x03 linked its rows.
+     *
+     * The floor folds the other way: keep the HIGHER, since each was filed
+     * where a frame went missing and neither has been disproved. */
+    if (src->haveApRpt && (!dst->haveApRpt ||
+                           (int32_t)(src->apRptMs - dst->apRptMs) > 0)) {
+        dst->haveApRpt = true;
+        dst->apRptRssi = src->apRptRssi;
+        dst->apRptTxp  = src->apRptTxp;
+        dst->apRptMs   = src->apRptMs;
     }
+    if (src->havePair && (!dst->havePair ||
+                          (int32_t)(src->pairMs - dst->pairMs) > 0)) {
+        dst->havePair = true;
+        dst->pairRssi = src->pairRssi;
+        dst->pairTxp  = src->pairTxp;
+        dst->pairMs   = src->pairMs;
+    }
+    if (src->haveStepPair && (!dst->haveStepPair ||
+                              (int32_t)(src->stepPairMs - dst->stepPairMs) > 0)) {
+        dst->haveStepPair = true;
+        dst->stepRssi     = src->stepRssi;
+        dst->stepTxp      = src->stepTxp;
+        dst->stepPairStep = src->stepPairStep;
+        dst->stepPairMs   = src->stepPairMs;
+    }
+    if (src->haveApFloor && (!dst->haveApFloor || src->apFloorDbm > dst->apFloorDbm)) {
+        dst->haveApFloor    = true;
+        dst->apFloorDbm     = src->apFloorDbm;
+        dst->apFloorDecayMs = src->apFloorDecayMs;
+    }
+    if (src->apOffsetDb < dst->apOffsetDb) dst->apOffsetDb = src->apOffsetDb;
+    if (src->apEstWalkDb < dst->apEstWalkDb) dst->apEstWalkDb = src->apEstWalkDb;
     dst->provesData |= src->provesData;
     dst->transit    |= src->transit;
     dst->ourProto   |= src->ourProto;
@@ -385,17 +419,28 @@ static int peersAssumedPeerTxp(void) {
 }
 
 /* Recent mean signal for a node, from the 5-minute bucket ring, in the same
- * byte encoding the probe uses. Returns the sample count (0 = nothing recent). */
-static uint32_t peersRecentSignal(const Neighbor* e, uint32_t now,
-                                uint8_t* rssiB, int8_t* snrQ) {
-    uint32_t absNow = now / NEI_BUCKET_MS, cnt = 0;
+ * byte encoding the probe uses. Returns the sample count (0 = nothing recent),
+ * and through `buckets` how many distinct slots those samples fell in — which
+ * is the only handle there is on whether they are spread over time or are one
+ * burst, and the power controller declines to move on a burst.
+ *
+ * `span` is how many of the newest slots to average, so a caller can ask a
+ * narrower question than the ring's hour. The ring is 5-minute quantised, so a
+ * span of n covers somewhere between (n−1) × 5 and n × 5 minutes depending on
+ * where in the current slot the question is asked. */
+static uint32_t peersRecentSignal(const Neighbor* e, uint32_t now, int span,
+                                  uint8_t* rssiB, int8_t* snrQ,
+                                  uint32_t* buckets) {
+    uint32_t absNow = now / NEI_BUCKET_MS, cnt = 0, slots = 0;
     int64_t rs = 0, ss = 0;
+    if (span > NEI_BUCKETS) span = NEI_BUCKETS;
     for (int b = 0; b < NEI_BUCKETS; b++) {
         const NeiBucket* bk = &e->buck[b];
-        if (bk->cnt && absNow - bk->absIdx < NEI_BUCKETS) {
-            cnt += bk->cnt; rs += bk->rssiSum; ss += bk->snrSum10;
+        if (bk->cnt && absNow - bk->absIdx < (uint32_t)span) {
+            cnt += bk->cnt; rs += bk->rssiSum; ss += bk->snrSum10; slots++;
         }
     }
+    if (buckets) *buckets = slots;
     if (!cnt) return 0;
     int rssi = (int)(rs / (int64_t)cnt);
     int snr10 = (int)(ss / (int64_t)cnt);
@@ -421,11 +466,14 @@ static int peersHeadroom10(const LoraRadio* r, uint8_t rssiB, int8_t snrQ) {
     return margin > 0 ? margin : 0;
 }
 
-/* Estimated us->them cliff, deci-dBm. */
+/* Estimated us->them cliff, deci-dBm. Averaged over the newest AP_EST_BUCKETS
+ * slots: an estimate is about the link as it is now, and a mean taken over the
+ * ring's whole hour would still be quoting a neighbour that has since moved. */
 bool peersEstimateCliff10(const LoraRadio* r, const Neighbor* e,
-                               uint32_t now, int* cliff10, uint32_t* samples) {
+                          uint32_t now, int* cliff10, uint32_t* samples,
+                          uint32_t* buckets) {
     uint8_t rssiB; int8_t snrQ;
-    uint32_t n = peersRecentSignal(e, now, &rssiB, &snrQ);
+    uint32_t n = peersRecentSignal(e, now, AP_EST_BUCKETS, &rssiB, &snrQ, buckets);
     if (samples) *samples = n;
     if (!n) return false;
     *cliff10 = peersAssumedPeerTxp() * 10 - peersHeadroom10(r, rssiB, snrQ);

@@ -8,16 +8,32 @@ struct LoraRadio;
 /* lora_supe — the ESP-IDF boundary around the pure engine: the one recursive
  * mutex every entry point takes (the engine itself is single-threaded by
  * contract and lock-free), the esp_timer that carries host->schedule, the
- * SupeHost implementation over the radio/queue/peers/airtime modules, and the
- * announce beat. The contexts the boundary covers: the radio task (RX/TX-done,
- * the drain, polling), the esp_timer task (the engine's step timer), the
- * console task (CLI), and config callbacks. */
+ * SupeHost implementation over the radio/queue/peers/airtime modules, the
+ * train buffers, and the announce beat. The contexts the boundary covers: the
+ * radio task (RX/TX-done, the drain, polling), the esp_timer task (the
+ * engine's step timer), the console task (CLI), and config callbacks. */
 struct SupeState {
     SemaphoreHandle_t  lock;
     SupeEngine         eng;
     esp_timer_handle_t timer;
     bool               engineTx;     /* the frame on the air is the engine's */
-    /* the announce beat (SUPE.md §7) — platform-paced, engine-built */
+    /* The meeting's trains (SUPE.md §8). Outgoing frames are held whole to the
+     * close, because the repair round resends them byte for byte — a changed
+     * byte is a changed checksum. Inbound frames are held for whole,
+     * in-sequence delivery at the close: split halves must reach rnsd
+     * adjacent, and a repaired frame takes its place, not the end. This is the
+     * RAM commitment SUPE_TRAIN_MAX bounds. */
+    uint8_t  txT[SUPE_TRAIN_MAX][1 + RNODE_MAX_PAYLOAD];
+    uint16_t txTLen[SUPE_TRAIN_MAX];
+    uint8_t* txTPkt[SUPE_TRAIN_MAX]; /* the queue heap block each frame was cut
+                                      * from — how a delivered close consumes */
+    uint8_t  txTCount;
+    uint8_t  rxT[SUPE_TRAIN_MAX][1 + RNODE_MAX_PAYLOAD];
+    uint16_t rxTLen[SUPE_TRAIN_MAX];
+    int16_t  rxTRssi[SUPE_TRAIN_MAX];
+    int16_t  rxTSnr10[SUPE_TRAIN_MAX];
+    uint8_t  rxTCount;
+    /* the announce beat (SUPE.md §9) — platform-paced, engine-built */
     uint32_t annNextMs;
     bool     annPending;
     uint32_t annTryMs;
@@ -29,10 +45,9 @@ struct SupeState {
 bool     supeInit(LoraRadio* r);            /* alloc + configure; false = no memory */
 void     supeOnRadioStop(LoraRadio* r);
 bool     supeReady(const LoraRadio* r);
-bool     supeBusy(const LoraRadio* r);      /* a transaction owns the radio */
-/* Narrower: a transaction is actually under way, so what it will carry has been
- * declared and the queue is the engine's to walk. An armed offer is not this —
- * nothing has been said on the air yet. */
+bool     supeBusy(const LoraRadio* r);      /* the engine owns the radio */
+/* Narrower: a meeting is actually under way, so the queue is the engine's to
+ * walk. A seed merely armed is not this — nothing has been met yet. */
 bool     supeXactLive(const LoraRadio* r);
 uint16_t supeCargoPeer(const LoraRadio* r); /* whose cargo is arriving, if any */
 bool     supeHoldsRadio(const LoraRadio* r);
@@ -40,7 +55,12 @@ void     supeLock(LoraRadio* r);
 void     supeUnlock(LoraRadio* r);
 void     supeOnFrame(LoraRadio* r, const uint8_t* f, size_t len,
                      int16_t rssi, int16_t snr10);
-void     supeOnPacketRx(LoraRadio* r, int16_t rssi, int16_t snr10);
+/* A non-SUPE frame arrived while the engine held the radio. True: it belongs
+ * to the meeting's inbound train and was buffered — the receive path stops
+ * here, and the frame reaches the ordinary delivery path at the meeting's
+ * close, in sequence. False: ordinary traffic; the caller proceeds. */
+bool     supeTrainCapture(LoraRadio* r, const uint8_t* frame, size_t len,
+                          int16_t rssi, int16_t snr10);
 bool     supeAfterTx(LoraRadio* r);         /* true = the engine dealt with the radio */
 uint8_t  supeHeadVerdict(LoraRadio* r);
 void     supePoll(LoraRadio* r);

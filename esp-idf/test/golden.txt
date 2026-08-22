@@ -2,13 +2,14 @@
 # Replay one on device: `lora <n> supe rx 0x…` — paste the second
 # column verbatim. Never hand-hex a frame, or the codec and the
 # injection can disagree, which is the one thing this file prevents.
-announce2.regime0.2ids       0xc40002d64e6b87eb8b4e052101
-announce2.regime0.1id        0xc40002564e6b87eb8b
-grant.regime1.ch4.budget6    0xc510463c4edfeaabcdef
-grant.regime1.reverse        0xc510463ccedfeaabcdef
-grant.refused.airtime        0xc5102f3c4edfeaabcdef
-start2.regime1.load2pkt      0xc210d10d510821
-start2.regime1.ident         0xc210d10d5108216b87eb
-manifest2.count7             0xc94ee80e08d60780abcdef
-manifest2.close              0xc94ee80e08d60000abcdef
-manifest2.grace100ms         0xc94ee80e08d60014abcdef
+announce2.regime0.2ids       0xc30002564e6b87eb8b4e052101
+announce2.regime0.1id        0xc30002564e6b87eb8b
+privsync.regime1.anon        0xc210d10d513700
+privsync.regime1.ident       0xc210d10d513700a1a2a3
+havedata.open.5frames        0xc4dead0142080528
+havedata.answer.mask22       0xc4dead0142080528e81222
+gimme.tight.budget6          0xc5dead014006e118fa24
+gimme.wide.budget6           0xc5dead014006fa24
+thatsit.4frames              0xc6450011222244
+bye                          0xc7
+resend.mask0501              0xc80501

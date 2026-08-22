@@ -17,6 +17,21 @@ struct LoraRadio;
 #define CSMA_CW_MAX          6       /* CW ceiling → up to 2^6 = 64 slots */
 #define CSMA_RSSI_MARGIN_DB  6.0f    /* dB above noise floor that reads as busy */
 #define CSMA_NOISE_FLOOR_DBM (-105.0f)  /* initial noise-floor estimate */
+
+/* The slot sense's threshold is ABSOLUTE, not floor-relative, and that is the
+ * whole point (SUPE.md §14.2, EN 300 220-1 table 45): −81 dBm in 125 kHz,
+ * rising 10·log10 with the bandwidth to −75 dBm in 500 kHz.
+ *
+ * A tracked floor cannot serve here. It is learned by sensing, the hailing
+ * channel is sensed constantly and converges, and an agile channel is visited
+ * for one sample a second or two apart — so its floor never leaves the seed.
+ * The tracker's asymmetry then decides everything: a seed ABOVE the real floor
+ * is corrected by the next sample, a seed BELOW it is walked off at 2 % of the
+ * gap per sense. A −105 dBm seed against the ~−91 dBm a quiet 500 kHz channel
+ * actually reads is the second case, so every slot on every fresh channel reads
+ * busy, forever, and no schedule can ever speak. */
+#define CSMA_CCA_DBM_125K   (-81.0f)
+#define CSMA_CCA_SAMPLES      3      /* the sense takes the quietest of these */
 #define CSMA_SLOT_MS_MIN     2       /* slot-time clamp (derived from symbol time) */
 #define CSMA_SLOT_MS_MAX     25
 
@@ -63,6 +78,7 @@ enum CsmaPhase : uint8_t { CSMA_IDLE, CSMA_DIFS, CSMA_BACKOFF };
 
 /* ─────────────── lora_csma: medium access on the hailing channel ────────── */
 void     csmaMediumHeld(LoraRadio* r, uint32_t durMs);
+bool     csmaSenseClear(LoraRadio* r);   /* one CCA at the current tuning */
 void     csmaNoiseFloorReset(LoraRadio* r);
 void     csmaFloorSwitch(LoraRadio* r, uint8_t from, uint8_t to);
 void     csmaPrime(LoraRadio* r);

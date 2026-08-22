@@ -125,15 +125,12 @@ static void deliverInbound(LoraRadio* r, const uint8_t* data, size_t len,
     auto rnd = [](float x) { return (int16_t)(x < 0 ? x - 0.5f : x + 0.5f); };
     int16_t rssi = rnd(r->rssiLast);
     int16_t snr  = rnd(r->snrLast * 10.0f);
-    /* Inside a transaction the sender is not a guess: the GRANT went to one
-     * node and this arrived under it, so the tap can attribute what the packet
+    /* Inside a meeting the sender is not a guess: the schedule belongs to one
+     * pair and this arrived under it, so the tap can attribute what the packet
      * establishes — a link identifier above all — to that peer instead of
      * waiting to overhear the association in the clear. */
 #if !defined(CONFIG_LORA_NO_SUPE)
     peersObserve(r, data, len, false, rssi, snr, LORA_ORIG_RNSD, supeCargoPeer(r));
-    /* A whole packet, which is what a train is counted in: a split packet
-     * counts once, when both halves are in, which is exactly here. */
-    supeOnPacketRx(r, rssi, snr);
 #else
     /* No transaction to attribute it to: every packet is overheard in the clear. */
     peersObserve(r, data, len, false, rssi, snr, LORA_ORIG_RNSD, 0);
@@ -226,8 +223,6 @@ static void handleRxDone(LoraRadio* r) {
     rearmRx(r);
 
     uint8_t  header     = frame[0];
-    uint8_t  seq        = header & 0xF0;
-    bool     isSplit    = (header & RNODE_FLAG_SPLIT) != 0;
     size_t   payloadLen = pktLen - 1;
 
     /* Our own air protocol is consumed
@@ -307,6 +302,29 @@ static void handleRxDone(LoraRadio* r) {
 #endif
         return;
     }
+
+#if !defined(CONFIG_LORA_NO_SUPE)
+    /* A meeting's inbound train is buffered whole and delivered in sequence at
+     * the close (SUPE.md §8) — a repaired frame takes its place, not the end,
+     * and split halves reach rnsd adjacent. Captured at the FRAME level,
+     * before reassembly, because that is the unit the protocol counts,
+     * checksums and repairs. */
+    if (supeTrainCapture(r, frame, pktLen,
+                         (int16_t)lround(r->rssiLast),
+                         (int16_t)lround(r->snrLast * 10.0)))
+        return;
+#endif
+
+    bridgeFrameDeliver(r, frame, pktLen);
+}
+
+/* The frame-level tail of the receive path: split reassembly and delivery.
+ * Shared by the live path above and the meeting buffer's replay at close. */
+void bridgeFrameDeliver(LoraRadio* r, const uint8_t* frame, size_t pktLen) {
+    uint8_t  header     = frame[0];
+    uint8_t  seq        = header & 0xF0;
+    bool     isSplit    = (header & RNODE_FLAG_SPLIT) != 0;
+    size_t   payloadLen = pktLen - 1;
 
     if (!isSplit) {
         size_t fl = pktLen;                        /* whole on-air frame (incl. header) */
@@ -799,6 +817,13 @@ void drainOneOutbound(LoraRadio* r) {
     else if (!r->txWaitPend) { r->txWaitPend = true; r->txWaitStartMs = millis(); }
 
     if (r->mtxPhase != MTXP_OFF) return;
+    /* Somebody is editing this radio's settings. Nothing new goes on air until
+     * they stop and the apply lands (LORA_CFG_SETTLE_MS): the parameters a
+     * frame would fly at are the ones being changed, and a packet held for ten
+     * seconds is cheaper than one transmitted on a configuration nobody chose.
+     * The queue simply holds, exactly as it does for every other owner of the
+     * radio above and below. */
+    if (loraCfgQuiet()) return;
     /* A SUPE transaction owns the radio — its frames sit inside a schedule the
      * other end is timing against — and it owns the queue's head with it. This
      * is the one gate left on the drain, and it is radio ownership rather than
@@ -836,15 +861,15 @@ void drainOneOutbound(LoraRadio* r) {
      * the medium. With SUPE off it answers PLAIN and the head simply flies. */
 #if !defined(CONFIG_LORA_NO_SUPE)
     uint8_t sv = supeHeadVerdict(r);
-    if (sv == SUPE_V_HOLD) return;      /* the line behind it waits too */
-    /* Our own wait, not a reservation: nobody has claimed the medium, so serve
-     * the channel access underneath it and have it ready when the wait ends. */
+    /* WAIT is our own timing — a live schedule the packet rides at its next
+     * met slot, or the ladder's pause between seeds. It reserves nothing, so
+     * channel access runs underneath it and is ready when the wait lifts. */
     if (sv == SUPE_V_WAIT) { csmaPrime(r); return; }
     if (sv == SUPE_V_DROP) { queueDiscardHead(r); return; }
-    /* An offer takes the channel on its own terms — after the pre-offer
-     * delay, from supePoll — so it stands down here rather than winning the
-     * medium now and holding it through a delay. If the transaction will
-     * not set up, the packet simply flies. */
+    /* A seed takes the channel on its own terms — after the pre-seed jitter,
+     * from supePoll — so it stands down here rather than winning the medium
+     * now and holding it through a delay. If no meeting comes of it, the
+     * packet simply flies. */
     if (sv == SUPE_V_OFFER) return;   /* the glue launches it after the jitter */
 #endif
 

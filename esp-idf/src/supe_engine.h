@@ -1,9 +1,11 @@
 /**
- * supe_engine — the SUPE state machine on the revised protocol (plans/SUPE.md):
- * the requester states its load, the peer chooses the channel and the budget
- * (SUPE_GRANT), both sides send MANIFEST and a train, and the whole thing ends
- * by arithmetic. One machine, both roles, and the one decider in the system —
- * everything else answers questions.
+ * supe_engine — the SUPE state machine (plans/SUPE.md): PRIVSYNC seeds a
+ * derived schedule of slots, the pair meets at the first slot that works,
+ * HAVEDATA/GIMME confirm attention and budget, trains of LoRa frames flow with
+ * THATSIT's checksum list naming the sequence after the fact, one RESEND round
+ * repairs, and every meeting's final THATSIT seeds the next schedule. One
+ * machine, both roles, and the one decider in the system — everything else
+ * answers questions.
  *
  * **Single-threaded by contract, no lock anywhere.** Every entry point is
  * called from one context; the host serialises at the boundary (on ESP-IDF a
@@ -15,7 +17,7 @@
  * FreeRTOS or Reticulum — everything platform arrives through SupeHost, peers
  * arrive as views, and packets arrive already tagged (the observer computed
  * the tag at ingress). That is what makes the engine host-runnable:
- * test/supe_engine_test.cpp steps whole transactions against a stub host.
+ * test/supe_engine_test.cpp steps whole meetings against a stub host.
  */
 #ifndef IFACE_LORA_SUPE_ENGINE_H
 #define IFACE_LORA_SUPE_ENGINE_H
@@ -33,51 +35,50 @@ struct SupePeerView {
     uint8_t  fam;
     uint8_t  topBudget;      /* the ceiling nibble it announced */
     int8_t   maxTxpDbm;      /* what it announced as its maximum */
-    bool     adaptive;
     /* ours toward it */
-    int8_t   txpOpen;        /* what the power controller opens at (§15) */
+    int8_t   txpOpen;        /* what the power controller opens at, at the
+                              * HAILING configuration (§15); any other
+                              * configuration asks host->txp_open */
     int8_t   txpMax;         /* our configured maximum, channel-capped */
-    /* the absence ladder's record (§11) */
-    uint8_t  absentStrikes;  /* silences since last evidence of life */
+    /* the absence ladder's record (§12) */
+    uint8_t  absentStrikes;  /* tight schedules expired unmet since evidence of life */
     uint32_t absentUntilMs;  /* while in the future: its traffic is dropped */
-    uint32_t retryWaitUntilMs; /* the ladder's randomised wait between requests —
-                                * the packet HOLDS through it */
-    uint32_t backoffUntilMs; /* a refusal said how long not to ask — traffic
-                              * flies plainly meanwhile */
-    bool     detoured;       /* a detour with it has completed before */
+    uint32_t retryWaitUntilMs; /* the ladder's randomised wait between seeds —
+                                * the packet WAITS through it */
+    bool     detoured;       /* a meeting with it has completed before */
 };
 
 /* ─────────────── what the engine tells the platform ───────────────
  *
- * One event, delivered through host->peer_note against the transaction's tag.
- * The platform files it where the tag resolves — a node row, a link, or
- * nowhere (an anonymous requester), which is the platform's call. */
+ * One event, delivered through host->peer_note against a tag. The platform
+ * files it where the tag resolves — a node row, a link, or nowhere (an
+ * anonymous peer), which is the platform's call. */
 enum SupePeerEvent : uint8_t {
     SUPE_EV_ALIVE = 1,       /* any evidence of life — cancels absence outright */
-    SUPE_EV_STRIKE,          /* a request drew silence; the ladder advances */
-    SUPE_EV_REFUSED,         /* a refusal arrived; backoffMs says how long not to ask */
-    SUPE_EV_PAIR,            /* a path-loss pair: level + stated power at cfg */
-    SUPE_EV_TRAIN_OK,        /* the peer's MANIFEST confirmed our train (§15) */
-    SUPE_EV_TRAIN_LOST,      /* no reverse MANIFEST — raise power, remember where */
-    SUPE_EV_DETOURED,        /* a detour completed — lifts first-contact caution */
-    SUPE_EV_CAPS,            /* the peer's MANIFEST capabilities — filed against
-                              * the link for the peer that can never be named */
+    SUPE_EV_STRIKE,          /* a tight schedule expired unmet; the ladder advances */
+    SUPE_EV_PAIR,            /* a path-loss pair: level measured here + stated power */
+    SUPE_EV_REPORT,          /* the peer's account of how OUR transmission landed:
+                              * its reading + the power we sent at, at cfg */
+    SUPE_EV_TRAIN_OK,        /* our train was confirmed (§15) */
+    SUPE_EV_TRAIN_LOST,      /* a meeting died after our train flew — raise power,
+                              * remember where */
+    SUPE_EV_MET,             /* a meeting completed — lifts first-contact caution */
 };
 
 struct SupePeerNote {
     uint8_t  ev;
-    uint8_t  reason;         /* REFUSED: the SupeRefusal nibble */
-    uint32_t backoffMs;      /* REFUSED/STRIKE: how long not to ask */
-    uint32_t agoMs;          /* STRIKE: how long ago the request this answers for
-                              * went out. The wait paces REQUESTS, so it runs from
-                              * the request; the deadline spent waiting for a GRANT
-                              * that never came is already time spent not asking. */
-    /* PAIR / TRAIN_OK: the measurement */
+    uint32_t backoffMs;      /* STRIKE: how long not to seed again */
+    uint32_t agoMs;          /* STRIKE: how long ago the seed went out. The wait
+                              * paces SEEDS, so it runs from the seed; the
+                              * horizon just waited out is already time spent
+                              * not asking. */
+    /* PAIR / REPORT / TRAIN_OK: the measurement */
     SupeCfg  cfg;            /* the configuration the level was read at */
     int16_t  rssiDbm;
-    int8_t   txpDbm;         /* the power the other side stated */
+    int8_t   txpDbm;         /* PAIR: the power the other side stated;
+                              * REPORT/TRAIN_OK: the power WE transmitted at */
+    bool     haveLevel;      /* TRAIN_OK: rssiDbm carries the peer's reading */
     int8_t   triedTxpDbm;    /* TRAIN_LOST: what we transmitted at */
-    SupeCaps caps;           /* CAPS: what the MANIFEST carried */
 };
 
 /* ─────────────── what the platform says about the channels ─────────────── */
@@ -87,6 +88,18 @@ struct SupeChanView {
     bool    anyBudget;              /* false: every channel is out of airtime */
 };
 
+/* ─────────────── the outgoing train ───────────────
+ *
+ * Built by the host from the queue at meeting time and held until the meeting
+ * closes — the frames are what a repair round resends, so they outlive the
+ * queue entries they were built from (consumed at build; a meeting that dies
+ * loses them to the layers above, exactly as the air would have). */
+struct SupeTrainInfo {
+    uint8_t  count;                     /* LoRa frames */
+    uint16_t lens[SUPE_TRAIN_MAX];      /* each frame's on-air byte count */
+    uint8_t  csum[SUPE_TRAIN_MAX];      /* supeCrc8 over each frame */
+};
+
 /* ─────────────── the host ───────────────
  *
  * Everything the engine needs from the platform, in one struct. Nothing in it
@@ -94,7 +107,7 @@ struct SupeChanView {
  * behind it: lora_queue is itself pure and single-threaded under the same
  * boundary, so the engine holds a LoraQueue* and calls it directly.
  *
- * tx_frame / tx_packet fire the radio and return; the completion arrives as
+ * tx_frame / train_fire fire the radio and return; the completion arrives as
  * supeEngOnTxDone. tune/tune_home are synchronous register work. */
 struct SupeHost {
     void*    ctx;
@@ -106,21 +119,36 @@ struct SupeHost {
     bool     (*tune)(void* ctx, uint8_t chan, const SupeCfg* c, uint8_t sync);
     void     (*tune_home)(void* ctx);                  /* unconditional, unchecked */
     bool     (*tx_frame)(void* ctx, const uint8_t* f, uint16_t len, int8_t dbm);
-    /* The train pipeline: stage builds the packet's on-air frames — split,
-     * observer tap, fan-out, everything expensive — during the PREVIOUS
-     * packet's airtime; fire is a buffer copy and a startTransmit, so the
-     * inter-packet gap carries no work at all. */
-    bool     (*stage_packet)(void* ctx, const LoraPkt* p, int8_t dbm);
-    bool     (*fire_staged)(void* ctx);
     void     (*rx)(void* ctx);                         /* (re)arm the receiver */
     /* Is a frame arriving at this instant — a preamble or a valid header the
-     * modem is still working on? The one question the engine cannot answer for
-     * itself, and the difference between "nobody answered" and "the answer has
-     * not finished arriving". */
+     * modem is still working on? What lets a slot window close on evidence
+     * rather than walk off mid-preamble. */
     bool     (*rx_busy)(void* ctx);
+    /* One clear-channel read at the current tuning. The appointment grants the
+     * peer's attention, never the spectrum: a busy channel skips the slot. */
+    bool     (*cca)(void* ctx);
+    /* the outgoing train: build whole from the queue (consuming what it takes),
+     * fire one frame, release at close */
+    bool     (*train_build)(void* ctx, uint16_t peerId,
+                            const uint8_t tag[SUPE_TAG_LEN], uint8_t maxFrames,
+                            SupeTrainInfo* out);
+    bool     (*train_fire)(void* ctx, uint8_t idx, int8_t dbm);
+    /* delivered=true: the peer's answer proved the train (and its THATSIT)
+     * landed — the queue entries it was built from are consumed. false: the
+     * meeting died unproven; the entries stay queued for the next chance, and
+     * Reticulum's duplicate hash list absorbs the rare both-happened case. */
+    void     (*train_done)(void* ctx, bool delivered);
+    /* the incoming train: the host buffered each frame as it arrived (it told
+     * the engine through supeEngOnTrainFrame); at close the engine hands back
+     * the delivery order — indices into the host's buffer, sequence-sorted,
+     * holes simply absent — and the host flushes them upward */
+    void     (*train_deliver)(void* ctx, const uint8_t* order, uint8_t n);
     /* stores */
     bool     (*peer_get)(void* ctx, const uint8_t tag[SUPE_TAG_LEN], SupePeerView* out);
     void     (*peer_note)(void* ctx, const uint8_t tag[SUPE_TAG_LEN], const SupePeerNote* n);
+    /* The power to open toward the node behind a tag AT a configuration —
+     * asked where the frames will actually fly (§15). */
+    int8_t   (*txp_open)(void* ctx, const uint8_t tag[SUPE_TAG_LEN], const SupeCfg* cfg);
     void     (*chan_get)(void* ctx, SupeChanView* out);
     /* diagnostics — may be null; the engine formats, the host routes it to its
      * own logger. `dbgLevel` gates the chatty lines. */
@@ -130,11 +158,9 @@ struct SupeHost {
 
 /* ─────────────── addresses that mean us (SUPE.md §5) ─────────────── */
 #define SUPE_TAGS_MAX        256
-#define SUPE_HOLD_MAX          8
 #define SUPE_PROOFRET_MAX      8
 #define SUPE_LINK_TTL_MS   (10u * 60u * 1000u)   /* a link with no traffic on it */
 #define SUPE_PROOF_TTL_MS  30000                 /* the receipt/reverse-table window */
-#define SUPE_STARTS_SEEN_MAX   8     /* recent overheard STARTs, for GRANT holds */
 
 struct SupeTag {
     uint8_t  tag[SUPE_TAG_LEN];
@@ -144,12 +170,6 @@ struct SupeTag {
     uint32_t expiryMs;
 };
 
-struct SupeHold {
-    uint8_t  tag[SUPE_TAG_LEN];
-    bool     used;
-    uint32_t untilMs;
-};
-
 struct SupeProofRet {
     uint8_t  phash[SUPE_TAG_LEN];
     uint8_t  node4[4];
@@ -157,87 +177,125 @@ struct SupeProofRet {
     bool     used;
 };
 
-/* An overheard START, kept until its GRANT arrives (or a few seconds pass):
- * the GRANT quotes the START's hash, and a third party holding for the
- * requester's identity needs the START it named itself in. */
-struct SupeStartSeen {
-    uint8_t  hash[SUPE_HASH_LEN];
-    uint8_t  tag[SUPE_TAG_LEN];
-    bool     haveIdent;
-    uint8_t  ident[SUPE_TAG_LEN];
-    uint32_t ms;
-    bool     used;
+/* ─────────────── schedules (SUPE.md §7) ─────────────── */
+#define SUPE_SCHED_MAX  4
+
+struct SupeSched {
+    bool      used;
+    bool      wide;           /* seeded by a goodbye rather than a PRIVSYNC */
+    bool      weSeeded;       /* tight only: our PRIVSYNC — its expiry strikes */
+    bool      weTx0;          /* we transmit in slot 0, 2, 4…; else 1, 3, 5… */
+    bool      consumed;       /* a slot was met: every later slot is void */
+    uint8_t   tag[SUPE_TAG_LEN];  /* how peer_get/peer_note reach the node — the
+                                   * packet tag we seeded on, or the seeker's
+                                   * identity; zeros for an anonymous seeker */
+    bool      haveTag;
+    uint16_t  peerId;
+    uint32_t  epochMs;        /* the end of the seeding frame, as timed here */
+    SupeCfg   slotCfg;        /* what the slot frames fly at: the hailing
+                               * configuration (tight) or the budget the seeding
+                               * meeting confirmed (wide) */
+    SupeSchedD d;
+    uint8_t   nextSlot;
+    int8_t    seedTxp;        /* tight+weSeeded: what the PRIVSYNC flew at */
+    bool      havePs;         /* tight+listener: our reading of the PRIVSYNC */
+    int16_t   psRssi;
+    int8_t    psSnrQ;
+    /* Why a schedule carried nothing, counted as it happens. A schedule that
+     * expires unmet while its traffic waited is the one failure that costs a
+     * whole horizon, and no frame on the air records it: the packet ring shows
+     * only the fallback that follows. These say which branch spent the slots. */
+    uint8_t   nOwnDue;        /* own slots whose moment arrived */
+    uint8_t   nSpoke;         /* …opened with HAVEDATA */
+    uint8_t   nNoTraffic;     /* …nothing queued for this peer at that instant */
+    uint8_t   nBusy;          /* …the channel was not clear */
+    uint8_t   nLate;          /* …reached past the lateness tolerance */
+    uint8_t   nNoTrain;       /* …the queue matched but built no frames */
+    uint8_t   nNoTune;        /* …the retune failed */
 };
 
-/* ─────────────── the transaction ─────────────── */
-enum SupeXPhase : uint8_t {
-    SUPE_X_IDLE = 0,
-    /* requester */
-    SUPE_X_A_START_TX,     /* START handed to the radio */
-    SUPE_X_A_AWAIT_GRANT,
-    SUPE_X_A_RETUNE,       /* grant taken; the retune gap is running */
-    SUPE_X_A_MAN_TX,
-    SUPE_X_A_TRAIN_LEAD,   /* the receiver-flip gap before/between packets */
-    SUPE_X_A_TRAIN_TX,
-    SUPE_X_A_AWAIT_RMAN,   /* our train is out; the reverse MANIFEST is owed */
-    SUPE_X_A_RECV,         /* counting the peer's train */
-    /* answerer */
-    SUPE_X_B_GRANT_TX,
-    SUPE_X_B_AWAIT_MAN,
-    SUPE_X_B_RECV,
-    SUPE_X_B_MAN_TX,       /* the reverse MANIFEST — its train, or the close */
-    SUPE_X_B_TRAIN_LEAD,
-    SUPE_X_B_TRAIN_TX,
+/* ─────────────── the meeting ─────────────── */
+enum SupeMPhase : uint8_t {
+    SUPE_M_IDLE = 0,
+    SUPE_M_PS_TX,          /* PRIVSYNC on the air; its end is the epoch */
+    SUPE_M_SLOT_LISTEN,    /* a slot window is open */
+    SUPE_M_HD_TX,          /* our HAVEDATA (opening or answering) on the air */
+    SUPE_M_AWAIT_GIMME,
+    SUPE_M_GIMME_TX,
+    SUPE_M_TRAIN_WAIT,     /* the flip gap / retune lead before our next frame */
+    SUPE_M_TRAIN_TX,       /* one of our train frames on the air */
+    SUPE_M_THATSIT_TX,
+    SUPE_M_TRAIN_RX,       /* counting the peer's frames */
+    SUPE_M_AWAIT_THATSIT,
+    SUPE_M_AWAIT_ANSWER,   /* our THATSIT is out; BYE / RESEND / answering
+                            * HAVEDATA decides what follows */
+    SUPE_M_REPAIR_TX,      /* resending the frames the peer named */
+    SUPE_M_REPAIR_RX,      /* the peer is resending the frames we named */
+    SUPE_M_CLOSE_TX,       /* our BYE or RESEND on the air */
 };
 
-struct SupeXact {
+struct SupeMeet {
     uint8_t  phase;
-    uint8_t  role_b;               /* answering side */
+    bool     listener;             /* we answered the HAVEDATA */
+    int8_t   schedIdx;             /* the schedule this meeting consumed */
+    uint8_t  hash3[SUPE_HASH_LEN];
     uint8_t  tag[SUPE_TAG_LEN];
-    uint8_t  hash[SUPE_HASH_LEN];  /* the START's — the transaction id */
-    uint8_t  regime;               /* the detour's */
-    uint8_t  chan, budget;
-    SupeCfg  cfg;
-    uint32_t durMs;                /* what the GRANT announced */
-    bool     reverseExpected;      /* the GRANT's bit: a reverse MANIFEST will
-                                    * follow the requester's train. Clear
-                                    * means both sides go home on the train's
-                                    * end — no frame, nothing waited on. */
+    bool     haveTag;
+    uint16_t peerId;
+    uint8_t  chan;
+    uint8_t  sByte;                /* the slot's word byte — the train re-indexes it */
+    SupeCfg  slotCfg, cfg;         /* the slot's modulation and the confirmed one */
+    uint8_t  budget;
+    bool     retuned;              /* off the hailing configuration */
+    bool     atTrainCfg;           /* the confirmed budget is on the radio */
+    int8_t   ourTxp;               /* our meeting power (HAVEDATA/GIMME stated) */
+    int8_t   trainTxp;             /* our train's power — THATSIT states it */
+    uint8_t  leg;                  /* 0: opener's train; 1: the return leg */
+    /* outgoing */
+    SupeTrainInfo tx;
+    bool     txBuilt;
+    uint8_t  txNext;               /* next frame index to fire */
+    uint8_t  txMask[SUPE_MASK_MAX];/* a repair: which frames to refire */
+    bool     txMaskAny;
+    uint8_t  txThatsit[SUPE_THATSIT_BASE + SUPE_TRAIN_MAX];
+    uint8_t  txThatsitLen;
+    bool     ourTrainConfirmed;    /* anything of theirs answered our THATSIT */
+    bool     laterThatsit;         /* an answering HAVEDATA promised a return
+                                    * train, so a THATSIT later than ours will
+                                    * close the meeting: the one we hold is not
+                                    * the goodbye until that one arrives */
+    /* incoming */
+    uint8_t  exCount;              /* what the peer's HAVEDATA declared */
+    uint8_t  rxN;                  /* frames buffered by the host, arrival order */
+    uint8_t  rxCsum[SUPE_TRAIN_MAX];
+    uint8_t  rxPos[SUPE_TRAIN_MAX];   /* arrival → sequence position (after align) */
+    bool     rxAligned;
+    uint8_t  peerCount;            /* the peer train's THATSIT count */
+    uint8_t  missMask[SUPE_MASK_MAX];
+    uint8_t  missCount;
+    uint8_t  repairPos[SUPE_TRAIN_MAX];  /* positions the peer will resend, in order */
+    uint8_t  repairExpect, repairGot;
+    int16_t  worstRssi;
+    int8_t   worstSnrQ;
+    bool     anyRx;
+    /* the goodbye */
+    uint8_t  lastThatsit[SUPE_THATSIT_BASE + SUPE_TRAIN_MAX];
+    uint8_t  lastThatsitLen;
+    bool     weReceivedFinal;      /* the final train was theirs → we transmit
+                                    * first on the reseeded schedule */
+    bool     closeIsFinal;         /* the CLOSE_TX on the air ends the meeting */
+    uint8_t  pendClose;            /* what to send once repairs are out: 1 BYE,
+                                    * 2 RESEND */
+    uint8_t  pendSend;             /* what this TRAIN_WAIT fires instead of a
+                                    * train frame (SUPE_PEND_*): a send parked
+                                    * one train gap so the receiver it is aimed
+                                    * at has flipped back from its own frame */
+    uint32_t deadlineMs;
     uint32_t beganMs;
-    uint32_t deadlineMs;           /* what the armed timer means, per phase */
-    bool     retuned;
-    /* The node at the other end, as the ANSWERING side knows it: resolved from
-     * the START's sender identity, since the tag it named is one of ours and
-     * says nothing about who asked. This is what makes a link dialled to us
-     * attributable — the cargo arriving under it provably came from this node. */
-    uint16_t fromPeer;
-    uint8_t  peerFam;              /* the peer's family, for resolving the GRANT */
-    uint8_t  attempt;              /* the absence ladder's rung, 1.. */
-    /* The START exactly as it went out. A retransmission has to be byte-identical
-     * or its hash changes, and the hash is what a GRANT names — so the frame is
-     * kept rather than rebuilt from a queue that may have moved on. */
-    uint8_t  startFrame[SUPE_START2_ID_LEN];
-    uint8_t  startLen;
-    uint8_t  resends;              /* retransmissions spent inside this request */
-    bool     grantOnAir;           /* stage two: something was arriving when the
-                                    * GRANT was due to begin, so it is being
-                                    * waited out rather than declared missing */
-    int8_t   startTxp;
-    int16_t  grantRssi;            /* our reading of the GRANT */
-    int8_t   grantSnrQ;
-    /* trains */
-    int8_t   trainTxp;
-    uint8_t  sendCount, sentCount;
-    uint8_t  planCount;            /* what the MANIFEST promised — sendCount
-                                    * can be trimmed after the promise (a
-                                    * staging failure), and the difference is
-                                    * a packet the far end waits out */
-    bool     lenExpired;           /* the receive deadline ended the train */
-    bool     staged;               /* the next packet is built and ready to pop */
-    uint8_t  expectCount, gotCount;
-    int16_t  lastPktRssi;          /* the peer's train as heard, for our MANIFEST */
-    int8_t   lastPktSnrQ;
-    uint8_t  pendingKind;          /* what the frame in flight was (internal) */
+    /* the pending seed (PS_TX) */
+    uint8_t  psFrame[SUPE_PRIVSYNC_ID_LEN];
+    uint8_t  psLen;
+    int8_t   psTxp;
 };
 
 /* ─────────────── the engine ─────────────── */
@@ -246,84 +304,68 @@ struct SupeEngine {
     LoraQueue*      q;
 
     /* the interface's own facts, refreshed by supeEngConfig */
-    uint8_t  regime;               /* the frequency-agility key's number */
+    uint8_t  regime;
     uint8_t  ownFam;
-    /* Who we are, for the START's sender_ident: one of this node's identities,
-     * truncated. The answering side has no other way to name the requester —
-     * the tag a START carries is one of ITS addresses. Set by the platform,
-     * which is where the identity list lives; until it is, STARTs go out in
-     * the short form as before. */
     uint8_t  ownIdent[SUPE_TAG_LEN];
     bool     haveOwnIdent;
-    uint8_t  ownTop;               /* our ceiling nibble */
+    uint8_t  ownTop;
     int8_t   txpMax;               /* configured tx_power (the hailing cap) */
-    bool     adaptive;
     uint8_t  hailSf;
     uint32_t hailBwHz;
     uint8_t  crDenom;
     uint16_t preamble;
     uint8_t  ifaceSync;
-    uint16_t maxFrameLen;          /* the interface's per-frame payload quantum
-                                    * (how a packet splits), for train airtime */
-    uint16_t holdEarlyMs;          /* the access procedure's fixed interval
-                                    * (DIFS): a hold releases this early, so a
-                                    * node that politely held enters the random
-                                    * draw on the same footing as one that never
-                                    * heard the hint (SUPE.md §6) */
+    uint16_t maxFrameLen;
     bool     expired;              /* the dialect is past its date */
 
     SupeTag       tags[SUPE_TAGS_MAX];
-    SupeHold      hold[SUPE_HOLD_MAX];
     SupeProofRet  pret[SUPE_PROOFRET_MAX];
-    SupeStartSeen seen[SUPE_STARTS_SEEN_MAX];
+    SupeSched     sched[SUPE_SCHED_MAX];
 
-    SupeXact x;
-    bool     plainOnce;            /* the head packet goes plainly, once, without
-                                    * being re-classified into another offer */
+    SupeMeet m;
+    bool     plainOnce;            /* the head packet goes plainly, once */
     bool     offerArmed;           /* verdict said OFFER; the launch waits for the
-                                    * pre-offer jitter, then the channel */
+                                    * pre-seed jitter, then the channel */
     uint32_t offerJitterUntilMs;
-    bool     resendArmed;          /* a START is waiting for the medium to go back
-                                    * out; the backoff is its decorrelation too */
 
     /* what `lora <n> supe` prints */
     uint32_t rxFrames, rxDiscard, rxForeign;
-    uint32_t startsOut, grantsIn, grantsOut, refusalsIn, refusalsOut;
-    uint32_t detoursDone, trainPktsOut, trainPktsIn;
-    uint32_t holdsTaken, dropsAbsent, strikes;
+    uint32_t seedsOut, schedsIn, meetingsDone;
+    uint32_t schedsAbandoned; /* wide schedules dropped for the shared channel
+                               * after their own slots went unanswered (§12) */
+    uint32_t framesOut, framesIn, repairsOut, repairsIn;
+    uint32_t slotsListened, slotsSpoken, slotsSkipped;
+    uint32_t slotsYielded;   /* deferred: a frame was arriving (§7) */
+    uint16_t slotsLateOpen;  /* windows opened after the speaker's start — the
+                              * preamble was already gone, so the slot was spent
+                              * listening to the middle of a frame it could not
+                              * lock. A rising count means the first-slot gap is
+                              * shorter than this hardware's cold retune. */
+    uint32_t strikes, dropsAbsent;
 
-    /* The last transaction ends, newest last — ground truth for `lora <n>
-     * supe` that survives a lossy debug log. `why` points at the static
-     * literals home() is called with, never at anything owned. */
+    /* The last meeting ends, newest last — ground truth for `lora <n> supe`
+     * that survives a lossy debug log. `why` points at static literals. */
     struct SupeEndRec {
-        const char* why;               /* nullptr = slot unused */
+        const char* why;
         uint32_t endedMs;
-        uint8_t  phase;                /* the phase the end came in */
+        uint8_t  phase;
         uint8_t  chan;
-        bool     role_b, ok;
-        uint8_t  sent, plan;           /* fired vs what the MANIFEST promised */
-        uint8_t  got, expect;
+        bool     listener, ok;
+        uint8_t  sent, got, expect;
     } ends[8];
-    uint8_t endsAt;                    /* next slot to write (ring) */
+    uint8_t endsAt;
 };
 
 /* The classifier's verdicts, decided on the head of the queue before anything
- * contends for the medium.
- *
- * HOLD and WAIT both leave the packet queued and differ in what the medium is
- * doing. HOLD means somebody else's GRANT reserved it: sensing it is pointless
- * and contending through it is what the reservation exists to prevent. WAIT is
- * our own timing — the absence ladder's pause between requests, a proof biding
- * its time — and reserves nothing, so channel access may run underneath it and
- * be ready the moment the wait lifts. */
-enum : uint8_t { SUPE_V_PLAIN = 0, SUPE_V_HOLD, SUPE_V_DROP, SUPE_V_OFFER,
-                 SUPE_V_WAIT };
+ * contends for the medium. WAIT leaves the packet queued: a schedule with its
+ * peer is live (the packet rides the next met slot), or the absence ladder's
+ * randomised pause between seeds is running. */
+enum : uint8_t { SUPE_V_PLAIN = 0, SUPE_V_DROP, SUPE_V_OFFER, SUPE_V_WAIT };
 
-/* The one deliberately-unspecified decision (SUPE.md §18): whether to detour.
+/* The one deliberately-unspecified decision (SUPE.md §18): whether to seed.
  * One call site (the classifier); inputs are the peer, the queue and the
  * channels; output is no / now / wait-until. plans/simulation.md §7 owns what
- * it should decide; the v0 policy detours whenever there is a peer to detour
- * with. */
+ * it should decide; the v0 policy seeds whenever there is a peer to meet. */
 enum { DETOUR_NO = 0, DETOUR_NOW, DETOUR_WAIT };
 int shouldDetour(const SupePeerView* peer, const LoraQueue* q,
                  const SupeChanView* chans, uint32_t now,
@@ -332,48 +374,35 @@ int shouldDetour(const SupePeerView* peer, const LoraQueue* q,
 /* lifecycle */
 void supeEngInit(SupeEngine* e, const SupeHost* host, LoraQueue* q);
 void supeEngConfig(SupeEngine* e, uint8_t regime, uint8_t ownFam, uint8_t ownTop,
-                   int8_t txpMax, bool adaptive, uint8_t hailSf, uint32_t hailBwHz,
+                   int8_t txpMax, uint8_t hailSf, uint32_t hailBwHz,
                    uint8_t crDenom, uint16_t preamble, uint8_t ifaceSync,
                    uint16_t maxFrameLen);
 void supeEngReset(SupeEngine* e);         /* the radio went away underneath */
 void supeEngAbort(SupeEngine* e, const char* why);   /* the watchdog's exit */
-bool supeEngBusy(const SupeEngine* e);    /* a transaction owns the radio */
-/* A transaction is under way — as opposed to an offer merely armed. What a
- * transaction will carry is already on the air in a START's load and a GRANT's
- * duration, so the queue behind it must stand still; before that it may grow. */
-bool supeEngXactLive(const SupeEngine* e);
-/* The node whose cargo is arriving right now, or LORAQ_PEER_NONE outside a
- * transaction we are answering. What a packet delivered under it may be
- * attributed to — the only moment an inbound packet has a provable sender. */
+bool supeEngBusy(const SupeEngine* e);    /* the engine owns the radio right now */
+bool supeEngXactLive(const SupeEngine* e);/* a meeting is under way */
 uint16_t supeEngCargoPeer(const SupeEngine* e);
-/* Name this node on the STARTs it sends. Idempotent; the platform calls it as
- * soon as it holds an identity to give. */
 void supeEngSetIdent(SupeEngine* e, const uint8_t id[SUPE_TAG_LEN]);
 
-/* A START that went unanswered with the channel silent at the moment the answer
- * was due: the request stands, so it is retransmitted rather than abandoned.
- * The platform drives it because it owes the retransmission the same channel
- * access the original had — the engine's own tx_frame fires immediately, which
- * is right for a scheduled frame inside a transaction and wrong for this one.
- *
- *   supeEngResendDue   a retransmission is waiting for the medium
- *   supeEngResend      the medium was granted: put it back on the air
- *   supeEngResendDrop  the medium never came; fall through to the ladder */
-bool supeEngResendDue(const SupeEngine* e);
-void supeEngResend(SupeEngine* e);
-void supeEngResendDrop(SupeEngine* e);
-
-/* callbacks in — the whole surface (plan §5) */
+/* callbacks in */
 void supeEngOnRx(SupeEngine* e, const uint8_t* f, uint16_t len,
                  int16_t rssi, int16_t snr10);
-void supeEngOnPacketRx(SupeEngine* e, int16_t rssi, int16_t snr10);
+/* A non-SUPE frame arrived while the engine held the radio. True: it belongs
+ * to the meeting's inbound train — the host buffers it (in arrival order,
+ * repairs appended) and will flush on train_deliver. False: not the engine's;
+ * the host handles it as ordinary traffic. */
+bool supeEngOnTrainFrame(SupeEngine* e, uint8_t csum, int16_t rssi, int16_t snr10);
 void supeEngOnTxDone(SupeEngine* e, bool ok);
 void supeEngOnTimer(SupeEngine* e);
 
-/* the sender path: the drain classifies the head, wins the channel, launches */
+/* the sender path: the drain classifies the head, wins the channel, seeds */
 uint8_t supeEngVerdict(SupeEngine* e);
 bool    supeEngLaunchDue(const SupeEngine* e);   /* jitter passed; wants the channel */
-void    supeEngLaunch(SupeEngine* e);            /* channel won: emit the START */
+void    supeEngLaunch(SupeEngine* e);            /* channel won: emit the PRIVSYNC */
+
+/* The soonest instant the engine wants the clock for — a slot edge, a window
+ * close, a meeting deadline, a schedule expiry. UINT32_MAX for none. */
+uint32_t supeEngNextEventMs(const SupeEngine* e, uint32_t now);
 
 /* addresses that mean us — fed by the observer through the glue */
 void supeEngTagAdd(SupeEngine* e, const uint8_t* addr, bool perm, uint32_t ttlMs);
@@ -382,7 +411,6 @@ void supeEngTagExpire(SupeEngine* e, uint32_t now);
 bool supeEngTagIsOurs(const SupeEngine* e, const uint8_t* addr);
 void supeEngProofRetFile(SupeEngine* e, const uint8_t phash[16], const uint8_t node4[4]);
 const uint8_t* supeEngProofRetLookup(SupeEngine* e, const uint8_t* addr);
-bool supeEngHeld(SupeEngine* e, const uint8_t* tag);
 
 /* build our own announcement (the glue paces and transmits it) */
 size_t supeEngBuildAnn(SupeEngine* e, uint8_t* out, size_t cap,

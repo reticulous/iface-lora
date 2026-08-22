@@ -75,6 +75,20 @@ float   radioOcpMilliamps(LoraChip c);
  * and power paths have to agree with it. */
 #define LORA_HF_CUTOFF_MHZ  1500.0f
 static inline bool loraFreqIsHighBand(float freqMhz) { return freqMhz > LORA_HF_CUTOFF_MHZ; }
+/* Which of the two receive-side settings a part actually answers to. Both are
+ * offered to the user per radio, and a slot whose chip ignores one must not
+ * show it: a control that does nothing is worse than an absent one, because it
+ * is read as an explanation for whatever the radio is doing.
+ *
+ * `rx_boosted_gain` is a flag on SX126x and a gain LEVEL on the LR2021 — one
+ * switch over two mechanisms, so both families offer it. `agc_reset` is the
+ * SX126x's analog front end and nothing else's; `radioAgcReset` refuses on
+ * every other family, and these are what keep the surfaces honest about that. */
+static inline bool radioHasRxBoost(LoraFamily f) {
+    return f == FAM_SX126X || f == FAM_LR2021;
+}
+static inline bool radioHasAgcReset(LoraFamily f) { return f == FAM_SX126X; }
+
 void    radioIrqCache(LoraRadio* r);
 int16_t radioStartRx(LoraRadio* r);
 bool    radioRxInProgress(LoraRadio* r);

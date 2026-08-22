@@ -51,6 +51,38 @@ static bool channelBusy(LoraRadio* r) {
     return rssi > r->noiseFloor + CSMA_RSSI_MARGIN_DB;
 }
 
+/* The slot-attendance sense: the appointment grants the peer's attention, never
+ * the spectrum, so a channel carrying somebody else skips the slot. Distinct
+ * from the DIFS/backoff machinery, which belongs to the shared channel — a slot
+ * is private and its sense is a look, not a queue position — and distinct in
+ * what it compares against: an ABSOLUTE threshold scaled to the bandwidth
+ * (CSMA_CCA_DBM_125K), never the tracked floor, for the reason given there.
+ *
+ * The demodulator still outranks the threshold. A LoRa frame is routinely
+ * decodable below the noise, so a preamble the receiver has locked means the
+ * channel is occupied whatever the power says. */
+bool csmaSenseClear(LoraRadio* r) {
+    if (r->splitPending) return false;
+    if (radioRxInProgress(r)) return false;
+    float thresh = CSMA_CCA_DBM_125K
+                 + 10.0f * log10f((float)r->airBwHz / 125000.0f);
+    /* The quietest of a few reads. One sample can catch the tail of a
+     * transmission that is already over, or a receiver that has not settled
+     * since the retune; the minimum is the honest answer to "is anyone here". */
+    float best = 0.0f;
+    bool  any  = false;
+    for (int i = 0; i < CSMA_CCA_SAMPLES; i++) {
+        float rssi = channelRssi(r);
+        /* The receiver answering before it is listening (LORA_RSSI_INVALID_DBM)
+         * is not a measurement — skip it rather than read it as a quiet
+         * channel or a busy one. */
+        if (rssi <= LORA_RSSI_INVALID_DBM) continue;
+        if (!any || rssi < best) { best = rssi; any = true; }
+    }
+    if (!any) return true;      /* nothing measurable: the settle is µs, go */
+    return best < thresh;
+}
+
 /* Forget the tracked floor and start again from the seed.
  *
  * The floor describes one channel measured through one receiver, so it survives
@@ -324,9 +356,8 @@ static bool csmaAdvance(LoraRadio* r, bool prime) {
  * medium that goes busy still restarts the DIFS, exactly as it would for a
  * frame about to fly), and the first csmaClear after the wait lifts takes it.
  *
- * Never call this for a SUPE_V_HOLD: that medium is reserved by somebody else's
- * GRANT, and contending underneath a reservation is the one thing the
- * reservation exists to stop. */
+ * SUPE's WAIT verdict is the caller here: a packet waiting for its slot
+ * reserves nothing, so the medium is served underneath the wait. */
 void csmaPrime(LoraRadio* r) {
     if (!r->lbt) return;
     (void)csmaAdvance(r, /*prime=*/true);

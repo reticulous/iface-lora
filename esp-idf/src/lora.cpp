@@ -132,6 +132,12 @@ static volatile bool s_parked = false; /* true while parked (stopped); loraStop 
  * validation window needs exactly that. */
 static volatile bool       s_cfgPend    = true;
 static volatile TickType_t s_cfgDueTick = 0;
+/* The settle window (LORA_CFG_SETTLE_MS): true while the pending deadline is a
+ * settling one, which is both what lets a further change push it out and what
+ * holds the radio off the air meanwhile. An urgent cfgArm clears it — that
+ * deadline is immovable and its apply is not a user editing anything. */
+static volatile bool       s_settling      = false;
+static volatile TickType_t s_settleCapTick = 0;
 static volatile bool s_displayDirty = false;   /* an MHz/kHz display key was edited */
 
 /* Ask for a config apply in at most `delayMs`. Keeps the earlier of the
@@ -144,8 +150,36 @@ void cfgArm(uint32_t delayMs) {
     }
     s_cfgDueTick = due;
     s_cfgPend    = true;
+    s_settling   = false;   /* pulled in by something that is not a user's edit */
     if (s_task) xTaskNotifyGive(s_task);
 }
+
+/* Ask for an apply once the settings have stopped moving: LORA_CFG_SETTLE_MS
+ * from now, pushed out by every further change, and never past the cap the
+ * first change of the burst set.
+ *
+ * This is the one arming path that may move a deadline later, so it may only
+ * move its OWN: an apply already pending for any other reason is left where it
+ * is, or a stream of edits could hold off a radio the orchestrator is trying to
+ * bring up. */
+static void cfgArmSettle(void) {
+    TickType_t now = xTaskGetTickCount();
+    if (s_cfgPend && !s_settling) {
+        if (s_task) xTaskNotifyGive(s_task);
+        return;
+    }
+    if (!s_settling) {
+        s_settling      = true;
+        s_settleCapTick = now + pdMS_TO_TICKS(LORA_CFG_SETTLE_MAX_MS);
+    }
+    TickType_t due = now + pdMS_TO_TICKS(LORA_CFG_SETTLE_MS);
+    if ((int32_t)(due - s_settleCapTick) > 0) due = s_settleCapTick;
+    s_cfgDueTick = due;
+    s_cfgPend    = true;
+    if (s_task) xTaskNotifyGive(s_task);
+}
+
+bool loraCfgQuiet(void) { return s_cfgPend && s_settling; }
 static volatile bool     s_radioIrq  = false;  /* DIO1 fired; gate the chip SPI poll on it */
 static volatile uint32_t s_radioIrqUs = 0;     /* µs stamp of the last DIO1 IRQ (truncated
                                                 * esp_timer time; 32-bit so the store is
@@ -383,15 +417,7 @@ static bool radioStart(LoraRadio* r) {
      * the modem cannot read an address and has nothing to match. An interface
      * with one configured degrades to plain main-channel operation whatever the
      * enable key says, and says so once rather than failing quietly. */
-    /* One adaptive-power key, not two. The older `adaptive_txpwr` governed the
-     * reciprocity determination and the 0x04 power request; both of those are
-     * SUPE's air protocol too, so they read the same key the detour's derived
-     * form does. A node that has the old key set keeps its choice — it
-     * is migrated at the version gate — and there is no second name to wonder
-     * about. */
-    r->supeAdaptive = storageGetInt(sk(kb, sizeof kb, r->idx, "SUPE.adaptive_txpower"), 1) != 0;
-    r->adaptive     = r->supeAdaptive;
-    /* And one announce interval. SUPE's own beat and the interface's announce
+    /* One announce interval. SUPE's own beat and the interface's announce
      * replay are different runs on different timers, but "how often does this
      * node tell the neighbourhood about itself" is one question and deserves
      * one answer; two keys of the same name and the same default were only ever
@@ -413,11 +439,15 @@ static bool radioStart(LoraRadio* r) {
     if (r->supeOn && supeExpired((uint32_t)time(nullptr)))
         warn("lora/%d SUPE dialect expired — this build stopped speaking it; reflash", r->idx);
     if (r->supeOn && !supeInit(r)) r->supeOn = false;
-#else
-    /* The adaptive-power determination and the 0x04 request are configured by a
-     * key this build does not have, so they stay off with it. */
-    r->adaptive = false;
 #endif
+    /* The one thing about transmit power that is a user's choice: whether to
+     * dial down toward a peer that has never told us what it hears. Everything
+     * derived from a measurement is part of SUPE's own operation — the protocol
+     * states a power in every frame it sends so that both ends can use it — and
+     * is not switchable. This key reaches the estimate and nothing else, which
+     * is why it lives outside the SUPE prefix and outside the gate that
+     * compiles SUPE out. */
+    r->adaptive = storageGetInt(sk(kb, sizeof kb, r->idx, "adaptive_txpwr"), 1) != 0;
 
     /* Each store allocates once and keeps its history across config cycles. */
     loraMonInit(r);
@@ -509,6 +539,24 @@ static void probeRadio(LoraRadio* r) {
 
 /* ─────────────── config reload ─────────────── */
 
+/* Is any radio mid-transmission, or inside a transaction another node is timing
+ * against? The apply stops and restarts the radio, so doing it here would cut a
+ * frame off the air or strand a detour the far end is still waiting on. The
+ * settle window makes this rare — nothing new starts during it — but a frame
+ * that began just before the window opened can still be flying, and at SF12 it
+ * is flying for seconds. Re-armed a beat later rather than skipped. */
+static bool anyRadioOnAir(void) {
+    for (int i = 0; i < kNumRadios; i++) {
+        LoraRadio* r = &s_radios[i];
+        if (!r->running) continue;
+        if (r->txActive || r->mtxPhase != MTXP_OFF) return true;
+#if !defined(CONFIG_LORA_NO_SUPE)
+        if (supeXactLive(r)) return true;
+#endif
+    }
+    return false;
+}
+
 static void applyConfig(LoraRadio* r) {
     char kb[48];
     r->enabled = storageGetInt(sk(kb, sizeof kb, r->idx, "enable"), 0) != 0;
@@ -527,7 +575,7 @@ static void applyConfig(LoraRadio* r) {
 }
 
 static void onCfgChange(const char* /*key*/, const char* /*val*/) {
-    cfgArm(LORA_CFG_COALESCE_MS);
+    cfgArmSettle();
 }
 
 /* ─────────── unit bridge: Hz storage ↔ human display keys ───────────
@@ -691,7 +739,12 @@ static TickType_t nextDeadline(void) {
             }
         }
 #endif
-        bool outReady = r->running && !r->splitPending && !r->txActive;
+        /* Nothing drains during a settings settle window, so nothing here may
+         * ask to be woken for it: with LBT off this term returns 0, which would
+         * spend the whole window at full CPU instead of asleep. The window's own
+         * deadline is the s_cfgPend term at the top. */
+        bool outReady = r->running && !r->splitPending && !r->txActive &&
+                        !loraCfgQuiet();
         bool outAvail = (r->rnsdHandle >= 0 && itsBytesAvailable(r->rnsdHandle) > 0) ||
                         loraqDepth(&r->q) > 0 ||
                         (s_rnode.handle >= 0 && s_rnode.radio == r->idx &&
@@ -838,8 +891,17 @@ static void loraTaskMain(void*) {
                 * ITS slot + boost lock are reused, not leaked (rns/INTERNALS §6.1). */
     cfgArm(0);   /* (re)apply config on entry + each resume → radios up + registered */
     while (!s_stop) {
+        if (s_cfgPend && (int32_t)(xTaskGetTickCount() - s_cfgDueTick) >= 0 &&
+            anyRadioOnAir()) {
+            /* Due, but something is on air. The deadline must MOVE, not merely
+             * fail the test: nextDeadline() turns an overdue apply into a
+             * zero-length sleep, so leaving it past-due spins the task for as
+             * long as the radio stays busy. */
+            s_cfgDueTick = xTaskGetTickCount() + pdMS_TO_TICKS(LORA_CFG_ONAIR_RETRY_MS);
+        }
         if (s_cfgPend && (int32_t)(xTaskGetTickCount() - s_cfgDueTick) >= 0) {
-            s_cfgPend = false;
+            s_cfgPend  = false;
+            s_settling = false;
             rnodeSettleOff();   /* a radio-off the client stayed connected through */
             for (int i = 0; i < kNumRadios; i++) applyConfig(&s_radios[i]);
             for (int i = 0; i < kNumRadios; i++) loraPublishDisplay(i);   /* Hz → MHz/kHz */
@@ -892,6 +954,13 @@ static void loraTaskMain(void*) {
             }
             if (r->running && r->rnsdHandle < 0 && r->enabled) registerWithRnsd(r);
             peersExpire(r, millis());
+            /* A long stay on one channel is drawn as it accrues rather than
+             * only when it ends, so a viewer opened mid-session sees where the
+             * radio is now and not a lane that fills in later. Radio task, like
+             * every other writer of dwellSince. */
+            if (loraMonOpen() && r->mon.dwellSince &&
+                (uint32_t)(millis() - r->mon.dwellSince) >= 500u)
+                loraMonDwell(r, millis());
             manualTxPoll(r);    /* CLI tx/tx_psa/tx_prot; holds the radio while active */
             agcResetPoll(r);    /* front-end recalibration; skips a busy radio */
 #if !defined(CONFIG_LORA_NO_SUPE)
@@ -1023,29 +1092,20 @@ void LoraService::onInit() {
          * frequency-agility key, because the regime IS the statement of what is
          * permissible on which channels and a second key would be a second
          * answer to one question. */
-        for (int i = 1; i < kNumRadios; i++) {
+        for (int i = 1; i < kNumRadios; i++)
             storageDefault(sk(kb, sizeof kb, i, "SUPE.enable"), 0);
-            storageDefault(sk(kb, sizeof kb, i, "SUPE.adaptive_txpower"), 1);
-        }
-        /* Migration. Both of these were one setting under two names, which is
-         * how two keys that mean one thing end up disagreeing — so each is
+        /* Migration: a move rather than a merge. The run these pace — the
+         * announce replay and ANNOUNCE2 — is this straddle's own air protocol
+         * from end to end, so the keys belong with the rest of it. Each is
          * carried across at its existing value rather than silently changing a
          * node's behaviour, and the old name is deleted.
          *
-         *   adaptive_txpwr     → SUPE.adaptive_txpower
          *   afa                → SUPE.afa
          *   announce_interval  → SUPE.announce_interval
          *
-         * The second is a move rather than a merge: the run it paces — the
-         * announce replay and ANNOUNCE2 — is this straddle's own air protocol
-         * from end to end, so the key belongs with the rest of it. A copy seeded under the SUPE name by an interim build is left
-         * alone; the operator's own value wins over a default either way. */
+         * A copy seeded under the SUPE name by an interim build is left alone;
+         * the operator's own value wins over a default either way. */
         for (int i = 0; i < kNumRadios; i++) {
-            int oldAp = storageGetInt(sk(kb, sizeof kb, i, "adaptive_txpwr"), -1);
-            if (oldAp >= 0) {
-                storageSet(sk(kb, sizeof kb, i, "SUPE.adaptive_txpower"), oldAp);
-                storageDeleteTree(sk(kb, sizeof kb, i, "adaptive_txpwr"));
-            }
             int oldAfa = storageGetInt(sk(kb, sizeof kb, i, "afa"), -1);
             if (oldAfa >= 0) {
                 storageSet(sk(kb, sizeof kb, i, "SUPE.afa"), oldAfa);
@@ -1089,7 +1149,15 @@ void LoraService::onInit() {
             storageDefault(sk(kb, sizeof kb, i, "coding_rate"), 5);        /* 4/5 */
             storageDefault(sk(kb, sizeof kb, i, "preamble"), 12);
             storageDefault(sk(kb, sizeof kb, i, "sync_word"), "0x42");
+            storageDefault(sk(kb, sizeof kb, i, "adaptive_txpwr"), 1);
         }
+        /* Adaptive power under the SUPE prefix was one switch over both the
+         * measured tiers and the estimate. The measured ones answer to the air
+         * protocol now and nothing else, so what is left is a different setting
+         * with a different meaning and the old value would be a wrong answer to
+         * a question nobody asked — the key goes, and the estimate starts on. */
+        for (int i = 0; i < kNumRadios; i++)
+            storageDeleteTree(sk(kb, sizeof kb, i, "SUPE.adaptive_txpower"));
         storageSet("s.lora.version", LORA_VERSION);
         storageEnd();
     }
@@ -1103,6 +1171,16 @@ void LoraService::onInit() {
         s_radios[i].idx        = i;
         s_radios[i].slot       = &kSlots[i];
         s_radios[i].rnsdHandle = -1;
+        /* What this slot's chip actually answers to, for the pane rows to gate
+         * on (`when_key`). A board fact, known from the slot alone, so it is
+         * published here rather than waiting for the radio to come up — the
+         * settings pane is readable long before that. */
+        LoraFamily fam = chipFamily(kSlots[i].chip);
+        char cb[48];
+        storageSet(rk(cb, sizeof cb, i, "has_rx_boost"),
+                   radioHasRxBoost(fam) ? "1" : "");
+        storageSet(rk(cb, sizeof cb, i, "has_agc_reset"),
+                   radioHasAgcReset(fam) ? "1" : "");
     }
 
     /* Seed the ephemeral MHz/kHz display keys up front, so the settings pane

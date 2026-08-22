@@ -62,17 +62,18 @@ contributes:
 - **`lora a[nnounce]`** (§14) — a copy of every announce this node originates,
   kept for an hour and repeated on demand. Announces are not held back, batched
   or paced: they air when `rnsd` hands them over.
-- **Adaptive TX power** (§15) — a per-peer offset controller
-  (`power = clamp(maximum − offset)`) walked down on evidence from SUPE's
-  reverse MANIFEST and back up fast on a miss, plus the reciprocity estimate
-  for peers that never detour.
+- **Adaptive TX power** (§15) — a per-peer, per-configuration derivation from
+  a measured path loss (`need = loss + sensitivity(cfg) + margin`), walked down
+  one dB at a time on evidence and back up immediately on a miss. Four tiers of
+  evidence, of which only the guessed one is a setting.
 - **Channels and frequency agility** (§18) — a channel index on every record and
   every measurement, the numbered regime table that names a channel set, and the
   per-second channel-RSSI beat that measures it. Instrumentation: what actually
   transmits off the hailing channel is SUPE.
-- **SUPE** (§19) — unicast traffic leaves the shared channel for short private
-  high-rate detours: the requester states its load, the peer answers with the
-  channel and the budget (SUPE_GRANT), both directions ride one detour. Off by
+- **SUPE** (§19) — unicast traffic leaves the shared channel for private
+  meetings at derived times, channels and sync words: one PRIVSYNC seeds a
+  schedule, the pair meets at the first slot that works, and every meeting's
+  goodbye seeds the next — both directions ride one meeting. Off by
   default. The arithmetic — regime tables, the family-filtered ladder, the
   codec, every deadline — is `supe.{h,cpp}`; the state machine is
   `supe_engine.{h,cpp}`, single-threaded and lock-free behind the `SupeHost`
@@ -491,6 +492,14 @@ header bit 0       (0x01): SPLIT — this frame is part of a 2-frame split
 - The random seq nibble lets a receiver tell one sender's split from another's
   interleaved on the air. A half-assembled split is dropped after
   `SPLIT_RX_TIMEOUT_MS` (5 s), bumping `split_rx_timeout`.
+- **A SUPE meeting drops its own orphan at the close.** Train frames reach the
+  same reassembler (`hTrainDeliver` → `bridgeFrameDeliver`), and a meeting hands
+  over everything it collected in one delivery, once. A half still pending after
+  that batch is waiting for a frame the repair round already failed to recover,
+  so it is dropped there rather than left to the timeout — the counter is the
+  same. Holding it was not merely idle: a pending split is state the rest of the
+  interface has to reason around, and reasoning around it wrongly is what put
+  five seconds of deafness after every lossy train.
 
 This is a self-contained framing local to this codebase — it is **not** RNode
 firmware, HDLC, or KISS, and there is no byte-stuffing. Constants:
@@ -530,16 +539,15 @@ the standing cost is the chip's standby delta plus the board's TCXO current, the
 larger of the two by an order of magnitude. SX126x only; other families have no
 equivalent in RadioLib and keep the gaps they have.
 
-**Ingress is gated on the transaction, not on the radio.** `drainOneOutbound`
+**Ingress is gated on the meeting, not on the radio.** `drainOneOutbound`
 pulls from rnsd and the RNode client (`queueFill`) *above* the `txActive` and
-`supeHoldsRadio` returns and *below* the transaction one. The distinction is the
-protocol's: what a transaction carries is declared before it runs — the
-requester's load in the START, the duration everyone else holds for in the GRANT
-— so a packet arriving after that cannot join it and must not disturb the queue
-the engine is walking. Until then it can, and the polite wait before a START is
-hundreds of milliseconds, which is where most of the chances to coalesce live. A
-packet pulled in during that wait is still in the queue when `headRun` measures
-the load, and rides the very detour being waited for. Pulling while a frame is on
+`supeHoldsRadio` returns and *below* the meeting one. The distinction is the
+protocol's: what a train carries is declared before it runs — the HAVEDATA's
+count and length — so a packet arriving after the build cannot join it and must
+not disturb the frames the engine is firing. Until then it can, and the wait
+for a slot is up to hundreds of milliseconds, which is where most of the
+chances to coalesce live. A packet pulled in during that wait is still in the
+queue when the train is built, and rides the very meeting being waited for. Pulling while a frame is on
 air is safe because `queueSendHead` consumes the head the moment `beginTx` has
 copied the bytes out, so the in-flight packet is no longer in the queue for a
 later push — or a per-peer cap eviction — to touch.
@@ -628,9 +636,9 @@ is guarded by `logIsVerbose("lora")`, so the trace costs nothing when off. The
 tag is the task name `lora`.
 
 **Verbose, not debug, and the split is a discipline rather than a preference**:
-debug carries decisions and verbose carries frames. At debug a SUPE detour
-reads as a short story — START, GRANT, MANIFEST, trains, home — with no frame
-dumps between the lines; at verbose the same story is interleaved with every
+debug carries decisions and verbose carries frames. At debug a SUPE meeting
+reads as a short story — PRIVSYNC, schedule, HAVEDATA, GIMME, trains, THATSIT,
+home — with no frame dumps between the lines; at verbose the same story is interleaved with every
 frame that flew. A line that would fire per packet inside a train belongs at
 verbose. See §19.
 
@@ -798,10 +806,9 @@ pause between requests, `DETOUR_WAIT` — reserves nothing on the air, so DIFS a
 the contention window are served *during* the wait rather than after it: the
 machine advances to one step short of the grant, keeps sensing, and the first
 `csmaClear` after the wait lifts takes it. A busy medium still restarts the DIFS
-and evaporates the withheld grant, so freshness needs no timer of its own. This
-is why the classifier distinguishes `SUPE_V_WAIT` from `SUPE_V_HOLD`: the latter
-is somebody else's GRANT reserving the medium, and contending underneath it is
-exactly what the reservation exists to prevent.
+and evaporates the withheld grant, so freshness needs no timer of its own.
+SUPE's `SUPE_V_WAIT` is the caller: a packet waiting for its slot reserves
+nothing, so the medium is served underneath the wait.
 
 **Observability.** `lora <n>` prints the regime, slot/DIFS times and, under
 `appc`, the live airtime percentage with its band and window range, plus the
@@ -910,12 +917,69 @@ margin instead of a fixed budget. It is **not** the LoRa channel symbol rate
 ## 9. Config lifecycle
 
 A change to any `s.lora.*` or `secrets.lora.*` key fires `onCfgChange`, which
-calls `cfgArm(LORA_CFG_COALESCE_MS)` (300 ms). The apply is **coalesced**: a
-radio restart is what an apply costs (`radioStop` + `radioStart` + a fresh rnsd
-registration), and a configuration burst — an RNode client's frequency,
-bandwidth, spreading factor and power arriving as four separate writes, or the
-same typed as one `;`-separated CLI line — would otherwise pay that once per key.
-One burst becomes one restart and one `registerWithRnsd`.
+calls `cfgArmSettle()`. The apply is **coalesced**: a radio restart is what an
+apply costs (`radioStop` + `radioStart` + a fresh rnsd registration), and a
+configuration burst — an RNode client's frequency, bandwidth, spreading factor
+and power arriving as four separate writes, or the same typed as one
+`;`-separated CLI line — would otherwise pay that once per key. One burst
+becomes one restart and one `registerWithRnsd`.
+
+### 9.1 The settle window
+
+There are two coalescing questions here and they have different answers.
+`LORA_CFG_COALESCE_MS` (300 ms) is "four keys written in one breath cost one
+apply". `LORA_CFG_SETTLE_MS` (10 s) is **"the person is still typing"** — a
+frequency, a bandwidth and a spreading factor arriving seconds apart as somebody
+works down a settings pane. Between those writes the radio is configured for a
+combination the user never asked for and would not choose, and 300 ms is
+nowhere near long enough to span it.
+
+So a change to a user's own settings arms the settle window instead, and the
+window is **radio silence as well as a deferred apply** — transmitting on a
+half-edited configuration is the part that reaches other people. While
+`loraCfgQuiet()` holds:
+
+- `drainOneOutbound` returns before staging anything: the queue and the ITS
+  buffers hold what they hold, exactly as they do for every other owner of the
+  radio;
+- `supePoll` starts no transaction and skips its announce beat. A transaction
+  already running is left to finish — the far end is timing against it and it
+  is over in well under the window — and an armed offer simply launches when
+  the window closes;
+- a manual `lora <n> tx` is **refused** rather than held: it is a typed
+  one-shot, and a transmit that happens ten seconds later on different
+  parameters is not the one that was asked for.
+
+Receive is untouched throughout.
+
+**This is the one deadline that slides.** `cfgArm` arms once and can only be
+pulled in (below); "after the last change" means the opposite, so
+`cfgArmSettle()` pushes its deadline out on every further change. That needs the
+starvation bound the immovable one did not, which is `LORA_CFG_SETTLE_MAX_MS`
+(60 s), measured from the first change of the burst: past it the apply happens
+whatever is still arriving. And it may only move **its own** deadline — an apply
+pending for any other reason is left where it is, or a stream of edits could
+hold off a radio the orchestrator is trying to bring up. `cfgArm` clears
+`s_settling` for the same reason.
+
+**Two places must not be left past-due.** `nextDeadline()` turns an overdue
+deadline into a zero-length sleep, so an apply that is due but held spins the
+task at full CPU. The apply that comes due with a frame still on air
+(`anyRadioOnAir`, below) therefore *moves* its deadline by
+`LORA_CFG_ONAIR_RETRY_MS` rather than merely failing a test; and the outbound
+and SUPE wake terms in `nextDeadline` drop out entirely while the window is open
+(`outReady` takes `!loraCfgQuiet()`, `supeNextDeadlineMs` returns `UINT32_MAX`),
+since an armed offer or a queued packet would otherwise ask to be re-sensed at
+slot pace for ten seconds over work that is not going to happen.
+
+**The apply itself waits for the air to clear.** `anyRadioOnAir()` — a transmit
+in flight, a manual transmit, or a live SUPE transaction on any radio — defers
+the pass, because the apply stops and restarts the radio and would otherwise cut
+a frame off the air or strand a detour the far end is still waiting on. The
+settle window makes this rare, but a frame that began just before the window
+opened is still flying, and at SF12 it flies for seconds.
+
+### 9.2 Why `cfgArm` itself is immovable
 
 `cfgArm(delayMs)` **arms once and is never pushed out** by a later change; it can
 only be pulled *in*. That asymmetry is the whole design:
@@ -928,7 +992,7 @@ only be pulled *in*. That asymmetry is the whole design:
   client's configuration burst — calls `cfgArm(0)`, so the apply and its echo
   land inside that sleep while the burst before it still coalesces (the earlier
   writes armed 300 ms and nothing has applied yet). A CLI or web burst has no
-  such terminator and simply takes the 300 ms window.
+  such terminator, and takes the settle window of §9.1 instead.
 
 `nextDeadline()` carries an `s_cfgPend` clause so the task wakes at the deadline.
 When it fires, the pass runs — in order — `rnodeSettleOff()`, `applyConfig(r)`
@@ -992,11 +1056,13 @@ only — radio 0's defaults come from this straddle's `settings:` block in
 `straddle.yaml`, **except** `s.lora.0.bandwidth`, seeded here because its pane
 row binds the kHz display key rather than the Hz config key.
 
-The same gate carries three renames, each of which was one setting under two
-names: `adaptive_txpwr` → `SUPE.adaptive_txpower`, `afa` → `SUPE.afa`, and
-`announce_interval` → `SUPE.announce_interval`. Each moves at its existing
-value rather than silently changing a node's behaviour, and the old key is
-deleted. Frequency and TX power carry no default
+The same gate carries two renames, each of which was one setting under two
+names: `afa` → `SUPE.afa` and `announce_interval` → `SUPE.announce_interval`.
+Each moves at its existing value rather than silently changing a node's
+behaviour, and the old key is deleted. It also deletes
+`SUPE.adaptive_txpower` outright rather than carrying it: `adaptive_txpwr`
+governs a strictly narrower thing (§15), so the old value would be an answer to
+a question nobody asked. Frequency and TX power carry no default
 (region/antenna — the user must pick); everything else defaults so an
 enable-toggle alone gets a radio up. The **RNode group is global, not per radio**
 — there is one endpoint for the device — and is seeded under the same gate with
@@ -1091,7 +1157,7 @@ storage subtree **is** the ring — no in-firmware record buffer, no ITS transfe
   our own air protocol from the split-header subtraction (`doneType ==
   LORA_PKT_OURS ? 0 : 1`); the receive path does not, and hands the record the
   same `payloadLen` it computes for Reticulum framing, which SUPE frames do not
-  carry. So a 10-byte GRANT reads 10 on the sender's graph and 9 on the
+  carry. So a 10-byte GIMME reads 10 on the sender's graph and 9 on the
   receiver's. Cosmetic for the drawing, load-bearing when checking a frame
   against §3 of `plans/SUPE.md`.
 - **A second series, live-only: the channel noise floor.** While a viewer is
@@ -1125,8 +1191,13 @@ show **one graph carrying both directions** over one selected window, picked
 from a pill row (10s / 1m / 5m / 10m / 30m / 1hr). Each frame is a horizontal
 line spanning its time-on-air, placed on **one of two dBm axes sharing the same
 four gradient bands**: transmit power −10…+30 dBm in **10 dB** steps down the
-left gutter, received strength −130…−30 dBm in **25 dB** steps down the right.
-The steps differ because the ranges do (100 dB against 40) and both have to land
+left gutter, received strength −128…0 dBm in **32 dB** steps down the right. The
+receive axis is the reportable range itself rather than a comfortable subset of
+it: packet strength is a byte read as −value/2 dBm, so 0 is the strongest level
+a receiver can state and −127.5 the weakest, and the round 32 dB step falls out
+of that. A pair on one bench reads well above −30, and an axis stopping there
+put every one of those in the top band with nothing to tell them apart.
+The steps differ because the ranges do (128 dB against 40) and both have to land
 on the same band edges for one grid to serve them; the axis names stand in the
 pill strip over their own gutter, which is what pushes the pills inward.
 Direction is read off **the background**: over a transmit's time-on-air — and
@@ -1336,8 +1407,8 @@ A capability line closes each non-`us` block:
 | `TRANSPORT` | it relayed someone else's frame to us — a rebroadcast announce naming itself as `transport_id`, or any HEADER_2 frame at hops > 0 that does |
 | `ROAMING` | its node-flags bit (a moving node wants more margin) |
 | `SUPE` (`RF_PROTO_NAME`) | it has spoken our air protocol to us — a SUPE announcement, or a 0x04 power request |
-| `EST <dBm>` | the power this node needs toward that peer, *inferred* by reciprocity from frames we overheard, crediting the peer with `s.lora.assumed_peer_txp` (default 22). It is the only passive source there is now that the power sweep is gone (§14); SUPE's own path-loss pairs replace it for anything it actually detours with (§19.7). |
-| `USE <dBm>` | the determination frames to this node actually go out at under `SUPE.adaptive_txpower`, `~` when it came from `EST` plus a margin rather than from a measurement (§15) |
+| `EST <dBm>` | the power this node needs toward that peer, *inferred* by reciprocity from frames we overheard over the last three bucket-ring slots, crediting the peer with `s.lora.assumed_peer_txp` (default 22). It is the only source there is for a peer that does not speak our air protocol; for anything that does, a stated power replaces the assumed one and a meeting's reports (GIMME, the answering HAVEDATA) replace the direction (§15.2). |
+| `USE <dBm>` | what the last frame to this node went out at, and the tildes say how much of it was guessed: none when the peer itself reported the level our frame landed at, `~` from a path loss measured the other way round, `~~` from `EST` alone (§15). Absent means the configured `tx_power` — no evidence, or none of it fresh |
 
 Identities are the **join, not the display**: they build the rows but appear
 only under `-v`, which also adds the signal envelope, link quality, the
@@ -1381,58 +1452,166 @@ carry is unreachable rather than avoided.
 
 The second is why `lora n` has no measured `TX <dBm>` column: the only passive
 source outside a detour is `EST` (reciprocity, §13.1), and SUPE's own path-loss
-pairs replace it for any peer it actually detours with.
+pairs replace it for any peer it actually detours with (§15.2).
 
-## 15. Adaptive TX power (`s.lora.<n>.SUPE.adaptive_txpower`)
+## 15. Adaptive TX power
 
-The §15 controller of `plans/SUPE.md`, in `lora_power.cpp`, with its per-peer
-state on the peer table's rows. On by default; a node with the key off
-transmits everything at `tx_power`, because obeying someone else's power
-suggestion puts our transmitter under their control and the opt-out must be
-real.
+Every frame whose first RF hop is a known node goes out at a power derived for
+that node, at the configuration the frame is about to fly at. `lora_power.cpp`
+owns the derivation; the per-node evidence sits on the peer table's rows.
 
-**Power is derived from a learned offset, never computed as an absolute:**
+**Nothing is stored as a power.** `apDerive` recomputes the number for every
+frame, so evidence going stale, a floor decaying and a link that has moved all
+show up on the next transmission rather than at some settling time. What *is*
+stored is the ratchet's trim and the failure floor — what the loop has learnt
+and no measurement can supply. `Neighbor::apPwr` is a display cache for
+`lora <n>` and nothing reads it back.
 
-    power = clamp( maximum − offset , floor , maximum )
+### 15.1 The evidence is a path loss
 
-`apOpenPower` is that expression. The offset starts at zero — a peer the
-controller has never adapted to is opened at the configured maximum — and only
-ever moves on evidence about that peer. A path loss and a modelled sensitivity
-never set the power directly: that arithmetic produces plausible-looking
-nonsense (−62 dBm "needed" power on a strong link) that only a floor constant
-would be saving, and a floor doing that much work is the design failing.
+A measurement is a level in dBm and the power that produced it; the difference
+is the loss, and the loss is one property of the link however it was read. What
+a *configuration* changes is the sensitivity that loss has to clear. So:
 
-- **Failure raises the power fast.** `supeApFailed` — no reverse MANIFEST, or
-  a delivery-proof miss on plain traffic — cuts the offset by 6 dB and records
-  the failed power plus 3 dB as a floor, on a decay (`AP_FLOOR_DECAY_MS`), so
-  the loop settles above the cliff instead of oscillating across it.
-- **Success lowers it slowly, and only on evidence.** `supeApSucceeded` needs
-  `AP_MIN_SAMPLES` clean exchanges since the last change, and the glue only
-  calls it when the peer's MANIFEST reported real headroom (margin above the
-  target plus slack) — thin margin holds. A controller that dials down on a
-  timer walks a quiet link into the ground.
-- **The reverse MANIFEST is the evidence loop.** Every detour ends with the
-  peer's MANIFEST stating the level our train landed at, so the controller gets
-  a complete round trip with a measurement in it on every transaction, at no
-  cost. Delivery proofs on plain traffic (`peersQuality`) feed the same two
-  functions, slower.
-- **SUPE_GRANT is never adapted and SUPE_START always is.** The GRANT is the
-  frame every third party holds traffic on, so its reach is the reach of the
-  hint; the START is addressed to one node, and §11's absence ladder is the
-  power probe run to conclusion — each retry at more power, the third at
-  maximum.
+    need = path loss + sensitivity(cfg) + margin
 
-**What remains of the passive path.** For a peer that has never detoured with
-us there is still the reciprocity estimate (`apSettle`, §13.1): the assumed
-peer power minus the headroom its frames arrive with here, plus
-`AP_EST_MARGIN_DB` because the assumption may be wrong and because ambient
-noise is not reciprocal even where path loss is. It needs `AP_MIN_SAMPLES`
-recent frames before it settles anything, settles once per node (through the
-identity clustering of §13), and is outranked the moment a filed path-loss
-pair exists. The 0x04 power request an LR can carry (§13) is unchanged.
+and one measurement serves the hailing channel and every detour step alike.
+This is why `host->txp_open` takes a `SupeCfg`: SF5/500k sits some 15–20 dB
+above SF12/125k in sensitivity, and a single per-peer power would be tuned for
+one of them and wrong for the other by that much. The main channel resolves
+against the hailing configuration (`apOpenPower`); a granted step resolves
+against the step (`apOpenPowerAt`), on both sides of the transaction.
 
-Never on a broadcast: an announce has no single next hop and must reach
-everyone, so it always goes out at the configured `tx_power`.
+### 15.2 Four tiers, best evidence first
+
+Each is gated on `AP_FRESH_MS` (10 minutes). Stale evidence falls to the next
+tier, and a node we have heard nothing from opens at the configured `tx_power`.
+
+| tier | evidence | margin |
+|---|---|---|
+| `AP_SRC_REPORT` | the peer stated the level our own frame landed at — GIMME reporting the PRIVSYNC and the HAVEDATA, the answering HAVEDATA reporting the train: the only measurements of the direction we transmit in | `SUPE_TARGET_MARGIN_DB` |
+| `AP_SRC_PAIR` | a frame heard here with the power the peer stated for it (§10's pairs, either the hailing one or the step one, whichever is fresher) | `+ AP_RECIP_MARGIN_DB` |
+| `AP_SRC_EST` | the same, against `s.lora.assumed_peer_txp` instead of a stated power | `+ AP_EST_MARGIN_DB` |
+| `AP_SRC_NONE` | none of the above is fresh | the configured `tx_power` |
+
+The reciprocal tiers cost their extra margin because ambient noise is **not**
+reciprocal even where path loss is: a node sitting beside an interferer needs
+more from us than our own quiet receiver would suggest, and no measurement we
+can make from here will say so.
+
+### 15.3 The ratchet: up fast, down slowly
+
+- **A miss raises the power immediately.** `apFailed` — a meeting dying after
+  contact with our train unconfirmed, or a delivery proof that never came from
+  a peer that has also stopped being heard — files a floor `AP_FLOOR_STEP_DB` above what was tried, on a decay
+  (`AP_FLOOR_DECAY_MS`), zeroes the trim and halves the EST walk. The floor
+  outranks every tier, because a measurement can be optimistic and the thing
+  that proved it optimistic was a frame that never arrived. Successive misses
+  climb 6 dB at a time, each filing its floor above what the last one tried.
+- **A miss from a peer we can still hear is not one.** `peersQuality` reaches
+  `apFailed` only when nothing has been heard from that node for
+  `AP_MISS_QUIET_MS`. An unresolved proof expectation from a node whose frames
+  keep arriving is a congested medium, a busy far end, or a transfer stalled
+  above the radio — all of them made worse by transmitting harder. The quality
+  counters score it regardless: that is a statement about the link, and this is
+  a statement about the power.
+- **A success lowers it one dB, and only on evidence.** `apSucceeded` needs
+  `AP_MIN_SAMPLES` clean exchanges, and the glue only calls it when the peer's
+  report carried real headroom — thin margin holds. A controller that dials
+  down on a timer walks a quiet link into the ground.
+- **The trim is capped at `AP_TRIM_MAX_DB` over a measured need.** The
+  measurement already aimed at a target margin; the trim is for what
+  measurement cannot see, not a second opinion about the link.
+
+Both feedback paths land in the same two functions: a meeting's close
+(`SUPE_EV_TRAIN_OK` / `SUPE_EV_TRAIN_LOST`) on every exchange at no cost, and
+Reticulum's own delivery proofs on plain traffic (`peersQuality`), slower.
+
+**Every miss note carries the configuration it failed at.** `apMissWasPower`
+weighs the loss the peer measured against what that regime needs, and a note
+that leaves `cfg` unset defeats it silently rather than loudly: a zero bandwidth
+puts zero into a logarithm, and the result lands on 0 dBm — a receiver that
+needs a signal stronger than any transmitter can produce, against which every
+real link reads as too weak and every miss is scored as too little power.
+`supeSensitivityDeci` now answers "unknown" for a blank configuration instead,
+with a floor no measurement will beat, so the same omission can only ever hold
+the power rather than raise it. What that cost on the bench: an unanswered
+closing frame means only that an acknowledgement went missing — the train
+itself arrived — and it recurs, so a table-top pair ratcheted −9 dBm to 22 dBm
+over four minutes, each end climbing because the other had.
+
+### 15.4 The `EST` tier is the only thing `adaptive_txpwr` governs
+
+Everything above it is fed by frames that state the power they went out at, and
+stating that power is what the protocol is *for* — a node cannot both speak it
+and decline to use what it says. So the measured tiers are not switchable.
+
+`s.lora.<n>.adaptive_txpwr` (default 1) reaches the `EST` tier alone, which is
+also the only tier a node that does not speak our air protocol can ever reach.
+There is no return measurement there to catch it being wrong, and nothing but a
+delivery proof will ever notice. It is therefore deliberately timid:
+
+- **more evidence to start** — `AP_PASSIVE_MIN_SAMPLES` frames spread over at
+  least two bucket-ring slots, so one announce burst from a passing node cannot
+  move it, and `lastHeardMs` inside `AP_FRESH_MS`;
+- **half the surplus** — it claims `(cfgTxp − estimate) / 2`, so the timidity
+  scales with the size of the guess where a flat extra margin would not;
+- **a capped cut** — `AP_PASSIVE_CUT_MAX_DB`, or `AP_PASSIVE_CUT_BLIND_DB`
+  while `qProved == 0`, since for that peer the cut is unfalsifiable and will
+  stay that way;
+- **a walk, not a jump** — the estimate is a *target*, and the cut is bounded
+  by `apEstWalkDb`, which buys one dB per `AP_EST_WALK_FRAMES` frames heard from
+  that peer (`apHeard`, off `peersSample`). A peer the controller has never
+  adapted to opens at the configured power.
+
+The walk is the tier's own counter and not the ratchet's trim, because the two
+are paid for in different currency. The ratchet spends returned delivery
+signals, and a peer that speaks only Reticulum to us barely produces any —
+nothing inside an established link elicits a proof — so a walk bounded by the
+trim never leaves zero and this tier resolves to `tx_power` forever. Frames
+heard are the evidence the estimate is built from in the first place, they
+arrive whenever the peer is talking to us, and they stop arriving exactly when
+the link is in trouble. The walk holds still while a failure floor stands
+(walking under a floor buys nothing now and lands the power somewhere unproven
+when it decays) and halves rather than zeroes on a miss, so a decayed floor does
+not hand back the cut that just failed.
+
+### 15.5 The answering side
+
+**Every meeting frame is adapted to the one node it addresses** — `meetTxp` in
+the engine: the controller's derivation for the peer at the configuration the
+frame flies at, capped by the channel's regulatory limit. The listener's GIMME
+and everything behind it fly at its derivation for the seeker; a seeker that
+did not name itself (`sender_ident=0`) leaves no row to resolve, and the answer
+takes the cap. Nothing needs third-party reach: no frame carries a hold, a
+reservation or a hint for anyone but its addressee, so there is no frame that
+must go out at maximum for somebody else's sake.
+
+**The train's power is resolved where the train flies, on the report just
+received.** GIMME's HAVEDATA reading is filed through `SUPE_EV_REPORT` into
+`apFileReport` before the engine asks `txp_open` at the confirmed budget's
+configuration — so the freshest measurement in the protocol, milliseconds old
+on the very channel, is what the train power derives from. THATSIT states the
+result one frame later, which is what keeps the peer's pairing true.
+
+### 15.6 What is never adapted
+
+**A broadcast**, always. An announce has no single next hop and must reach
+everyone, so it goes out at the configured `tx_power`.
+
+**The second attempt and every one after it.** The ladder's first rung is what
+the evidence says the peer needs; a request that drew silence has already shown
+that wrong, and the only question left — is this peer reachable at all — is one
+maximum answers in a single frame. `supeEngLaunch` takes `pv.txpOpen` at rung 0
+and `txpMax` above it, and `supeEngResend` raises `startTxp` to `txpMax` before
+retransmitting, so a strike is scored against what was actually tried.
+
+### 15.7 The capability bit that is not one
+
+`SupeCaps` carries no adaptive-power flag. Every node that speaks SUPE derives
+its power this way, so a bit announcing it would announce a constant — and the
+top bit of the maximum-power byte it used to ride in is back to being part of
+the level.
 
 ## 16. Pitfalls
 
@@ -1454,7 +1633,15 @@ everyone, so it always goes out at the configured `tx_power`.
   IRQ pin or the radio goes silent.
 - **Half-duplex: `splitPending` blocks all TX** until the second frame arrives or
   the 5 s timeout fires. Outbound bytes sit in the ITS stream buffer meanwhile —
-  don't drain them in a tight loop.
+  don't drain them in a tight loop. It must **not** also stand the SUPE engine
+  down, and must not reach it as `rx_busy` either. Standing the engine down
+  leaves its next event computed from a slot already past, so the deadline pins
+  at zero and the main loop spins for the whole timeout while no schedule can
+  reach its horizon. Reporting it as `rx_busy` is the opposite error: that
+  answer defers attending a slot, which is right for a preamble ending in
+  milliseconds and wrong for a timer measured in seconds — every slot inside the
+  window is walked past, so the node goes deaf to the peer hailing it. Only a
+  transmit of our own (`txActive`) stands the engine down.
 - **`startReceive` after every `transmit`.** RadioLib leaves the radio in standby;
   without re-arming, RX is dead until the next config reload.
 - **Airtime depends on framing, not just SF/BW/CR.** A headerless frame drops
@@ -1805,37 +1992,35 @@ per second for an SPI read nobody sees. The gate is the same cached
 it via the watch-key subscription and nudges the task, and the stale-by-then
 deadline samples on that very pass. The hailing channel is read in place — the
 radio is already on it and settled, so it costs one SPI transaction and no
-retune — and that reading also decides whether the excursion happens at all.
+retune.
 
-`rssiSweepAgile` measures the regime's agile channels as **one excursion off the
-hailing channel and back**: standby → `setFrequency` → `startReceive` →
-`getRSSI` per channel, then home. Nine channels is 2–3 ms away, inside the ~4 ms
-an 8-symbol SF7/BW125 preamble allows before a frame could be missed. Four
-things about it are load-bearing:
+**And no other channel is measured. The radio never leaves the hailing channel
+to take a reading** — not for the regime's agile channels, not for anything. The
+rule is worth stating as a rule, because sampling them is a natural-looking idea
+(standby → `setFrequency` → `startReceive` → `getRSSI` per channel, then home)
+and it costs more than it looks:
 
-- **The excursion is cancelled when the hailing channel is not quiet.** Leaving
-  it mid-reception destroys the frame outright, and unlike a preamble there is no
-  partial-recovery argument. The reading just taken is the cheapest evidence
-  available that something is on air, so energy above the tracked noise floor
-  skips this beat's agile channels — they go unreported and the viewers draw the
-  gap. It carries carrier sense's blind spot with it: a frame below the floor is
-  invisible to it, and closing that needs the preamble-detect and header-valid
-  interrupts the receive path does not currently arm.
-- **Bandwidth is deliberately not retuned.** Every channel is measured with the
-  receiver the hailing channel is configured for, so all the readings share one
-  noise reference and are directly comparable — which is what a graph of nine
-  channels needs. Measuring each at its own width would make a 500 kHz channel
-  read ~6 dB hotter than a 125 kHz one from thermal noise alone. A regulatory
-  Clear Channel Assessment is the opposite case and must match the channel's
-  occupied bandwidth; that is a different measurement for a different purpose.
-- **A settling delay, and a floor test on the result.** `GetRssiInst` asked
-  before the receiver is actually running answers 0xFF, which decodes to
-  −127.5 dBm and looks exactly like a very quiet channel. Anything at or below
-  `LORA_RSSI_INVALID_DBM` is therefore not reported at all, rather than drawn as
-  a floor that isn't one.
-- **Coming home is unconditional and unchecked.** A failed retune mid-sweep must
-  not strand the radio off the hailing channel, which is the one thing this must
-  never do.
+- **A frame arriving inside the excursion is lost, invisibly.** Gating the trip
+  on the hailing channel reading quiet does not save it: that test is carrier
+  sense's and inherits carrier sense's blind spot — a frame below the tracked
+  floor does not register, and a preamble that begins *during* the trip cannot.
+  Nothing counts what it costs, so the loss surfaces only as a link that
+  underperforms for no visible reason.
+- **The excursion's cost is per part, and the window it has to fit is per
+  configuration.** The ~4 ms an 8-symbol SF7/BW125 preamble allows is not the
+  budget at SF12, and an SX126x's retune-and-restart is not an LR2021's. A
+  margin that has to hold across both axes is a margin nobody is tracking.
+- **Nothing operational would read it.** Channel access takes its own samples,
+  SUPE's channel choice reads the airtime ledger alone (`hChanGet`, §19), and
+  the power controller works from stated powers (§15). A per-channel noise graph
+  is decoration, and decoration does not get to drop frames.
+
+`publishChannels` still lists the regime's channels, and the viewer still stacks
+a graph per agile channel — **what those graphs draw is the traffic a detour put
+there**, from records that exist whether or not anything sampled the noise. The
+RSSI series was only a grey backdrop under them, so the lanes now plot their
+frames against a plain background. The record's per-channel RSSI fields stay in
+the format; a radio publishes one of them.
 
 Carrier sense outranks the beat: it is skipped while a transmit, a split
 reassembly, an announce replay (§14), a SUPE transaction (§19) or any channel-access phase is in progress, so
@@ -1882,28 +2067,31 @@ hailing channel's at a quarter its height and the same width — so the same tim
 axis, and a moment is the same column in every one of them. Same bands, same
 dBm scale, same window; only the gutter labels are left off, since repeating one
 scale ten times is noise. Each carries its frequency/bandwidth label and its own
-transmit airtime over the window on screen.
+transmit airtime over the window on screen. What fills an agile lane is the
+**traffic a detour put on that channel** — packet records carry a channel index,
+so they land in the right lane with no measurement involved.
 
 The channel-RSSI series draws as a **very light grey backdrop** under the
 traffic — a bar always wins the pixels it lands on, so the floor reads as
 background texture rather than as something drawn over. The series accumulates
 live from the newest published sample, the same rule the packet records follow:
-it starts when the window opens.
+it starts when the window opens. A radio publishes one channel's (§18.3), so the
+backdrop appears under the hailing graph and the agile lanes plot against a
+plain background.
 
-Per-channel captions carry transmit airtime and **not** "channel busy". What
-another node is doing on a channel we only visit to measure says little, and the
-figure would invite being read as occupancy when it is one instant sampled per
-second. The hailing channel's caption keeps both, and its live-hour figures still
-come from the firmware's published rollup.
+Per-channel captions carry transmit airtime and **not** "channel busy". A level
+sampled once a second invites being read as occupancy, which it is not. The
+hailing channel's caption keeps both, and its live-hour figures come from the
+firmware's published rollup.
 
 ## 19. SUPE (`s.lora.<n>.SUPE.*`)
 
 Protocol: **`plans/SUPE.md`**, authoritative for anything on the air. This
 section is what the code does and where it lives.
 
-**SUPE moves unicast traffic off the shared channel onto short private
-high-rate detours**, arranged in two short frames on the shared channel, with
-rnsd unmodified and unaware. The wire sequence, in full:
+**SUPE moves unicast traffic off the shared channel onto private meetings at
+derived times, channels and sync words**, seeded by one frame on the shared
+channel, with rnsd unmodified and unaware. The wire sequence, in full:
 
 ```
 main channel (the hailing channel — where everyone camps)
@@ -1911,55 +2099,53 @@ main channel (the hailing channel — where everyone camps)
   A→*  SUPE_ANNOUNCE2  5+4n B   who I am, what my radio does, at what power
                                └─ once per SUPE.announce_interval, jittered
 
-  A→*  SUPE_START         7 B   "traffic for whoever holds this tag, this
-                               much of it (a byte load), and this is what my
-                               radio can do (family, ceiling)"
+  A→*  PRIVSYNC        6/9 B   "traffic for whoever holds this tag — you know
+                               where to find me" (+ A's identity, sender_ident)
                                └─ carrier-sensed like any other transmission
-  B→*  SUPE_GRANT        10 B   "meet me on that channel at that budget, for
-                               this long" — or budget 15: refused, with the
-                               reason in the channel nibble
-                               └─ a turnaround response: no carrier sense
-                               └─ carries the REVERSE bit (power byte's free
-                                  top bit): B has traffic queued back, so a
-                                  reverse MANIFEST will exist at all
-                               └─ everyone else holds traffic for the tag for
-                                  the stated duration (released one DIFS early,
-                                  so the polite node is not last in the draw)
+                               └─ its hash seeds the TIGHT schedule: slots at
+                                  +26 ms then every 40–63 ms to 400 ms, each
+                                  with a derived channel and sync word; A
+                                  speaks in even slots, B in odd
 
-        both retune, observing the 1 ms retune gap
+traffic channel (a slot the schedule named; regime 0: the hailing frequency
+                 under a derived sync word)
 
-unicast channel (the channel the GRANT named; regime 0: the hailing
-                 frequency at a faster modulation)
+  A→B  HAVEDATA          8 B   "this schedule; n frames, this long, propose
+                               this budget ceiling" — after one CCA
+  B→A  GIMME          10/8 B   "heard you; fly at this budget" + how the
+                               PRIVSYNC and the HAVEDATA landed (the readings
+                               the budget choice and the train power run on)
+  A→B  the frames      × n     LoRa frames, ordinary framing, at the
+                               confirmed budget, flip-gap apart
+  A→B  THATSIT         2+n B   the train's power (chosen AFTER the report)
+                               and one CRC-8 per frame — the checksum list IS
+                               the sequence; the frames carry no numbering
+  B→A  BYE               1 B   everything accounted for
+   -or- RESEND      1+⌈n/8⌉ B  ONE repair round: A refires exactly those
+   -or- HAVEDATA  10+⌈n/8⌉ B  B's return leg — GIMME is skipped, the frame
+                               carries the train's reading + the repair mask;
+                               B's train and THATSIT follow, A's repairs ride
+                               ahead of its closing BYE or RESEND
 
-  A→B  MANIFEST          11 B   this train's power, how the GRANT was heard,
-                               capabilities, count, length, the START's hash
-  A→B  the packets    × count   ordinary Reticulum frames, ordinary framing
-
-  reverse bit set:
-  B→A  MANIFEST          11 B   B's own count and length, how A's train landed
-  B→A  the packets    × count
-  reverse bit clear:
-       nothing — B goes home on A's count/length, A on its own last TxDone
-
-        both return to the main channel
+  the goodbye: the final THATSIT's hash seeds the WIDE schedule — slots from
+  +150 ms, widening to a 350 ms cap, horizon 3 s, the receiver of the final
+  train speaking first. A pair with steady traffic touches the shared channel
+  once, ever.
 ```
 
-One detour carries traffic in **both** directions, ends by arithmetic, and is
-not acknowledged. **Nothing is waited for anywhere when things go right**:
-ping-pong traffic has its reverse leg (the previous packet's proof, the next
-request) buffered before the transaction starts, so the answer is a train or
-nothing, decided in the GRANT — never a timed grace, and no close frame. The
-only per-frame delays are receiver-turnaround cover (1 ms retune gap, 3 ms
-manifest lead, 2 ms between packets), counted into every stated length.
-Deadlines exist for misses alone; a packet lost is lost, and the layers above
-retry. A count-0 MANIFEST retains one meaning — "nothing after all" — for the
-corner where declared reverse traffic vanished (a radio cycle) underneath the
-transaction. Silence after an undeclared train is the normal end, so the power
-controller reads a missing reverse MANIFEST as loss only when one was
-declared. The peer chooses the channel and the budget because it is
-the node that knows: it has been camped on the main channel, holds its own
-airtime ledger and reuse gaps, and resolves the family-filtered ladder for the
-channel it names in the same byte.
+The failure ladder is private and bounded: a listener spends a preamble-width
+per slot (window `[t−guard, t+guard+preamble]`, extended only while the modem
+reports a frame mid-air); a speaker spends one short frame per owned slot and
+only attends with traffic queued; a busy channel at a slot is skipped —
+the appointment grants the peer's attention, never the spectrum. A missed slot
+scores NOTHING, in any direction. The one silence that scores is a tight
+schedule we seeded expiring unmet: one strike on the absence ladder, because
+that seed flew carrier-sensed on the shared channel and its slots gave the
+peer several hundred milliseconds of chances. Delivery is whole and in
+sequence at the meeting's close — the inbound train is buffered (the
+`SUPE_TRAIN_MAX` RAM commitment), the repair round fills what it can, a
+repaired frame takes its place rather than the end, and holes are surrendered
+to the layers above.
 
 ### 19.1 What gates it
 
@@ -1991,10 +2177,12 @@ remains references them. What that removes along the way:
 - **The channel plan.** One channel — the configured carrier — so the RSSI beat
   reports one, `publishChannels` lists one, and every transmission's airtime
   feeds the APPC band directly instead of a per-channel ledger.
-- **The adaptive TX power determination.** `LoraRadio::adaptive` is the
-  reciprocity determination's own flag now rather than an alias of
-  `supeAdaptive`; with no `SUPE.adaptive_txpower` key to read it stays off, and
-  `apOpenPower` returns the configured power.
+- **Every measured power tier.** They are fed by frames that state the power
+  they went out at, and those frames are SUPE's. What survives is the `EST`
+  tier — `s.lora.<n>.adaptive_txpwr`, which this build still reads, since in a
+  build with no SUPE every peer is a peer that cannot tell us what it hears.
+  `apDerive` compiles without a sensitivity model, which only the measured
+  tiers need.
 - **The settings.** Every SUPE row in `straddle.yaml` carries
   `when_kconfig: "!CONFIG_LORA_NO_SUPE"`, which gates the LCD pane row, the
   browser row and the `storageDefault()` at once — so the keys are **absent**
@@ -2014,35 +2202,41 @@ Three layers, one direction of dependency:
 
 - **`supe.{h,cpp}` — the pure core.** Regime tables, the §14.3 ladder
   (integer-only, family-filtered, channel-bound; `supeLadder` /
-  `supeResolveBudget`), the codec for START/GRANT/ANNOUNCE2/MANIFEST, the load
-  quantisation (`ceil(Σ(bytes+16)/32)`), every §14.7 deadline, sync words,
-  expiry. Conformance for the ladder is `test/supe-ladder-vectors.txt`,
-  generated over the full §14.3.4 cross-product by `supe_core_test`; the file
-  is the authority when it and a reading of the prose disagree.
-- **`supe_engine.{h,cpp}` — the one decider.** The whole state machine, both
-  roles, single-threaded by contract with no lock and no blocking anywhere: a
-  step that must happen later is `host->schedule`d and the entry returns.
-  Everything platform arrives through `SupeHost` (time, randomness, one-shot
-  timer, SHA, tune/tx/rx, peer views in, peer notes out, the channel view);
-  the packet queue it reads is `lora_queue`, pure itself. The engine also owns
-  the tag set ("addresses that mean us", fed by the observer), the third-party
-  holds, the proof-return table, and the recent-STARTs cache that lets a GRANT
-  be correlated with the START it answers. `shouldDetour` is the one
+  `supeResolveBudget`), the codec for every frame, the CRC-8 frame checksum,
+  the §14.5 sync-word list, the §7 schedule derivation
+  (`supeDeriveSchedule`, pure integer arithmetic over the seed's two digests),
+  and expiry. Conformance: `test/supe-ladder-vectors.txt` over the full
+  §14.3.4 cross-product and `test/supe-schedule-vectors.txt` over fixed digest
+  patterns, both regenerated by `supe_core_test`; the files are the authority
+  when they and a reading of the prose disagree.
+- **`supe_engine.{h,cpp}` — the one decider.** The schedule table, the slot
+  attendance and the whole meeting state machine, both roles, single-threaded
+  by contract with no lock and no blocking anywhere: a step that must happen
+  later is `host->schedule`d and the entry returns. Everything platform
+  arrives through `SupeHost` (time, randomness, one-shot timer, SHA, tune/tx/
+  rx/CCA, the train build/fire/deliver hooks, peer views in, peer notes out,
+  the channel view); the packet queue it reads is `lora_queue`, pure itself.
+  The engine also owns the tag set ("addresses that mean us", fed by the
+  observer) and the proof-return table. `shouldDetour` is the one
   deliberately-open policy function (`plans/simulation.md` §7); v0 says NOW
   whenever there is a peer.
 - **`lora_supe.cpp` — the boundary.** The recursive mutex every entry point
   takes (radio task, esp_timer task, console, config callbacks — the engine
   itself never locks), the `SupeHost` implementation over
-  radio/queue/peers/airtime/chanplan/power, the ANNOUNCE2 beat and its
-  peer-table ingest, and the note handlers that file the engine's events into
-  `Neighbor` rows (pairs, strikes, absence, refusal backoffs) and the power
-  controller (§15).
+  radio/queue/peers/airtime/chanplan/power, the train buffers (outgoing
+  frames held whole to the close for the repair round; inbound frames held
+  for in-sequence delivery — `supeTrainCapture` diverts them off the live
+  receive path and `bridgeFrameDeliver` replays them through it at the
+  close), the ANNOUNCE2 beat and its peer-table ingest, and the note handlers
+  that file the engine's events into `Neighbor` rows (pairs, reports,
+  strikes, absence) and the power controller (§15).
 
 Host tests: `make -C esp-idf/test` runs the core checks and regenerates
-`golden.txt` + the ladder vectors; `make -C esp-idf/test engine` steps whole
-transactions — the bidirectional detour, a refusal, the absence ladder, the
-reverse flag's no-frame ending, the shared-link-tag crossfire, the third-party
-hold and the no-waiting contract — against a stub host.
+`golden.txt` + both vector files; `make -C esp-idf/test engine` steps whole
+meetings — seed to goodbye, the return leg, a repair round recovering a
+dropped frame, in-sequence delivery around a hole, the absence ladder on
+tight expiry, the no-evidence rules, and the seed-hash gate — against a stub
+host.
 
 ### 19.3 Frame dispatch
 
@@ -2050,60 +2244,97 @@ One assumption, stated once: SUPE types are `0xC0`–`0xDF`, never ending in 0
 or 1, disjoint from split framing's reachable bytes and from Reticulum flags
 on an interface without an access code. `handleRxDone` sorts byte 0 into
 framing / SUPE / discard on that rule alone; any change to receive dispatch
-preserves it. Assigned: START `0xC2`, ANNOUNCE2 `0xC4`, GRANT `0xC5`,
-MANIFEST `0xC9`. `0xC3` (the old ANNOUNCE1) and `0xC8` (the old HERE) are
-burned and never reassigned.
+preserves it. Assigned densely from the bottom: PRIVSYNC `0xC2`, ANNOUNCE2
+`0xC3`, HAVEDATA `0xC4`, GIMME `0xC5`, THATSIT `0xC6`, BYE `0xC7`, RESEND
+`0xC8`. Inside a meeting a non-SUPE frame is the train's: `supeTrainCapture`
+buffers it (checksummed, counted) instead of the live delivery path, and the
+close replays the buffer in sequence through `bridgeFrameDeliver` — split
+halves reach rnsd adjacent, a repaired frame in its place.
 
 ### 19.4 The sender path
 
 The classifier (`supeEngVerdict`) runs on the head of the packet queue before
-anything contends for the medium: held tag → HOLD (released one DIFS early);
-absent peer → DROP; mid-ladder retry wait → HOLD; refusal backoff → PLAIN (the
-peer is present, the traffic flies); not a peer → PLAIN, untouched, exactly as
-with the feature off. OFFER arms a jittered launch; `supePoll` wins the
-channel through ordinary carrier sense and `supeEngLaunch` emits the START.
-The absence ladder (§11) is three requests — power up, ceiling down, the third
-at maximum and budget 0 — then the peer is absent for a minute and its traffic
-drops; one request per minute thereafter; any evidence of life cancels the
-record outright (`SUPE_EV_ALIVE`).
+anything contends for the medium: a live schedule with the packet's peer →
+WAIT (the packet rides the next met slot, channel access primed underneath);
+absent peer → DROP; the ladder's randomised pause between seeds → WAIT; not a
+peer → PLAIN, untouched, exactly as with the feature off. OFFER arms a
+jittered launch; `supePoll` wins the channel through ordinary carrier sense
+and `supeEngLaunch` emits the PRIVSYNC — the only frame this protocol ever
+puts on the shared channel beyond the announcement. Its completion is the
+epoch both radios just timed, and the schedule derives from its bytes with
+nothing further transmitted.
 
-**Silence is established from the receiver, not from arithmetic.** The GRANT
-deadline is two stages. The first is `turnaround + guard` with no time on air in
-it — the instant the answer must have *begun* — and asks the host's `rx_busy`
-(`radioRxInProgress`, §6b) what the modem is doing. A frame arriving is the
-answer being delivered, so the second stage waits it out; nothing arriving is
-silence, reached half a frame earlier and without trusting an estimate of a frame
-that was never sent. Silence there retransmits the START once, byte for byte from
-`x->startFrame` — a rebuilt frame would carry a different load byte and therefore
-a different hash, orphaning the GRANT that names it — inside the same request,
-with no strike and no rung. The platform drives that retransmission
-(`supeEngResendDue`/`Resend`) rather than the engine firing it, so it pays the
-same channel access the original did, which is also its decorrelation; and when
-the peer's GRANT does start late, carrier sense sees it and the retransmission
-defers instead of transmitting over the reply.
+The absence ladder (§12 of the spec) is three seeds — the first at the power
+the evidence says the peer needs, every one after at maximum — each expiring
+unmet striking once, after which the peer is held off and its traffic drops;
+any evidence of life cancels the record outright (`SUPE_EV_ALIVE`).
+There is no ceiling axis: the budget conversation happens at the meeting,
+informed by measurement instead of by guessing at silence.
 
-**The requester is named by the START, or not at all.** On the answering side the
-tag names one of *our own* addresses, so it says nothing about who is asking:
-`sender_ident` is the only handle. It is what `bAnswerStart` resolves into
-`x->fromPeer`, and everything that needs to know who the far end is hangs off it
-— the reverse leg's scan and staging, and filing a link identifier the cargo
-creates against the node that dialled (§10 of `plans/SUPE.md`). Without it
-`scanReverse` is handed `LORAQ_PEER_NONE` and returns 0, so the GRANT's reverse
-flag is never set and the mechanism is inert. The host tests hid exactly that for
-a long time, because their stub `peer_get` resolved *any* tag including the
-answerer's own; `testReverseNeedsIdent` is the guard against it reopening.
+Two things bound what the ladder may conclude, both learned on the bench.
+**A strike scores only while nothing is being heard from the peer**
+(`SUPE_PRESENT_MS`): frames arriving refute the only claim absence makes, and
+without the test two schedules colliding over one moment reads as a peer that
+has gone — which blacklists a party in mid-conversation. **The hold starts at
+`SUPE_ABSENT_BASE_MS` and doubles per further strike to `SUPE_ABSENT_MAX_MS`**,
+rather than opening at the ceiling. A minute imposed on the first finding
+outlives the conversation that provoked it, so the next attempt falls inside it
+too and a fault that would have cleared looks permanent to anyone retrying.
+
+**Which schedule gets a contested moment: the tight one.** `slotService` walks
+the table twice, tight before wide. A tight schedule was bought moments ago with
+a frame on the shared channel by a party holding traffic, and its whole horizon
+is a few hundred milliseconds; a wide one is a standing appointment from a
+meeting already closed, three seconds long and quite possibly empty at both
+ends. Taken in table order the wide one wins about half the contested moments
+and each of its retunes lands this node late for the appointment that had
+something behind it — which is a peer hailing, going unanswered, and concluding
+we are gone while we keep an empty engagement. Deferring the other kind's
+bookkeeping for one tick is safe because acting on a slot leaves a meeting
+phase, where the next event is that meeting's own deadline and no schedule is
+consulted.
+
+**A schedule nobody attends is dropped, not spent.** The final answer of any
+goodbye cannot itself be acknowledged, so some single lost frame will always
+leave one end holding a schedule the other never derived; that is a property of
+the exchange, not a defect to remove. What is removable is the cost. A wide
+schedule that has spoken `SUPE_SCHED_GIVEUP_SPOKE` times without one answer is
+freed and the traffic hails instead — a HAVEDATA is a question the far end owes
+a GIMME to, and a schedule that met is freed as consumed, so a live one that has
+spoken has been ignored every time. The same reasoning names it at expiry:
+`expired UNANSWERED` where the old wording reported six unanswered slots as
+though they were an idle horizon.
+
+**Slot telemetry says how late the window opened**, not just which slot it was:
+`listen <hash> slot N t=… (open ±ms)`. Negative is the only good answer. Being
+inside a slot's window is not the same as hearing it — a receiver opened
+part-way through a frame has missed the preamble and hears nothing however
+strong the signal — so a run of small positives means the first-slot gap is
+short for this hardware's cold retune (`SUPE_TIGHT_T0_MS`), not a peer that has
+stopped speaking. `slotsLateOpen` counts them.
+
+**The peer is named by the PRIVSYNC, or not at all.** On the listening side
+the tag names one of *our own* addresses, so it says nothing about who is
+seeking: `sender_ident` is the only handle. It is what resolves the seeker
+into a peer id, and everything that needs to know who the far end is hangs
+off it — the return leg's queue scan above all. Without it the meeting still
+happens; the return leg cannot.
 
 ### 19.5 What is learned
 
 Every measurement is a path-loss pair — a level read here against the power
-the other side stated in the frame itself — filed through `SUPE_EV_PAIR` into
-the peer table (hailing pair and detour pair separately), or against the link
-for the one peer that can never be named (it dialled us; a link-id tag is the
-shared handle). The reverse MANIFEST both proves the train landed and states
-the level it landed at, which is §15's whole evidence loop. Refusals carry a
-reason mapped to a backoff (busy 300 ms, no quiet channel 2 s, out of airtime
-5 min, wrong regime / ceiling 1 h) — knowing *how long* not to ask is what a
-refusal buys over silence.
+the other side stated (PRIVSYNC and the meeting-opening frames state theirs;
+a train's rides its THATSIT, one frame after the fact, so it could be chosen
+on the report) — filed through `SUPE_EV_PAIR`, or against the link for the
+one peer that can never be named. `SUPE_EV_REPORT` carries the peer's account
+of our own transmission: GIMME reports the PRIVSYNC and the HAVEDATA, the
+answering HAVEDATA reports the train — the direction we transmit in, which no
+transmitter can measure for itself, filed into `apFileReport` and consumed by
+the very next `txp_open` ask, which is how the train's power resolves on a
+reading milliseconds old. The closing BYE/RESEND is the arrival proof
+(`SUPE_EV_TRAIN_OK`); a meeting dying after contact with our train
+unconfirmed is `SUPE_EV_TRAIN_LOST`, and only that — missed slots and wide
+expiries feed nothing.
 
 ### 19.6 Airtime
 
@@ -2132,15 +2363,6 @@ transaction, so with zero packets queued it never fires.
 The browser LoRaMon carries the current feature set; the LCD app lags it in two
 places. Both are deliberate deferrals rather than oversights, recorded here so
 the intent survives.
-
-**Agile channels want a different shape on a small screen.** The LCD currently
-just displays the other channels the way the browser does — a stack of
-quarter-height graphs on the same dBm bands. On a screen a third the width that
-spends its vertical budget on a power dimension nothing much varies in: the
-agile channels are visited once a second to be measured, so what they actually
-convey is *occupancy over time*, not level. The intended shape is **plain lines
-per channel with the power dimension dropped**, leaving the hailing channel as
-the only graph that keeps the dBm axis. Not built.
 
 **The two wait marks are browser-only.** `own_ms` (§12) is drawn dotted beside
 the solid contention run in the browser; the LCD reads the older six-field form

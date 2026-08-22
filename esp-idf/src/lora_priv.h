@@ -48,7 +48,7 @@
 
 #if defined(CONFIG_LORA0_CS_PIN)
 
-#define LORA_VERSION         8
+#define LORA_VERSION         9
 #define RNS_MTU              500
 #define RNODE_MAX_PAYLOAD    254
 #define RNODE_FLAG_SPLIT     0x01
@@ -79,21 +79,12 @@
  * power. Carrier sense outranks it — see rssiSamplePoll. */
 #define LORA_RSSI_SAMPLE_MS 1000
 
-/* Settling allowed after entering RX on a retuned channel, before the reading
- * is believed. `GetRssiInst` is only meaningful once the receiver is actually
- * running: asked earlier it answers 0xFF, which decodes to −127.5 dBm and looks
- * exactly like a very quiet channel. That is below the thermal noise of any
- * bandwidth this part receives, which is what makes it detectable as garbage
- * rather than data — see LORA_RSSI_INVALID_DBM.
- *
- * STDBY_RC → FS → RX is tens of µs on an SX126x; this is several times that,
- * and the whole nine-channel sweep still fits the excursion budget in
- * plans/psa.md §3.5. */
-#define LORA_RSSI_SETTLE_US   200
-
 /* Thermal noise in the narrowest bandwidth in use is about −123 dBm
  * (−174 + 10·log₁₀(125 kHz) + 6 dB noise figure ≈ −117, with margin). Anything
- * at or below this is the receiver not being ready, not a quiet channel. */
+ * at or below this is the receiver not being ready, not a quiet channel:
+ * `GetRssiInst` is only meaningful once the receiver is actually running, and
+ * asked earlier it answers 0xFF — −127.5 dBm, which looks exactly like a very
+ * quiet channel and would read as clear to carrier sense. */
 #define LORA_RSSI_INVALID_DBM (-125.0f)
 
 /* "No reading this beat" — positive, so it cannot collide with a dBm value.
@@ -118,6 +109,30 @@ enum : uint8_t { MTXP_OFF = 0, MTXP_LBT = 1, MTXP_TX = 2 };
 
 
 #define LORA_CFG_COALESCE_MS 300
+
+/* The settle window on a user's own settings (s.lora.* / secrets.lora.*): the
+ * apply waits this long after the LAST change, and the radio stays off the air
+ * for the whole of it.
+ *
+ * Editing a radio is not one write. A frequency, a bandwidth and a spreading
+ * factor arrive as three, seconds apart, as somebody works down a settings
+ * pane — and between them the radio is configured for a combination the user
+ * never asked for and would not choose. LORA_CFG_COALESCE_MS is far too short
+ * to span that: it exists so four keys written in one breath cost one apply.
+ * Waiting for the typing to stop is a different question, and this is its
+ * answer. Transmitting on a half-edited configuration is the part that reaches
+ * other people, which is why the window is a radio silence and not merely a
+ * deferred apply.
+ *
+ * Unlike LORA_CFG_COALESCE_MS this deadline SLIDES — each further change pushes
+ * it out, which is what "after the last change" means — so it needs the
+ * starvation bound the immovable one did not: the cap is measured from the
+ * first change of a burst and the apply happens then regardless. */
+#define LORA_CFG_SETTLE_MS      10000
+#define LORA_CFG_SETTLE_MAX_MS  60000
+/* How soon to look again when the apply comes due with a frame still on air. */
+#define LORA_CFG_ONAIR_RETRY_MS 50
+
 #define LORA_STATS_MIN_MS 1000
 
 #define LORA_FREQ_MIN_HZ  100000000    /* 100 MHz */
@@ -386,13 +401,13 @@ struct LoraRadio {
      * throw away a tag set that took real traffic to learn. */
     SupeState*      supe;
     bool            supeOn;          /* s.lora.<i>.SUPE.enable, AND no access code */
-    bool            supeAdaptive;    /* s.lora.<i>.SUPE.adaptive_txpower */
     bool            supeNameSender;  /* s.lora.<i>.SUPE.sender_ident */
 #endif
 
-    /* Adaptive TX power (overview at AP_EST_MARGIN_DB). */
-    bool            adaptive;        /* the reciprocity determination and the
-                                      * 0x04 request read the same key */
+    /* Adaptive TX power (overview at AP_FRESH_MS, in lora_power.h). */
+    bool            adaptive;        /* s.lora.<i>.adaptive_txpwr — the EST tier
+                                      * alone; every measured tier is the air
+                                      * protocol's and runs regardless */
     /* A 0x04 power request just received, awaiting the frame it prefixes. The
      * frame carries no binding field — it binds by adjacency alone — so this is
      * consumed or discarded by the very next rx frame, never held. */
@@ -423,8 +438,16 @@ extern LoraRadio     s_radios[LORA_NUM_RADIOS];
 extern TaskHandle_t  s_task;
 extern volatile bool s_stop;
 
-/* Config apply coalescing — ask for an apply in at most `delayMs`. */
+/* Config apply coalescing — ask for an apply in at most `delayMs`. Immovable:
+ * a later call can only pull the deadline in. */
 void cfgArm(uint32_t delayMs);
+
+/* Is a settings settle window open? While it is, this radio starts nothing new
+ * on air: the outbound drain holds, SUPE launches no transaction and skips its
+ * announce beat, and a manual transmit is refused. A frame already in flight
+ * and a transaction already running are not interrupted — they are over long
+ * before the window is. */
+bool loraCfgQuiet(void);
 
 /* Wake the interface task: its wake deadlines just changed. */
 void loraNudge(void);
