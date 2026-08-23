@@ -132,6 +132,29 @@ static void testAnn2Codec(void) {
     a.count = 1;
     n = supeEncAnn2(f, sizeof f, &a);
     golden("announce2.regime0.1id", f, n);
+
+    /* "I do not speak SUPE" — the one announcement that is not about a dialect.
+     * It must decode without being checked against a regime table it is not
+     * claiming membership of, and it must still carry the identities, because a
+     * neighbour dropping its SUPE bit for this node still wants to know which
+     * node that is. */
+    a.regime = SUPE_REGIME_NONE;
+    a.version = 0;
+    n = supeEncAnn2(f, sizeof f, &a);
+    ok(n > 0, "the renunciation encodes");
+    eqi((long)(f[1] >> 4), SUPE_REGIME_NONE, "the regime nibble carries it");
+    golden("announce2.notspeaking.1id", f, n);
+    ok(supeDecAnn2(f, n, &d), "…and decodes without a regime table entry");
+    eqi(d.regime, SUPE_REGIME_NONE, "…as the renunciation");
+    eqi(d.count, 1, "…still naming the node");
+    ok(memcmp(d.ids[0], ids[0], 4) == 0, "…by its identity");
+    /* A version nibble means nothing here, so it may not be a reason to drop
+     * the frame: a node that has stopped speaking has no dialect to agree on. */
+    f[1] = (uint8_t)((SUPE_REGIME_NONE << 4) | 0x0D);
+    ok(supeDecAnn2(f, n, &d), "any version decodes — there is no dialect to match");
+    /* An unknown REAL regime is still refused: that one IS a dialect claim. */
+    f[1] = 0x9F;
+    ok(!supeDecAnn2(f, n, &d), "an unknown regime is still discarded");
 }
 
 static void testPrivsyncCodec(void) {
@@ -216,10 +239,10 @@ static void testGimmeCodec(void) {
     g.hdSnrQ = supeEncSnrQ(90);
     uint8_t f[SUPE_GIMME_LEN];
     size_t n = supeEncGimme(f, sizeof f, &g);
-    eqi((long)n, SUPE_GIMME_LEN, "the tight form is ten bytes");
-    golden("gimme.tight.budget6", f, n);
+    eqi((long)n, SUPE_GIMME_LEN, "the narrow form is ten bytes");
+    golden("gimme.narrow.budget6", f, n);
     SupeGimme d = {};
-    ok(supeDecGimme(f, n, &d) && d.havePsHeard, "it decodes as the tight form");
+    ok(supeDecGimme(f, n, &d) && d.havePsHeard, "it decodes as the narrow form");
     eqi(d.psRssi, -95, "the PRIVSYNC reading rides — the headroom the budget ran on");
     eqi(d.hdRssi, -70, "the HAVEDATA reading rides — the freshest pair there is");
     eqi(d.budget, 6, "the confirmed budget rides");
@@ -334,15 +357,15 @@ static void testSchedule(void) {
     SupeSchedD s;
     supeDeriveSchedule(d0, d1, /*wide=*/false, /*nChans=*/9, &s);
     ok(memcmp(s.hash3, d0, 3) == 0, "the wire id is D0's first three bytes");
-    ok(s.nSlots >= 6, "a tight schedule holds several slots");
-    eqi(s.slot[0].tMs, SUPE_TIGHT_T0_MS,
-        "the first tight slot is one turnaround + retune after the epoch");
+    ok(s.nSlots >= 6, "a narrow schedule holds several slots");
+    eqi(s.slot[0].tMs, SUPE_NARROW_T0_MS,
+        "the first narrow slot is one turnaround + retune after the epoch");
     for (int k = 0; k < s.nSlots; k++) {
-        ok(s.slot[k].tMs <= SUPE_TIGHT_HORIZON_MS, "slots stay inside the horizon");
+        ok(s.slot[k].tMs <= SUPE_NARROW_HORIZON_MS, "slots stay inside the horizon");
         ok(s.slot[k].chan >= 1 && s.slot[k].chan <= 9, "channels come from the raster");
         if (k) {
             int gap = s.slot[k].tMs - s.slot[k - 1].tMs;
-            ok(gap >= 40 && gap <= 63, "tight spacing is 40 + (j mod 24)");
+            ok(gap >= 40 && gap <= 63, "narrow spacing is 40 + (j mod 24)");
         }
     }
 
@@ -396,7 +419,7 @@ static void testAirtime(void) {
     };
     eqi(ms(3), 26, "three bytes fill the first symbol group");
     eqi(ms(7), 31, "seven bytes fill the second");
-    eqi(ms(10), 36, "ten bytes fill the third — GIMME's tight form sits on it");
+    eqi(ms(10), 36, "ten bytes fill the third — GIMME's narrow form sits on it");
     ok(ms(4) == ms(7), "every length inside a group costs the same");
     ok(ms(7) == ms(4), "PRIVSYNC's seven bytes fill the second group exactly");
     ok(ms(8) > ms(7), "the byte that crosses costs the whole group");

@@ -219,8 +219,14 @@ bool supeDecAnn2(const uint8_t* f, size_t len, SupeAnn2* out) {
     if (len < 2 || f[0] != SUPE_T_ANNOUNCE2) return false;
     uint8_t regime  = (uint8_t)(f[1] >> 4);
     uint8_t version = (uint8_t)(f[1] & 0x0F);
-    const SupeRegime* g = supeRegime(regime);
-    if (!g || g->version != version || !lenOkAnn2(len)) return false;
+    if (!lenOkAnn2(len)) return false;
+    /* "I do not speak SUPE" is not a dialect, so it is not checked against one:
+     * a node renouncing the protocol has no version to agree about, and the
+     * identities the frame carries are worth reading either way. */
+    if (regime != SUPE_REGIME_NONE) {
+        const SupeRegime* g = supeRegime(regime);
+        if (!g || g->version != version) return false;
+    }
     out->regime  = regime;
     out->version = version;
     decCaps(f + 2, &out->caps);
@@ -423,7 +429,7 @@ void supeDeriveSchedule(const uint8_t d0[32], const uint8_t d1[32],
     memcpy(stream, d0 + 3, 29);
     memcpy(stream + 29, d1, 32);
 
-    uint32_t horizon = wide ? SUPE_WIDE_HORIZON_MS : SUPE_TIGHT_HORIZON_MS;
+    uint32_t horizon = wide ? SUPE_WIDE_HORIZON_MS : SUPE_NARROW_HORIZON_MS;
     uint32_t t = 0;
     uint8_t  n = 0;
     for (uint8_t k = 0; k < SUPE_SLOTS_MAX; k++) {
@@ -431,7 +437,7 @@ void supeDeriveSchedule(const uint8_t d0[32], const uint8_t d1[32],
         uint8_t c = stream[3 * k + 1];
         uint8_t s = stream[3 * k + 2];
         if (k == 0) {
-            t = wide ? 150u + (j % 40u) : (uint32_t)SUPE_TIGHT_T0_MS;
+            t = wide ? 150u + (j % 40u) : (uint32_t)SUPE_NARROW_T0_MS;
         } else {
             uint32_t base = wide ? (60u + 30u * k) : 40u;
             if (wide && base > 350u) base = 350u;

@@ -41,7 +41,7 @@ struct SupePeerView {
                               * configuration asks host->txp_open */
     int8_t   txpMax;         /* our configured maximum, channel-capped */
     /* the absence ladder's record (§12) */
-    uint8_t  absentStrikes;  /* tight schedules expired unmet since evidence of life */
+    uint8_t  absentStrikes;  /* narrow schedules expired unmet since evidence of life */
     uint32_t absentUntilMs;  /* while in the future: its traffic is dropped */
     uint32_t retryWaitUntilMs; /* the ladder's randomised wait between seeds —
                                 * the packet WAITS through it */
@@ -55,7 +55,7 @@ struct SupePeerView {
  * anonymous peer), which is the platform's call. */
 enum SupePeerEvent : uint8_t {
     SUPE_EV_ALIVE = 1,       /* any evidence of life — cancels absence outright */
-    SUPE_EV_STRIKE,          /* a tight schedule expired unmet; the ladder advances */
+    SUPE_EV_STRIKE,          /* a narrow schedule expired unmet; the ladder advances */
     SUPE_EV_PAIR,            /* a path-loss pair: level measured here + stated power */
     SUPE_EV_REPORT,          /* the peer's account of how OUR transmission landed:
                               * its reading + the power we sent at, at cfg */
@@ -150,11 +150,21 @@ struct SupeHost {
      * asked where the frames will actually fly (§15). */
     int8_t   (*txp_open)(void* ctx, const uint8_t tag[SUPE_TAG_LEN], const SupeCfg* cfg);
     void     (*chan_get)(void* ctx, SupeChanView* out);
-    /* diagnostics — may be null; the engine formats, the host routes it to its
-     * own logger. `dbgLevel` gates the chatty lines. */
-    void     (*log)(void* ctx, const char* msg);
-    bool     dbgLevel;
+    /* Diagnostics — may be null; the engine formats, the host routes it to its
+     * own logger at the level the engine asked for.
+     *
+     * Debug is **one line per meeting** and the failures that cost something.
+     * Everything a meeting is made of — the schedule, each slot, each frame —
+     * is verbose, because a line per step turns a busy pair into a scroll
+     * nobody reads and buries the one line that says what happened. The
+     * meeting's line carries what those steps would have said anyway: what
+     * each side transmitted at, how the other read it, and the counts. */
+    void     (*log)(void* ctx, bool verbose, const char* msg);
+    uint8_t  logLevel;                  /* 0 none, 1 debug, 2 verbose */
 };
+#define SUPE_LOG_NONE  0
+#define SUPE_LOG_DBG   1
+#define SUPE_LOG_VERB  2
 
 /* ─────────────── addresses that mean us (SUPE.md §5) ─────────────── */
 #define SUPE_TAGS_MAX        256
@@ -183,7 +193,7 @@ struct SupeProofRet {
 struct SupeSched {
     bool      used;
     bool      wide;           /* seeded by a goodbye rather than a PRIVSYNC */
-    bool      weSeeded;       /* tight only: our PRIVSYNC — its expiry strikes */
+    bool      weSeeded;       /* narrow only: our PRIVSYNC — its expiry strikes */
     bool      weTx0;          /* we transmit in slot 0, 2, 4…; else 1, 3, 5… */
     bool      consumed;       /* a slot was met: every later slot is void */
     uint8_t   tag[SUPE_TAG_LEN];  /* how peer_get/peer_note reach the node — the
@@ -193,12 +203,12 @@ struct SupeSched {
     uint16_t  peerId;
     uint32_t  epochMs;        /* the end of the seeding frame, as timed here */
     SupeCfg   slotCfg;        /* what the slot frames fly at: the hailing
-                               * configuration (tight) or the budget the seeding
+                               * configuration (narrow) or the budget the seeding
                                * meeting confirmed (wide) */
     SupeSchedD d;
     uint8_t   nextSlot;
-    int8_t    seedTxp;        /* tight+weSeeded: what the PRIVSYNC flew at */
-    bool      havePs;         /* tight+listener: our reading of the PRIVSYNC */
+    int8_t    seedTxp;        /* narrow+weSeeded: what the PRIVSYNC flew at */
+    bool      havePs;         /* narrow+listener: our reading of the PRIVSYNC */
     int16_t   psRssi;
     int8_t    psSnrQ;
     /* Why a schedule carried nothing, counted as it happens. A schedule that
@@ -275,9 +285,25 @@ struct SupeMeet {
     uint8_t  missCount;
     uint8_t  repairPos[SUPE_TRAIN_MAX];  /* positions the peer will resend, in order */
     uint8_t  repairExpect, repairGot;
-    int16_t  worstRssi;
+    int16_t  worstRssi;            /* our reading of THEIR train, worst frame */
     int8_t   worstSnrQ;
     bool     anyRx;
+    /* The meeting's one line, gathered as it happens. Each side states the
+     * power it transmits at and reports what it read, so every direction is a
+     * triple: the power sent, the level the far end read, the SNR it read. */
+    int8_t   hailTxp;              /* the PRIVSYNC's power — whoever seeded */
+    int16_t  hailRssi;             /* and how the other end read it */
+    int8_t   hailSnrQ;
+    bool     haveHail;
+    int16_t  ourTrainRssi;         /* THEIR reading of OUR train */
+    int8_t   ourTrainSnrQ;
+    bool     haveOurRead;
+    int8_t   peerTrainTxp;         /* what their train flew at (their THATSIT) */
+    bool     havePeerTxp;
+    uint8_t  txFired;              /* frames of ours actually put on air, repairs
+                                    * included — so it may exceed tx.count */
+    bool     fromHail;             /* reached through a PRIVSYNC's schedule
+                                    * rather than a goodbye's rendezvous */
     /* the goodbye */
     uint8_t  lastThatsit[SUPE_THATSIT_BASE + SUPE_TRAIN_MAX];
     uint8_t  lastThatsitLen;
@@ -331,6 +357,15 @@ struct SupeEngine {
     /* what `lora <n> supe` prints */
     uint32_t rxFrames, rxDiscard, rxForeign;
     uint32_t seedsOut, schedsIn, meetingsDone;
+    /* Why the head packet last went plain. The verdict is polled continuously,
+     * so this is the last one NAMED rather than a count: a packet declining to
+     * meet leaves no frame saying so, and the ring shows only an ordinary
+     * transmission on the shared channel — identical to the one a node with the
+     * feature switched off would make. Repeats are suppressed on the triple,
+     * so a steady stream of the same refusal costs one line. */
+    uint8_t  plainWhy;
+    uint8_t  plainTag[SUPE_TAG_LEN];
+    uint16_t plainLen;
     uint32_t schedsAbandoned; /* wide schedules dropped for the shared channel
                                * after their own slots went unanswered (§12) */
     uint32_t framesOut, framesIn, repairsOut, repairsIn;
@@ -415,6 +450,6 @@ const uint8_t* supeEngProofRetLookup(SupeEngine* e, const uint8_t* addr);
 /* build our own announcement (the glue paces and transmits it) */
 size_t supeEngBuildAnn(SupeEngine* e, uint8_t* out, size_t cap,
                        const uint8_t ids[][SUPE_ID_LEN], uint8_t count,
-                       int8_t pwrDbm);
+                       int8_t pwrDbm, bool speaking);
 
 #endif /* IFACE_LORA_SUPE_ENGINE_H */

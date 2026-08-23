@@ -7,7 +7,7 @@
  * What it steps: a PRIVSYNC seeding a schedule and the meeting a slot opens,
  * the return leg riding the answering HAVEDATA, a repair round recovering a
  * dropped frame, in-sequence delivery around a hole, the absence ladder on
- * tight-schedule expiry, the no-evidence rules, contact consuming a schedule,
+ * narrow-schedule expiry, the no-evidence rules, contact consuming a schedule,
  * and the seed-hash gate.
  *
  *   make -C iface-lora/esp-idf/test engine
@@ -258,8 +258,13 @@ static void hPeerNote(void* c, const uint8_t tag[3], const SupePeerNote* nt) {
     }
 }
 static void hChanGet(void* c, SupeChanView* out) { *out = ((Node*)c)->chans; }
-static void hLog(void* c, const char* msg) {
-    if (getenv("VERBOSE")) printf("  [%s %6u] %s\n", ((Node*)c)->name, g_now, msg);
+static void hLog(void* c, bool verbose, const char* msg) {
+    /* VERBOSE=1 shows the meeting lines, VERBOSE=2 the steps behind them —
+     * the same split the firmware makes. */
+    const char* v = getenv("VERBOSE");
+    if (!v) return;
+    if (verbose && atoi(v) < 2) return;
+    printf("  [%s %6u]%s %s\n", ((Node*)c)->name, g_now, verbose ? " ." : "", msg);
 }
 
 /* Each node's own identity, which its PRIVSYNCs carry. The listening side has
@@ -292,7 +297,7 @@ static void nodeInit(Node* n, const char* name, uint8_t regime) {
     n->host.txp_open = hTxpOpen;
     n->host.chan_get = hChanGet;
     n->host.log = hLog;
-    n->host.dbgLevel = true;
+    n->host.logLevel = SUPE_LOG_VERB;
     loraqInit(&n->q);
     supeEngInit(&n->eng, &n->host, &n->q);
     supeEngConfig(&n->eng, regime, SUPE_FAM_SX126X, 8, 14,
@@ -628,9 +633,9 @@ static void testAbsenceLadder(void) {
         launchFrom(&A);
         /* The PRIVSYNC is the first air item. */
         seedTxp[attempt] = A.txq.front().dbm;
-        drive(air, 800);                       /* the tight horizon passes in silence */
+        drive(air, 800);                       /* the narrow horizon passes in silence */
     }
-    eqi(A.eng.strikes, 3, "three tight schedules expired unmet — three strikes");
+    eqi(A.eng.strikes, 3, "three narrow schedules expired unmet — three strikes");
     eqi(seedTxp[0], 2, "the first seed at what the evidence said");
     eqi(seedTxp[1], 8, "the second halfway to maximum (§12: more power)");
     eqi(seedTxp[2], 14, "the third at maximum");
@@ -861,13 +866,13 @@ static void testBusyReceiverStillRetiresSchedules(void) {
     B.peer.known = true;
     B.peer.peerId = 9;
     supeEngTagAdd(&B.eng, TAG, true, 0);
-    hailB(&B, 0x77);                     /* one hail: B holds a tight schedule */
+    hailB(&B, 0x77);                     /* one hail: B holds a narrow schedule */
     int held = 0;
     for (int i = 0; i < SUPE_SCHED_MAX; i++) if (B.eng.sched[i].used) held++;
     eqi(held, 1, "B holds a schedule from the hail");
 
     g_rxBusy = true;                     /* the modem is mid-frame from here on */
-    uint32_t stop = g_now + 3000;        /* well past the tight horizon */
+    uint32_t stop = g_now + 3000;        /* well past the narrow horizon */
     while ((int32_t)(stop - g_now) > 0) { supeEngOnTimer(&B.eng); g_now += 5; }
 
     int live = 0;
@@ -879,7 +884,7 @@ static void testBusyReceiverStillRetiresSchedules(void) {
        "…and the engine asks for no wake at-or-before now");
 }
 
-/* One tight schedule per peer. A hail retried is a hail whose schedule went
+/* One narrow schedule per peer. A hail retried is a hail whose schedule went
  * unanswered, so that schedule is dead to both ends — held alongside the new
  * one its slots are appointments nobody keeps, and the two sets interleave
  * until each retune arrives late for the other. The salt makes every retry a
@@ -895,12 +900,12 @@ static void testHailRetryReplacesSchedule(void) {
 
     for (int retry = 0; retry < 3; retry++) {
         hailB(&B, (uint8_t)(0x10 + retry));     /* each retry a different seed */
-        g_now += 40;                            /* inside the tight horizon */
+        g_now += 40;                            /* inside the narrow horizon */
     }
-    int tight = 0;
+    int narrow = 0;
     for (int i = 0; i < SUPE_SCHED_MAX; i++)
-        if (B.eng.sched[i].used && !B.eng.sched[i].wide) tight++;
-    eqi(tight, 1, "three hails from one peer leave one tight schedule");
+        if (B.eng.sched[i].used && !B.eng.sched[i].wide) narrow++;
+    eqi(narrow, 1, "three hails from one peer leave one narrow schedule");
 }
 
 /* A train that went unconfirmed reports the configuration it failed at. The
@@ -961,39 +966,39 @@ static void testHailOutranksRendezvous(void) {
     launchFrom(&A);
     driveUntilDone(air, &A, 1, 20000);        /* both ends now hold a rendezvous */
 
-    int wideA = 0, tightA = 0;
+    int wideA = 0, narrowA = 0;
     for (int i = 0; i < SUPE_SCHED_MAX; i++) {
         if (!A.eng.sched[i].used) continue;
-        if (A.eng.sched[i].wide) wideA++; else tightA++;
+        if (A.eng.sched[i].wide) wideA++; else narrowA++;
     }
     eqi(wideA, 1, "A holds the rendezvous the goodbye seeded");
 
-    /* A hail lands on top of it. Both are live; the tight one must be served. */
+    /* A hail lands on top of it. Both are live; the narrow one must be served. */
     supeEngTagAdd(&A.eng, IDENT_A, true, 0);   /* A's own address, so it is for A */
     hailB(&A, 0x5a, IDENT_A, IDENT_B);
-    tightA = 0;
+    narrowA = 0;
     for (int i = 0; i < SUPE_SCHED_MAX; i++)
-        if (A.eng.sched[i].used && !A.eng.sched[i].wide) tightA++;
-    eqi(tightA, 1, "…and the hail installs a tight one beside it");
+        if (A.eng.sched[i].used && !A.eng.sched[i].wide) narrowA++;
+    eqi(narrowA, 1, "…and the hail installs a narrow one beside it");
 
     /* Line the two up so their first slots fall at the same instant — the
      * contended case, which chance alone produces only now and then. The
      * rendezvous sits earlier in the table, so array order would take it. */
-    SupeSched* tight = nullptr; SupeSched* wideS = nullptr;
+    SupeSched* narrow = nullptr; SupeSched* wideS = nullptr;
     for (int i = 0; i < SUPE_SCHED_MAX; i++) {
         SupeSched* s = &A.eng.sched[i];
         if (!s->used) continue;
-        if (s->wide) { if (!wideS) wideS = s; } else if (!tight) tight = s;
+        if (s->wide) { if (!wideS) wideS = s; } else if (!narrow) narrow = s;
     }
-    ok(tight && wideS, "both kinds are live");
-    ok(wideS && tight && wideS < tight, "…with the rendezvous found first");
-    if (!tight || !wideS) return;
-    uint32_t both = tight->epochMs + tight->d.slot[0].tMs;
+    ok(narrow && wideS, "both kinds are live");
+    ok(wideS && narrow && wideS < narrow, "…with the rendezvous found first");
+    if (!narrow || !wideS) return;
+    uint32_t both = narrow->epochMs + narrow->d.slot[0].tMs;
     wideS->epochMs = both - wideS->d.slot[0].tMs;
 
     g_now = both;
     supeEngOnTimer(&A.eng);
-    eqi(tight->nextSlot, 1, "the hail's slot is the one taken");
+    eqi(narrow->nextSlot, 1, "the hail's slot is the one taken");
     eqi(wideS->nextSlot, 0, "…and the rendezvous still has its slot to come");
 }
 

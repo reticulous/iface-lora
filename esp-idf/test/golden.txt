@@ -4,11 +4,12 @@
 # injection can disagree, which is the one thing this file prevents.
 announce2.regime0.2ids       0xc30002564e6b87eb8b4e052101
 announce2.regime0.1id        0xc30002564e6b87eb8b
+announce2.notspeaking.1id    0xc3f002564e6b87eb8b
 privsync.regime1.anon        0xc210d10d513700
 privsync.regime1.ident       0xc210d10d513700a1a2a3
 havedata.open.5frames        0xc4dead0142080528
 havedata.answer.mask22       0xc4dead0142080528e81222
-gimme.tight.budget6          0xc5dead014006e118fa24
+gimme.narrow.budget6         0xc5dead014006e118fa24
 gimme.wide.budget6           0xc5dead014006fa24
 thatsit.4frames              0xc6450011222244
 bye                          0xc7

@@ -41,16 +41,19 @@
 
 static uint32_t eNow(SupeEngine* e) { return e->host->now_ms(e->host->ctx); }
 
-static void eLog(SupeEngine* e, bool dbg, const char* fmt, ...)
+/* `verbose` is the level this line belongs at, not a flag: false = one of the
+ * few lines debug keeps, true = the step-by-step behind them. */
+static void eLog(SupeEngine* e, bool verbose, const char* fmt, ...)
     __attribute__((format(printf, 3, 4)));
-static void eLog(SupeEngine* e, bool dbg, const char* fmt, ...) {
-    if (!e->host->log || (dbg && !e->host->dbgLevel)) return;
-    char b[128];
+static void eLog(SupeEngine* e, bool verbose, const char* fmt, ...) {
+    if (!e->host->log) return;
+    if (e->host->logLevel < (verbose ? SUPE_LOG_VERB : SUPE_LOG_DBG)) return;
+    char b[160];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(b, sizeof b, fmt, ap);
     va_end(ap);
-    e->host->log(e->host->ctx, b);
+    e->host->log(e->host->ctx, verbose, b);
 }
 
 static SupeCfg hailCfgOf(const SupeEngine* e) {
@@ -319,7 +322,7 @@ void supeEngSetIdent(SupeEngine* e, const uint8_t id[SUPE_TAG_LEN]) {
 /* ─────────────── schedules ─────────────── */
 
 static uint32_t schedHorizon(const SupeSched* s) {
-    return s->wide ? SUPE_WIDE_HORIZON_MS : SUPE_TIGHT_HORIZON_MS;
+    return s->wide ? SUPE_WIDE_HORIZON_MS : SUPE_NARROW_HORIZON_MS;
 }
 
 static void schedFree(SupeEngine* e, SupeSched* s) {
@@ -327,14 +330,16 @@ static void schedFree(SupeEngine* e, SupeSched* s) {
     s->used = false;
 }
 
-/* A tight schedule we seeded expiring unmet is the one silence that scores:
+/* A narrow schedule we seeded expiring unmet is the one silence that scores:
  * its seed was carrier-sensed onto the shared channel and its slots gave the
  * peer several hundred milliseconds of chances (§12). */
 static bool queueHasFor(SupeEngine* e, const SupeSched* s);
 
 static void schedExpire(SupeEngine* e, SupeSched* s, uint32_t now) {
+    bool struck = false;
     if (s->weSeeded && !s->wide && !s->consumed && s->haveTag) {
         e->strikes++;
+        struck = true;
         SupePeerNote nt = {};
         nt.ev = SUPE_EV_STRIKE;
         nt.backoffMs = SUPE_RETRY_WAIT_MIN_MS
@@ -342,37 +347,39 @@ static void schedExpire(SupeEngine* e, SupeSched* s, uint32_t now) {
         nt.agoMs = now - s->epochMs;
         nt.triedTxpDbm = s->seedTxp;
         e->host->peer_note(e->host->ctx, s->tag, &nt);
-        eLog(e, true, "supe: schedule %02x%02x%02x expired unmet — strike",
-             s->d.hash3[0], s->d.hash3[1], s->d.hash3[2]);
     }
-    /* A schedule that expired unmet while its traffic waited is a whole
-     * horizon spent for nothing, and no frame on the air says so — the ring
-     * shows only the fallback that follows. Say which branch spent the slots. */
-    if (s->nSpoke == 0 && queueHasFor(e, s)) {
-        eLog(e, true, "supe: schedule %02x%02x%02x expired UNUSED with traffic — "
-             "%s, %u slots (%u ours due: %u no-traffic, %u busy, %u late, "
-             "%u no-train, %u no-tune)",
-             s->d.hash3[0], s->d.hash3[1], s->d.hash3[2],
-             s->wide ? "wide" : "tight", (unsigned)s->d.nSlots,
-             (unsigned)s->nOwnDue, (unsigned)s->nNoTraffic, (unsigned)s->nBusy,
-             (unsigned)s->nLate, (unsigned)s->nNoTrain, (unsigned)s->nNoTune);
+
+    /* A horizon that carried nothing while its traffic waited is the one
+     * failure no frame on the air records — the ring shows only the fallback
+     * that follows — so it is the one schedule ending debug keeps, in a line.
+     * An idle horizon is ordinary and stays verbose.
+     *
+     * Two shapes, told apart by whether this node ever spoke. Silent with
+     * traffic waiting means the slots were spent on something else, and the
+     * census says which. Spoken and unanswered means the far end is not
+     * attending this schedule at all — it derived a different one, or it is
+     * gone — and what tells those apart is whether the shared channel still
+     * works, which is the very next thing the traffic tries. */
+    bool waiting = queueHasFor(e, s);
+    const char* kind = s->wide ? "wide" : "narrow";
+    if (s->nSpoke == 0 && waiting) {
+        eLog(e, false, "supe: sched %02x%02x%02x %s dead — %u slots, %u due "
+             "(%u idle, %u busy, %u late, %u no-train, %u no-tune)%s",
+             s->d.hash3[0], s->d.hash3[1], s->d.hash3[2], kind,
+             (unsigned)s->d.nSlots, (unsigned)s->nOwnDue,
+             (unsigned)s->nNoTraffic, (unsigned)s->nBusy, (unsigned)s->nLate,
+             (unsigned)s->nNoTrain, (unsigned)s->nNoTune,
+             struck ? " — strike" : "");
     } else if (s->nSpoke > 0) {
-        /* A schedule that met is freed as consumed and never reaches here, so
-         * reaching expiry having spoken at all means every one of those slots
-         * went unanswered. That is not the same event as an idle horizon and
-         * must not read like one: it says the far end is not attending this
-         * schedule — either it derived a different one, or it is gone — and the
-         * two are told apart by whether the shared channel still works, which
-         * is the very next thing the traffic tries. */
-        eLog(e, true, "supe: schedule %02x%02x%02x expired UNANSWERED — "
-             "%s, spoke %u of %u own, nothing met",
-             s->d.hash3[0], s->d.hash3[1], s->d.hash3[2],
-             s->wide ? "wide" : "tight",
-             (unsigned)s->nSpoke, (unsigned)s->nOwnDue);
+        eLog(e, false, "supe: sched %02x%02x%02x %s unanswered — spoke %u of %u"
+             "%s", s->d.hash3[0], s->d.hash3[1], s->d.hash3[2], kind,
+             (unsigned)s->nSpoke, (unsigned)s->nOwnDue,
+             struck ? " — strike" : "");
     } else {
-        eLog(e, true, "supe: schedule %02x%02x%02x expired (spoke %u of %u own)",
-             s->d.hash3[0], s->d.hash3[1], s->d.hash3[2],
-             (unsigned)s->nSpoke, (unsigned)s->nOwnDue);
+        eLog(e, true, "supe: sched %02x%02x%02x %s idle — spoke %u of %u%s",
+             s->d.hash3[0], s->d.hash3[1], s->d.hash3[2], kind,
+             (unsigned)s->nSpoke, (unsigned)s->nOwnDue,
+             struck ? " — strike" : "");
     }
     schedFree(e, s);
 }
@@ -422,7 +429,7 @@ static SupeSched* schedInstall(SupeEngine* e, const uint8_t* seed, uint16_t seed
         if (e->sched[i].used && memcmp(e->sched[i].d.hash3, d0, SUPE_HASH_LEN) == 0)
             e->sched[i].used = false;
 
-    /* One tight schedule per peer. A second PRIVSYNC naming the same peer says
+    /* One narrow schedule per peer. A second PRIVSYNC naming the same peer says
      * the first went unanswered — that is why it is being retried — so the
      * schedule it seeded is dead to both ends and its slots are appointments
      * nobody will keep. Held alongside the new one they are not merely idle:
@@ -464,7 +471,7 @@ static SupeSched* schedInstall(SupeEngine* e, const uint8_t* seed, uint16_t seed
     e->schedsIn++;
     eLog(e, true, "supe: schedule %02x%02x%02x (%s, %u slots, we tx %s)",
          s->d.hash3[0], s->d.hash3[1], s->d.hash3[2],
-         wide ? "wide" : "tight", (unsigned)s->d.nSlots,
+         wide ? "wide" : "narrow", (unsigned)s->d.nSlots,
          weTx0 ? "even" : "odd");
     return s;
 }
@@ -530,6 +537,81 @@ static void deliverInbound(SupeEngine* e) {
     m->rxN = 0;
 }
 
+/* One direction, as a triple: the power that side transmitted at, and the level
+ * and SNR the OTHER side read it as. `tx{…}` is ours going out, `rx{…}` is
+ * theirs coming in, and a reading that never came back is `?` rather than a
+ * zero that would read as a measurement. */
+static void fmtLeg(char* out, size_t cap, const char* dir,
+                   int txp, bool haveRead, int rssi, int snrQ) {
+    if (haveRead)
+        snprintf(out, cap, "%s{%d %d %d}", dir, txp, rssi, supeDecSnr10(snrQ) / 10);
+    else
+        snprintf(out, cap, "%s{%d ? ?}", dir, txp);
+}
+
+/* The meeting, in one line. Whoever hailed is named first and their leg is
+ * printed first, so the order on the line is the order on the air:
+ *
+ *   Our hail tx{10 -58 12} 3/500/5: tx{10 -50 12} rx{14 -45 10} - sent 5/5, rcvd 2/2
+ *   Their hail rx{14 -45 10} 3/500/5: rx{14 -45 10} tx{10 -50 12} - rcvd 2/2, sent 5/5
+ *
+ * `<ch>/<bw kHz>/<sf>` is the configuration the trains actually flew at, which
+ * is the confirmed budget rather than the slot's. Anything that went wrong is
+ * appended to the same line — a failure is a property of the meeting, not a
+ * separate event, and splitting it off is what made the old log unreadable. */
+static void meetingLine(SupeEngine* e, uint8_t got, bool ok, const char* why) {
+    SupeMeet* m = &e->m;
+    bool weOpened = !m->listener;
+    char hail[32] = "", ours[32] = "", theirs[32] = "", counts[64] = "";
+
+    /* The opening: a hail is a frame with levels to report, a rendezvous is an
+     * appointment that cost nothing and has none. */
+    if (m->fromHail && m->haveHail)
+        fmtLeg(hail, sizeof hail, weOpened ? "tx" : "rx", m->hailTxp,
+               true, m->hailRssi, m->hailSnrQ);
+
+    /* A side that sent no train has no leg — a power of zero there would read
+     * as a measurement rather than as nothing having happened. */
+    if (m->txFired)
+        fmtLeg(ours, sizeof ours, "tx", m->trainTxp, m->haveOurRead,
+               m->ourTrainRssi, m->ourTrainSnrQ);
+    if (m->havePeerTxp)
+        fmtLeg(theirs, sizeof theirs, "rx", m->peerTrainTxp, m->anyRx,
+               m->worstRssi, m->worstSnrQ);
+
+    /* The counts, and only for a leg that carried something: "0/0" reads as a
+     * measurement of nothing rather than as nothing having happened, which is
+     * the same reason a silent side gets no leg above. Repairs are
+     * transmissions beyond the train, so they are named as such rather than
+     * pushing the count past its own total. */
+    {
+        char sent[28] = "", rcvd[28] = "";
+        if (m->tx.count || m->txFired) {
+            if (m->txFired > m->tx.count)
+                snprintf(sent, sizeof sent, "sent %u/%u+%u", m->tx.count, m->tx.count,
+                         (unsigned)(m->txFired - m->tx.count));
+            else
+                snprintf(sent, sizeof sent, "sent %u/%u", m->txFired, m->tx.count);
+        }
+        if (got || m->exCount)
+            snprintf(rcvd, sizeof rcvd, "rcvd %u/%u", got, m->exCount);
+        /* Whoever opened is named first, so the line reads in the order the
+         * meeting happened. */
+        const char* a = weOpened ? sent : rcvd;
+        const char* b = weOpened ? rcvd : sent;
+        if (a[0] && b[0]) snprintf(counts, sizeof counts, " - %s, %s", a, b);
+        else if (a[0] || b[0]) snprintf(counts, sizeof counts, " - %s", a[0] ? a : b);
+    }
+
+    eLog(e, false, "supe: %s %s%s%s %u/%lu/%u:%s%s%s%s%s%s%s",
+         weOpened ? "Our" : "Their", m->fromHail ? "hail" : "rndv",
+         hail[0] ? " " : "", hail,
+         m->chan, (unsigned long)(m->cfg.bwHz / 1000u), m->cfg.sf,
+         (weOpened ? ours : theirs)[0] ? " " : "", weOpened ? ours : theirs,
+         (weOpened ? theirs : ours)[0] ? " " : "", weOpened ? theirs : ours,
+         counts, ok ? "" : " — ", ok ? "" : why);
+}
+
 static void finishMeeting(SupeEngine* e, bool ok, const char* why) {
     SupeMeet* m = &e->m;
     uint8_t was = m->phase;
@@ -582,10 +664,7 @@ static void finishMeeting(SupeEngine* e, bool ok, const char* why) {
     er->sent = m->txNext;   er->got = got;
     er->expect = m->exCount;
 
-    if (was >= SUPE_M_HD_TX)
-        eLog(e, true, "supe: meeting ch%u sf%u %luk: sent %u, rcvd %u/%u (%s)",
-             m->chan, m->cfg.sf, (unsigned long)(m->cfg.bwHz / 1000u),
-             m->txNext, got, m->exCount, why);
+    if (was >= SUPE_M_HD_TX) meetingLine(e, got, ok, why);
 
     memset(m, 0, sizeof *m);
     m->phase = SUPE_M_IDLE;
@@ -607,11 +686,55 @@ int shouldDetour(const SupePeerView* peer, const LoraQueue* q,
     return DETOUR_NOW;
 }
 
+/* Name the door a packet left by, once per distinct refusal. The reasons are
+ * genuinely different faults wearing one outcome: no tag at all is a broadcast
+ * or a packet the observer could not attribute, while a tag that names no SUPE
+ * peer is an attribution that failed to resolve — and a link dialled TO this
+ * node is the case that produces the second while the far end sees neither. */
+enum : uint8_t {
+    PLAIN_NONE = 0,
+    PLAIN_EXPIRED,
+    PLAIN_NO_TAG,
+    PLAIN_NOT_PEER,
+    PLAIN_ONCE,
+};
+
+static void notePlain(SupeEngine* e, uint8_t why, const LoraPkt* p) {
+    uint8_t tag[SUPE_TAG_LEN] = { 0, 0, 0 };
+    uint16_t len = 0;
+    if (p) {
+        len = p->len;
+        if (p->flags & LORAQ_F_HAVE_TAG) memcpy(tag, p->tag, SUPE_TAG_LEN);
+    }
+    /* Keyed on the reason and the peer, NOT the length: a mixed segment carries
+     * ordinary traffic to nodes that simply do not speak the protocol, and
+     * keying on size would put a line on every distinct packet forever. One
+     * line per peer per reason says the same thing and stops. */
+    if (why == e->plainWhy && memcmp(tag, e->plainTag, SUPE_TAG_LEN) == 0) return;
+    e->plainWhy = why;
+    e->plainLen = len;
+    memcpy(e->plainTag, tag, SUPE_TAG_LEN);
+    static const char* kWhy[] = {
+        "", "dialect expired", "no tag — broadcast or unattributable",
+        "tag names no SUPE peer", "one plain pass, deliberate",
+    };
+    eLog(e, false, "supe: %uB plain via %02x%02x%02x — %s", (unsigned)len,
+         tag[0], tag[1], tag[2], kWhy[why < 5 ? why : 0]);
+}
+
 uint8_t supeEngVerdict(SupeEngine* e) {
-    if (e->expired) { e->offerArmed = false; return SUPE_V_PLAIN; }
     LoraPkt* p = loraqAt(e->q, 0);
+    if (e->expired) {
+        e->offerArmed = false;
+        notePlain(e, PLAIN_EXPIRED, p);
+        return SUPE_V_PLAIN;
+    }
     if (!p) { e->offerArmed = false; return SUPE_V_PLAIN; }
-    if (!(p->flags & LORAQ_F_HAVE_TAG)) { e->offerArmed = false; return SUPE_V_PLAIN; }
+    if (!(p->flags & LORAQ_F_HAVE_TAG)) {
+        e->offerArmed = false;
+        notePlain(e, PLAIN_NO_TAG, p);
+        return SUPE_V_PLAIN;
+    }
 
     /* A live schedule with this peer: the packet rides the next met slot
      * rather than contending on the shared channel. */
@@ -629,6 +752,7 @@ uint8_t supeEngVerdict(SupeEngine* e) {
     if (!e->host->peer_get(e->host->ctx, p->tag, &pv) || !pv.known) {
         /* Not a SUPE peer: untouched, exactly as with the feature off. */
         e->offerArmed = false;
+        notePlain(e, PLAIN_NOT_PEER, p);
         return SUPE_V_PLAIN;
     }
     uint32_t now = eNow(e);
@@ -646,6 +770,7 @@ uint8_t supeEngVerdict(SupeEngine* e) {
     if (e->plainOnce) {
         e->plainOnce = false;
         e->offerArmed = false;
+        notePlain(e, PLAIN_ONCE, p);
         return SUPE_V_PLAIN;
     }
 
@@ -927,8 +1052,8 @@ static void slotService(SupeEngine* e) {
      * each other's slots. A declined slot is therefore walked past, not
      * retried: by the time the reception ends its moment has gone. */
     bool rxBusy = e->host->rx_busy && e->host->rx_busy(e->host->ctx);
-    /* Tight schedules first, and the order is the whole point rather than a
-     * detail of iteration. A tight schedule was bought with a PRIVSYNC on the
+    /* Narrow schedules first, and the order is the whole point rather than a
+     * detail of iteration. A narrow schedule was bought with a PRIVSYNC on the
      * shared channel moments ago: someone has traffic *now* and paid to say so,
      * and its whole horizon is a few hundred milliseconds. A wide one is a
      * standing appointment from a meeting already closed, three seconds long
@@ -964,12 +1089,12 @@ static void slotService(SupeEngine* e) {
          * designed away, only made cheap: the cost of an orphan is whatever is
          * spent before falling back, and the shared channel is always right
          * there. Three seconds of speaking into silence buys nothing a hail
-         * would not have bought at once. Wide only — a tight horizon is already
+         * would not have bought at once. Wide only — a narrow horizon is already
          * shorter than the hail that would replace it. */
         if (s->wide && s->nSpoke >= SUPE_SCHED_GIVEUP_SPOKE && queueHasFor(e, s)) {
-            eLog(e, true, "supe: schedule %02x%02x%02x abandoned — %u own slots "
-                 "unanswered, hailing instead",
-                 s->d.hash3[0], s->d.hash3[1], s->d.hash3[2], (unsigned)s->nSpoke);
+            eLog(e, false, "supe: sched %02x%02x%02x wide abandoned — %u "
+                 "unanswered, hailing", s->d.hash3[0], s->d.hash3[1],
+                 s->d.hash3[2], (unsigned)s->nSpoke);
             e->schedsAbandoned++;
             schedFree(e, s);
             continue;
@@ -1085,6 +1210,7 @@ static void fireNext(SupeEngine* e) {
         return;
     }
     m->txNext = (uint8_t)(idx + 1);
+    if (m->txFired < 255) m->txFired++;
     enterTxPhase(m, m->txMaskAny ? SUPE_M_REPAIR_TX : SUPE_M_TRAIN_TX);
     if (m->txMaskAny) e->repairsOut++;
     else              e->framesOut++;
@@ -1195,7 +1321,7 @@ static void onPrivsync(SupeEngine* e, const uint8_t* f, uint16_t len,
     if (e->expired) { e->rxDiscard++; return; }
     if (e->m.phase != SUPE_M_IDLE && e->m.phase != SUPE_M_SLOT_LISTEN) return;
 
-    /* Seed the tight schedule as its listener: the seeker transmits first.
+    /* Seed the narrow schedule as its listener: the seeker transmits first.
      * The peer is named by the seed's identity or not at all — an anonymous
      * seeker still gets its meeting, just no return leg (§4). */
     uint16_t peerId = LORAQ_PEER_NONE;
@@ -1213,6 +1339,7 @@ static void onPrivsync(SupeEngine* e, const uint8_t* f, uint16_t len,
         s->havePs = true;
         s->psRssi = rssi;
         s->psSnrQ = supeEncSnrQ(snr10);
+        s->seedTxp = ps.pwrDbm;   /* theirs, stated — ours when we are the seeder */
     }
     armTimer(e);
 }
@@ -1234,9 +1361,9 @@ static void onHaveData(SupeEngine* e, const uint8_t* f, uint16_t len,
             return;
         }
         SupeSched* s = m->schedIdx >= 0 ? &e->sched[m->schedIdx] : nullptr;
-        bool    tightPs = s && s->havePs && !s->wide;
-        int16_t psRssi  = tightPs ? s->psRssi : 0;
-        int8_t  psSnrQ  = tightPs ? s->psSnrQ : 0;
+        bool    narrowPs = s && s->havePs && !s->wide;
+        int16_t psRssi  = narrowPs ? s->psRssi : 0;
+        int8_t  psSnrQ  = narrowPs ? s->psSnrQ : 0;
         notePair(e, m->tag, &m->slotCfg, rssi, hd.pwrDbm);
 
         /* The budget: the receiver's choice, never above the proposed ceiling,
@@ -1253,7 +1380,7 @@ static void onHaveData(SupeEngine* e, const uint8_t* f, uint16_t len,
         if (top > e->ownTop)  top = e->ownTop;
         int headroomDeci = (int)snr10 - (int)supeReqSnrDeci(m->slotCfg.sf)
                            + (int)m->slotCfg.marginDeci;
-        if (tightPs) {
+        if (narrowPs) {
             int hHail = (int)supeDecSnr10(psSnrQ) - (int)supeReqSnrDeci(e->hailSf);
             if (hHail < headroomDeci) headroomDeci = hHail;
         }
@@ -1268,19 +1395,34 @@ static void onHaveData(SupeEngine* e, const uint8_t* f, uint16_t len,
          * is held whole to the close (§8). SUPE_TRAIN_MAX is that commitment. */
         m->listener = true;
         m->exCount = hd.count;
+        m->peerTrainTxp = hd.pwrDbm;   /* until their THATSIT states the train's */
+        m->havePeerTxp = true;
         m->budget  = budget;
         m->cfg     = cfg;
         m->ourTxp  = meetTxp(e, m->tag, m->haveTag, m->chan, &m->slotCfg);
         m->worstRssi = 127;
         m->beganMs = eNow(e);
-        if (s) { s->consumed = true; schedFree(e, s); }
+        if (s) {
+            /* Their hail, for the meeting's line: what they said it flew at
+             * and what we read it as. Taken now, because consuming the
+             * schedule is what frees it. */
+            m->fromHail = !s->wide;
+            if (s->havePs) {
+                m->hailTxp  = s->seedTxp;
+                m->hailRssi = s->psRssi;
+                m->hailSnrQ = s->psSnrQ;
+                m->haveHail = true;
+            }
+            s->consumed = true;
+            schedFree(e, s);
+        }
         m->schedIdx = -1;
 
         SupeGimme g = {};
         memcpy(g.hash, m->hash3, SUPE_HASH_LEN);
         g.pwrDbm = m->ourTxp;
         g.budget = budget;
-        g.havePsHeard = tightPs;
+        g.havePsHeard = narrowPs;
         if (g.havePsHeard) { g.psRssi = psRssi; g.psSnrQ = psSnrQ; }
         g.hdRssi = rssi;
         g.hdSnrQ = supeEncSnrQ(snr10);
@@ -1315,6 +1457,9 @@ static void onHaveData(SupeEngine* e, const uint8_t* f, uint16_t len,
         m->ourTrainConfirmed = true;
         notePair(e, m->tag, &m->cfg, rssi, hd.pwrDbm);
         noteReport(e, m->tag, &m->cfg, hd.trainRssi, m->trainTxp);
+        m->ourTrainRssi = hd.trainRssi;
+        m->ourTrainSnrQ = hd.trainSnrQ;
+        m->haveOurRead = true;
         {
             SupePeerNote nt = {};
             nt.ev = SUPE_EV_TRAIN_OK;
@@ -1357,22 +1502,36 @@ static void onGimme(SupeEngine* e, const uint8_t* f, uint16_t len,
     if (m->schedIdx >= 0) {
         SupeSched* s = &e->sched[m->schedIdx];
         int8_t seedTxp = s->seedTxp;
-        bool wasTightSeed = s->weSeeded && !s->wide;
+        bool wasNarrowSeed = s->weSeeded && !s->wide;
+        m->fromHail = !s->wide;
         s->consumed = true;
         schedFree(e, s);
         m->schedIdx = -1;
-        if (wasTightSeed && m->haveTag && g.havePsHeard) {
+        if (wasNarrowSeed && m->haveTag && g.havePsHeard) {
             /* The GIMME's PRIVSYNC reading: the direction we transmit in, at
              * the hailing configuration — what no transmitter can measure for
              * itself. */
             SupeCfg hail = hailCfgOf(e);
             noteReport(e, m->tag, &hail, g.psRssi, seedTxp);
         }
+        if (wasNarrowSeed) {
+            m->hailTxp = seedTxp;
+            m->haveHail = g.havePsHeard;
+            m->hailRssi = g.psRssi;
+            m->hailSnrQ = g.psSnrQ;
+        }
     }
     if (m->haveTag) {
         noteSimple(e, m->tag, SUPE_EV_ALIVE);
         notePair(e, m->tag, &m->slotCfg, rssi, g.pwrDbm);
         noteReport(e, m->tag, &m->slotCfg, g.hdRssi, m->ourTxp);
+    }
+    /* Stands in for the train's own reading until an answering HAVEDATA
+     * carries one: same peer, same tuning, one frame earlier. */
+    if (!m->haveOurRead) {
+        m->ourTrainRssi = g.hdRssi;
+        m->ourTrainSnrQ = g.hdSnrQ;
+        m->haveOurRead = true;
     }
 
     /* The confirmed budget: at or below what we proposed, resolved against the
@@ -1419,6 +1578,8 @@ static void onThatsit(SupeEngine* e, const uint8_t* f, uint16_t len,
      * pairable while letting it be chosen on the report (§0.1). */
     if (m->haveTag && m->anyRx)
         notePair(e, m->tag, &m->cfg, m->worstRssi, t.pwrDbm);
+    m->peerTrainTxp = t.pwrDbm;
+    m->havePeerTxp = true;
 
     /* Their THATSIT is now the meeting's newest goodbye. */
     if (len <= sizeof m->lastThatsit) {
@@ -1792,9 +1953,15 @@ void supeEngOnTimer(SupeEngine* e) {
 
 size_t supeEngBuildAnn(SupeEngine* e, uint8_t* out, size_t cap,
                        const uint8_t ids[][SUPE_ID_LEN], uint8_t count,
-                       int8_t pwrDbm) {
+                       int8_t pwrDbm, bool speaking) {
     SupeAnn2 a = {};
-    a.regime = e->regime;
+    /* A node that has SUPE turned off still announces — that is the only way to
+     * tell a neighbour holding the opposite belief to stop, and going quiet
+     * cannot say it: silence from a node that used to speak reads as a node
+     * that has gone away, which is a peer to keep trying rather than one to
+     * write off. The identities and the power ride the frame as usual, so the
+     * neighbourhood keeps a correct picture of a node it simply may not meet. */
+    a.regime = speaking ? e->regime : SUPE_REGIME_NONE;
     a.version = SUPE_VERSION;
     a.caps.fam = e->ownFam;
     a.caps.topStep = e->ownTop;

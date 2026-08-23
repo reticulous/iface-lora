@@ -124,6 +124,13 @@ enum SupeFamily : uint8_t {
 
 #define SUPE_REGIME_SINGLE  0    /* Single Channel — the SF ladder, nowhere else to go */
 #define SUPE_REGIME_EU863   1    /* ETSI EN 300 220, 863–870 MHz, nine channels */
+/* Not a regime: an announcement stating that this node does NOT speak SUPE, so
+ * a neighbour holding the opposite belief drops it and goes back to plain
+ * framing. Silence cannot say this — a node that has spoken SUPE and then stops
+ * is indistinguishable from one that has gone away, and the neighbour would
+ * keep trying to meet it. The regime field is a nibble, so this is its top
+ * value rather than a byte-wide sentinel. */
+#define SUPE_REGIME_NONE  0x0F
 #define SUPE_VERSION        0
 
 /** Channel 0 is the hailing channel in every regime: regime 0's schedules
@@ -316,19 +323,19 @@ uint8_t supeSyncWordAt(uint8_t sf, uint8_t ifaceSync, uint8_t sByte);
  *   hash   = D0[0..2]                     the 3 bytes HAVEDATA and GIMME quote
  *   stream = D0[3..31] ‖ D1[0..31]        slot k consumes stream[3k..3k+2]
  *                                         as j_k, c_k, s_k
- *   t_0    = turnaround + retune_gap                       (tight)
+ *   t_0    = turnaround + retune_gap                       (narrow)
  *          = 150 + (j_0 mod 40)                            (wide)
- *   t_k    = t_(k-1) + 40 + (j_k mod 24)                   (tight)
+ *   t_k    = t_(k-1) + 40 + (j_k mod 24)                   (narrow)
  *          = t_(k-1) + min(60 + 30·k, 350) + (j_k mod 40)  (wide)
  *   chan_k = 1 + (c_k mod nChans); always 0 with nChans 0  (regime 0)
- *   slots exist while t_k ≤ horizon (400 tight, 3000 wide)
+ *   slots exist while t_k ≤ horizon (400 narrow, 3000 wide)
  *
  * The transmitter parity is fixed by ROLE and is deliberately not derived:
  * a disagreed seed under fixed parity means empty slots, which the horizon
  * already handles; parity from the stream would mean both parties transmitting
  * at each other with nothing to detect it. */
 #define SUPE_SLOTS_MAX          16
-#define SUPE_TIGHT_HORIZON_MS  400
+#define SUPE_NARROW_HORIZON_MS  400
 #define SUPE_WIDE_HORIZON_MS  3000
 
 /* The seed's end to the first slot. Not the answer turnaround: that one measures
@@ -344,7 +351,7 @@ uint8_t supeSyncWordAt(uint8_t sf, uint8_t ifaceSync, uint8_t sByte);
  * meets when the speaker happens to be later than the listener — which works
  * often enough to look correct and fails whenever either side is briefly
  * busy. */
-#define SUPE_TIGHT_T0_MS      100
+#define SUPE_NARROW_T0_MS      100
 
 /* Own slots a wide schedule may spend unanswered before it is abandoned for the
  * shared channel. A schedule that meets is freed on the spot, so a live one
@@ -444,7 +451,7 @@ struct SupeGimme {
     uint8_t hash[SUPE_HASH_LEN];
     int8_t  pwrDbm;
     uint8_t budget;                     /* the receiver's choice, ≤ the ceiling */
-    bool    havePsHeard;                /* tight schedule: how PRIVSYNC landed */
+    bool    havePsHeard;                /* narrow schedule: how PRIVSYNC landed */
     int16_t psRssi;
     int8_t  psSnrQ;
     int16_t hdRssi;                     /* how the HAVEDATA just landed */
