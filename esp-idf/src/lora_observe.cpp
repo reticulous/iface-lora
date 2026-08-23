@@ -307,7 +307,7 @@ static void observeAnnounce(LoraRadio* r, const RnsHdr* h, bool isTx,
         e = d;
     } else if (e && d && e != d && d->nIds == 0) {
         /* Same device split across an identity entry and a dest-only entry. */
-        peersMergeInto(e, d);
+        peersMergeInto(st, e, d);
     }
     if (!e) {
         e = peersAlloc(st, now);
@@ -327,7 +327,7 @@ static void observeAnnounce(LoraRadio* r, const RnsHdr* h, bool isTx,
         for (int i = 0; i < NEI_MAX; i++) {
             Neighbor* o = &st->nei[i];
             if (o == e || !o->used) continue;
-            if ((e->isUs && o->isUs) || (e->isRnode && o->isRnode)) peersMergeInto(e, o);
+            if ((e->isUs && o->isUs) || (e->isRnode && o->isRnode)) peersMergeInto(st, e, o);
         }
     }
 
@@ -338,16 +338,16 @@ static void observeAnnounce(LoraRadio* r, const RnsHdr* h, bool isTx,
      * us/them guard as neiLink(): a peer's claim must not reach our row. */
     if (!peersIsLocal(e)) {
         Neighbor* c = peersFindClaim4(st, h->dest);
-        if (c && c != e && !peersIsLocal(c)) peersMergeInto(e, c);
+        if (c && c != e && !peersIsLocal(c)) peersMergeInto(st, e, c);
         /* And the same by identity: a SUPE announcement heard before this one
          * files what it knows — four bytes of an identity and the radio's
          * capabilities — against a claim row, and this is the frame that
          * supplies the identity itself. */
         c = peersFindClaim4(st, idh);
-        if (c && c != e && !peersIsLocal(c)) peersMergeInto(e, c);
+        if (c && c != e && !peersIsLocal(c)) peersMergeInto(st, e, c);
     }
 
-    NeiDest* nd = peersAddDest(e, h->dest, now);
+    NeiDest* nd = peersAddDest(st, e, h->dest, now);
     memcpy(nd->nameHash, nameH, 10);
     nd->haveName = true;
     nd->announces++;
@@ -500,6 +500,12 @@ void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
              * Counted only if the dest is already a known direct neighbour. */
             Neighbor* e = peersFindByDest(st, h.dest);
             peersPendAdd(st, lid, h.dest, true, e && !e->isUs, now);
+            /* WE dialled, so the node at the far end is the one whose
+             * destination we dialled — the identifier belongs on its row. Every
+             * later frame of the session is addressed to that identifier and to
+             * no destination at all, so without this the whole session resolves
+             * to nobody: it is absent from `lora n` and unnamed on a graph. */
+            if (e && !peersIsLocal(e)) peersAddLink4(st, e, lid, now);
             /* A link identifier we terminate. Held for as long as the link
              * plausibly lives; a link that goes quiet takes its entry with it. */
 #if !defined(CONFIG_LORA_NO_SUPE)
@@ -533,7 +539,7 @@ void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
                  * identifier on its row makes the very first frame back
                  * detourable. */
                 Neighbor* from = peersById(st, fromPeer);
-                if (from && !peersIsLocal(from)) peersAddLink4(from, lid);
+                if (from && !peersIsLocal(from)) peersAddLink4(st, from, lid, now);
             }
             L->haveSig = true;                             /* initiator's setup signal */
             L->lastRssi = rssi;
@@ -638,8 +644,23 @@ void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
                  * at hops 0 is provably the peer (the dest) transmitting. */
                 if (h.hops == 0 && L->ours && L->haveDest && !peersDestIsLocal(st, L->dest)) {
                     Neighbor* e = peersEnsureDest(st, L->dest, now);
-                    if (e) peersSample(e, rssi, snr10, now);
+                    if (e) {
+                        peersSample(e, rssi, snr10, now);
+                        /* The identifier too, and not only at setup: a link we
+                         * picked up mid-session never saw its request, and this
+                         * is the first frame that proves whose it is. */
+                        peersAddLink4(st, e, h.dest, now);
+                    }
                 }
+                /* A link DIALLED to us is anonymous in the clear — a link
+                 * request carries no sender, and the session's own identify
+                 * step is encrypted inside it — so the far end of every link we
+                 * host would stay unknown. Arriving as a detour's cargo it is
+                 * not anonymous at all: the schedule belongs to one pair, and
+                 * this came under it. That is the only handle the responder
+                 * ever gets, so it is taken on any frame and not just at setup. */
+                Neighbor* from = peersById(st, fromPeer);
+                if (from && !peersIsLocal(from)) peersAddLink4(st, from, h.dest, now);
             }
         } else if (h.dtype == NEI_DT_SINGLE && isTx) {
             /* Every single-dest data packet we send or relay may attract a

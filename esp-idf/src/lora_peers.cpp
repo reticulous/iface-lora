@@ -46,9 +46,9 @@ Neighbor* peersFindClaim4(NeiState* st, const uint8_t b4[4]) {
         Neighbor* e = &st->nei[i];
         if (!e->used) continue;
         if (e->haveNode4 && memcmp(e->node4, b4, 4) == 0) return e;
-        for (int l = 0; l < e->nLink4; l++)
-            if (memcmp(e->link4[l], b4, 4) == 0) return e;
     }
+    if (NeiHash* h = peersHashFind(st, b4, 4))
+        if (st->nei[h->node].used) return &st->nei[h->node];
     return nullptr;
 }
 
@@ -68,22 +68,14 @@ Neighbor* peersAlloc(NeiState* st, uint32_t now) {
     return victim;
 }
 
-/* Drop the placeholder a linkage frame left for a first-4. Invariant: a hash is
- * on a row either as a dest or as a `link4` stub, never both — peersKnownHashes()
- * counts the two together, and the printer lists them as separate lines. */
-static void peersDropLink4(Neighbor* e, const uint8_t b4[4]) {
-    for (int l = 0; l < e->nLink4; l++) {
-        if (memcmp(e->link4[l], b4, 4) != 0) continue;
-        memmove(e->link4[l], e->link4[l + 1], (size_t)(e->nLink4 - 1 - l) * 4);
-        e->nLink4--;
-        return;
-    }
-}
-
-NeiDest* peersAddDest(Neighbor* e, const uint8_t dest[16], uint32_t now) {
+NeiDest* peersAddDest(NeiState* st, Neighbor* e, const uint8_t dest[16], uint32_t now) {
     for (int d = 0; d < e->nDests; d++)
         if (memcmp(e->dests[d].hash, dest, 16) == 0) return &e->dests[d];
-    peersDropLink4(e, dest);   /* the hash is heard now; the stub is redundant */
+    /* The hash is heard directly now, so the stub some linkage frame left for
+     * it is redundant. Invariant: a hash is a destination OR a stub, never both
+     * — peersKnownHashes() counts the two together and the printer lists them
+     * as separate lines, so a hash on both would be double. */
+    peersHashDrop(st, dest);
     NeiDest* nd;
     if (e->nDests < NEI_DESTS_MAX) nd = &e->dests[e->nDests++];
     else {                                       /* replace the stalest dest */
@@ -106,9 +98,9 @@ Neighbor* peersEnsureDest(NeiState* st, const uint8_t dest[16], uint32_t now) {
      * that row, not on a fresh one. Never across the us/them boundary: a peer's
      * linkage claim is unauthenticated. */
     e = peersFindClaim4(st, dest);
-    if (e && !peersIsLocal(e)) { peersAddDest(e, dest, now); return e; }
+    if (e && !peersIsLocal(e)) { peersAddDest(st, e, dest, now); return e; }
     e = peersAlloc(st, now);
-    if (e) peersAddDest(e, dest, now);
+    if (e) peersAddDest(st, e, dest, now);
     return e;
 }
 
@@ -121,7 +113,7 @@ void peersSample(Neighbor* e, int16_t rssi, int16_t snr10, uint32_t now) {
     e->haveSig = true;
     e->lastHeardMs = now;
     e->frames++;
-    apHeard(e, now);            /* the EST tier's walk is paid for in these */
+    apHeard(e, now);            /* retires a failure floor that has decayed */
     uint32_t absIdx = now / NEI_BUCKET_MS;
     NeiBucket* b = &e->buck[absIdx % NEI_BUCKETS];
     if (b->absIdx != absIdx) { b->absIdx = absIdx; b->cnt = 0; b->rssiSum = 0; b->snrSum10 = 0; }
@@ -171,6 +163,10 @@ NeiLink* peersLinkFindBy3(NeiState* st, const uint8_t b3[3]) {
 
 NeiLink* peersLinkEnsure(NeiState* st, const uint8_t linkId[16], uint32_t now) {
     NeiLink* L = peersLinkFind(st, linkId);
+    /* Every path that touches a link comes through here, so this is the one
+     * place that can keep the hash store's idea of "still alive" honest — and
+     * it has to, or the ageing pass would time out a link carrying traffic. */
+    peersHashTouch(st, linkId, now);
     if (L) return L;
     NeiLink* victim = nullptr;
     for (int i = 0; i < NEI_LINKS_MAX; i++) {
@@ -226,30 +222,100 @@ void peersAddId(Neighbor* e, const uint8_t id[16]) {
     memcpy(e->ids[NEI_IDS_MAX - 1], id, 16);
 }
 
-static void peersAddLink4Raw(Neighbor* e, const uint8_t b4[4]) {
-    for (int d = 0; d < e->nDests; d++)
-        if (memcmp(e->dests[d].hash, b4, 4) == 0) return;
-    for (int l = 0; l < e->nLink4; l++)
-        if (memcmp(e->link4[l], b4, 4) == 0) return;
-    if (e->nLink4 < NEI_LINK4_MAX) { memcpy(e->link4[e->nLink4++], b4, 4); return; }
-    memmove(e->link4[0], e->link4[1], (NEI_LINK4_MAX - 1) * 4);
-    memcpy(e->link4[NEI_LINK4_MAX - 1], b4, 4);
+/* ── the shared hash store ──
+ * One table, not a slice per node: which node a hash means is a fact about the
+ * pair, and a fixed per-node array spends nearly all its bytes empty while the
+ * one node that opens a thirteenth link quietly loses its oldest. */
+NeiHash* peersHashFind(NeiState* st, const uint8_t* b, int len) {
+    if (!st || len < 1 || len > 4) return nullptr;
+    for (int i = 0; i < NEI_HASHES_MAX; i++) {
+        NeiHash* h = &st->hashes[i];
+        if (h->used && memcmp(h->hash4, b, (size_t)len) == 0) return h;
+    }
+    return nullptr;
 }
 
-void peersAddLink4(Neighbor* e, const uint8_t lid[16]) {
-    /* Stored as a first-4 stub like every other hash on a row; SUPE's 3-byte
+void peersHashAdd(NeiState* st, Neighbor* e, const uint8_t hash[16], uint32_t now) {
+    if (!st || !e) return;
+    /* A hash a node already owns as a destination needs no stub — the invariant
+     * is that it is one or the other, never both. */
+    for (int d = 0; d < e->nDests; d++)
+        if (memcmp(e->dests[d].hash, hash, 4) == 0) return;
+    uint8_t node = (uint8_t)(e - st->nei);
+    if (NeiHash* h = peersHashFind(st, hash, 4)) {
+        h->node = node; h->lastMs = now; h->timedOut = false;
+        return;
+    }
+    /* Free slot, else the least recently used — and a timed-out row goes before
+     * a live one whatever their ages, since the live one is still resolving
+     * traffic and the dead one only history. */
+    NeiHash* victim = nullptr;
+    for (int i = 0; i < NEI_HASHES_MAX; i++) {
+        NeiHash* h = &st->hashes[i];
+        if (!h->used) { victim = h; break; }
+        if (!victim) { victim = h; continue; }
+        if (victim->timedOut != h->timedOut) { if (h->timedOut) victim = h; continue; }
+        if ((int32_t)(victim->lastMs - h->lastMs) > 0) victim = h;
+    }
+    if (!victim) return;
+    victim->used = true;
+    victim->timedOut = false;
+    memcpy(victim->hash4, hash, 4);
+    victim->node = node;
+    victim->lastMs = now;
+}
+
+void peersHashDrop(NeiState* st, const uint8_t b4[4]) {
+    if (NeiHash* h = peersHashFind(st, b4, 4)) h->used = false;
+}
+
+void peersHashTouch(NeiState* st, const uint8_t b4[4], uint32_t now) {
+    if (NeiHash* h = peersHashFind(st, b4, 4)) { h->lastMs = now; h->timedOut = false; }
+}
+
+void peersHashAge(NeiState* st, uint32_t now) {
+    if (!st) return;
+    for (int i = 0; i < NEI_HASHES_MAX; i++) {
+        NeiHash* h = &st->hashes[i];
+        if (h->used && !h->timedOut && (now - h->lastMs) > NEI_LINK_QUIET_MS)
+            h->timedOut = true;
+    }
+}
+
+int peersHashCount(const NeiState* st, const Neighbor* e) {
+    if (!st || !e) return 0;
+    uint8_t node = (uint8_t)(e - st->nei);
+    int n = 0;
+    for (int i = 0; i < NEI_HASHES_MAX; i++)
+        if (st->hashes[i].used && st->hashes[i].node == node) n++;
+    return n;
+}
+
+bool peersHashAt(const NeiState* st, const Neighbor* e, int n, uint8_t out[4]) {
+    if (!st || !e || n < 0) return false;
+    uint8_t node = (uint8_t)(e - st->nei);
+    for (int i = 0; i < NEI_HASHES_MAX; i++) {
+        const NeiHash* h = &st->hashes[i];
+        if (!h->used || h->node != node) continue;
+        if (n-- == 0) { memcpy(out, h->hash4, 4); return true; }
+    }
+    return false;
+}
+
+void peersAddLink4(NeiState* st, Neighbor* e, const uint8_t lid[16], uint32_t now) {
+    /* Held as a first-4 like every other hash in the store; SUPE's three-byte
      * tag matches against its leading bytes. */
-    peersAddLink4Raw(e, lid);
+    peersHashAdd(st, e, lid, now);
 }
 
 /* Fold `src` into `dst` and free it. Used when two rows turn out to be one
  * device: an announce naming a dest-only row's identity, or a 0x03 asserting
  * that several hashes (and so several identities) are the same node. */
-void peersMergeInto(Neighbor* dst, Neighbor* src) {
-    if (dst == src || !src->used) return;
+void peersMergeInto(NeiState* st, Neighbor* dst, Neighbor* src) {
+    if (!st || dst == src || !src->used) return;
     for (int n = 0; n < src->nIds; n++) peersAddId(dst, src->ids[n]);
     for (int i = 0; i < src->nDests; i++) {
-        NeiDest* nd = peersAddDest(dst, src->dests[i].hash, src->dests[i].lastMs);
+        NeiDest* nd = peersAddDest(st, dst, src->dests[i].hash, src->dests[i].lastMs);
         nd->announces += src->dests[i].announces;
         if (src->dests[i].haveName) {
             memcpy(nd->nameHash, src->dests[i].nameHash, 10);
@@ -258,7 +324,13 @@ void peersMergeInto(Neighbor* dst, Neighbor* src) {
         if (!nd->name[0] && src->dests[i].name[0])
             safeStrncpy(nd->name, src->dests[i].name, sizeof nd->name);
     }
-    for (int l = 0; l < src->nLink4; l++) peersAddLink4Raw(dst, src->link4[l]);
+    /* Hashes follow the node, and the store is shared, so this is a change of
+     * owner rather than a copy — which is also why the table needs no room for
+     * the merge. */
+    uint8_t from = (uint8_t)(src - st->nei), to = (uint8_t)(dst - st->nei);
+    for (int i = 0; i < NEI_HASHES_MAX; i++)
+        if (st->hashes[i].used && st->hashes[i].node == from)
+            st->hashes[i].node = to;
     if (src->haveSig) {
         if (!dst->haveSig || src->rssiMin < dst->rssiMin)   dst->rssiMin  = src->rssiMin;
         if (!dst->haveSig || src->rssiMax > dst->rssiMax)   dst->rssiMax  = src->rssiMax;
@@ -306,7 +378,6 @@ void peersMergeInto(Neighbor* dst, Neighbor* src) {
         dst->apFloorDecayMs = src->apFloorDecayMs;
     }
     if (src->apOffsetDb < dst->apOffsetDb) dst->apOffsetDb = src->apOffsetDb;
-    if (src->apEstWalkDb < dst->apEstWalkDb) dst->apEstWalkDb = src->apEstWalkDb;
     dst->provesData |= src->provesData;
     dst->transit    |= src->transit;
     dst->ourProto   |= src->ourProto;
@@ -346,6 +417,12 @@ void peersExpire(LoraRadio* r, uint32_t now) {
             if (e) peersQuality(r, e, false);
         }
     }
+    /* A link that has carried nothing for long enough is over. Nothing on the
+     * air says so — no close is ever observed — so silence is the only evidence
+     * there is, and it is only ever used to sort a row first for eviction. The
+     * row itself stays: a frame recorded an hour ago still has to resolve
+     * through it, and LoRaMon reads back exactly that far. */
+    peersHashAge(st, now);
 }
 
 /* ── cooperative hash linkage (0x02 / 0x03) ──
@@ -363,9 +440,9 @@ Neighbor* peersFindBy4(NeiState* st, const uint8_t b4[4]) {
         if (e->haveNode4 && memcmp(e->node4, b4, 4) == 0) return e;
         for (int d = 0; d < e->nDests; d++)
             if (memcmp(e->dests[d].hash, b4, 4) == 0) return e;
-        for (int l = 0; l < e->nLink4; l++)
-            if (memcmp(e->link4[l], b4, 4) == 0) return e;
     }
+    if (NeiHash* h = peersHashFind(st, b4, 4))
+        if (st->nei[h->node].used) return &st->nei[h->node];
     return nullptr;
 }
 
@@ -394,8 +471,38 @@ Neighbor* peersFindByIdent4(NeiState* st, const uint8_t b4[4]) {
 
 /* How many distinct hashes we hold for a node — announced dests plus the ones
  * a 0x03 linked in. This is what we compare against a peer's advertised count. */
-int peersKnownHashes(const Neighbor* e) {
-    return (int)e->nDests + (int)e->nLink4;
+int peersKnownHashes(const NeiState* st, const Neighbor* e) {
+    return (int)e->nDests + peersHashCount(st, e);
+}
+
+void peersNodeNames(const Neighbor* e, char* out, size_t outLen) {
+    if (!out || outLen == 0) return;
+    out[0] = '\0';
+    if (!e) return;
+    size_t o = 0;
+    for (int d = 0; d < e->nDests; d++) {
+        const char* n = e->dests[d].name;
+        if (!n[0]) continue;
+        /* First word only — everything after the first space is caption. */
+        size_t w = 0;
+        while (n[w] && n[w] != ' ' && n[w] != '\t') w++;
+        if (!w) continue;
+        /* A node's aspects routinely announce the same name, and repeating it
+         * once per destination says nothing the first one did not. */
+        bool dup = false;
+        for (size_t p = 0; p < o && !dup; ) {
+            size_t q = p;
+            while (q < o && out[q] != ',') q++;
+            if (q - p == w && memcmp(out + p, n, w) == 0) dup = true;
+            p = q < o ? q + 1 : o;
+        }
+        if (dup) continue;
+        if (o + w + (o ? 1 : 0) + 1 > outLen) break;
+        if (o) out[o++] = ',';
+        memcpy(out + o, n, w);
+        o += w;
+        out[o] = '\0';
+    }
 }
 
 /* ── reciprocity estimate: a power determination, guessed for free ──
@@ -512,7 +619,7 @@ bool peersNodeFirst4(const Neighbor* e, uint8_t out[4]) {
     }
     if (e->nDests)   { memcpy(out, e->dests[0].hash, 4); return true; }
     if (e->haveNode4) { memcpy(out, e->node4, 4); return true; }
-    if (e->nLink4)   { memcpy(out, e->link4[0], 4); return true; }
+    /* No hash of its own, but something linked one to it. */
     return false;
 }
 

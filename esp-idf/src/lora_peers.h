@@ -18,17 +18,35 @@ struct LoraRadio;
  * an IFAC network). Surfaced by `lora [<n>] neighbors`. */
 #define NEI_MAX              24      /* neighbour entries per radio */
 #define NEI_DESTS_MAX        8       /* dest hashes clustered per node */
-#define NEI_IDS_MAX          4       /* identities clustered per node — one
+#define NEI_IDS_MAX          8       /* identities clustered per node — one
                                       * device legitimately runs several (its
-                                      * transport, rnsh and lxmf identities are
-                                      * all distinct), and a 0x03 is what folds
-                                      * them into one row */
+                                      * transport, rnsh, lxmf, rlpg and nomad
+                                      * identities are all distinct), and an
+                                      * announcement naming them together is
+                                      * what folds them into one row.
+                                      *
+                                      * Overflow evicts the OLDEST, and the
+                                      * eviction is what makes this a size worth
+                                      * getting right rather than a cap: the
+                                      * identity dropped is one a neighbour may
+                                      * still be holding, and it is dropped from
+                                      * the list this node's own announcement is
+                                      * built from — so the pair loses the very
+                                      * name that would have folded their rows
+                                      * together. Four was set before rnsh and
+                                      * lxmf each carried one. Costs 16 bytes
+                                      * per slot per row: 2 KB a radio at
+                                      * NEI_MAX. */
 #define NEI_LINKS_MAX        12      /* observed links per radio */
 #define NEI_PEND_MAX         8       /* outstanding proof expectations per radio */
 #define NEI_PROOF_TIMEOUT_MS 30000   /* elicited proof must return within this */
 #define NEI_BUCKETS          12      /* last-hour rollup: 12 × 5 min */
 #define NEI_BUCKET_MS        (5u * 60u * 1000u)
-#define NEI_LINK4_MAX        12      /* first-4 hashes linked to a node by 0x03 */
+#define NEI_HASHES_MAX       48      /* shared: hashes linked to a node by 0x03 */
+/* Silence that means a link is over. Nothing announces a teardown, so this is
+ * the only evidence available; generous, because the cost of calling a live
+ * link dead is only that it sorts first for eviction. */
+#define NEI_LINK_QUIET_MS    (10u * 60u * 1000u)
 
 struct NeiBucket {                  /* one 5-minute rollup slot */
     uint32_t absIdx;                /* millis()/NEI_BUCKET_MS this slot holds */
@@ -51,8 +69,9 @@ struct NeiDest {                    /* one destination hash in a node's cluster 
 /* Where an opening power came from, best evidence first. The order is the
  * precedence the controller resolves in, so it compares. */
 enum ApSource : uint8_t {
-    AP_SRC_NONE = 0,        /* nothing recent enough — the configured tx_power */
-    AP_SRC_EST,             /* reciprocity against an ASSUMED peer power */
+    AP_SRC_NONE = 0,        /* nothing recent enough — the configured tx_power.
+                             * Also every node outside SUPE, permanently: both
+                             * tiers below need a power the PEER stated */
     AP_SRC_PAIR,            /* reciprocity against a STATED peer power */
     AP_SRC_REPORT,          /* the peer stated the level our own frame landed at */
 };
@@ -83,8 +102,10 @@ struct Neighbor {
      * node's rnstransport first-4. Both are populated by the identity join. */
     uint8_t  node4[4];
     bool     haveNode4;
-    uint8_t  link4[NEI_LINK4_MAX][4];
-    uint8_t  nLink4;
+    /* Link stubs are NOT here: they live in one shared table on NeiState. A
+     * hash that means a node is a property of the pair, and a fixed slice per
+     * node spends most of its bytes empty while the one node that opens many
+     * links silently loses its oldest. See NeiHash. */
     bool     haveAdv;               /* peer stated a hash count / roaming bit */
     uint8_t  advHashes;
     bool     roaming;
@@ -149,14 +170,6 @@ struct Neighbor {
      * floor takes over. It is what the loop learns and measurement cannot
      * reach: the far end's noise floor, antenna and front-end differences. */
     int8_t   apOffsetDb;
-    /* The EST tier's own walk, and the frames heard toward its next dB. It is
-     * separate from the ratchet because the two are paid for in different
-     * currency: the ratchet spends clean exchanges, which a peer that does not
-     * speak our air protocol almost never provides, while this spends frames
-     * heard from that peer — which is the same evidence the estimate itself is
-     * built from, and the only evidence such a peer ever gives us. */
-    int8_t   apEstWalkDb;
-    uint8_t  apEstHeard;
     bool     haveApFloor;
     int8_t   apFloorDbm;
     uint32_t apFloorDecayMs;
@@ -235,8 +248,30 @@ struct NeiSeen {
     uint32_t ms;
 };
 
+/* One hash that means one node — a link identifier, above all. Shared across
+ * every node rather than sliced per node: which node a hash belongs to is a
+ * fact about the pair, and a per-node array of twelve spends nearly all of its
+ * bytes empty while the single node that opens a thirteenth link quietly loses
+ * its oldest. One table sized to what a radio actually sees is both smaller
+ * and never drops a resolution it still needs.
+ *
+ * `timedOut` is a link that has gone silent long enough to call it over.
+ * Nothing on the air announces a link ending — no close is ever observed — so
+ * silence is the only signal there is. The row STAYS when it trips: a frame
+ * recorded an hour ago still has to resolve to the node it was for, and LoRaMon
+ * reads back exactly that far. Only a full table evicts anything, and it takes
+ * the timed-out rows first. */
+struct NeiHash {
+    bool     used;
+    bool     timedOut;              /* silent long enough to call it over */
+    uint8_t  hash4[4];
+    uint8_t  node;                  /* index into nei[] */
+    uint32_t lastMs;
+};
+
 struct NeiState {
     Neighbor nei[NEI_MAX];
+    NeiHash  hashes[NEI_HASHES_MAX];
     NeiLink  links[NEI_LINKS_MAX];
     NeiPend  pend[NEI_PEND_MAX];
     NeiAnon  anon;
@@ -271,7 +306,7 @@ Neighbor* peersFindByDest(NeiState* st, const uint8_t dest[16]);
 bool      peersDestIsLocal(NeiState* st, const uint8_t dest[16]);
 Neighbor* peersFindClaim4(NeiState* st, const uint8_t b4[4]);
 Neighbor* peersAlloc(NeiState* st, uint32_t now);
-NeiDest*  peersAddDest(Neighbor* e, const uint8_t dest[16], uint32_t now);
+NeiDest*  peersAddDest(NeiState* st, Neighbor* e, const uint8_t dest[16], uint32_t now);
 Neighbor* peersEnsureDest(NeiState* st, const uint8_t dest[16], uint32_t now);
 void      peersSample(Neighbor* e, int16_t rssi, int16_t snr10, uint32_t now);
 void      peersQuality(LoraRadio* r, Neighbor* e, bool hit);
@@ -284,11 +319,35 @@ NeiPend*  peersPendTake(NeiState* st, const uint8_t phash[16]);
 void      peersAddId(Neighbor* e, const uint8_t id[16]);
 /* File a link identifier on a row: an address that resolves to this node for as
  * long as the entry survives, which is what lets traffic on the link detour. */
-void      peersAddLink4(Neighbor* e, const uint8_t lid[16]);
-void      peersMergeInto(Neighbor* dst, Neighbor* src);
+/* A linkage frame says this hash means that node. Kept in the shared store, so
+ * it needs the state rather than the row. */
+void      peersAddLink4(NeiState* st, Neighbor* e, const uint8_t lid[16], uint32_t now);
+void      peersMergeInto(NeiState* st, Neighbor* dst, Neighbor* src);
+
+/* ── the shared hash store ──
+ * A hash that means a node — a link identifier above all. `len` is how many
+ * leading bytes to match, so a SUPE 3-byte tag and a 4-byte stub hit the same
+ * rows. Adding when the table is full evicts the least recently used, and a
+ * dead row goes before a live one. */
+NeiHash*  peersHashFind(NeiState* st, const uint8_t* b, int len);
+void      peersHashAdd(NeiState* st, Neighbor* e, const uint8_t hash[16], uint32_t now);
+void      peersHashDrop(NeiState* st, const uint8_t b4[4]);
+void      peersHashTouch(NeiState* st, const uint8_t b4[4], uint32_t now);
+/* Mark every hash that has been silent past NEI_LINK_QUIET_MS. */
+void      peersHashAge(NeiState* st, uint32_t now);
+int       peersHashCount(const NeiState* st, const Neighbor* e);
+/* Copy the `n`th hash held for a node into `out`; false past the end. */
+bool      peersHashAt(const NeiState* st, const Neighbor* e, int n, uint8_t out[4]);
 Neighbor* peersFindBy4(NeiState* st, const uint8_t b4[4]);
 Neighbor* peersFindByIdent4(NeiState* st, const uint8_t b4[4]);
-int       peersKnownHashes(const Neighbor* e);
+int       peersKnownHashes(const NeiState* st, const Neighbor* e);
+
+/* What to call a node: the FIRST WORD of each announced name it holds, comma
+ * joined, duplicates dropped. An LXMF name is written for a human reading one
+ * message ("tdeck — lab bench, do not unplug"); what identifies the node across
+ * a graph or a packet list is the head of it, and the rest is caption. Empty
+ * when nothing has announced a name. */
+void      peersNodeNames(const Neighbor* e, char* out, size_t outLen);
 void      peersExpire(LoraRadio* r, uint32_t now);
 Neighbor* peersWalk(NeiState* st, int want, PeersVisitFn fn, void* ud);
 bool      peersNodeFirst4(const Neighbor* e, uint8_t out[4]);
