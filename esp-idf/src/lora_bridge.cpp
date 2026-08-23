@@ -197,11 +197,13 @@ static void handleRxDone(LoraRadio* r) {
             csmaMediumHeld(r, airMs);
             /* On the record: a corrupt frame is a real event on the air, and
              * the graph must show the hole in a train where it died. */
+            /* Nothing to describe: the bytes did not survive their CRC, so
+              * reading a type out of them would be reading noise. */
             loraMonPush(r, 0 /*rx*/, (airMs <= rxEndMs ? rxEndMs - airMs : rxEndMs),
                         (uint16_t)airMs, (uint16_t)pktLen,
                         (int16_t)lround(r->radio->getRSSI()),
                         (int16_t)lround(r->radio->getSNR() * 10.0), 0,
-                        LORA_PKT_BAD, 0, 0);
+                        LORA_PKT_BAD, 0, 0, LMD_NONE, nullptr, LMC_BCAST);
             if (logIsVerbose(TAG))        /* a frame, so it belongs at verbose */
                 verb("lora/%d rx CRC-FAIL %uB rssi=%.0f snr=%.1f",
                      r->idx, (unsigned)pktLen,
@@ -260,7 +262,15 @@ static void handleRxDone(LoraRadio* r) {
      * arrived on, so that is captured first. */
     uint8_t rxCh = r->chNow;
     bool foreign = false;
+    /* And whether this frame belongs to a meeting of ours — captured here for
+     * the same reason, because the frame that CLOSES a meeting ends it, and a
+     * record asking afterwards would call the closing frame somebody else's.
+     * The opener is the mirror case and is picked up after the dispatch, so a
+     * frame that either began or ended one of our meetings counts as ours. */
+    bool inMeeting = false;
 #if !defined(CONFIG_LORA_NO_SUPE)
+    uint8_t meetTag[SUPE_TAG_LEN];
+    inMeeting = supeMeetingTag(r, meetTag);
     if (!ours && !supeIsFramingByte(header)) {
         if (supeIsTypeByte(header)) {
             supeOnFrame(r, frame, pktLen, (int16_t)lround(r->rssiLast),
@@ -279,15 +289,62 @@ static void handleRxDone(LoraRadio* r) {
     /* Record this on-air frame (RX_DONE marks end-of-air, so start = end − ToA),
      * against the channel it arrived on — chNow may already be the detour's. */
     {
+        uint8_t rxType = ours ? LORA_PKT_OURS : LORA_PKT_RNS;
+
+        /* What it is and the address it was aimed at, with a split's two halves
+         * answering as the one packet they are — the head carries the header
+         * and speaks for both. */
+        uint8_t rxDesc, rxWhole;
+        uint8_t addrTag[3] = {0, 0, 0};
+        loraMonClassify(r, 0 /*rx*/, frame, pktLen, rxType, rxEndMs,
+                        &rxDesc, &rxWhole, addrTag);
+
+        uint8_t rxTag[3] = {0, 0, 0};
+#if !defined(CONFIG_LORA_NO_SUPE)
+        /* The dispatch above may have opened a meeting on this very frame; the
+         * sample taken before it catches the one that closed on it. Either way
+         * the frame belongs to an exchange we are a party to, and both answers
+         * below turn on that. */
+        if (!inMeeting) inMeeting = supeMeetingTag(r, meetTag);
+        if (inMeeting) memcpy(rxTag, meetTag, 3);
+#endif
+        /* Two questions, and they are NOT the same one: whose traffic this is
+         * decides the colour, and who it is with is a label for a person. A
+         * meeting frame is with the peer and for us, so answering the first
+         * from the second would call the bulk of our own traffic somebody
+         * else's. */
+        uint8_t rxCast = (rxWhole == LMD_RNS_ANNOUNCE || rxWhole == LMD_ANNOUNCE2)
+                             ? LMC_BCAST
+                             : inMeeting ? LMC_US    /* a meeting has two parties
+                                                      * and we are one of them */
+                                         : loraMonCastOf(r, addrTag);
+
+        /* Who it is with. Inside a meeting the peer outranks the frame's own
+         * address: every frame of that exchange is with one node, and saying so
+         * is what makes a train read as one conversation instead of a scatter.
+         * A received hail names US in its address field, so it concerns the
+         * sender it carries. Everything else concerns the address it was aimed
+         * at. */
+        if (!inMeeting && !loraMonSenderOf(frame, pktLen, rxType, rxTag))
+            memcpy(rxTag, addrTag, 3);
         uint32_t now = rxEndMs;
         uint32_t dur = airMs;
         uint8_t  chLive = r->chNow;
         r->chNow = rxCh;
+        /* Payload bytes, by the same rule transmit uses: everything but our own
+         * air protocol carries the 1-byte seq/split header, and SUPE carries
+         * none. Subtracting it from a SUPE frame anyway put every one of them in
+         * the record a byte short of what flew — which is not cosmetic, because
+         * the wire lengths are how a reader gets at fields the record does not
+         * carry: a THATSIT is SUPE_THATSIT_BASE + one checksum per train frame,
+         * so a byte off is a frame off, and a repair round reads as a resend of
+         * something already received. */
+        uint16_t rxBytes = (uint16_t)(rxType == LORA_PKT_OURS ? pktLen : payloadLen);
         loraMonPush(r, 0 /*rx*/, (dur <= now ? now - dur : now), (uint16_t)dur,
-                    (uint16_t)payloadLen, (int16_t)lround(r->rssiLast),
+                    rxBytes, (int16_t)lround(r->rssiLast),
                     (int16_t)lround(r->snrLast * 10.0), 0,
-                    ours ? LORA_PKT_OURS : LORA_PKT_RNS,
-                    0, 0 /*rx never waits*/);
+                    rxType, 0, 0 /*rx never waits*/,
+                    rxDesc, rxTag, rxCast);
         r->chNow = chLive;
     }
 
@@ -984,6 +1041,32 @@ static void serviceRadioLocked(LoraRadio* r) {
                      r->idx, (unsigned long)measured, (unsigned long)dur,
                      (unsigned)r->txFrameLen[doneIdx]);
         }
+        /* What it is and the address it was aimed at. The frame index cannot say
+         * which half of a split this is — a train stages every frame as
+         * txFrame[0] — so the classifier tracks the transmit stream itself and
+         * a tail takes its head's answers. */
+        uint8_t txDesc, txWhole;
+        uint8_t addrTag[3] = {0, 0, 0};
+        loraMonClassify(r, 1 /*tx*/, r->txFrame[doneIdx], r->txFrameLen[doneIdx],
+                        doneType, r->txFrameStartMs, &txDesc, &txWhole, addrTag);
+        /* Our own transmit: it went to everyone or to one node, and "for us"
+         * cannot arise — so OTHER is what the graph reads as "unicast" here.
+         * Being aimed at everyone is what the description says, not what an
+         * address lookup says, so nothing is looked up — and it is the PACKET's
+         * description that says it, so a split announce is a broadcast in both
+         * its halves. */
+        uint8_t txCast = (txWhole == LMD_RNS_ANNOUNCE || txWhole == LMD_ANNOUNCE2)
+                             ? LMC_BCAST : LMC_OTHER;
+        /* Who it is with. Our own broadcast is with nobody: the address on it is
+         * ours, and naming ourselves above a bar that is already ours by its
+         * colour says nothing. */
+        uint8_t txTag[3] = {0, 0, 0};
+        if (txCast != LMC_BCAST) {
+#if !defined(CONFIG_LORA_NO_SUPE)
+            if (!supeMeetingTag(r, txTag))
+#endif
+                memcpy(txTag, addrTag, 3);
+        }
         /* Everything but our own air protocol carries the 1-byte seq/split
          * header on air; the record reports payload bytes, so strip it.
          * RNode-origin packets go out through that same framing as rnsd's. */
@@ -992,7 +1075,8 @@ static void serviceRadioLocked(LoraRadio* r) {
                                (doneType == LORA_PKT_OURS ? 0 : 1)),
                     0, 0, r->txPwrNow, doneType,
                     doneIdx == 0 ? r->txWaitMs : 0,
-                    doneIdx == 0 ? r->txOwnMs  : 0);
+                    doneIdx == 0 ? r->txOwnMs  : 0,
+                    txDesc, txTag, txCast);
         /* Every frame we put on air is charged somewhere, and *which* somewhere
          * is the whole point. Hailing-channel frames feed the APPC band, which
          * is chosen from this radio's own recent airtime. A detour's frames —

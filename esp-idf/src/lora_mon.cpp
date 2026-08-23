@@ -45,6 +45,9 @@ struct IfMsg {
     uint8_t  radio;
     uint8_t  dir;        /* MON: 0 rx, 1 tx */
     uint8_t  type;       /* MON: LORA_PKT_* */
+    uint8_t  desc;       /* MON: LMD_* — what the frame is */
+    uint8_t  cast;       /* MON: LMC_* — who it was aimed at */
+    uint8_t  tag[3];     /* MON: the node the frame concerns, 0 if unattributable */
     uint8_t  ch;         /* channel index; 0 = the reticulum hailing channel */
     int8_t   txp;        /* MON tx: power of the frame */
     uint32_t t_ms;       /* MON: frame start; RSSI: sample time */
@@ -84,6 +87,105 @@ static bool ifPost(const IfMsg* m) {
     return xQueueSend(s_ifq, m, 0) == pdTRUE;
 }
 
+/* True while something is actually reading the neighbourhood — today the web
+ * LoRaMon's packet hover, tomorrow a graph view. Its own key, not LoRaMon's:
+ * these are different appetites. LoRaMon wants frames and can run on an LCD
+ * that needs no published peers at all; a graph wants the peer table and no
+ * frames. Publishing on the wrong one costs a rewrite of every peer row on
+ * every stats beat for a reader that is not there. */
+static bool loraPeersWatched(void) {
+    return storageGetInt("sys.stats.web_peers", 0) != 0;
+}
+
+/* The neighbourhood, one node per peer-table slot, for anything that has to
+ * turn a tag or an address back into a node — and to say what has been learned
+ * about it. Published rather than derived, because all of it lives in the peer
+ * table and nothing outside this straddle can rebuild it: a viewer sees frames,
+ * not the announces, proofs and measurements that clustered and characterised
+ * them.
+ *
+ *   lora.<n>.peers.<slot> =
+ *     "<num>|<supe>|<tags…>|<names…>|<loss>|<rssi>|<snr>|<q>|<heard_s>|<flags>|<budget>"
+ *
+ * Empty means not known rather than zero — a peer with no path-loss pair yet is
+ * a different thing from one measured at 0 dB, and a graph that cannot tell
+ * them apart draws a confident line where there is no measurement.
+ *
+ * On-device viewers do NOT read this. They are inside the same binary as the
+ * peer table and ask it directly (see loraPeerSummary in lora.h); serialising a
+ * fact so the same firmware can parse it back is a round trip for nothing. */
+static void publishPeers(LoraRadio* r) {
+    if (!r->nei) return;
+    char k[48], v[224];
+    uint32_t now = millis();
+    /* The number `lora n` prints beside a node, counted the same way it counts:
+     * used, not us, in table order. A viewer that has no name to show falls
+     * back to it, and a person reading both surfaces sees the same #4. */
+    int num = 0;
+    for (int i = 0; i < NEI_MAX; i++) {
+        Neighbor* e = &r->nei->nei[i];
+        snprintf(k, sizeof k, "lora.%d.peers.%d", r->idx, i);
+        if (!e->used || peersIsLocal(e)) { storageDeleteTree(k); continue; }
+        num++;
+        uint8_t tg[NEI_DESTS_MAX + NEI_HASHES_MAX + NEI_IDS_MAX + 1][3];
+        int nt = 0;
+        auto addTag = [&](const uint8_t* b) {
+            for (int j = 0; j < nt; j++) if (memcmp(tg[j], b, 3) == 0) return;
+            if (nt < (int)(sizeof tg / sizeof tg[0])) memcpy(tg[nt++], b, 3);
+        };
+        if (e->haveNode4) addTag(e->node4);
+        for (int d = 0; d < e->nDests; d++) addTag(e->dests[d].hash);
+        for (int q = 0; q < e->nIds; q++)   addTag(e->ids[q]);
+        for (int l = 0; ; l++) {
+            uint8_t h4[4];
+            if (!peersHashAt(r->nei, e, l, h4)) break;
+            addTag(h4);
+        }
+
+        int o = snprintf(v, sizeof v, "%d|", num);
+#if !defined(CONFIG_LORA_NO_SUPE)
+        o += snprintf(v + o, sizeof v - (size_t)o, "%d|", e->supeSeen ? 1 : 0);
+#else
+        o += snprintf(v + o, sizeof v - (size_t)o, "0|");
+#endif
+        for (int j = 0; j < nt && o < (int)sizeof v - 8; j++)
+            o += snprintf(v + o, sizeof v - (size_t)o, "%s%02x%02x%02x",
+                          j ? "," : "", tg[j][0], tg[j][1], tg[j][2]);
+        o += snprintf(v + o, sizeof v - (size_t)o, "|");
+        {
+            char names[NEI_NAME_MAX * 3];
+            peersNodeNames(e, names, sizeof names);
+            o += snprintf(v + o, sizeof v - (size_t)o, "%s", names);
+        }
+        /* What has been learned about it. Path loss is the one number a graph
+         * actually wants — it is symmetric, it does not move when either end
+         * changes power, and it is what an edge length should be drawn from. */
+        o += snprintf(v + o, sizeof v - (size_t)o, "|");
+        if (e->havePair)
+            o += snprintf(v + o, sizeof v - (size_t)o, "%d",
+                          (int)e->pairTxp - (int)e->pairRssi);
+        o += snprintf(v + o, sizeof v - (size_t)o, "|");
+        if (e->haveSig)
+            o += snprintf(v + o, sizeof v - (size_t)o, "%d", (int)e->rssiMax);
+        o += snprintf(v + o, sizeof v - (size_t)o, "|");
+        if (e->haveSig)
+            o += snprintf(v + o, sizeof v - (size_t)o, "%d", (int)e->snrMax10);
+        o += snprintf(v + o, sizeof v - (size_t)o, "|");
+        if (e->haveQuality)
+            o += snprintf(v + o, sizeof v - (size_t)o, "%u", (unsigned)e->quality);
+        o += snprintf(v + o, sizeof v - (size_t)o, "|%u|%s%s",
+                      (unsigned)((now - e->lastHeardMs) / 1000),
+                      e->transit ? "T" : "", e->roaming ? "R" : "");
+#if !defined(CONFIG_LORA_NO_SUPE)
+        o += snprintf(v + o, sizeof v - (size_t)o, "|");
+        if (e->supeSeen)
+            snprintf(v + o, sizeof v - (size_t)o, "%u",
+                     (unsigned)e->supeCaps.topStep);
+#endif
+        storageSet(k, v);
+    }
+}
+
 void publishStats(LoraRadio* r) {
     /* Skip the churn on a headless, WiFi-down node — nothing pulls these keys
      * there. A UI (web over WiFi, or an LCD build) re-populates them when it
@@ -94,6 +196,7 @@ void publishStats(LoraRadio* r) {
      * round-trips to the storage task every second; under an inbound-message
      * burst those pile up on the storage op port and stall the radio task. */
     storageBegin();
+    if (loraPeersWatched()) publishPeers(r);
     storageSet(rk(b, sizeof b, r->idx, "stats.tx_bytes"),  (int)(r->txBytes & 0x7fffffff));
     storageSet(rk(b, sizeof b, r->idx, "stats.rx_bytes"),  (int)(r->rxBytes & 0x7fffffff));
     storageSet(rk(b, sizeof b, r->idx, "stats.tx_frames"), (int)(r->txFrames & 0x7fffffff));
@@ -152,11 +255,17 @@ static void loraMonExpire(LoraRadio* r, uint32_t now) {
 }
 
 /* Publish one packet node `lora.<n>.packets.<ms>` holding a packed string:
- * "r|rssi|snr|dur|bytes|type|ch" (rx), "t|txp|dur|bytes|type|wait|ch" (tx), or
- * "a|ch|dur" — a DWELL: the radio was tuned to that channel and listening for
+ *
+ *   r|rssi|snr|dur|bytes|type|ch|desc|cast[|tag]
+ *   t|txp|dur|bytes|type|wait|ch|own|desc|cast[|tag]
+ *   a|ch|dur
+ *
+ * The last is a DWELL: the radio was tuned to that channel and listening for
  * that long, ending where the next one begins. The leading token is the
  * direction; snr is deci-dB; ch is the channel, 0 being the reticulum hailing
- * channel. Then age old nodes out.
+ * channel; desc is what the frame is (LMD_*); cast is who it was aimed at
+ * (LMC_*); tag is six hex characters naming the peer, absent when unknown.
+ * Then age old nodes out.
  *
  * The dwell is what makes a viewer able to say where the radio *was*, which no
  * frame record can: a slot attended in silence, a meeting's channel held open,
@@ -199,13 +308,22 @@ static void loraMonRecordOne(LoraRadio* r, const IfMsg* m) {
     snprintf(key, sizeof key, "lora.%d.packets.%u", r->idx, (unsigned)m->t_ms);
     if (m->dir == 2) snprintf(val, sizeof val, "a|%u|%u",
                               (unsigned)m->ch, (unsigned)m->dur_ms);
-    else if (m->dir) snprintf(val, sizeof val, "t|%d|%u|%u|%u|%u|%u|%u",
+    else if (m->dir) snprintf(val, sizeof val, "t|%d|%u|%u|%u|%u|%u|%u|%u|%u",
                          (int)m->txp, (unsigned)m->dur_ms, (unsigned)m->bytes,
                          (unsigned)m->type, (unsigned)m->wait_ms, (unsigned)m->ch,
-                         (unsigned)m->own_ms);
-    else        snprintf(val, sizeof val, "r|%d|%d|%u|%u|%u|%u",
+                         (unsigned)m->own_ms, (unsigned)m->desc, (unsigned)m->cast);
+    else        snprintf(val, sizeof val, "r|%d|%d|%u|%u|%u|%u|%u|%u",
                          (int)m->rssi, (int)m->snr10, (unsigned)m->dur_ms,
-                         (unsigned)m->bytes, (unsigned)m->type, (unsigned)m->ch);
+                         (unsigned)m->bytes, (unsigned)m->type, (unsigned)m->ch,
+                         (unsigned)m->desc, (unsigned)m->cast);
+    /* The tag rides last and only when there is one. Six characters on every
+     * record of a thousand is worth not spending on zeros, and a viewer that
+     * finds the field absent has the same answer as one that finds it empty. */
+    if (m->dir != 2 && (m->tag[0] | m->tag[1] | m->tag[2])) {
+        size_t o = strlen(val);
+        snprintf(val + o, sizeof val - o, "|%02x%02x%02x",
+                 m->tag[0], m->tag[1], m->tag[2]);
+    }
     storageSet(key, val);
 
     loraMonExpire(r, m->t_ms);                           /* age out + free a slot if full */
@@ -253,9 +371,143 @@ static void loraMonRecord(LoraRadio* r, const IfMsg* m) {
  * held by our own traffic, a split still landing, or a deliberate pre-offer
  * delay. Conflated, a busy channel and a busy radio look identical, and only
  * one of them is somebody else's fault. */
+/* What a frame is, from the frame itself. Our own protocol names itself in its
+ * first byte; Reticulum's packet type is the bottom two bits of its first
+ * header byte. A split half is left unread beyond that — its second frame
+ * carries no header at all, and guessing which half this is from a record that
+ * does not know would put a confident wrong name on the graph. */
+/* The three bytes of the address a frame was AIMED AT — the same prefix the
+ * protocol classifies on, so a record and a log line agree about who a frame
+ * was for. Our own frames carry it where their own codec puts it; a Reticulum
+ * packet's is the front of its first address field, which sits behind this
+ * interface's framing byte and the two header bytes. Zero where there is none
+ * to take: a frame too short, or one that names no address at all.
+ *
+ * A split packet's address is in its head — the only half with a header — and
+ * the caller passes that half, because nothing in a frame says which half it
+ * is. */
+void loraMonTagOf(const uint8_t* f, size_t len, uint8_t type, uint8_t out[3]) {
+    out[0] = out[1] = out[2] = 0;
+    if (!f || len < 1) return;
+    if (type == LORA_PKT_OURS) {
+        /* PRIVSYNC is the one that names a peer: type, regime/version, then the
+         * tag it is asking about. The meeting frames name a schedule, not a
+         * node, so they have none to give. */
+        if (f[0] == SUPE_T_PRIVSYNC && len >= 2 + SUPE_TAG_LEN)
+            memcpy(out, f + 2, SUPE_TAG_LEN);
+        return;
+    }
+    if (len >= 1 + 2 + 3) memcpy(out, f + 1 + 2, 3);
+}
+
+/* PRIVSYNC's sender_ident, which sits behind the tag, the power and the salt.
+ * It is optional on the wire — a hail from a node with nothing to say about
+ * itself omits it — so the length is what says whether there is one. */
+bool loraMonSenderOf(const uint8_t* f, size_t len, uint8_t type, uint8_t out[3]) {
+    if (!f || type != LORA_PKT_OURS || len < SUPE_PRIVSYNC_ID_LEN) return false;
+    if (f[0] != SUPE_T_PRIVSYNC) return false;
+    memcpy(out, f + SUPE_PRIVSYNC_LEN, SUPE_TAG_LEN);
+    return true;
+}
+
+/* What one recorded frame IS and who it concerns, resolving which half of a
+ * split it holds from the record stream itself.
+ *
+ * Both loraMonDescribe and loraMonTagOf read the Reticulum header, so both need
+ * the half that HAS one. Nothing in a frame says which half it is, and the
+ * reassembly state cannot answer either — a train's frames are buffered by the
+ * meeting and reassembled at its close, so at record time none of it has moved.
+ * The stream tracks itself instead, by the seq-and-timeout rule reassembly uses:
+ * a split frame whose seq matches a pending head is that head's tail, and takes
+ * the head's answers rather than inventing its own out of payload bytes.
+ *
+ * Two descriptions come back because they answer different questions. `desc` is
+ * what this FRAME is, and a tail is honestly a `split`. `whole` is what the
+ * PACKET is, which a tail inherits — an announce too big for one frame is a
+ * broadcast in both its halves, and colouring the second one as a unicast would
+ * say the packet changed audience halfway through the air.
+ *
+ * RADIO TASK — called from the rx drain and from TxDone. */
+void loraMonClassify(LoraRadio* r, uint8_t dir, const uint8_t* f, size_t len,
+                     uint8_t type, uint32_t now,
+                     uint8_t* desc, uint8_t* whole, uint8_t tag[3]) {
+    LoraRadio::MonSplit* ms = &r->monSplit[dir ? 1 : 0];
+    bool split = type != LORA_PKT_OURS && len >= 1 && (f[0] & RNODE_FLAG_SPLIT);
+    /* A head whose tail never came does not get to claim the next one. */
+    if (ms->pend && (uint32_t)(now - ms->atMs) > SPLIT_RX_TIMEOUT_MS) ms->pend = false;
+    if (split && ms->pend && ms->seq == (uint8_t)(f[0] & 0xF0)) {
+        *desc  = LMD_RNS_SPLIT;             /* what this FRAME is: the rest of one */
+        *whole = ms->desc;                  /* what the PACKET is: its head's answer */
+        memcpy(tag, ms->tag, 3);
+        ms->pend = false;
+        return;
+    }
+    *desc  = loraMonDescribe(f, len, type);
+    *whole = *desc;
+    loraMonTagOf(f, len, type, tag);
+    if (split) {
+        ms->pend = true;
+        ms->seq  = (uint8_t)(f[0] & 0xF0);
+        ms->atMs = now;
+        ms->desc = *desc;
+        memcpy(ms->tag, tag, 3);
+    }
+}
+
+uint8_t loraMonCastOf(LoraRadio* r, const uint8_t tag[3]) {
+    if (!r->nei || !tag || !(tag[0] | tag[1] | tag[2])) return LMC_OTHER;
+    /* Ours means a LOCAL row's — this node's own destinations and identities,
+     * and the attached RNode client's, since an RNode is us (§17). */
+    for (int i = 0; i < NEI_MAX; i++) {
+        Neighbor* e = &r->nei->nei[i];
+        if (!e->used || !peersIsLocal(e)) continue;
+        if (e->haveNode4 && memcmp(e->node4, tag, 3) == 0) return LMC_US;
+        for (int d = 0; d < e->nDests; d++)
+            if (memcmp(e->dests[d].hash, tag, 3) == 0) return LMC_US;
+        for (int k = 0; k < e->nIds; k++)
+            if (memcmp(e->ids[k], tag, 3) == 0) return LMC_US;
+    }
+    /* A link we are an endpoint of carries our traffic even though its
+     * identifier belongs to neither side's announced set. `ours` is the whole
+     * test — we only ever track links we are one end of. */
+    for (int i = 0; i < NEI_LINKS_MAX; i++) {
+        NeiLink* L = &r->nei->links[i];
+        if (L->used && L->ours && memcmp(L->linkId, tag, 3) == 0) return LMC_US;
+    }
+    return LMC_OTHER;
+}
+
+uint8_t loraMonDescribe(const uint8_t* f, size_t len, uint8_t type) {
+    if (!f || len < 1) return LMD_NONE;
+    if (type == LORA_PKT_OURS) {
+        switch (f[0]) {
+            case SUPE_T_PRIVSYNC:  return LMD_PRIVSYNC;
+            case SUPE_T_ANNOUNCE2: return LMD_ANNOUNCE2;
+            case SUPE_T_HAVEDATA:  return LMD_HAVEDATA;
+            case SUPE_T_GIMME:     return LMD_GIMME;
+            case SUPE_T_THATSIT:   return LMD_THATSIT;
+            case SUPE_T_BYE:       return LMD_BYE;
+            case SUPE_T_RESEND:    return LMD_RESEND;
+            default: return LMD_NONE;
+        }
+    }
+    /* Everything else flew behind this interface's own framing byte, and the
+     * Reticulum header begins right after it. A split's TAIL carries no header
+     * and must not reach here — the caller knows which half it holds and names
+     * a tail LMD_RNS_SPLIT itself. */
+    if (len < 2) return type == LORA_PKT_RNODE ? LMD_RNODE : LMD_NONE;
+    switch (f[1] & 0x03) {
+        case 0x00: return LMD_RNS_DATA;
+        case 0x01: return LMD_RNS_ANNOUNCE;
+        case 0x02: return LMD_RNS_LINKREQ;
+        default:   return LMD_RNS_PROOF;
+    }
+}
+
 void loraMonPush(LoraRadio* r, uint8_t dir, uint32_t t_ms, uint16_t dur_ms,
                         uint16_t bytes, int16_t rssi, int16_t snr10, int8_t txp,
-                        uint8_t type, uint16_t wait_ms, uint16_t own_ms) {
+                        uint8_t type, uint16_t wait_ms, uint16_t own_ms,
+                        uint8_t desc, const uint8_t tag[3], uint8_t cast) {
     /* Airtime rollup runs whether or not a viewer is open — the hour it covers
      * is longer than a viewer is typically up, so it can't be built on demand. */
     {
@@ -296,6 +548,9 @@ void loraMonPush(LoraRadio* r, uint8_t dir, uint32_t t_ms, uint16_t dur_ms,
     m.txp  = txp;      m.t_ms  = t_ms;
     m.dur_ms = dur_ms; m.bytes = bytes; m.wait_ms = wait_ms; m.own_ms = own_ms;
     m.rssi = rssi;     m.snr10 = snr10;
+    m.desc = desc;
+    m.cast = cast;
+    if (tag) memcpy(m.tag, tag, 3);
     if (!ifPost(&m)) r->mon.monDropped++;
 }
 
@@ -348,6 +603,19 @@ static void loraMonClear(LoraRadio* r) {
     snprintf(pfx, sizeof pfx, "lora.%d.packets", r->idx);
     storageDeleteTree(pfx);
     r->mon.pktHead = r->mon.pktCount = 0;
+    /* The dwell that was still growing goes with them. A stay on one channel is
+     * ONE record extended in place, so the key it extends has to exist: kept
+     * across a clear, the next stay would rewrite a node that was just deleted —
+     * at a timestamp from before the viewer opened, outside the ring that
+     * expires it, and with nothing recorded at the time the radio is actually
+     * listening. The lane then reads as "not here" from the moment the window
+     * opens until the next retune breaks the chain, which is exactly the span a
+     * viewer has its eyes on.
+     *
+     * Only this half. `dwellSince` is radio-task state and its own task drops it
+     * on the watch edge — reaching across from here to clear it while a span is
+     * being closed would be a cross-task write for nothing. */
+    r->mon.dwellKeyMs = 0;
 }
 
 /* Publish the channel list the regime puts in force:

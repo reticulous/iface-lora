@@ -10,6 +10,8 @@
  */
 #pragma once
 
+#include <stddef.h>
+
 #include "service.h"
 
 class LoraService : public Service {
@@ -36,3 +38,16 @@ struct lora_peer_summary {
 /** Fill `out` for radio slot `radio`. False when the slot is invalid, no
  *  radios are configured, or the radio has never been up (no observations). */
 bool loraPeerSummary(int radio, lora_peer_summary* out);
+
+/** What to call the node a three-byte tag resolves to: its announced name(s),
+ *  comma-joined, or "#N" — the number `lora n` prints — where it has none. Empty
+ *  only where the tag names nobody known. `tag` is six lowercase hex characters,
+ *  the form every SUPE log line and every LoRaMon record uses.
+ *
+ *  For an ON-DEVICE surface. A browser cannot call this and reads
+ *  `lora.<n>.peers.*` instead, which carries the same mapping and more; anything
+ *  inside this firmware should come here rather than parse that back, since the
+ *  peer table is right there and the published copy is written only while a web
+ *  reader says it is looking. Same unsynchronised cross-task read as
+ *  loraPeerSummary: advisory display data, not state to act on. */
+void loraNameForTag(int radio, const char* tag, char* out, size_t outLen);

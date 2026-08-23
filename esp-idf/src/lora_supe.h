@@ -44,6 +44,7 @@ struct SupeState {
 
 bool     supeInit(LoraRadio* r);            /* alloc + configure; false = no memory */
 void     supeOnRadioStop(LoraRadio* r);
+bool     supeMounted(const LoraRadio* r);
 bool     supeReady(const LoraRadio* r);
 bool     supeBusy(const LoraRadio* r);      /* the engine owns the radio */
 /* Narrower: a meeting is actually under way, so the queue is the engine's to
@@ -51,6 +52,13 @@ bool     supeBusy(const LoraRadio* r);      /* the engine owns the radio */
 bool     supeXactLive(const LoraRadio* r);
 uint16_t supeCargoPeer(const LoraRadio* r); /* whose cargo is arriving, if any */
 bool     supeHoldsRadio(const LoraRadio* r);
+
+/* The peer a meeting in progress is with, if there is one. Every frame a
+ * meeting puts on air concerns that peer whatever its own bytes say — a THATSIT
+ * names a schedule and a train frame names whichever destination the packet
+ * inside it was for, so without this a single exchange with one node reads as a
+ * scatter of unrelated addresses and unnamed control frames. */
+bool     supeMeetingTag(const LoraRadio* r, uint8_t out[SUPE_TAG_LEN]);
 void     supeLock(LoraRadio* r);
 void     supeUnlock(LoraRadio* r);
 void     supeOnFrame(LoraRadio* r, const uint8_t* f, size_t len,

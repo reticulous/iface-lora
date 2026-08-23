@@ -32,7 +32,16 @@ struct LoraMonState {
     uint32_t   rssiDropped;          /* samples lost to a full interface queue */
     uint32_t   monDropped;           /* frame records lost to a full interface queue */
     uint32_t   dwellSince;           /* when the radio arrived on its current
-                                      * channel; 0 before the first retune */
+                                      * channel; 0 = no stay in progress, take
+                                      * the next pass as its start */
+    bool       dwellWatched;         /* the watch state dwellSince belongs to.
+                                      * A stay that began before the window
+                                      * opened is not one this viewer may be
+                                      * shown, and the edge has to be noticed on
+                                      * the RADIO task — dwellSince is its
+                                      * state, and the interface task clearing
+                                      * it from under a span being closed is a
+                                      * cross-task write for no reason. */
     /* The dwell node currently being extended, so a stay on one channel is one
      * growing record rather than one node per beat. Interface task only, like
      * the FIFO beside it. */
@@ -43,9 +52,77 @@ struct LoraMonState {
 };
 
 /* ─────────────── lora_mon: telemetry ─────────────── */
+/* What a frame IS, for the graph to say on demand. A code rather than a string:
+ * every record is a storage node and there may be thousands of them, so the
+ * name lives once in each viewer's own table (browser and LCD) and the record
+ * carries a byte. Values are wire — a viewer decodes them — so they are
+ * appended to, never renumbered.
+ *
+ *   0 unknown   1 PRIVSYNC  2 ANNOUNCE2  3 HAVEDATA  4 GIMME
+ *   5 THATSIT   6 BYE       7 RESEND     8 data      9 announce
+ *  10 link req 11 proof    12 split     13 RNode */
+enum : uint8_t {
+    LMD_NONE = 0,
+    LMD_PRIVSYNC, LMD_ANNOUNCE2, LMD_HAVEDATA, LMD_GIMME,
+    LMD_THATSIT, LMD_BYE, LMD_RESEND,
+    LMD_RNS_DATA, LMD_RNS_ANNOUNCE, LMD_RNS_LINKREQ, LMD_RNS_PROOF,
+    LMD_RNS_SPLIT, LMD_RNODE,
+};
+
+/* Classify one on-air frame. `type` is the LORA_PKT_* class the caller already
+ * knows; `f` is the frame as it flew, framing byte included.
+ *
+ * Both this and loraMonTagOf read the Reticulum header, so both want the half of
+ * a split packet that HAS one — the head. Nothing in a frame says which half it
+ * is, so a recorder should call loraMonClassify below rather than either of
+ * these: it is the thing that tracks halves. */
+uint8_t loraMonDescribe(const uint8_t* f, size_t len, uint8_t type);
+
+/* The three bytes of the address a frame was AIMED AT, or zeros where there are
+ * none to take. The same prefix the protocol classifies on, so a record and a
+ * log line agree about who a frame was for.
+ *
+ * A split packet's address lives in its head, which is the only half carrying a
+ * header — pass that half, or call loraMonClassify, which knows which half it
+ * has. */
+void loraMonTagOf(const uint8_t* f, size_t len, uint8_t type, uint8_t out[3]);
+
+/* What one recorded frame is and who it concerns, in one call — which is how a
+ * caller should ask, since answering either needs to know which half of a split
+ * the frame holds and nothing in the frame says. Tracks that itself, per
+ * direction, so it is right for a train (buffered by its meeting, reassembled
+ * only at close) as well as for plain traffic.
+ *
+ * `desc` is what this FRAME is — a tail is a `split`. `whole` is what the PACKET
+ * is, which a tail inherits from its head; cast keys off that one. RADIO TASK. */
+void loraMonClassify(LoraRadio* r, uint8_t dir, const uint8_t* f, size_t len,
+                     uint8_t type, uint32_t now,
+                     uint8_t* desc, uint8_t* whole, uint8_t tag[3]);
+
+/* Who SENT a frame, where the frame says so, and false where it does not. Only
+ * PRIVSYNC does: it carries the sender's identity prefix precisely because the
+ * node it names in its address field is the node being hailed, not the one
+ * hailing. A received hail concerns the sender — the address on it is us. */
+bool loraMonSenderOf(const uint8_t* f, size_t len, uint8_t type, uint8_t out[3]);
+
+/* Whose traffic an address is: ours, or somebody else's. Never broadcast —
+ * being aimed at everyone is a property of the frame, not of an address, and
+ * the caller knows it from the description. An address that resolves to nobody
+ * is OTHER: unknown is not the same as ours.
+ *
+ * Decided here rather than in the viewer: it turns on which addresses mean US,
+ * which lives in the peer table and reaches no browser. */
+enum : uint8_t {
+    LMC_BCAST = 0,   /* aimed at everyone — an announce */
+    LMC_US,          /* unicast, and the address is one of ours */
+    LMC_OTHER,       /* unicast for somebody else, overheard */
+};
+uint8_t loraMonCastOf(LoraRadio* r, const uint8_t tag[3]);
+
 void loraMonPush(LoraRadio* r, uint8_t dir, uint32_t t_ms, uint16_t dur_ms,
                  uint16_t bytes, int16_t rssi, int16_t snr10, int8_t txp,
-                 uint8_t type, uint16_t wait_ms, uint16_t own_ms);
+                 uint8_t type, uint16_t wait_ms, uint16_t own_ms,
+                 uint8_t desc, const uint8_t tag[3], uint8_t cast);
 /* One listening span closed off: where the radio was and for how long. Called
  * on every retune and on the maintenance beat — see the note at the record. */
 void loraMonDwell(LoraRadio* r, uint32_t now);

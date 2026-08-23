@@ -432,23 +432,23 @@ static bool radioStart(LoraRadio* r) {
         sk(kb, sizeof kb, r->idx, "SUPE.sender_ident"), 1) != 0;
     bool supeWanted = storageGetInt(sk(kb, sizeof kb, r->idx, "SUPE.enable"), 0) != 0;
     bool haveIfac   = storageGetInt(sk(kb, sizeof kb, r->idx, "ifac_size"), 0) != 0;
-    r->supeOn = supeWanted && !haveIfac;
-    if (supeWanted && !r->supeOn)
+    /* Two different questions. An access code or an expired dialect means the
+     * machinery cannot run at all; the enable key means it runs but does not
+     * SPEAK — it still reads announcements, so the picture of the neighbourhood
+     * stays current and the switch can be thrown back without waiting to
+     * rediscover everyone. That is also what lets a node announce that it does
+     * not speak SUPE, which is the only way to tell a neighbour to stop. */
+    bool canRun = !haveIfac;
+    if (haveIfac)
         info("lora/%d SUPE off: an access code is configured, so the modem cannot "
              "read an address to match", r->idx);
-    if (r->supeOn && supeExpired((uint32_t)time(nullptr)))
+    if (canRun && supeExpired((uint32_t)time(nullptr))) {
         warn("lora/%d SUPE dialect expired — this build stopped speaking it; reflash", r->idx);
-    if (r->supeOn && !supeInit(r)) r->supeOn = false;
+        canRun = false;
+    }
+    r->supeOn = supeWanted && canRun;
+    if (canRun && !supeInit(r)) r->supeOn = false;
 #endif
-    /* The one thing about transmit power that is a user's choice: whether to
-     * dial down toward a peer that has never told us what it hears. Everything
-     * derived from a measurement is part of SUPE's own operation — the protocol
-     * states a power in every frame it sends so that both ends can use it — and
-     * is not switchable. This key reaches the estimate and nothing else, which
-     * is why it lives outside the SUPE prefix and outside the gate that
-     * compiles SUPE out. */
-    r->adaptive = storageGetInt(sk(kb, sizeof kb, r->idx, "adaptive_txpwr"), 1) != 0;
-
     /* Each store allocates once and keeps its history across config cycles. */
     loraMonInit(r);
     annInit(r);
@@ -574,7 +574,19 @@ static void applyConfig(LoraRadio* r) {
     radioStart(r);
 }
 
-static void onCfgChange(const char* /*key*/, const char* /*val*/) {
+#if !defined(CONFIG_LORA_NO_SUPE)
+/* Set by the SUPE.enable subscription, read on the radio task. */
+static volatile bool s_supeEnDirty = false;
+#endif
+
+static void onCfgChange(const char* key, const char* /*val*/) {
+    /* SUPE's enable switch is not a radio setting: nothing about the modem
+     * changes, only whether this node speaks the protocol. Sending it through
+     * the settle window would take the radio off the air for ten seconds to
+     * change a boolean, and the toggle exists precisely so a node can be taken
+     * out of SUPE mid-debug without disturbing anything else. It has its own
+     * subscription below. */
+    if (key && strstr(key, ".SUPE.enable")) return;
     cfgArmSettle();
 }
 
@@ -832,6 +844,17 @@ static void loraTaskMain(void*) {
         storageSubscribeChanges(rk(kb, sizeof kb, i, "freq_mhz"), onDisplayChange);
         storageSubscribeChanges(rk(kb, sizeof kb, i, "bw_khz"),   onDisplayChange);
     }
+#if !defined(CONFIG_LORA_NO_SUPE)
+    /* Speaking SUPE or not, applied where it is read rather than through a
+     * radio restart, and announced at once: the neighbourhood learns from the
+     * frame, not from silence. Flagged here and acted on by the task, since a
+     * storage callback runs on whoever wrote the key. */
+    for (int i = 0; i < kNumRadios; i++) {
+        char kb[48];
+        storageSubscribeChanges(sk(kb, sizeof kb, i, "SUPE.enable"),
+                                ON_CHANGE { (void)key; (void)val; s_supeEnDirty = true; });
+    }
+#endif
 
     /* Construct radio + HAL per slot. The shared SPI bus is brought up
      * idempotently by spi_helper (EspIdfHal::init), so every radio adds
@@ -957,13 +980,46 @@ static void loraTaskMain(void*) {
             /* A long stay on one channel is drawn as it accrues rather than
              * only when it ends, so a viewer opened mid-session sees where the
              * radio is now and not a lane that fills in later. Radio task, like
-             * every other writer of dwellSince. */
-            if (loraMonOpen() && r->mon.dwellSince &&
-                (uint32_t)(millis() - r->mon.dwellSince) >= 500u)
-                loraMonDwell(r, millis());
+             * every other writer of dwellSince.
+             *
+             * The watch edge is taken here for the same reason. A window that
+             * has just opened must start recording the stay the radio is ALREADY
+             * on — waiting for the next retune leaves the lane veiled until
+             * something happens to move the radio, so the background appears to
+             * begin at the first traffic rather than at the moment the viewer
+             * opened. Dropping the anchor on the edge is what makes the first
+             * span start at the window rather than reach back before it. */
+            {
+                bool watched = loraMonOpen();
+                if (watched != r->mon.dwellWatched) {
+                    r->mon.dwellWatched = watched;
+                    r->mon.dwellSince = 0;
+                }
+                if (watched && (!r->mon.dwellSince ||
+                                (uint32_t)(millis() - r->mon.dwellSince) >= 500u))
+                    loraMonDwell(r, millis());
+            }
             manualTxPoll(r);    /* CLI tx/tx_psa/tx_prot; holds the radio while active */
             agcResetPoll(r);    /* front-end recalibration; skips a busy radio */
 #if !defined(CONFIG_LORA_NO_SUPE)
+            /* The enable switch, applied where it is read. Nothing about the
+             * modem changes — only whether this node speaks — so the radio
+             * stays on the air, and the announcement goes out at once so the
+             * neighbourhood is told rather than left to infer it. */
+            if (s_supeEnDirty) {
+                s_supeEnDirty = false;
+                for (int k = 0; k < kNumRadios; k++) {
+                    LoraRadio* rr = &s_radios[k];
+                    char kb[48];
+                    bool want = storageGetInt(
+                        sk(kb, sizeof kb, rr->idx, "SUPE.enable"), 0) != 0;
+                    if (!supeMounted(rr) || want == rr->supeOn) continue;
+                    rr->supeOn = want;
+                    info("lora/%d SUPE %s — announcing it", rr->idx,
+                         want ? "enabled" : "disabled");
+                    supeAnnArm(rr);
+                }
+            }
             supePoll(r);        /* the SUPE beat and the offer's channel access */
 #endif
             drainOneOutbound(r);
@@ -1149,13 +1205,11 @@ void LoraService::onInit() {
             storageDefault(sk(kb, sizeof kb, i, "coding_rate"), 5);        /* 4/5 */
             storageDefault(sk(kb, sizeof kb, i, "preamble"), 12);
             storageDefault(sk(kb, sizeof kb, i, "sync_word"), "0x42");
-            storageDefault(sk(kb, sizeof kb, i, "adaptive_txpwr"), 1);
         }
-        /* Adaptive power under the SUPE prefix was one switch over both the
-         * measured tiers and the estimate. The measured ones answer to the air
-         * protocol now and nothing else, so what is left is a different setting
-         * with a different meaning and the old value would be a wrong answer to
-         * a question nobody asked — the key goes, and the estimate starts on. */
+        /* Transmit power is not a switch: every power this node derives rests on
+         * one the PEER stated, which only a SUPE node ever does, so there is
+         * nothing for a setting to govern. The key goes rather than sitting in
+         * storage answering a question nobody asks. */
         for (int i = 0; i < kNumRadios; i++)
             storageDeleteTree(sk(kb, sizeof kb, i, "SUPE.adaptive_txpower"));
         storageSet("s.lora.version", LORA_VERSION);
@@ -1216,6 +1270,56 @@ bool loraPeerSummary(int radio, lora_peer_summary* out) {
     return true;
 }
 
+static int tagHexVal(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+void loraNameForTag(int radio, const char* tag, char* out, size_t outLen) {
+    if (!out || outLen == 0) return;
+    out[0] = '\0';
+    if (radio < 0 || radio >= kNumRadios || !tag) return;
+    /* Six hex characters to three bytes. Anything else is not a tag, and
+     * guessing at a malformed one would answer with somebody's name. */
+    uint8_t want[3];
+    for (int i = 0; i < 3; i++) {
+        int hi = tagHexVal(tag[i * 2]), lo = tagHexVal(tag[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return;
+        want[i] = (uint8_t)((hi << 4) | lo);
+    }
+    if (tag[6]) return;
+    NeiState* st = s_radios[radio].nei;
+    if (!st) return;
+    /* The same set of prefixes that resolves an address to a node — a
+     * destination, a link it opened, the identity behind either, or the bare
+     * node key a SUPE announcement left. */
+    int num = 0;
+    for (int k = 0; k < NEI_MAX; k++) {
+        Neighbor* e = &st->nei[k];
+        if (!e->used || peersIsLocal(e)) continue;
+        num++;                              /* counted as `lora n` counts */
+        bool hit = e->haveNode4 && memcmp(e->node4, want, 3) == 0;
+        for (int d = 0; d < e->nDests && !hit; d++)
+            if (memcmp(e->dests[d].hash, want, 3) == 0) hit = true;
+        for (int l = 0; !hit; l++) {
+            uint8_t h4[4];
+            if (!peersHashAt(st, e, l, h4)) break;
+            if (memcmp(h4, want, 3) == 0) hit = true;
+        }
+        for (int q = 0; q < e->nIds && !hit; q++)
+            if (memcmp(e->ids[q], want, 3) == 0) hit = true;
+        if (!hit) continue;
+        peersNodeNames(e, out, outLen);
+        /* A node nobody has named is still a node you can refer to: the number
+         * `lora n` prints beside it. The two surfaces then agree, so a bar on
+         * the graph and a line in the console are recognisably the same peer. */
+        if (!out[0]) snprintf(out, outLen, "#%d", num);
+        return;
+    }
+}
+
 #else  /* ── no radios configured (CONFIG_LORA_COUNT = 0) ── */
 
 void LoraService::onInit() {
@@ -1224,5 +1328,8 @@ void LoraService::onInit() {
 }
 
 bool loraPeerSummary(int, lora_peer_summary*) { return false; }
+void loraNameForTag(int, const char*, char* out, size_t outLen) {
+    if (out && outLen) out[0] = '\0';
+}
 
 #endif

@@ -84,8 +84,11 @@ static void manualTxProt(LoraRadio* r) {
      * next serviceRadio pass can't mistake it for a queued frame's completion. */
     r->radio->finishTransmit();
 
+    /* Addressed at nobody — a bare header with a body that is never heard — so
+     * it records as a broadcast, which is what "no addressee" means on the air. */
     loraMonPush(r, 1 /*tx*/, r->txFrameStartMs, hdrMs,
-                (uint16_t)bestL, 0, 0, r->cfgTxp, LORA_PKT_OURS, 0, 0);
+                (uint16_t)bestL, 0, 0, r->cfgTxp, LORA_PKT_OURS, 0, 0,
+                LMD_NONE, nullptr, LMC_BCAST);
     appcAddAirtime(r, hdrMs);
     r->txFrames++;
 
@@ -316,11 +319,18 @@ static void cliPrintNode(Neighbor* e, int num, void* ud) {
             first = false;
         }
     }
-    /* Hashes a peer linked to this node that we have never heard directly. */
-    for (int l = 0; l < e->nLink4; l++) {
-        cliPrintf("  %-5s%02x%02x%02x%02x........................ (not seen yet)\n",
-                  first ? lbl : "",
-                  e->link4[l][0], e->link4[l][1], e->link4[l][2], e->link4[l][3]);
+    /* Hashes a linkage frame said mean this node — a link identifier above all
+     * — which we have never heard announced. Only the first four bytes were
+     * ever on the air, hence the ellipsis. A timed-out one is still listed:
+     * nothing announces a link ending, so silence is all we have, and the row
+     * stays because a frame from an hour ago still resolves through it. */
+    for (int l = 0; ; l++) {
+        uint8_t h4[4];
+        if (!peersHashAt(c->r->nei, e, l, h4)) break;
+        NeiHash* h = peersHashFind(c->r->nei, h4, 4);
+        cliPrintf("  %-5s%02x%02x%02x%02x........................ (link%s)\n",
+                  first ? lbl : "", h4[0], h4[1], h4[2], h4[3],
+                  h && h->timedOut ? ", timed out" : "");
         first = false;
     }
     if (first) {   /* nothing but a bare node key */
@@ -331,12 +341,48 @@ static void cliPrintNode(Neighbor* e, int num, void* ud) {
             cliPrintf("  %-5s(no hash seen)\n", lbl);
     }
 
+    /* The identity prefixes this node answers to, for a SUPE node only — what
+     * turns a SUPE log line back into a node with a name. Only for a SUPE node:
+     * for anyone else these name a protocol they do not speak, and printing
+     * them would be noise on every row. */
+#if !defined(CONFIG_LORA_NO_SUPE)
+    if (!peersIsLocal(e) && e->supeSeen) {
+        /* Only what cannot already be read off the block above: a destination's
+         * tag IS the first six characters of the hash printed there, and a link
+         * gets a line of its own. What is left is the identities, which appear
+         * nowhere else and are what a PRIVSYNC names its SENDER by.
+         *
+         * Labelled `ident` rather than `tags` because it is not one. A TAG is an
+         * address prefix — a destination hash or a link id — since that is what
+         * a packet carries and what the protocol classifies on. An IDENT names
+         * the node itself, and a caller uses it because its own addresses are
+         * plural and it cannot know which of them the far end has heard. */
+        uint8_t tg[NEI_IDS_MAX + 1][3];
+        int ni = 0;
+        auto known = [&](const uint8_t* b) {
+            for (int i2 = 0; i2 < ni; i2++)
+                if (memcmp(tg[i2], b, 3) == 0) return true;
+            for (int d = 0; d < e->nDests; d++)
+                if (memcmp(e->dests[d].hash, b, 3) == 0) return true;
+            return false;
+        };
+        if (e->haveNode4 && !known(e->node4)) memcpy(tg[ni++], e->node4, 3);
+        for (int k = 0; k < e->nIds && ni < (int)(sizeof tg / sizeof tg[0]); k++)
+            if (!known(e->ids[k])) memcpy(tg[ni++], e->ids[k], 3);
+        if (ni) {
+            cliPrintf("  %-5sident", "");
+            for (int i2 = 0; i2 < ni; i2++)
+                cliPrintf(" %02x%02x%02x", tg[i2][0], tg[i2][1], tg[i2][2]);
+            cliPrintf("\n");
+        }
+    }
+#endif
+
     if (!peersIsLocal(e)) {
         /* Capability line. TRANSPORT means it forwards for others; ROAMING is
          * its node-flags bit; the mesh tag that it speaks our air protocol; TX
-         * the power a probe settled on for it; EST the reciprocity estimate;
-         * WALK how many dB of that estimate the EST tier has been paid for in
-         * frames heard so far; USE the power we last transmitted to it at. */
+         * the power a probe settled on for it; EST what we would ask IT to
+         * transmit at; USE the power we last transmitted to it at. */
         char f[128];
         int o = 0;
         auto add = [&](const char* t) {
@@ -369,28 +415,28 @@ static void cliPrintNode(Neighbor* e, int num, void* ud) {
             add(t);
         } else if (e->ourProto) add(RF_PROTO_NAME);
 #endif
+        /* What we would ask this node to transmit at — the power request's own
+         * number. Only for a node that speaks our protocol, since that is the
+         * only node the request is ever sent to; against anyone else it would
+         * be an estimate driving nothing. */
         int est10;
-        if (peersEstimateCliff10(c->r, e, c->now, &est10, nullptr, nullptr)) {
+        if (e->ourProto &&
+            peersEstimateCliff10(c->r, e, c->now, &est10, nullptr, nullptr)) {
             char t[24];
             snprintf(t, sizeof t, "EST %.0f", (double)est10 / 10.0);
             add(t);
         }
-        if (e->apEstWalkDb > 0) {
-            char t[16];
-            snprintf(t, sizeof t, "WALK %d", (int)e->apEstWalkDb);
-            add(t);
-        }
         /* USE is the power the last frame to this node went out at, and the
-         * tildes say how much of it was guessed: none for the peer's own report
+         * tilde says how much of it was guessed: none for the peer's own report
          * of what it heard from us, one for a path loss measured the other way
-         * round, two for a reciprocity estimate against a power nobody stated.
-         * Absent means the node is being transmitted to at the configured
-         * power — no evidence, or none of it recent enough. */
+         * round and assumed reciprocal. Absent means the node is being
+         * transmitted to at the configured power — no evidence, none of it
+         * recent enough, or a node that does not speak the protocol and so
+         * never states a power to derive one from. */
         if (e->apSrc != AP_SRC_NONE) {
             char t[16];
-            const char* mark = e->apSrc == AP_SRC_REPORT ? ""
-                             : e->apSrc == AP_SRC_PAIR   ? "~" : "~~";
-            snprintf(t, sizeof t, "USE %s%d", mark, (int)e->apPwr);
+            snprintf(t, sizeof t, "USE %s%d",
+                     e->apSrc == AP_SRC_REPORT ? "" : "~", (int)e->apPwr);
             add(t);
         }
         if (o) cliPrintf("       ( %s )\n", f);
@@ -412,7 +458,8 @@ static void cliPrintNode(Neighbor* e, int num, void* ud) {
                       (unsigned)e->quality, (unsigned)e->qProved, (unsigned)e->qSent,
                       e->provesData ? "  proves-data" : "");
         if (e->haveAdv)
-            cliPrintf("       hashes %d/%u\n", peersKnownHashes(e), (unsigned)e->advHashes);
+            cliPrintf("       hashes %d/%u\n", peersKnownHashes(c->r->nei, e),
+                      (unsigned)e->advHashes);
         uint32_t absNow = c->now / NEI_BUCKET_MS;
         uint32_t cnt = 0; int64_t rs = 0, ss = 0;
         for (int b = 0; b < NEI_BUCKETS; b++) {
@@ -525,12 +572,35 @@ static void cliSupe(int idx, const char* sub, const char* arg) {
     LoraRadio* r = &s_radios[idx];
     SupeState* st = r->supe;
 
+    /* `lora [<n>] supe enable|disable` — the setting, not a runtime toggle, so
+     * it survives a reboot and reads the same in the settings pane. The radio
+     * watches the key: flipping it re-announces at once, which is what tells
+     * the neighbourhood to start or stop meeting this node rather than leaving
+     * them to discover it by silence. */
+    if (sub && (cliVerbIs(sub, "enable", 1) || cliVerbIs(sub, "disable", 1))) {
+        bool on = cliVerbIs(sub, "enable", 1);
+        char kb2[48];
+        storageSet(sk(kb2, sizeof kb2, idx, "SUPE.enable"), on ? 1 : 0);
+        cliPrintf("lora/%d SUPE.enable = %d — %s\n", idx, on ? 1 : 0,
+                  on ? "this node speaks SUPE"
+                     : "this node does NOT speak SUPE");
+        /* Unconditionally, and everything — not only the SUPE frame. A neighbour
+         * that has this node wrong is wrong about more than one bit: it may hold
+         * no destination for us at all, and a SUPE announcement alone names
+         * identities without saying what is reachable behind them. Running the
+         * whole replay is also why repeating the command is useful rather than
+         * idempotent — the second one is how you answer "did it hear me?". */
+        supeAnnArm(r);      /* certain, even if nothing else is buffered to replay */
+        cliAnnounce(idx);
+        return;
+    }
+
     if (sub && strcmp(sub, "rx") == 0) {
         if (!arg || !*arg) { cliPrintf("usage: lora %d supe rx <hex>\n", idx); return; }
         uint8_t f[SUPE_MAX_FRAME];
         int n = cliParseBytes(arg, f, sizeof f);
         if (n <= 0) { cliPrintf("bad hex\n"); return; }
-        if (!supeReady(r)) { cliPrintf("SUPE is not enabled on lora/%d\n", idx); return; }
+        if (!supeMounted(r)) { cliPrintf("SUPE is not running on lora/%d\n", idx); return; }
         /* A plausible level and signal-to-noise, so anything the frame feeds —
          * a path-loss pair, a capability row — lands with a believable pair
          * behind it rather than with zero. */
@@ -610,7 +680,7 @@ static void cliSupe(int idx, const char* sub, const char* arg) {
         if (!s->used) continue;
         cliPrintf("  schedule    %02x%02x%02x %s, %u slots, next %u, we tx %s%s\n",
                   s->d.hash3[0], s->d.hash3[1], s->d.hash3[2],
-                  s->wide ? "wide" : "tight", (unsigned)s->d.nSlots,
+                  s->wide ? "wide" : "narrow", (unsigned)s->d.nSlots,
                   (unsigned)s->nextSlot, s->weTx0 ? "even" : "odd",
                   s->weSeeded ? " (our seed)" : "");
     }
@@ -809,6 +879,7 @@ void cliLora(const char* args) {
         cliPrintf("%-*s emit a header committing receivers for <ms> (4/8)\n", CLI_HELP_COL, "lora <n> tx_prot <ms>");
 #if !defined(CONFIG_LORA_NO_SUPE)
         cliPrintf("%-*s SUPE state: regime, expiry, tag set, schedules, counters\n", CLI_HELP_COL, "lora [<n>] supe");
+        cliPrintf("%-*s speak SUPE here, or stop — announces the change\n", CLI_HELP_COL, "lora [<n>] s[upe] e[nable]|d[isable]");
         cliPrintf("%-*s inject a golden-vector frame into the receive path\n", CLI_HELP_COL, "lora [<n>] supe rx 0x<hex>");
 #endif
         return;
@@ -820,7 +891,7 @@ void cliLora(const char* args) {
     }
     if (cliVerbIs(tok[0], "announce", 1)) { cliAnnounce(0); return; }   /* no index → radio 0 */
 #if !defined(CONFIG_LORA_NO_SUPE)
-    if (cliVerbIs(tok[0], "supe", 4)) {                       /* likewise */
+    if (cliVerbIs(tok[0], "supe", 1)) {                       /* likewise */
         cliSupe(0, nt > 1 ? tok[1] : nullptr, cliRest(args, 2));
         return;
     }
@@ -866,7 +937,7 @@ void cliLora(const char* args) {
      * tokeniser holds four and truncates at 80 characters, and a bundled
      * ANNOUNCE2 vector is longer than that. */
 #if !defined(CONFIG_LORA_NO_SUPE)
-    if (cliVerbIs(cmd, "supe", 4)) {
+    if (cliVerbIs(cmd, "supe", 1)) {
         cliSupe((int)idx, nt > 2 ? tok[2] : nullptr, cliRest(args, 3));
         return;
     }

@@ -244,6 +244,28 @@ struct LoraRadio {
     bool            splitPending;
     TickType_t      splitDeadline;
 
+    /* LoRaMon's OWN view of split framing, one per direction, and it cannot be
+     * the reassembly state above.
+     *
+     * A train's frames are buffered by the meeting and reassembled only at its
+     * close, so at RECORD time nothing above has advanced — and a train's tail
+     * would be read as carrying a header when its second byte is payload. That
+     * is not a near miss: `f[1] & 0x03` on arbitrary bytes yields a confident
+     * packet type, so a 467-byte transfer records as "data" followed by
+     * "announce", and trains are most of the traffic. Transmit has the same
+     * problem from the other end — train_fire stages every frame as txFrame[0],
+     * so the completion index cannot say which half it holds either.
+     *
+     * The record stream therefore tracks itself, by the same seq/timeout rule
+     * reassembly uses. Radio task, like everything else that writes a record. */
+    struct MonSplit {
+        bool     pend;
+        uint8_t  seq;               /* the pending head's seq nibble */
+        uint32_t atMs;
+        uint8_t  tag[3];            /* the head's address, which speaks for both */
+        uint8_t  desc;              /* and what the head said the packet is */
+    } monSplit[2];                  /* [0] receive, [1] transmit */
+
     /* CSMA / listen-before-talk. slotTicks/difsTicks derive from the LoRa
      * symbol time at config; the phase machine is driven from the task loop. */
     bool            lbt;             /* carrier-sense enabled (s.lora.<i>.lbt) */
@@ -404,10 +426,9 @@ struct LoraRadio {
     bool            supeNameSender;  /* s.lora.<i>.SUPE.sender_ident */
 #endif
 
-    /* Adaptive TX power (overview at AP_FRESH_MS, in lora_power.h). */
-    bool            adaptive;        /* s.lora.<i>.adaptive_txpwr — the EST tier
-                                      * alone; every measured tier is the air
-                                      * protocol's and runs regardless */
+    /* Adaptive TX power (overview at AP_FRESH_MS, in lora_power.h). No switch:
+     * every power derived rests on one the PEER stated, which only a SUPE node
+     * ever does, so outside the protocol there is nothing to govern. */
     /* A 0x04 power request just received, awaiting the frame it prefixes. The
      * frame carries no binding field — it binds by adjacency alone — so this is
      * consumed or discarded by the very next rx frame, never held. */

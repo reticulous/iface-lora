@@ -8,11 +8,15 @@
  *   right edge, carrying both directions: each frame is a bar spanning its
  *   time-on-air, placed at its power on one of two dBm axes over the same four
  *   bands — transmit −10…+30 dBm down the left gutter in 10 dB steps, receive
- *   −130…−30 dBm down the right in 25 dB. Behind a transmit the bands are cast
- *   red, over its time-on-air only, so which direction a bar belongs to is
- *   legible without asking the colour: colour is the frame's PROTOCOL —
- *   Reticulum traffic yellow, the RNode client's orange, this straddle's own
- *   air protocol, SUPE (BATCH, sweep, power requests) red.
+ *   −128…0 dBm down the right in 32 dB. Colour is direction and audience: red
+ *   is what this radio put on the air, blue what arrived, light for a broadcast
+ *   anyone may read and dark for a frame with one addressee. Grey is somebody
+ *   else's unicast — on the air, but not our conversation — and purple a frame
+ *   whose CRC failed, which is neither, since nothing in it was readable.
+ *
+ *   Touching a frame prints what it is and who it was with along the top of the
+ *   plot; the hit test runs across every channel lane at that instant, so a
+ *   train is inspectable wherever it is on screen.
  *
  *   Touching the graph starts a highlighted span at that instant. Because the
  *   anchor is a *time*, not a pixel, holding still on a live graph widens the
@@ -27,8 +31,9 @@
  *   active.
  *
  * Source of truth is storage: the firmware publishes one node per frame at
- * `lora.<n>.packets.<ms>` = "r|rssi|snr|dur|bytes|type" (rx) /
- * "t|txp|dur|bytes|type|wait" (tx), and deletes them past 1 h. We rebuild our view
+ * `lora.<n>.packets.<ms>` = "r|rssi|snr|dur|bytes|type|ch|desc|cast[|tag]" (rx)
+ * / "t|txp|dur|bytes|type|wait|ch|own|desc|cast[|tag]" (tx) / "a|ch|dur" (a
+ * dwell — where the radio was), and deletes them past 1 h. We rebuild our view
  * by iterating that subtree each redraw (so expiry — which doesn't fire
  * subscribe callbacks — is handled), and setting `sys.stats.lcd_loramon` tells
  * the firmware to record while we're up. The caption's two figures — what we
@@ -42,6 +47,7 @@
 #include "loramon_app.h"
 
 #include "storage.h"
+#include "lora.h"     /* loraNameForTag — the peer table, not a published copy */
 #include "compat.h"     /* millis() */
 
 #include <esp_heap_caps.h>
@@ -60,10 +66,10 @@ constexpr int GUT_R = 30;         /* right scale gutter (rx dBm) — four digits
 /* The agile-channel strips under the hailing plot. Small by design: on this
  * screen a lane's job is to say *when* the radio was there and whether anything
  * landed, not to be read for dBm — the main plot carries the scale. Below
- * LORAMON_MAIN_MIN_H the hailing bands stop being legible, so strips are
- * dropped from the bottom until it fits rather than squeezing everything. */
+ * LORAMON_LANE_MIN_H a strip stops saying anything, so strips are dropped from
+ * the bottom until the rest fit rather than squeezing everything. */
 constexpr int LORAMON_LANE_H     = 7;    /* one agile strip, px */
-constexpr int LORAMON_MAIN_MIN_H = 60;   /* the hailing plot never shrinks past this */
+constexpr int LORAMON_LANE_MIN_H  = 6;   /* below this a strip says nothing legible */
 constexpr int LORAMON_MAX_LANES  = 9;    /* the largest regime's agile set */
 constexpr int LORAMON_LANE_PX    = 400;  /* widest plot the attendance mask covers */
 constexpr int MON_MAX = 4096;     /* max packets held for a redraw (matches fw cap) */
@@ -104,28 +110,54 @@ constexpr Axis AX_RX = { -128, 0 };
 /* dir: 0 rx, 1 tx, 2 a DWELL — the radio was tuned to `ch` and listening for
  * `dur`. A dwell carries no level and is never drawn as a bar; it is what tells
  * a lane the radio was watching from a lane it had left. */
-struct Rec { uint32_t t; uint8_t dir; uint32_t dur; uint32_t bytes; int rssi; int txp; uint8_t type; uint32_t wait; uint8_t ch; };
+struct Rec { uint32_t t; uint8_t dir; uint32_t dur; uint32_t bytes; int rssi; int txp; uint8_t type; uint32_t wait; uint8_t ch; uint8_t desc; uint8_t cast; char tag[7]; };
 
-/* A record's protocol class, as the firmware writes it into the packed string
- * (lora.cpp's LORA_PKT_*). Colour is the protocol, not the direction —
- * direction is already the graph you are looking at. */
-constexpr uint8_t PKT_RNS   = 0;   /* Reticulum traffic (yellow) */
-constexpr uint8_t PKT_OURS  = 1;   /* our own air protocol (red) */
-constexpr uint8_t PKT_RNODE = 2;   /* the attached RNode client (orange) */
+/* What a frame is, by the code the device writes into the record — the same
+ * table the browser keeps, kept short because this one is read on a strip of
+ * screen a few characters wide. Codes are appended to, never renumbered. */
+static const char* const kDesc[] = {
+    "", "PRIVSYNC", "ANNOUNCE2", "HAVEDATA", "GIMME", "THATSIT", "BYE",
+    "RESEND", "data", "announce", "link req", "proof", "split", "RNode",
+};
+static const char* descOf(uint8_t d) {
+    return d < (uint8_t)(sizeof kDesc / sizeof kDesc[0]) ? kDesc[d] : "";
+}
 
-uint16_t C_RNS, C_OURS, C_RNODE, C_BLACK, C_SEL, C_SELEDGE, C_GRID;
+/* A record's class as the firmware writes it into the packed string: only a
+ * CRC failure is read from it, since colour says direction and audience and a
+ * frame that failed its CRC has neither — nothing in it was readable. */
+constexpr uint8_t PKT_BAD = 3;
+
+/* Who a frame was aimed at, as the device decided it (lora_mon.h's LMC_*). The
+ * screen cannot work this out for itself: it turns on which addresses mean US,
+ * and that lives in the peer table. */
+constexpr uint8_t CAST_BCAST = 0;
+constexpr uint8_t CAST_US    = 1;
+
+uint16_t C_TX_BCAST, C_TX_UNI, C_RX_BCAST, C_RX_US, C_RX_OTHER, C_BAD;
+uint16_t C_BLACK, C_SEL, C_SELEDGE, C_GRID, C_FLOOR, C_BEZEL;
 bool s_colorsReady = false;
 void initColors() {
     if (s_colorsReady) return;
     C_BLACK   = lv_color_to_u16(lv_color_black());
-    C_RNS     = lv_color_to_u16(lv_color_hex(0xE8D040));   /* Reticulum traffic (yellow) */
-    C_OURS    = lv_color_to_u16(lv_color_hex(0xE84040));   /* our air protocol (red) */
-    C_RNODE   = lv_color_to_u16(lv_color_hex(0xE89040));   /* the RNode client (orange) */
+    /* Red is what we put on the air, blue is what arrived; light is a broadcast
+     * anyone may read, dark a frame with one addressee. Grey is somebody else's
+     * unicast — on the air, but not our conversation. */
+    C_TX_BCAST = lv_color_to_u16(lv_color_hex(0xF08080));
+    C_TX_UNI   = lv_color_to_u16(lv_color_hex(0xB02020));
+    C_RX_BCAST = lv_color_to_u16(lv_color_hex(0x80B8F0));
+    C_RX_US    = lv_color_to_u16(lv_color_hex(0x2060C0));
+    C_RX_OTHER = lv_color_to_u16(lv_color_hex(0x8A8A8A));
+    C_BAD      = lv_color_to_u16(lv_color_hex(0x8050C8));  /* CRC failure */
     C_SEL     = lv_color_to_u16(lv_color_hex(0x4A4A4A));   /* selection wash */
     C_SELEDGE = lv_color_to_u16(lv_color_hex(0xC8C8C8));
     /* The darkest tone of the band gradient, so the timescale reads as part of
      * the background rather than as something drawn over it. */
     C_GRID    = lv_color_to_u16(lv_color_hex(0x242424));
+    C_FLOOR   = lv_color_to_u16(lv_color_hex(0x4A4A4A));   /* the noise-floor line */
+    /* The frame around each lane's plot area. Light enough to stay background,
+     * solid enough to survive a lane with nothing in it. */
+    C_BEZEL   = lv_color_to_u16(lv_color_hex(0x5A5A5A));
     s_colorsReady = true;
 }
 
@@ -140,6 +172,20 @@ struct State {
     lv_obj_t* back = nullptr;
     lv_obj_t* zoomLbl = nullptr;    /* span + timescale, beside the back pill */
     lv_obj_t* cap = nullptr;
+    /* Floating labels over the canvas: the noise floor's figure sitting on its
+     * line, the description of whatever frame was last tapped, and a small pool
+     * naming the peer above a run of frames. Labels rather than pixels because
+     * this canvas has no glyph blitter, and adding one to print a few short
+     * strings would be the wrong trade.
+     *
+     * The pool is fixed and small on purpose. A run has to be wide enough to
+     * hold its own name before it gets one, so a view showing more than a
+     * handful of nameable runs is one where they would be shoulder to shoulder
+     * and unreadable anyway; the widest get the labels. */
+    lv_obj_t* nfLbl = nullptr;
+    lv_obj_t* insLbl = nullptr;
+    static constexpr int TRAIN_LBL_MAX = 4;
+    lv_obj_t* trainLbl[TRAIN_LBL_MAX] = {};
     uint16_t* buf = nullptr;
     Rec*      recs = nullptr;
     int       n = 0;                /* records in `recs` this redraw */
@@ -155,6 +201,22 @@ struct State {
     /* Selection in progress, held as times so a still finger still widens it. */
     bool      selActive = false;
     uint32_t  selAnchor = 0, selCur = 0;
+    /* The hailing channel's recent readings, for the noise floor. A minute at
+     * the publish beat is a handful of points, so a small ring is the whole
+     * store — this is a statement about conditions now, not history. */
+    static constexpr int NF_MAX = 96;
+    uint32_t  nfT[NF_MAX] = {};
+    int16_t   nfDbm[NF_MAX] = {};
+    uint8_t   nfN = 0, nfHead = 0;
+    uint32_t  nfLastMs = 0;
+    /* A tap that did not become a zoom leaves this: the instant to describe. */
+    bool      inspect = false;
+    uint32_t  inspectT = 0;
+    /* The name behind the inspected frame's tag, resolved once per tag rather
+     * than per redraw: the answer cannot change while a tap stands, and the
+     * lookup walks a storage subtree. */
+    char      insTag[7] = "";
+    char      insName[40] = "";
     bool      visible = false;
 };
 State s;
@@ -168,39 +230,24 @@ inline void vseg(int x, int yTop, int yBot, uint16_t c) {
 }
 
 /* One row's tone in the band sawtooth: darkest at the band's bottom edge,
- * lightest at its top. `tx` casts the same ramp red, which is how air this
- * radio was holding is marked. */
-inline uint16_t bandTone(int r, int bh, bool tx) {
+ * lightest at its top. */
+inline uint16_t bandTone(int r, int bh) {
     int lvl = 0x31 - ((r % bh) * (0x31 - 0x24)) / bh;
-    return tx ? lv_color_to_u16(lv_color_make(lvl + 0x17, lvl - 1, lvl - 1))
-              : lv_color_to_u16(lv_color_make(lvl, lvl, lvl));
+    return lv_color_to_u16(lv_color_make(lvl, lvl, lvl));
 }
 
-/* Gradient bands filling the plot area between the two gutters. */
+/* Gradient bands filling the plot area between the two gutters. Nothing tints
+ * the field behind a frame: direction lives in the bar's own colour, and
+ * repainting the bands under every transmit to repeat it costs the whole
+ * strip's contrast. The background is one thing. */
 void drawBands(int y0, int h) {
     int bh = h / NBANDS; if (bh < 1) bh = 1;
     for (int r = 0; r < h; r++) {
-        uint16_t gc = bandTone(r, bh, false);
+        uint16_t gc = bandTone(r, bh);
         int y = y0 + r;
         if ((unsigned)y >= (unsigned)s.H) break;
         uint16_t* row = &s.buf[y * s.stridePx];
         for (int x = GUT_L; x < s.W - GUT_R; x++) row[x] = gc;
-    }
-}
-
-/* Repaint one column range in the reddish cast of the same gradient: the frame's
- * time-on-air. The wait before it is channel access, not transmission, so
- * tinting that would claim airtime the radio never spent. */
-void tintTx(int y0, int h, int x0, int x1) {
-    int bh = h / NBANDS; if (bh < 1) bh = 1;
-    if (x0 < GUT_L) x0 = GUT_L;
-    if (x1 > s.W - GUT_R - 1) x1 = s.W - GUT_R - 1;
-    for (int r = 0; r < h; r++) {
-        uint16_t gc = bandTone(r, bh, true);
-        int y = y0 + r;
-        if ((unsigned)y >= (unsigned)s.H) break;
-        uint16_t* row = &s.buf[y * s.stridePx];
-        for (int x = x0; x <= x1; x++) row[x] = gc;
     }
 }
 
@@ -218,10 +265,21 @@ int barHpx(const Rec& r, int h) {
     return hp;
 }
 
-/* The span on screen: the top of the zoom stack, else the live window. */
+/* How far behind "now" the live edge sits. Past the 1 Hz publish beat with room
+ * for the batch a burst is flushed in, so what reaches the right edge is settled
+ * and the graph never corrects itself in front of you: a stay on one channel is
+ * one record that GROWS, so the background would otherwise arrive a step at a
+ * time, and frame records are batched, so a packet would land in a column
+ * already drawn as empty. A second and a half of latency on a plot whose
+ * shortest window is ten seconds is not a cost anybody is watching for. */
+constexpr uint32_t LAG_MS = 1500;
+
+/* The span on screen: the top of the zoom stack, else the live window — which
+ * ends LAG_MS ago, not at `now`. */
 void view(uint32_t now, uint32_t* lo, uint32_t* hi) {
     if (s.nZoom > 0) { *lo = s.zoom[s.nZoom - 1].t0; *hi = s.zoom[s.nZoom - 1].t1; return; }
     uint32_t win = WINS[s.win].ms;
+    now = now > LAG_MS ? now - LAG_MS : 0;
     *hi = now;
     *lo = now > win ? now - win : 0;
 }
@@ -291,22 +349,82 @@ void rebuildCb(const char* key, const char* val) {
     r = Rec{};
     r.t = (uint32_t)strtoul(dot + 1, nullptr, 10);
     if (val[0] == 'r') {
-        int rssi, snr, dur, bytes, type = 0, ch = 0;
-        if (sscanf(val + 2, "%d|%d|%d|%d|%d|%d", &rssi, &snr, &dur, &bytes, &type, &ch) < 4) return;
+        int rssi, snr, dur, bytes, type = 0, ch = 0, desc = 0, cast = 0;
+        char tg[8] = "";
+        if (sscanf(val + 2, "%d|%d|%d|%d|%d|%d|%d|%d|%7s",
+                   &rssi, &snr, &dur, &bytes, &type, &ch, &desc, &cast, tg) < 4) return;
+        safeStrncpy(r.tag, tg, sizeof r.tag);
         r.dir = 0; r.rssi = rssi; r.dur = (uint32_t)dur; r.bytes = (uint32_t)bytes;
-        r.txp = 0; r.type = (uint8_t)type; r.ch = (uint8_t)ch;
+        r.txp = 0; r.type = (uint8_t)type; r.ch = (uint8_t)ch; r.desc = (uint8_t)desc;
+        r.cast = (uint8_t)cast;
     } else if (val[0] == 't') {
-        int txp, dur, bytes, type = 0, wait = 0, ch = 0;
-        if (sscanf(val + 2, "%d|%d|%d|%d|%d|%d", &txp, &dur, &bytes, &type, &wait, &ch) < 3) return;
+        int txp, dur, bytes, type = 0, wait = 0, ch = 0, own = 0, desc = 0, cast = 0;
+        char tg[8] = "";
+        if (sscanf(val + 2, "%d|%d|%d|%d|%d|%d|%d|%d|%d|%7s",
+                   &txp, &dur, &bytes, &type, &wait, &ch, &own, &desc, &cast, tg) < 3) return;
+        safeStrncpy(r.tag, tg, sizeof r.tag);
         r.dir = 1; r.txp = txp; r.dur = (uint32_t)dur; r.bytes = (uint32_t)bytes;
         r.wait = (uint32_t)wait;
-        r.rssi = 0; r.type = (uint8_t)type; r.ch = (uint8_t)ch;
+        r.rssi = 0; r.type = (uint8_t)type; r.ch = (uint8_t)ch; r.desc = (uint8_t)desc;
+        r.cast = (uint8_t)cast;
     } else if (val[0] == 'a') {
         int ch = 0, dur = 0;
         if (sscanf(val + 2, "%d|%d", &ch, &dur) < 2) return;
         r.dir = 2; r.ch = (uint8_t)ch; r.dur = (uint32_t)dur;
     } else return;
     s.n++;
+}
+
+/* The newest channel-RSSI sweep for the hailing channel, appended if it is one
+ * we have not seen. Keyed on the device timestamp leading the value, so a
+ * repeat publish of an unchanged key adds nothing. */
+void pollFloor() {
+    char k[32]; snprintf(k, sizeof k, "lora.%d.rssi", s.radio);
+    char v[24 * 12];
+    storageGetStr(k, v, sizeof v, "");
+    if (!v[0]) return;
+    char* end = nullptr;
+    uint32_t t = (uint32_t)strtoul(v, &end, 10);
+    if (!end || *end != '|' || t == s.nfLastMs) return;
+    s.nfLastMs = t;
+    int dbm = (int)strtol(end + 1, nullptr, 10);      /* field 1 = channel 0 */
+    if (!dbm) return;                                 /* no reading this beat */
+    int slot = (s.nfHead + s.nfN) % State::NF_MAX;
+    if (s.nfN < State::NF_MAX) s.nfN++;
+    else s.nfHead = (uint8_t)((s.nfHead + 1) % State::NF_MAX);
+    s.nfT[slot] = t;
+    s.nfDbm[slot] = (int16_t)dbm;
+}
+
+/* The quietest reading the hailing channel has given in the last minute. A
+ * minute rather than the window on screen, because this describes conditions
+ * now — zooming out to an hour must not turn it into the quietest moment of
+ * that hour — and the quietest rather than a mean, because a mean over a
+ * channel carrying traffic measures the traffic.
+ *
+ * Two kinds of non-reading are dropped, and dropping them is the whole reason
+ * this returns false rather than a number: a floor nobody can vouch for is worse
+ * than none.
+ *   - a zero is a beat that produced no reading at all;
+ *   - anything at the register's weakest rail is the RAIL, not the channel. The
+ *     level is a byte read as −value/2 dBm, so −127.5 is as quiet as it can say,
+ *     and it says that whenever the front end has nothing yet — which is exactly
+ *     the first minutes after a radio comes up. It cannot be a measurement
+ *     either: thermal noise alone is about −123 dBm in 125 kHz before any
+ *     receiver's own noise figure, so no working front end reads below it. */
+constexpr int NOISE_RAIL_DBM = -127;
+bool noiseFloor(int* out) {
+    if (!s.nfN) return false;
+    uint32_t newest = s.nfT[(s.nfHead + s.nfN - 1) % State::NF_MAX];
+    int lo = 0; bool any = false;
+    for (int i = 0; i < s.nfN; i++) {
+        int j = (s.nfHead + i) % State::NF_MAX;
+        if (newest - s.nfT[j] > 60u * 1000) continue;
+        if (!s.nfDbm[j] || s.nfDbm[j] <= NOISE_RAIL_DBM) continue;
+        if (!any || s.nfDbm[j] < lo) { lo = s.nfDbm[j]; any = true; }
+    }
+    if (any) *out = lo;
+    return any;
 }
 
 /* How many channels the regime in force puts up, from `lora.<n>.chans` —
@@ -371,17 +489,6 @@ void drawLane(uint32_t now, int y0, int h, uint8_t ch, bool main) {
             if (!held[x]) vseg(GUT_L + x, y0, bottom, C_BLACK);
     }
 
-    /* Our own air first, so everything else lands on top of it. */
-    for (int i = 0; i < s.n; i++) {
-        const Rec& r = s.recs[i];
-        if (r.dir != 1 || r.ch != ch) continue;
-        uint32_t st = r.t, en = r.t + r.dur;
-        if (en < lo || st > hi) continue;
-        uint32_t cs = st > lo ? st - lo : 0;
-        uint32_t ce = (en < hi ? en : hi) - lo;
-        tintTx(y0, h, GUT_L + (int)((uint64_t)cs * plotW / win),
-                      GUT_L + (int)((uint64_t)ce * plotW / win));
-    }
     /* Frozen view only: a live one slides, and a grid on absolute time would
      * crawl across it. Lines land on round multiples of the step and go down
      * first, so a bar always wins the pixels it shares with one. */
@@ -406,8 +513,10 @@ void drawLane(uint32_t now, int y0, int h, uint8_t ch, bool main) {
         if (xe > xmax) xe = xmax;
         if (xe < xs) xe = xs;
         int hp = barHpx(r, h);
-        uint16_t col = r.type == PKT_RNODE ? C_RNODE
-                     : r.type == PKT_OURS  ? C_OURS : C_RNS;
+        uint16_t col = r.type == PKT_BAD          ? C_BAD
+                     : r.dir == 1                 ? (r.cast == CAST_BCAST ? C_TX_BCAST : C_TX_UNI)
+                     : r.cast == CAST_BCAST       ? C_RX_BCAST
+                     : r.cast == CAST_US          ? C_RX_US : C_RX_OTHER;
         /* Never thinner than two pixels: on an agile strip the proportional
          * term falls below one, and a frame that rounds away is a frame the
          * graph is lying about. */
@@ -447,7 +556,124 @@ void drawLane(uint32_t now, int y0, int h, uint8_t ch, bool main) {
         vseg(xa, y0, bottom, C_SELEDGE);
         vseg(xb, y0, bottom, C_SELEDGE);
     }
+
     (void)main;
+}
+
+/* The lane's own outline, drawn over everything it encloses so nothing can eat
+ * an edge. A lane the radio never visited is veiled end to end and has no
+ * traffic to give it shape, so without this it is a rectangle of dark against a
+ * dark screen — indistinguishable from the gap between two lanes, and from no
+ * lane at all. The bezel is what says a graph is there and empty rather than
+ * absent, which is exactly the case drawLane returns early on: the caller draws
+ * it, so an empty lane gets its frame whether or not there was anything to
+ * plot. */
+void drawBezel(int y0, int h) {
+    if (h < 2) return;
+    int bottom = y0 + h - 1, xl = GUT_L, xr = s.W - GUT_R - 1;
+    if (xr <= xl) return;
+    for (int x = xl; x <= xr; x++) { px(x, y0, C_BEZEL); px(x, bottom, C_BEZEL); }
+    vseg(xl, y0, bottom, C_BEZEL);
+    vseg(xr, y0, bottom, C_BEZEL);
+}
+
+/* Who a run of frames was with, named once above the run.
+ *
+ * Every frame of a SUPE train carries the same tag, and a single frame on the
+ * hailing channel is that run at length one — so one rule covers both. Frames
+ * on a lane sharing a tag are one run; a gap longer than the widest schedule
+ * spacing ends it, because past that they are two conversations that happened
+ * to be with the same node.
+ *
+ * The pill sits BESIDE the run — level with its top, a few pixels off its right
+ * end — and never over it. Centred, its offset from the frames it names changes
+ * with the run's width, so the same train's label lands somewhere different
+ * every time the view moves; anchored to one end it stays put.
+ *
+ * A run is named only where it is at least as wide as the name and the pill has
+ * room before the right gutter, so the labels come and go as the view zooms: at
+ * a width where the text would dwarf what it labels, it is pointing at the wrong
+ * traffic. With more nameable runs than labels the widest win — the rest are
+ * shoulder to shoulder at that zoom and would be unreadable regardless.
+ *
+ * Just past the widest slot spacing a schedule ever asks for, so a train stays
+ * whole across its longest legitimate gap. */
+constexpr uint32_t TRAIN_GAP_MS = 400;
+/* Pill geometry, shared with the noise floor's figure: one style for every note
+ * stuck on the graph. The character width is the 8 px mono face's, measured
+ * here rather than through LVGL, which would mean creating a label per
+ * candidate before knowing which candidates win. */
+constexpr int PILL_CH_W  = 5;
+constexpr int PILL_PAD   = 6;   /* the pill's own horizontal padding, both sides */
+constexpr int PILL_GAP   = 4;   /* between the pill and whatever it sits beside */
+
+struct TrainPill { int x0, x1, y; char name[24]; };
+
+void drawTrainPills(uint32_t now, int nAgile, int mainH, int laneH) {
+    uint32_t lo, hi; view(now, &lo, &hi);
+    TrainPill best[State::TRAIN_LBL_MAX];
+    int nBest = 0;
+    /* One lane at a time, and inside a lane in time order: the records arrive in
+     * whatever order the storage subtree walks, and a run is an ordering fact.
+     * Sorting an index rather than the records keeps this to a few dozen
+     * two-byte swaps instead of moving the record array around in PSRAM. */
+    static constexpr int IDX_MAX = 256;
+    int16_t idx[IDX_MAX];
+    for (int ch = 0; ch <= nAgile; ch++) {
+        int y = ch == 0 ? s.plotY : s.plotY + mainH + (ch - 1) * laneH;
+        int ni = 0;
+        for (int i = 0; i < s.n && ni < IDX_MAX; i++) {
+            const Rec& r = s.recs[i];
+            if (r.dir == 2 || r.ch != ch || !r.tag[0]) continue;
+            if (r.t + r.dur < lo || r.t > hi) continue;
+            int j = ni++;
+            while (j > 0 && s.recs[idx[j - 1]].t > r.t) { idx[j] = idx[j - 1]; j--; }
+            idx[j] = (int16_t)i;
+        }
+        const char* runTag = nullptr;
+        int x0 = 0, x1 = 0;
+        uint32_t endMs = 0;
+        auto flush = [&]() {
+            if (!runTag) return;
+            const char* tag = runTag;
+            runTag = nullptr;
+            /* The name, not the tag, decides the fit: it is what gets drawn, and
+             * a six-character measurement would let a long name spill past the
+             * frames it belongs to. */
+            TrainPill p{ x0, x1, y, "" };
+            loraNameForTag(s.radio, tag, p.name, sizeof p.name);
+            if (!p.name[0]) safeStrncpy(p.name, tag, sizeof p.name);
+            int wpx = (int)strlen(p.name) * PILL_CH_W + PILL_PAD * 2;
+            if (x1 - x0 < wpx) return;
+            if (x1 + PILL_GAP + wpx > s.W - GUT_R) return;   /* no room beside it */
+            /* Widest wins: keep the pool sorted by width, drop the narrowest
+             * once it is full. */
+            int at = nBest;
+            while (at > 0 && (best[at - 1].x1 - best[at - 1].x0) < (x1 - x0)) at--;
+            if (at >= State::TRAIN_LBL_MAX) return;
+            int last = nBest < State::TRAIN_LBL_MAX ? nBest : State::TRAIN_LBL_MAX - 1;
+            for (int k = last; k > at; k--) best[k] = best[k - 1];
+            best[at] = p;
+            if (nBest < State::TRAIN_LBL_MAX) nBest++;
+        };
+        for (int k = 0; k < ni; k++) {
+            const Rec& r = s.recs[idx[k]];
+            if (!runTag || strcmp(r.tag, runTag) != 0 ||
+                (r.t > endMs && r.t - endMs > TRAIN_GAP_MS)) {
+                flush();
+                runTag = r.tag; x0 = xAtTime(lo, hi, r.t);
+            }
+            x1 = xAtTime(lo, hi, r.t + r.dur); endMs = r.t + r.dur;
+        }
+        flush();
+    }
+    for (int i = 0; i < State::TRAIN_LBL_MAX; i++) {
+        if (i >= nBest) { lv_obj_add_flag(s.trainLbl[i], LV_OBJ_FLAG_HIDDEN); continue; }
+        lv_label_set_text(s.trainLbl[i], best[i].name);
+        lv_obj_align(s.trainLbl[i], LV_ALIGN_TOP_LEFT,
+                     best[i].x1 + PILL_GAP, best[i].y + 1);
+        lv_obj_clear_flag(s.trainLbl[i], LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 /* The hailing plot, then one strip per agile channel of the regime in force. */
@@ -457,12 +683,107 @@ void drawGraph(uint32_t now) {
     /* The strips take a fixed slice each and the hailing plot keeps the rest,
      * with a floor under it: below that the bands stop being readable and a
      * stack of unreadable lanes is worse than no lanes. */
-    int laneH = nAgile ? LORAMON_LANE_H : 0;
-    while (nAgile && s.plotH - nAgile * laneH < LORAMON_MAIN_MIN_H) nAgile--;
-    int mainH = s.plotH - nAgile * laneH;
+    /* The hailing plot is TWICE a strip — no more. It carries the same kind of
+     * information as its neighbours, and a lane many times their height says it
+     * matters many times as much, which is not what a monitor is for. So the
+     * plot divides into (agile + 2) equal parts and hailing takes two of them;
+     * lanes are dropped from the bottom only when a strip would fall below
+     * legibility, not to keep hailing large. */
+    int nLanes = nAgile + 2;
+    while (nAgile && s.plotH / (nAgile + 2) < LORAMON_LANE_MIN_H) { nAgile--; nLanes = nAgile + 2; }
+    int laneH = nAgile ? s.plotH / nLanes : 0;
+    int mainH = s.plotH - nAgile * laneH;      /* the rounding remainder rides here */
     drawLane(now, s.plotY, mainH, 0, true);
-    for (int i = 0; i < nAgile; i++)
+    drawBezel(s.plotY, mainH);
+    /* The noise floor: one dotted line at the quietest the channel has been
+     * lately, with its figure sitting ON the line, so the number and the level
+     * it describes are one object — at the right end of it, where the rx axis it
+     * is quoting runs, held clear of the scale itself. Same pill as a train's
+     * name: both are notes stuck on the graph, and two label styles for one job
+     * is one too many. */
+    int nf = 0;
+    if (noiseFloor(&nf)) {
+        int y = s.plotY + mainH - 1
+              - (int)((long)(nf - AX_RX.lo) * (mainH - 1) / (AX_RX.hi - AX_RX.lo));
+        if (y < s.plotY) y = s.plotY;
+        if (y >= s.plotY + mainH - 1) y = s.plotY + mainH - 2;
+        /* Two rows, not one: at this size a single-pixel dotted line reads as
+         * dirt on the glass rather than as a level. Between the gutters and
+         * inside the bezel — the line is a level ON the plot, and running it
+         * through the scales strikes out the very numbers it is read against. */
+        for (int x = GUT_L + 1; x < s.W - GUT_R - 1; x += 3) {
+            px(x, y, C_FLOOR);
+            px(x, y + 1, C_FLOOR);
+        }
+        char b[16];
+        int bn = snprintf(b, sizeof b, "%d dBm", nf);
+        int wpx = bn * PILL_CH_W + PILL_PAD * 2;
+        int x = s.W - GUT_R - PILL_GAP - wpx;
+        if (x < GUT_L) x = GUT_L;
+        /* Kept whole inside the lane even where the line runs along an edge:
+         * half a pill is unreadable, and the line already says which level it
+         * belongs to. */
+        int py = y - 5;
+        if (py < s.plotY) py = s.plotY;
+        if (py + 11 > s.plotY + mainH) py = s.plotY + mainH - 11;
+        lv_label_set_text(s.nfLbl, b);
+        lv_obj_align(s.nfLbl, LV_ALIGN_TOP_LEFT, x, py);
+        lv_obj_clear_flag(s.nfLbl, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s.nfLbl, LV_OBJ_FLAG_HIDDEN);
+    }
+    for (int i = 0; i < nAgile; i++) {
         drawLane(now, s.plotY + mainH + i * laneH, laneH, (uint8_t)(i + 1), false);
+        drawBezel(s.plotY + mainH + i * laneH, laneH);
+    }
+
+    drawTrainPills(now, nAgile, mainH, laneH);
+
+    /* What the tapped instant holds, if anything. Searched across every lane
+     * that is on screen, since the tap named a moment rather than a lane. */
+    const Rec* hit = nullptr;
+    if (s.inspect) {
+        for (int i = 0; i < s.n; i++) {
+            const Rec& r = s.recs[i];
+            if (r.dir == 2) continue;
+            if (r.ch != 0 && (r.ch - 1) >= nAgile) continue;
+            if (s.inspectT >= r.t && s.inspectT <= r.t + r.dur) { hit = &r; break; }
+        }
+    }
+    if (hit) {
+        const char* name = descOf(hit->desc);
+        /* What it is, how big, and who it was with — by the best name there is
+         * for them: what they announced, the number `lora n` gives them, or the
+         * six hex characters only where the tag resolves to nobody at all. The
+         * tag is what a log line quotes, so it is the fallback rather than a
+         * prefix on every line: once there is a name, the hex is the part
+         * nobody reads, and this strip is a few characters wide. Resolved only
+         * when the tag changes — this runs every redraw, and the peer table is
+         * a linear scan. */
+        if (strcmp(s.insTag, hit->tag) != 0) {
+            safeStrncpy(s.insTag, hit->tag, sizeof s.insTag);
+            loraNameForTag(s.radio, hit->tag, s.insName, sizeof s.insName);
+        }
+        char b[96];
+        int o = 0;
+        if (name[0]) o += snprintf(b + o, sizeof b - (size_t)o, "%s ", name);
+        o += snprintf(b + o, sizeof b - (size_t)o, "%uB", (unsigned)hit->bytes);
+        const char* who = s.insName[0] ? s.insName : hit->tag;
+        if (who[0]) snprintf(b + o, sizeof b - (size_t)o, " %s", who);
+        int laneY = hit->ch == 0 ? s.plotY
+                                 : s.plotY + mainH + (hit->ch - 1) * laneH;
+        int y = laneY - 10;
+        if (y < s.plotY) y = laneY + 2;
+        uint32_t vlo, vhi; view(now, &vlo, &vhi);
+        int x = xAtTime(vlo, vhi, hit->t);
+        if (x > s.W - GUT_R - 150) x = s.W - GUT_R - 150;
+        if (x < GUT_L) x = GUT_L;
+        lv_label_set_text(s.insLbl, b);
+        lv_obj_align(s.insLbl, LV_ALIGN_TOP_LEFT, x, y);
+        lv_obj_clear_flag(s.insLbl, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s.insLbl, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 void clearAll() {
@@ -543,6 +864,32 @@ void drawAll() {
 }
 
 void tickCb(lv_timer_t*) { if (s.visible) drawAll(); }
+
+/* A small label floating over the canvas, hidden until it has something to say. */
+lv_obj_t* mkFloat(lv_obj_t* root, uint32_t colour) {
+    lv_obj_t* l = lv_label_create(root);
+    lv_label_set_text(l, "");
+    lv_obj_set_style_text_font(l, lcdFont(LcdFace::MONO, 8), 0);
+    lv_obj_set_style_text_color(l, lv_color_hex(colour), 0);
+    lv_obj_set_style_bg_color(l, lv_color_hex(0x101010), 0);
+    lv_obj_set_style_bg_opa(l, LV_OPA_80, 0);
+    lv_obj_set_style_pad_all(l, 2, 0);
+    lv_obj_add_flag(l, LV_OBJ_FLAG_HIDDEN);
+    return l;
+}
+
+/* A pill: a note stuck on the graph rather than part of it, so it takes a paper
+ * colour and black text instead of joining the plot's palette, and rounds its
+ * corners to say the same thing. One style for both the peer names beside trains
+ * and the noise floor's figure — two label styles for one job is one too many. */
+lv_obj_t* mkNotePill(lv_obj_t* root) {
+    lv_obj_t* l = mkFloat(root, 0x000000);
+    lv_obj_set_style_bg_color(l, lv_color_hex(0xFFFFCC), 0);
+    lv_obj_set_style_bg_opa(l, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(l, 4, 0);
+    lv_obj_set_style_pad_hor(l, 3, 0);
+    return l;
+}
 
 lv_obj_t* mkCaption(lv_obj_t* root, int y, const char* text) {
     lv_obj_t* l = lv_label_create(root);
@@ -633,7 +980,15 @@ void canvasEventCb(lv_event_t* e) {
             s.zoom[s.nZoom].t0 = a;
             s.zoom[s.nZoom].t1 = b;
             s.nZoom++;
+            s.inspect = false;
             showPills();
+        } else {
+            /* A tap that never widened is not a zoom — it is a question about
+             * the instant under the finger. The answer is the same wherever in
+             * the stack the finger landed: the lanes share a time axis, so a tap
+             * names a COLUMN, and whichever lane holds a frame there answers. */
+            s.inspect = !(s.inspect && s.inspectT == a);   /* tap again to dismiss */
+            s.inspectT = a;
         }
         drawAll();
     }
@@ -799,6 +1154,9 @@ void LoraMonApp::onCreate(lv_obj_t* root) {
     s.plotY = top;
     s.plotH = H - top;               /* one plot now: it takes what is left */
     s.cap   = mkCaption(root, s.plotY + 1, "");
+    s.nfLbl  = mkNotePill(root);
+    s.insLbl = mkFloat(root, 0xE8E8E8);
+    for (int i = 0; i < State::TRAIN_LBL_MAX; i++) s.trainLbl[i] = mkNotePill(root);
     mkScale(root, AX_TX, true);
     mkScale(root, AX_RX, false);
 

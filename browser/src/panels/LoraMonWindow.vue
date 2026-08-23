@@ -34,7 +34,9 @@
                   :class="{ active: w.key === winKey }"
                   @click="winKey = w.key">{{ w.label }}</button>
           <span class="lm-legend">
-            <span class="c-rns">rnsd</span> / <span class="c-rnode">rnode</span><template v-if="hasSupe"> / <span class="c-ours">SUPE</span></template> / <span class="c-bad">CRC</span>
+            tx <span class="c-tx-bcast">all</span>/<span class="c-tx-uni">one</span>
+            rx <span class="c-rx-bcast">all</span>/<span class="c-rx-us">us</span>/<span class="c-rx-other">other</span>
+            / <span class="c-bad">CRC</span>
           </span>
           <span class="lm-axis lm-axis-rx">rx</span>
         </div>
@@ -44,6 +46,7 @@
                     @pointerdown="onDown"
                     @pointermove="onMove"
                     @pointerup="onUp"
+                    @pointerleave="onLeave"
                     @pointercancel="onUp" />
             <div class="lm-caption">
               <span class="lm-chan">{{ chanLabel(0) }}</span>
@@ -61,6 +64,7 @@
                     @pointerdown="onDown"
                     @pointermove="onMove"
                     @pointerup="onUp"
+                    @pointerleave="onLeave"
                     @pointercancel="onUp" />
             <div class="lm-caption lm-caption-chan">
               <span class="lm-chan">{{ chanLabel(c) }}</span>
@@ -87,12 +91,6 @@ const emit = defineEmits<{ 'update:visible': [value: boolean] }>()
 
 const device = useDeviceStore()
 
-/* No SUPE in this firmware means no third protocol on the air, so the legend
- * names two. The device publishes no keys under the prefix in that build (see
- * LoraPanel's hasSupe) — the graph itself needs no change, since the colour is
- * only ever drawn for a frame that was actually seen. */
-const hasSupe = computed(() => device.get('s.lora.0.SUPE.enable') !== undefined)
-
 const isPhoneInit = window.matchMedia?.('(max-width: 599px)').matches ?? false
 const defaultGeom = isPhoneInit
   ? { x: 0, y: 0, w: 100, h: 82 }
@@ -103,17 +101,23 @@ const MAX_RADIOS = 4
 const GUT_L_CSS = 30          // left scale gutter (tx dBm), CSS px
 const GUT_R_CSS = 34          // right scale gutter (rx dBm) — four-digit labels
 
-/* Colour is the frame's protocol, not its direction — direction is the axis a
- * bar is read against, and the tinted background under a transmit. Types match
- * the firmware's LORA_PKT_*. */
-const C_RNS = '#E8D040'       // Reticulum traffic (yellow)
-const C_OURS = '#40A0FF'      // our own air protocol, SUPE (blue)
-const C_RNODE = '#E89040'     // the attached RNode client's traffic (orange)
-const C_BAD = '#E04048'       // rx frame that failed CRC: air held, nothing decoded
-/* SUPE is blue rather than red because the transmit background IS red: a red
- * bar on a red field is the one pair a viewer cannot separate at a glance, and
- * the background is the more important of the two — direction is read off it
- * for every frame, where the protocol tag matters for a few. */
+/* Colour is DIRECTION and AUDIENCE, which is what a person wants at a glance:
+ * was that us talking, us being talked to, or somebody else's conversation we
+ * happened to overhear. Red is ours going out, blue is ours coming in, and the
+ * light/dark pair within each is broadcast against unicast.
+ *
+ * This replaced colour-as-protocol. Protocol was the wrong axis to spend hue
+ * on — it is a property of a few frames and the same for whole runs of them —
+ * and now that a frame can be inspected, what it IS can be read on demand while
+ * hue carries the thing that has to be legible without asking. It also frees
+ * the background: direction used to be a red cast behind every transmit, which
+ * cost the whole plot's contrast to say what one bar's colour now says. */
+const C_TX_BCAST = '#F08080'   // ours, to everyone — an announce
+const C_TX_UNI   = '#B02020'   // ours, to one node
+const C_RX_BCAST = '#80B8F0'   // theirs, to everyone
+const C_RX_US    = '#2060C0'   // theirs, to us
+const C_RX_OTHER = '#8A8A8A'   // theirs, to someone else — overheard
+const C_BAD      = '#8050C8'   // failed its CRC: air held, nothing decoded
 
 /* The politeness marks — what the frame waited before it went out. Near-white
  * and thin: they are annotation on a bar, not a quantity to compare against
@@ -121,13 +125,12 @@ const C_BAD = '#E04048'       // rx frame that failed CRC: air held, nothing dec
  * describing. */
 const C_WAIT = '#E8E8E8'
 
-/* Band gradient, bottom → top of each band, and the reddish cast of the same
- * gradient that marks the air being ours. The darkest tone doubles as the
- * timescale grid, so the grid reads as part of the background. */
+/* Band gradient, bottom → top of each band. One background now, with no cast
+ * behind a transmit: direction is in the bar's own colour, so tinting the field
+ * as well spent the plot's contrast to repeat something already said. The
+ * darkest tone doubles as the timescale grid, so the grid reads as part of the
+ * background. */
 const BG_LO = '#242424', BG_HI = '#313131'
-/* The transmit cast is a real red rather than a hint of one: it is how
- * direction is read, and at these bar widths a subtle tint is no signal at all. */
-const TX_LO = '#5e1c1c', TX_HI = '#8a2a2a'
 const C_GRID = BG_LO
 /* The veil over spans the radio spent on another channel. Nearly opaque black:
  * the point is that an unwatched stretch should not read as a quiet one, so it
@@ -142,6 +145,11 @@ const WINDOWS = [
   { key: '30m', ms: 1800 * 1000, label: '30m' },
   { key: '1h',  ms: HOUR_MS,    label: '1hr' },
 ] as const
+
+/* How far behind "now" the live edge sits. Past the 1 Hz publish beat with room
+ * for the batch a burst is flushed in, so what reaches the right edge is settled
+ * and the graph never corrects itself in front of you. */
+const LAG_MS = 1500
 
 /* One plot, two dBm axes reading the same four bands: transmit power down the
  * left gutter in 10 dB steps, received strength down the right in 32 dB. RX
@@ -159,9 +167,50 @@ const AX_RX = { lo: -128, hi: 0 }     // 32 dB per band
 
 /* The channel-noise floor the traffic sits on: very light grey, so a bar always
  * wins the pixels it lands on and the floor reads as background texture. */
-const C_FLOOR = 'rgba(255,255,255,0.09)'
+const C_FLOOR = 'rgba(255,255,255,0.20)'
 
-interface Rec { t: number; dir: number; dur: number; bytes: number; rssi: number; snr10: number; txp: number; type: number; wait: number; own: number; ch: number }
+/* The frame around each lane's plot area. Light enough to stay background, solid
+ * enough to survive a lane with nothing in it. */
+const C_BEZEL = 'rgba(255,255,255,0.30)'
+
+/* Pills — the train's peer name and the noise floor's figure. Both are notes
+ * stuck on the graph rather than part of it, so they take a paper colour and
+ * black text instead of joining the plot's palette, and both use this one style:
+ * two label styles for one job is one too many. */
+const C_PILL_BG = '#ffffcc'
+const C_PILL_FG = '#000000'
+
+interface Rec { t: number; dir: number; dur: number; bytes: number; rssi: number; snr10: number; txp: number; type: number; wait: number; own: number; ch: number; desc: number; cast: number; tag: string }
+
+/* How far two frames with the same tag may sit apart and still be one train.
+ * Just past the widest slot spacing a schedule ever asks for, so a train stays
+ * whole across its longest legitimate gap and two separate conversations with
+ * one node do not get named as if they were a single stretch of air. */
+const TRAIN_GAP_MS = 400
+
+/* Who a frame was aimed at, as the device decided it — the browser cannot, since
+ * it turns on which addresses mean US and that lives in the peer table. */
+const CAST_BCAST = 0, CAST_US = 1, CAST_OTHER = 2
+
+/* Direction and audience, which is what the colour says. A CRC failure is
+ * neither: nothing in it was readable, so it gets its own hue rather than a
+ * guess. */
+function colourOf(rec: Rec): string {
+  if (rec.type === 3) return C_BAD
+  if (rec.dir === 1) return rec.cast === CAST_BCAST ? C_TX_BCAST : C_TX_UNI
+  if (rec.cast === CAST_BCAST) return C_RX_BCAST
+  return rec.cast === CAST_US ? C_RX_US : C_RX_OTHER
+}
+
+/* What a frame is, indexed by the code the device writes into the record. The
+ * names live here rather than on the wire because every frame is a storage node
+ * and there may be thousands: the device sends a byte, each viewer holds its
+ * own table. Codes are appended to, never renumbered. */
+const DESC = [
+  '', 'PRIVSYNC', 'ANNOUNCE2', 'HAVEDATA', 'GIMME', 'THATSIT', 'BYE', 'RESEND',
+  'data', 'announce', 'link request', 'proof', 'split', 'RNode',
+] as const
+const descOf = (d: number) => DESC[d] ?? ''
 
 /* recs = the active radio's packets, rebuilt each tick from the mirrored
  * `lora.<n>.packets` subtree (the firmware adds/deletes those nodes). */
@@ -296,7 +345,17 @@ function reanchor(t: number) {
 function view(): { lo: number; hi: number } {
   const top = zoomStack.value[zoomStack.value.length - 1]
   if (top) return { lo: top.t0, hi: top.t1 }
-  const dnow = devNow()
+  /* The live edge stops short of "now" by LAG_MS. The most recent moment is not
+   * a finished picture: a stay on one channel is one record that grows, so the
+   * background arrives a step at a time, and frame records are batched, so a
+   * packet lands in a column the graph has already drawn as empty. Both read as
+   * the graph correcting itself in public — blocks filling in at the right edge
+   * and bars appearing out of nowhere behind them.
+   *
+   * Holding the edge back past the slowest of those publishers shows only what
+   * has settled. It costs a second and a half of latency, which on a plot whose
+   * shortest window is ten seconds is not a cost anybody is watching for. */
+  const dnow = devNow() - LAG_MS
   return { lo: dnow - winMs.value, hi: dnow }
 }
 
@@ -348,6 +407,20 @@ function drawBands(ctx: CanvasRenderingContext2D, w: number, h: number, dpr: num
 
 const clamp01 = (x: number) => Math.max(0, Math.min(1, x))
 
+/* The lane's own outline. A lane the radio never visited is veiled end to end
+ * and has no traffic to give it shape, so without this it is a rectangle of dark
+ * against a dark window — indistinguishable from the gap between two lanes, and
+ * from no lane at all. The bezel is what says a graph is there and empty rather
+ * than absent, which is why it is drawn both before the traffic (the lane that
+ * has nothing to draw yet still gets its frame) and again after it (nothing may
+ * eat an edge). */
+function drawBezel(ctx: CanvasRenderingContext2D, w: number, h: number,
+                   dpr: number, gl: number, gr: number) {
+  ctx.strokeStyle = C_BEZEL
+  ctx.lineWidth = Math.max(1, dpr)
+  ctx.strokeRect(gl + 0.5, 0.5, (w - gr) - gl - 1, h - 1)
+}
+
 /* Draw one channel's plot. `ch` selects the records and the RSSI series.
  *
  * The gutters are reserved on every graph, labelled only on the hailing
@@ -363,6 +436,7 @@ function drawOne(cv: HTMLCanvasElement | null, ch: number, main: boolean) {
   const gr = Math.round(GUT_R_CSS * dpr)
   ctx.clearRect(0, 0, w, h)
   drawBands(ctx, w, h, dpr, gl, gr, main)
+  drawBezel(ctx, w, h, dpr, gl, gr)
   if (!devClock) return
   const recsCh = recs.filter(r => r.ch === ch)
   const floorPts = floorSeries[ch] ?? []
@@ -403,48 +477,51 @@ function drawOne(cv: HTMLCanvasElement | null, ch: number, main: boolean) {
     if (x < w - gr) ctx.fillRect(x, 0, (w - gr) - x, h)
   }
 
-  /* Air we are holding ourselves: the same gradient cast red, over the frame's
-   * time-on-air only. The wait before it is channel access, not transmission —
-   * tinting that would claim airtime the radio never spent. */
-  const txSpans: { x: number; w: number }[] = []
-  for (const rec of recsCh) {
-    if (rec.dir !== 1) continue                 /* dir 2 (dwell) excluded by this */
-    const s = rec.t, e = rec.t + rec.dur
-    if (e < lo || s > hi) continue
-    const xs = xAt(s)
-    txSpans.push({ x: xs, w: Math.max(1, xAt(e) - xs) })
-  }
-  if (txSpans.length) {
-    for (let i = 0; i < NBANDS; i++) {
-      const yTop = h - (i + 1) * bh
-      const g = ctx.createLinearGradient(0, yTop + bh, 0, yTop)
-      g.addColorStop(0, TX_LO); g.addColorStop(1, TX_HI)
-      ctx.fillStyle = g
-      for (const s of txSpans) ctx.fillRect(s.x, yTop, s.w, bh)
-    }
-  }
-
   /* The channel noise floor: each sample a bar from the bottom of the plot up
    * to its dBm on the RX axis, held until the next sample so a 1 Hz series
-   * reads as a continuous floor rather than a picket fence. Drawn after the
-   * transmit tint and before the frames — traffic lies on top of the noise it
-   * had to get above.
+   * reads as a continuous floor rather than a picket fence. Drawn under the
+   * frames — traffic lies on top of the noise it had to get above.
    *
    * A gap in the series is a beat carrier sense took the radio for. It is left
    * empty on purpose: the bar would otherwise be drawn from a reading that
    * described the transmission we were queued behind. */
-  if (floorPts.length) {
-    ctx.fillStyle = C_FLOOR
-    for (let i = 0; i < floorPts.length; i++) {
-      const p = floorPts[i]
-      const next = floorPts[i + 1]
-      /* Hold for one beat at most: a longer silence is a gap, not a level. */
-      const end = Math.min(next ? next.t : p.t + 1000, p.t + 1000)
-      if (end < lo || p.t > hi) continue
-      const xs = xAt(p.t)
-      const bw = Math.max(1, xAt(end) - xs)
-      const y = h - clamp01((p.dbm - AX_RX.lo) / (AX_RX.hi - AX_RX.lo)) * h
-      ctx.fillRect(xs, y, bw, h - y)
+  if (main) {
+    const nf = noiseFloor(ch)
+    if (nf != null) {
+      const y = Math.round(h - clamp01((nf - AX_RX.lo) / (AX_RX.hi - AX_RX.lo)) * h) + 0.5
+      /* Between the gutters and no further: the line is a level ON the plot, and
+       * running it through the scales strikes out the very numbers it is read
+       * against. */
+      ctx.save()
+      ctx.strokeStyle = C_FLOOR
+      ctx.lineWidth = Math.max(2, 2 * dpr)
+      ctx.setLineDash([2 * dpr, 3 * dpr])
+      ctx.beginPath(); ctx.moveTo(gl, y); ctx.lineTo(w - gr, y); ctx.stroke()
+      ctx.restore()
+      /* The pill sits ON the line, so the number and the level it describes are
+       * one object rather than a legend to cross-reference — and at the right
+       * end of it, where the rx axis it is quoting runs, held clear of the
+       * scale itself. Same cream note as a train pill: both are labels stuck on
+       * the graph, and two label styles for one job is one too many. */
+      const label = `noise floor ${Math.round(nf)} dBm`
+      ctx.font = `${9 * dpr}px 'SF Mono','Menlo','Consolas',monospace`
+      const tw = ctx.measureText(label).width
+      const ph = 12 * dpr, pad = 4 * dpr, rad = 4 * dpr
+      const pw = tw + pad * 2
+      const px = w - gr - 8 * dpr - pw
+      /* Kept whole inside the lane even where the line runs along an edge: half
+       * a pill is unreadable, and the line itself already says which level it
+       * belongs to. */
+      let py = y - ph / 2
+      if (py < 0) py = 0
+      if (py + ph > h) py = h - ph
+      ctx.beginPath()
+      ctx.roundRect(px, py, pw, ph, rad)
+      ctx.fillStyle = C_PILL_BG
+      ctx.fill()
+      ctx.fillStyle = C_PILL_FG
+      ctx.textBaseline = 'middle'
+      ctx.fillText(label, px + pad, py + ph / 2)
     }
   }
 
@@ -477,8 +554,7 @@ function drawOne(cv: HTMLCanvasElement | null, ch: number, main: boolean) {
     let y = h - clamp01((dbm - ax.lo) / (ax.hi - ax.lo)) * h
     if (y > h - th) y = h - th
     if (y < 0) y = 0
-    const col = rec.type === 3 ? C_BAD
-              : rec.type === 2 ? C_RNODE : rec.type === 1 ? C_OURS : C_RNS
+    const col = colourOf(rec)
     /* What the frame waited before its first bit went on air, drawn as two
      * runs because they are two different facts. Both sit at mid-height in the
      * frame's own colour, light enough that channel occupancy still reads as
@@ -513,6 +589,59 @@ function drawOne(cv: HTMLCanvasElement | null, ch: number, main: boolean) {
     ctx.fillRect(xs, y, bw, th)
   }
 
+  /* Who a run of frames was with, named once above the run.
+   *
+   * Every frame of a SUPE train carries the same tag, and a single frame on the
+   * hailing channel is that run at length one — so the same rule covers both.
+   * Consecutive frames sharing a tag are one run; a gap longer than the widest
+   * schedule spacing ends it, because past that they are two conversations that
+   * happened to be with the same node.
+   *
+   * It sits BESIDE the run — level with its top, a few pixels off its right end
+   * — and never over it. Centred, the pill's offset from the frames it names
+   * changes with the run's width, so the same train's label lands somewhere
+   * different every time the view moves; anchored to one end it stays put.
+   * Nothing is hidden behind it either way.
+   *
+   * Drawn only where the run is at least as wide as the label and the pill has
+   * room before the right gutter. Appearing and disappearing as the view zooms
+   * is the intended behaviour: at a width where the label would dwarf what it
+   * labels, it is pointing at the wrong traffic. */
+  {
+    ctx.font = `${9 * dpr}px 'SF Mono','Menlo','Consolas',monospace`
+    const ph = 12 * dpr, pad = 4 * dpr, rad = 4 * dpr, gap = 4 * dpr
+    let runTag = '', x0 = 0, x1 = 0, endMs = 0
+    const flush = () => {
+      if (!runTag) return
+      const label = peerLabel(runTag)
+      const tw = ctx.measureText(label).width
+      const pw = tw + pad * 2
+      const px = x1 + gap
+      if (pw <= x1 - x0 && px + pw <= w - gr) {
+        ctx.beginPath()
+        ctx.roundRect(px, 1 * dpr, pw, ph, rad)
+        ctx.fillStyle = C_PILL_BG
+        ctx.fill()
+        ctx.fillStyle = C_PILL_FG
+        ctx.textBaseline = 'middle'
+        ctx.fillText(label, px + pad, 1 * dpr + ph / 2)
+      }
+      runTag = ''
+    }
+    for (const rec of recsCh) {
+      if (rec.dir === 2) continue
+      const e = rec.t + rec.dur
+      if (e < lo || rec.t > hi) continue
+      if (!rec.tag) { flush(); continue }
+      if (rec.tag !== runTag || rec.t - endMs > TRAIN_GAP_MS) {
+        flush()
+        runTag = rec.tag; x0 = xAt(rec.t)
+      }
+      x1 = xAt(e); endMs = e
+    }
+    flush()
+  }
+
   /* On every lane, not just the one under the pointer: the stack shares one
    * time axis, so the band is the same column everywhere and showing it whole
    * is what makes the selection legible. */
@@ -529,6 +658,58 @@ function drawOne(cv: HTMLCanvasElement | null, ch: number, main: boolean) {
     ctx.moveTo(xb, 0); ctx.lineTo(xb, h)
     ctx.stroke()
   }
+
+  drawBezel(ctx, w, h, dpr, gl, gr)   /* again, over the traffic it encloses */
+
+  /* The column under the pointer, and what the frame there IS. Drawn last, over
+   * everything: it is an answer to a question just asked, so it may cover the
+   * picture it is describing. Every lane draws its own — the hairline marks the
+   * instant in all of them, and whichever lane holds a frame at that instant is
+   * the one that gets the pill. */
+  if (hoverFrac.value != null) {
+    /* The line stands where the pointer is; the instant under it is whatever the
+     * view puts there this frame. On a live graph that instant advances while
+     * the hand holds still, which is the point — the cursor is not a bookmark. */
+    const ht = lo + hoverFrac.value * (hi - lo)
+    const hx = Math.round(gl + hoverFrac.value * span) + 0.5
+    ctx.save()
+    ctx.strokeStyle = 'rgba(255,255,255,0.35)'
+    ctx.lineWidth = Math.max(1, dpr)
+    ctx.beginPath(); ctx.moveTo(hx, 0); ctx.lineTo(hx, h); ctx.stroke()
+    ctx.restore()
+    let hit: Rec | null = null
+    for (const rec of recsCh) {
+      if (rec.dir === 2) continue
+      if (ht >= rec.t && ht <= rec.t + rec.dur) { hit = rec; break }
+    }
+    if (hit) {
+      const name = descOf(hit.desc)
+      /* Who it was with, by the best name there is for them: what they announced,
+       * the number `lora n` gives them, or — only when the tag resolves to
+       * nobody at all — the six hex characters themselves. The tag is what a log
+       * line quotes, so it is the fallback rather than a prefix on every pill:
+       * once there is a name, the hex is the part nobody reads. */
+      const who = peerLabel(hit.tag)
+      const label = [name, `${hit.bytes}B`, who].filter(Boolean).join(' · ')
+      ctx.font = `${10 * dpr}px 'SF Mono','Menlo','Consolas',monospace`
+      const tw = ctx.measureText(label).width
+      const pad = 4 * dpr, ph = 14 * dpr
+      const ax = hit.dir === 1 ? AX_TX : AX_RX
+      const dbm = hit.dir === 1 ? hit.txp : hit.rssi
+      let y = h - clamp01((dbm - ax.lo) / (ax.hi - ax.lo)) * h
+      /* Above the bar where there is room, below it where there is not. */
+      let py = y - ph - 2 * dpr
+      if (py < 0) py = Math.min(h - ph, y + 3 * dpr)
+      let px = xAt(hit.t)
+      if (px + tw + pad * 2 > w) px = Math.max(0, w - tw - pad * 2)
+      ctx.fillStyle = 'rgba(12,12,12,0.92)'
+      ctx.fillRect(px, py, tw + pad * 2, ph)
+      ctx.fillStyle = '#e8e8e8'
+      ctx.textBaseline = 'middle'
+      ctx.fillText(label, px + pad, py + ph / 2)
+    }
+  }
+
 }
 
 /* Canvases of the agile channels, collected by the v-for's ref callback. */
@@ -549,13 +730,32 @@ function redraw() {
  * a column means the same moment in all of them — which is exactly why a swipe
  * should work wherever the pointer happens to be. Reaching for the main graph
  * to zoom is a rule with no reason behind it. */
-function xToTime(ev: PointerEvent): number | null {
+/* Where the pointer is, shared by every lane. Hover is a COLUMN, not a spot in
+ * one graph: the lanes share a time axis, so the honest question a pointer asks
+ * is "what happened at this instant", and the answer may be in a lane the
+ * pointer is nowhere near.
+ *
+ * Held as a FRACTION of the plot width, not as a device time — which is the
+ * opposite of the selection anchor below, and deliberately so. A selection is a
+ * span of time and must keep meaning the same span while the graph slides; a
+ * cursor is where your hand is, and a live view sliding out from under a
+ * time-anchored line walks it off to the left while the mouse has not moved.
+ * The frame the line is over changes underneath it, which is exactly right: the
+ * pointer is asking about whatever is there now. */
+const hoverFrac = ref<number | null>(null)
+
+function xToFrac(ev: PointerEvent): number | null {
   const cv = (ev.currentTarget as HTMLCanvasElement | null) ?? canvasRef.value
   if (!cv) return null
   const rect = cv.getBoundingClientRect()
   const span = rect.width - GUT_L_CSS - GUT_R_CSS
   if (span <= 0) return null
-  const frac = clamp01((ev.clientX - rect.left - GUT_L_CSS) / span)
+  return clamp01((ev.clientX - rect.left - GUT_L_CSS) / span)
+}
+
+function xToTime(ev: PointerEvent): number | null {
+  const frac = xToFrac(ev)
+  if (frac == null) return null
   const { lo, hi } = view()
   return lo + frac * (hi - lo)
 }
@@ -575,10 +775,22 @@ function onDown(ev: PointerEvent) {
 }
 
 function onMove(ev: PointerEvent) {
-  if (!sel.value) return
-  const t = xToTime(ev)
-  if (t == null) return
-  sel.value = { anchor: sel.value.anchor, cur: t }
+  const frac = xToFrac(ev)
+  if (frac == null) return
+  if (!sel.value) {                 /* not dragging: this is a hover */
+    hoverFrac.value = frac
+    redraw()
+    return
+  }
+  hoverFrac.value = null            /* a drag is a zoom gesture, not an inspection */
+  const { lo, hi } = view()
+  sel.value = { anchor: sel.value.anchor, cur: lo + frac * (hi - lo) }
+}
+
+function onLeave() {
+  if (hoverFrac.value == null) return
+  hoverFrac.value = null
+  redraw()
 }
 
 function onUp() {
@@ -601,15 +813,80 @@ function zoomOut() {
   nextTick(redraw)
 }
 
+/* The neighbourhood the device publishes: `lora.<n>.peers.<slot>` =
+ * "<num>|<supe>|<tags…>|<names…>|…". A tag is three bytes and means nothing on
+ * its own; this is what turns one back into a node with a name, which is the
+ * whole reason a frame's tag is worth carrying. Rebuilt from the mirror each
+ * tick — peers come and go, and a stale map is worse than none. */
+interface Peer { num: number; supe: boolean; names: string[] }
+const peerByTag = ref<Map<string, Peer>>(new Map())
+
+/* What to call a node on screen: its name if anything announced one, and the
+ * number `lora n` gives it otherwise — so the graph and the console agree, and
+ * an unnamed node is still something you can refer to. */
+function peerLabel(tag: string): string {
+  if (!tag) return ''
+  const p = peerByTag.value.get(tag)
+  if (!p) return tag                      /* a tag that resolves to nobody */
+  return p.names.length ? p.names.join(',') : `#${p.num}`
+}
+
+function rebuildPeers() {
+  const m = new Map<string, Peer>()
+  const sub = device.get(`lora.${activeRadio.value}.peers`)
+  if (sub && typeof sub === 'object') {
+    for (const v of Object.values(sub as Record<string, unknown>)) {
+      const f = String(v).split('|')
+      const peer: Peer = {
+        num: +(f[0] ?? 0),
+        supe: f[1] === '1',
+        names: (f[3] ?? '').split(',').filter(Boolean),
+      }
+      for (const t of (f[2] ?? '').split(',')) if (t) m.set(t, peer)
+    }
+  }
+  peerByTag.value = m
+}
+
+/* The channel's noise floor: the quietest reading it has given in the last
+ * minute. A minute rather than the window on screen, because this is a statement
+ * about conditions now — zooming out to an hour should not turn it into the
+ * quietest moment of that hour — and the quietest rather than the mean, because
+ * a mean over a channel carrying traffic is a measure of the traffic.
+ *
+ * Two kinds of non-reading are dropped, and dropping them is the whole reason
+ * this can return null: a floor nobody can vouch for is worse than none.
+ *   - a zero is a beat that produced no reading at all;
+ *   - anything at the register's weakest rail is the RAIL, not the channel. The
+ *     level is a byte read as −value/2 dBm, so −127.5 is as quiet as it can say,
+ *     and it says that whenever the front end has nothing yet — which is exactly
+ *     the first minutes after a radio comes up. It cannot be a measurement
+ *     either: thermal noise alone is about −123 dBm in 125 kHz before any
+ *     receiver's own noise figure, so no working front end reads below it. */
+const NOISE_WINDOW_MS = 60 * 1000
+const NOISE_RAIL_DBM = -127
+function noiseFloor(ch: number): number | null {
+  const s = floorSeries[ch]
+  if (!s || !s.length) return null
+  const cut = s[s.length - 1].t - NOISE_WINDOW_MS
+  let lo: number | null = null
+  for (let i = s.length - 1; i >= 0 && s[i].t >= cut; i--) {
+    const d = s[i].dbm
+    if (!d || d <= NOISE_RAIL_DBM) continue
+    if (lo == null || d < lo) lo = d
+  }
+  return lo
+}
+
 /* ── rebuild recs from the mirrored subtree ── */
 function parseRec(t: number, s: string): Rec | null {
   const p = s.split('|')
-  if (p[0] === 'r') return { t, dir: 0, rssi: +p[1], snr10: +p[2], dur: +p[3], bytes: +p[4], txp: 0, type: +(p[5] ?? 0), wait: 0, own: 0, ch: +(p[6] ?? 0) }
-  if (p[0] === 't') return { t, dir: 1, txp: +p[1], dur: +p[2], bytes: +p[3], rssi: 0, snr10: 0, type: +(p[4] ?? 0), wait: +(p[5] ?? 0), ch: +(p[6] ?? 0), own: +(p[7] ?? 0) }
+  if (p[0] === 'r') return { t, dir: 0, rssi: +p[1], snr10: +p[2], dur: +p[3], bytes: +p[4], txp: 0, type: +(p[5] ?? 0), wait: 0, own: 0, ch: +(p[6] ?? 0), desc: +(p[7] ?? 0), cast: +(p[8] ?? 0), tag: p[9] ?? '' }
+  if (p[0] === 't') return { t, dir: 1, txp: +p[1], dur: +p[2], bytes: +p[3], rssi: 0, snr10: 0, type: +(p[4] ?? 0), wait: +(p[5] ?? 0), ch: +(p[6] ?? 0), own: +(p[7] ?? 0), desc: +(p[8] ?? 0), cast: +(p[9] ?? 0), tag: p[10] ?? '' }
   /* A dwell: the radio was tuned here and listening for this long. Not a frame
    * — it carries no level and is never drawn as one; it is what tells a lane
    * apart from a lane nobody was watching. */
-  if (p[0] === 'a') return { t, dir: 2, ch: +p[1], dur: +p[2], bytes: 0, rssi: 0, snr10: 0, txp: 0, type: 0, wait: 0, own: 0 }
+  if (p[0] === 'a') return { t, dir: 2, ch: +p[1], dur: +p[2], bytes: 0, rssi: 0, snr10: 0, txp: 0, type: 0, wait: 0, own: 0, desc: 0, cast: 0, tag: '' }
   return null
 }
 
@@ -791,9 +1068,15 @@ function chanAirFor(): string[] {
 }
 
 function tick() {
-  if (props.visible) device.set('sys.stats.web_loramon', 1)   // heartbeat while open
+  if (props.visible) {
+    device.set('sys.stats.web_loramon', 1)     // heartbeat while open
+    /* The neighbourhood is a separate appetite from the frames, and the device
+     * only publishes it while something says it is reading — so say so. */
+    device.set('sys.stats.web_peers', 1)
+  }
   pollChans()
   pollFloor()
+  rebuildPeers()
   rebuild()
   air.value = airFor()
   chanAir.value = chanAirFor()
@@ -826,10 +1109,12 @@ onUnmounted(() => {
   if (raf) { cancelAnimationFrame(raf); raf = 0 }
   if (copyTimer) { clearTimeout(copyTimer); copyTimer = null }
   device.set('sys.stats.web_loramon', 0)
+  device.set('sys.stats.web_peers', 0)
 })
 
 watch(() => props.visible, v => {
   device.set('sys.stats.web_loramon', v ? 1 : 0)
+  device.set('sys.stats.web_peers', v ? 1 : 0)
   if (v) { tick(); nextTick(redraw) }
 })
 
@@ -894,17 +1179,20 @@ watch(activeRadio, () => {
 
 /* Graphs stack, so every one of them spans the same width and therefore the
  * same time axis — a moment is the same column in all ten. The flex ratios are
- * the heights: the hailing channel takes 4, each agile channel 1. */
+ * the heights: the hailing channel takes 2, each agile channel 1. */
 .lm-graphs { flex: 1 1 auto; display: flex; flex-direction: column; gap: 8px; padding: 2px 8px 4px; min-height: 0; }
 .lm-graph { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
-.lm-graph-main { flex: 4 1 0; }
+.lm-graph-main { flex: 2 1 0; }
 .lm-graph-chan { flex: 1 1 0; }
 .lm-canvas { flex: 1 1 auto; display: block; width: 100%; min-height: 0; touch-action: none; cursor: crosshair; }
 
-/* Caption sits below the graph, left-aligned. */
+/* Caption sits below the graph and starts where the graph does: the left inset
+ * is the canvas's own tx gutter, so the channel it names lines up with the plot
+ * rather than with the scale beside it. Kept in step with GUT_L_CSS by hand —
+ * a stylesheet cannot read it. */
 .lm-caption {
   flex: 0 0 auto;
-  padding: 3px 0 0 2px;
+  padding: 3px 0 0 30px;
   display: flex; gap: 12px;
   font: 11px/1.2 'SF Mono', 'Menlo', 'Consolas', monospace;
   color: #c8c8c8;
@@ -923,8 +1211,13 @@ watch(activeRadio, () => {
  * own thing rather than as another pill. */
 .lm-legend { color: #7a7a7a; margin-left: 28px; white-space: nowrap;
              font: 11px/1.4 'SF Mono', 'Menlo', 'Consolas', monospace; }
-.lm-legend .c-rns { color: #E8D040; }
-.lm-legend .c-ours { color: #40A0FF; }
-.lm-legend .c-rnode { color: #E89040; }
-.lm-legend .c-bad { color: #E04048; }
+/* Kept in step with the canvas constants of the same names by hand — a stylesheet
+ * cannot read them, and a key in different colours from the plot is worse than
+ * no key at all. */
+.lm-legend .c-tx-bcast { color: #F08080; }
+.lm-legend .c-tx-uni   { color: #B02020; }
+.lm-legend .c-rx-bcast { color: #80B8F0; }
+.lm-legend .c-rx-us    { color: #2060C0; }
+.lm-legend .c-rx-other { color: #8A8A8A; }
+.lm-legend .c-bad      { color: #8050C8; }
 </style>

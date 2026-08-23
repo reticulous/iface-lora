@@ -15,7 +15,7 @@
  * announce, so the first one is worth having promptly. */
 #define SUPE_ANN_FIRST_MS    15000
 
-/* The absence ladder's verdict (SUPE.md §12): after three tight schedules
+/* The absence ladder's verdict (SUPE.md §12): after three narrow schedules
  * expired unmet the peer is absent this long, and its traffic is dropped
  * rather than transmitted into the void. */
 /* Declaring a peer absent is a bet that trying again is not worth the airtime,
@@ -53,8 +53,6 @@ static Neighbor* tagNode(LoraRadio* r, const uint8_t tag[SUPE_TAG_LEN]) {
         if (e->haveNode4 && memcmp(e->node4, tag, SUPE_TAG_LEN) == 0) return e;
         for (int d = 0; d < e->nDests; d++)
             if (memcmp(e->dests[d].hash, tag, SUPE_TAG_LEN) == 0) return e;
-        for (int l = 0; l < e->nLink4; l++)
-            if (memcmp(e->link4[l], tag, SUPE_TAG_LEN) == 0) return e;
         /* Identities, and not only the destinations derived from them: a
          * PRIVSYNC's sender_ident names the seeking node by its identity, and
          * nothing is ever *addressed* to an identity, so it appears in none of
@@ -62,6 +60,12 @@ static Neighbor* tagNode(LoraRadio* r, const uint8_t tag[SUPE_TAG_LEN]) {
         for (int k = 0; k < e->nIds; k++)
             if (memcmp(e->ids[k], tag, SUPE_TAG_LEN) == 0) return e;
     }
+    /* Hashes some linkage frame said mean a node — a link identifier above all.
+     * One shared store rather than a slice per row, so it is one lookup here
+     * instead of a walk inside the loop above. A timed-out row still answers:
+     * a frame recorded an hour ago is still a frame for that node. */
+    if (NeiHash* h = peersHashFind(st, tag, SUPE_TAG_LEN))
+        if (st->nei[h->node].used) return &st->nei[h->node];
     /* A link identifier we initiated resolves to the node the link request was
      * addressed to (SUPE.md §5.1, §11 "links inherit") — this is what keeps a
      * session's traffic meeting after rnsd switches from the destination hash
@@ -161,7 +165,7 @@ static void hTuneHome(void* ctx) {
     r->rxHeaderSeen  = false;
     r->chNow       = LORA_CH_HAIL;
     radioStartRx(r);
-    if (logIsDebug(TAG)) dbg("lora/%d supe: home", r->idx);
+    if (logIsVerbose(TAG)) verb("lora/%d supe: home", r->idx);
 }
 
 /* One SUPE frame, non-blocking: fired and left; the completion comes back
@@ -220,8 +224,8 @@ static bool hRxBusy(void* ctx) {
 static bool hCca(void* ctx) {
     LoraRadio* r = (LoraRadio*)ctx;
     bool clear = csmaSenseClear(r);
-    if (!clear && logIsDebug(TAG))
-        dbg("lora/%d supe: ch%u reads busy at %.0f dBm (bw %d kHz, rx %s)",
+    if (!clear && logIsVerbose(TAG))
+        verb("lora/%d supe: ch%u reads busy at %.0f dBm (bw %d kHz, rx %s)",
             r->idx, (unsigned)r->chNow, (double)channelRssi(r),
             r->airBwHz / 1000, radioRxInProgress(r) ? "in progress" : "idle");
     return clear;
@@ -518,9 +522,18 @@ static void hChanGet(void* ctx, SupeChanView* out) {
 /* One SupeHost per radio, pointing back at it. */
 static SupeHost s_hosts[LORA_NUM_RADIOS];
 
-static void hLog(void* ctx, const char* msg) {
+/* What the engine may emit, from what this tag's logger will actually print:
+ * asking for verbose lines nobody will show is formatting thrown away. */
+static uint8_t supeLogLevel(void) {
+    if (logIsVerbose(TAG)) return SUPE_LOG_VERB;
+    if (logIsDebug(TAG))   return SUPE_LOG_DBG;
+    return SUPE_LOG_NONE;
+}
+
+static void hLog(void* ctx, bool verbose, const char* msg) {
     LoraRadio* r = (LoraRadio*)ctx;
-    dbg("lora/%d %s", r->idx, msg);
+    if (verbose) verb("lora/%d %s", r->idx, msg);
+    else         dbg("lora/%d %s", r->idx, msg);
 }
 
 /* The timer only wakes the radio task; it never runs the engine. Everything a
@@ -558,7 +571,7 @@ static void hostFill(LoraRadio* r) {
     h->txp_open  = hTxpOpen;
     h->chan_get  = hChanGet;
     h->log       = hLog;
-    h->dbgLevel  = false;
+    h->logLevel  = SUPE_LOG_NONE;
 }
 
 /* ─────────────── lifecycle and the boundary ─────────────── */
@@ -640,6 +653,12 @@ void supeOnRadioStop(LoraRadio* r) {
     r->supe->rxTCount = 0;
 }
 
+/* Mounted: the machinery is up. Ready: it is up AND this node speaks the
+ * protocol. Everything that transmits asks the second; announcement ingest asks
+ * the first, because a node that has been switched off still wants a correct
+ * picture of who around it speaks SUPE — and still owes its neighbours the
+ * announcement that says it does not. */
+bool supeMounted(const LoraRadio* r) { return r->supe != nullptr; }
 bool supeReady(const LoraRadio* r) { return r->supeOn && r->supe != nullptr; }
 
 bool supeBusy(const LoraRadio* r) {
@@ -656,6 +675,14 @@ uint16_t supeCargoPeer(const LoraRadio* r) {
 
 bool supeHoldsRadio(const LoraRadio* r) {
     return r->supe && (supeEngBusy(&r->supe->eng) || r->supe->annPending);
+}
+
+bool supeMeetingTag(const LoraRadio* r, uint8_t out[SUPE_TAG_LEN]) {
+    if (!r->supe) return false;
+    const SupeMeet* m = &r->supe->eng.m;
+    if (m->phase == SUPE_M_IDLE || !m->haveTag) return false;
+    memcpy(out, m->tag, SUPE_TAG_LEN);
+    return true;
 }
 
 void supeLock(LoraRadio* r) {
@@ -677,6 +704,24 @@ static void annIngest(LoraRadio* r, const uint8_t* f, size_t len, int16_t rssi) 
     if (!r->nei) return;
     uint32_t now = millis();
     int matched = 0;
+    /* One frame, one node. The identities in an announcement are a statement
+     * that they all belong to the same radio, and until now nothing acted on
+     * it: each was resolved on its own and whatever row it landed on was
+     * stamped, so a node whose destinations had arrived on separate rows stayed
+     * split for as long as it lived — announcing every interval that it was one
+     * node, and being re-split every time. Everything downstream reads a row:
+     * the SUPE bit, the path-loss pairs, the adaptive power, the absence
+     * record. Split rows mean a node met on one of them and addressed at full
+     * power on the other.
+     *
+     * Four bytes is a short name to fuse two rows on, and fusing is not
+     * reversible. It is worth it because the alternative is permanent and
+     * visible while a collision is neither: two distinct nodes sharing an
+     * identity prefix would merge into one row, and what that costs is a power
+     * estimate fitted to the nearer of them — the far one is then addressed too
+     * quietly, misses, and the ratchet raises the power until it does not. A
+     * self-correcting error against a permanent one. */
+    Neighbor* keep = nullptr;
     for (int i = 0; i < a.count; i++) {
         Neighbor* e = peersFindByIdent4(r->nei, a.ids[i]);
         if (!e) e = peersFindBy4(r->nei, a.ids[i]);
@@ -693,7 +738,33 @@ static void annIngest(LoraRadio* r, const uint8_t* f, size_t len, int16_t rssi) 
             if (e) { memcpy(e->node4, a.ids[i], 4); e->haveNode4 = true; }
         }
         if (!e || peersIsLocal(e)) continue;
+        /* The first row this announcement resolves to keeps the node; every
+         * later one is the same radio arriving under another of its names. */
+        if (!keep) keep = e;
+        else if (e != keep) {
+            if (logIsDebug(TAG))
+                dbg("lora/%d supe: %02x%02x%02x folded into one node",
+                    r->idx, a.ids[i][0], a.ids[i][1], a.ids[i][2]);
+            peersMergeInto(r->nei, keep, e);
+            e = keep;
+        }
         matched++;
+        /* A node renouncing the protocol: drop the belief that it speaks it, so
+         * its traffic goes back out as plain framing. The row itself stays —
+         * this is still an announcement, and everything else in it (the
+         * identities, the level, that the node is alive at all) is as good as
+         * any other. What it is NOT is evidence for meeting: no absence record
+         * is cleared here, because there is nothing to be absent from. */
+        if (a.regime == SUPE_REGIME_NONE) {
+            if (e->supeSeen && logIsDebug(TAG))
+                dbg("lora/%d supe: %02x%02x%02x no longer speaks SUPE",
+                    r->idx, a.ids[i][0], a.ids[i][1], a.ids[i][2]);
+            e->supeSeen = false;
+            e->ourProto = false;
+            e->supeHeardMs = now;
+            supeFilePair(r, e, rssi, a.pwrDbm, 0);
+            continue;
+        }
         bool first = !e->supeSeen;
         e->supeSeen    = true;
         e->supeCaps    = a.caps;
@@ -734,7 +805,7 @@ static void supeIdentRefresh(LoraRadio* r) {
 }
 
 void supeAnnArm(LoraRadio* r) {
-    if (!supeReady(r)) return;
+    if (!supeMounted(r)) return;
     r->supe->annPending = true;
     r->supe->annTryMs   = millis();
 }
@@ -753,6 +824,8 @@ static uint32_t supeAnnGap(const LoraRadio* r) {
 /* Every identity this node holds, in one frame — ours and the attached
  * client's alike: a packet addressed to either terminates at this
  * transmitter. */
+static void supeAnnBeat(LoraRadio* r, uint32_t now);
+
 static void supeAnnSend(LoraRadio* r) {
     SupeState* ss = r->supe;
     ss->annPending = false;
@@ -772,29 +845,54 @@ static void supeAnnSend(LoraRadio* r) {
     }
     if (count == 0) { retrySoon(); return; }
     uint8_t f[SUPE_MAX_FRAME];
-    size_t n = supeEngBuildAnn(&ss->eng, f, sizeof f, ids, count, r->cfgTxp);
+    size_t n = supeEngBuildAnn(&ss->eng, f, sizeof f, ids, count, r->cfgTxp, r->supeOn);
     if (!n) { retrySoon(); return; }
     ss->annNextMs = millis() + supeAnnGap(r);   /* only a sent frame paces the beat */
     /* Broadcast, at the configured power, through the ordinary frame path.
      * The engine is idle (the beat stands off on it), so engineTx marks it and
      * the completion simply re-arms receive. */
     hTxFrame(r, f, (uint16_t)n, r->cfgTxp);
-    if (logIsDebug(TAG))
-        dbg("lora/%d supe: announced %u identit%s (%uB)", r->idx,
+    if (logIsVerbose(TAG))
+        verb("lora/%d supe: announced %u identit%s (%uB)", r->idx,
             (unsigned)count, count == 1 ? "y" : "ies", (unsigned)n);
+}
+
+/* The announce beat, which runs whether or not this node speaks the protocol:
+ * a silent node's announcement is what tells its neighbours to stop trying to
+ * meet it, and it has to keep saying so, because a neighbour that boots later
+ * or misses the one frame would otherwise hold the wrong belief indefinitely.
+ * One short frame per interval is a cheap price for that convergence. */
+static void supeAnnBeat(LoraRadio* r, uint32_t now) {
+    SupeState* ss = r->supe;
+    if (!ss->annPending && !r->annReplay && r->annIntervalMin &&
+        !ss->eng.expired && (int32_t)(now - ss->annNextMs) >= 0)
+        supeAnnArm(r);
+    if (!ss->annPending) return;
+    if (csmaClear(r)) {
+        supeAnnSend(r);
+        r->txWaitMs = csmaGrantWaitMs(r);   /* same restatement as the seed's */
+    } else if (r->lbtTimeoutMs && now - ss->annTryMs > r->lbtTimeoutMs) {
+        ss->annPending = false;
+        ss->annNextMs  = now + supeAnnGap(r);
+        csmaResetAccess(r);
+        if (logIsDebug(TAG))
+            dbg("lora/%d supe: announce gave up on a busy channel", r->idx);
+    }
 }
 
 /* ─────────────── the boundary's entry points ─────────────── */
 
 void supeOnFrame(LoraRadio* r, const uint8_t* f, size_t len,
                  int16_t rssi, int16_t snr10) {
-    if (!supeReady(r)) return;
+    if (!supeMounted(r)) return;
     supeLock(r);
-    s_hosts[r->idx].dbgLevel = logIsDebug(TAG);
+    s_hosts[r->idx].logLevel = supeLogLevel();
     if (len >= 1 && f[0] == SUPE_T_ANNOUNCE2) {
+        /* Always read: this is the world picture, not an invitation. */
         r->supe->eng.rxFrames++;
         annIngest(r, f, len, rssi);
-    } else {
+    } else if (supeReady(r)) {
+        /* Everything else IS an invitation, and answering one is speaking. */
         supeEngOnRx(&r->supe->eng, f, (uint16_t)len, rssi, snr10);
     }
     supeUnlock(r);
@@ -809,7 +907,7 @@ bool supeTrainCapture(LoraRadio* r, const uint8_t* frame, size_t len,
     bool took = false;
     if (ss->rxTCount < SUPE_TRAIN_MAX) {
         uint8_t csum = supeCrc8(frame, len);
-        s_hosts[r->idx].dbgLevel = logIsDebug(TAG);
+        s_hosts[r->idx].logLevel = supeLogLevel();
         if (supeEngOnTrainFrame(&ss->eng, csum, rssi, snr10)) {
             memcpy(ss->rxT[ss->rxTCount], frame, len);
             ss->rxTLen[ss->rxTCount]   = (uint16_t)len;
@@ -827,7 +925,7 @@ bool supeAfterTx(LoraRadio* r) {
     if (!r->supe || !r->supe->engineTx) return false;
     supeLock(r);
     r->supe->engineTx = false;
-    s_hosts[r->idx].dbgLevel = logIsDebug(TAG);
+    s_hosts[r->idx].logLevel = supeLogLevel();
     if (supeEngBusy(&r->supe->eng)) {
         supeEngOnTxDone(&r->supe->eng, !r->txAborted);
         supeUnlock(r);
@@ -839,17 +937,27 @@ bool supeAfterTx(LoraRadio* r) {
 
 uint8_t supeHeadVerdict(LoraRadio* r) {
     if (!supeReady(r)) return SUPE_V_PLAIN;
-    s_hosts[r->idx].dbgLevel = logIsDebug(TAG);
+    s_hosts[r->idx].logLevel = supeLogLevel();
     return supeEngVerdict(&r->supe->eng);
 }
 
 void supePoll(LoraRadio* r) {
-    if (!supeReady(r) || !r->running) return;
+    if (!supeMounted(r) || !r->running) return;
     if (!supeTryLock(r)) return;    /* another caller has it; nothing here waits */
     SupeState* ss = r->supe;
     SupeEngine* e = &ss->eng;
     uint32_t now = millis();
-    s_hosts[r->idx].dbgLevel = logIsDebug(TAG);
+    s_hosts[r->idx].logLevel = supeLogLevel();
+
+    /* Switched off: no meetings, no seeds, no slots — but an identity to find
+     * and an announcement to keep making, which is the whole of what a silent
+     * node owes the neighbourhood. */
+    if (!r->supeOn) {
+        supeIdentRefresh(r);
+        if (r->mtxPhase == MTXP_OFF && !r->txActive) supeAnnBeat(r, now);
+        supeUnlock(r);
+        return;
+    }
 
     supeEngTagExpire(e, now);
     supeIdentRefresh(r);
@@ -935,21 +1043,7 @@ void supePoll(LoraRadio* r) {
      * fires here, and since annPending gates the drain it would speak ahead of
      * the announces the replay has queued. */
     if (r->mtxPhase != MTXP_OFF) { supeUnlock(r); return; }
-    if (!ss->annPending && !r->annReplay && r->annIntervalMin && !e->expired &&
-        (int32_t)(now - ss->annNextMs) >= 0)
-        supeAnnArm(r);
-    if (ss->annPending) {
-        if (csmaClear(r)) {
-            supeAnnSend(r);
-            r->txWaitMs = csmaGrantWaitMs(r);   /* same restatement as the seed's */
-        } else if (r->lbtTimeoutMs && now - ss->annTryMs > r->lbtTimeoutMs) {
-            ss->annPending = false;
-            ss->annNextMs  = now + supeAnnGap(r);
-            csmaResetAccess(r);
-            if (logIsDebug(TAG))
-                dbg("lora/%d supe: announce gave up on a busy channel", r->idx);
-        }
-    }
+    supeAnnBeat(r, now);
     supeUnlock(r);
 }
 

@@ -88,6 +88,57 @@ contributes:
 - **The browser panel and generated LCD/web settings** (`browser/`, the
   `settings:` block in `straddle.yaml`).
 
+## 1a. How this straddle logs
+
+Two levels, and the split is not about how much detail you want — it is about
+what a line is *for*.
+
+**Debug is one line per meeting**, plus the failures that cost something: a
+schedule that spent a whole horizon carrying nothing, a rendezvous abandoned,
+a power floor raised, a peer held off. A busy pair meets several times a
+second, so a line per step is a scroll nobody reads, and the one line that
+says what happened is buried in it. **Verbose is the steps** — each schedule
+installed, each slot attended, each frame, each measurement filed.
+
+Anything that went wrong rides the line of the thing it went wrong in. A
+failure is a property of a meeting, not a separate event, and splitting the two
+is what makes a log unreadable in the first place.
+
+### The notation
+
+Two forms, used everywhere a level or a channel is stated:
+
+| Form | Means |
+|---|---|
+| `tx{<txpwr> <rssi> <snr>}` | **we** transmitted at `txpwr` dBm, and the far end reported reading it at `rssi` dBm / `snr` dB |
+| `rx{<txpwr> <rssi> <snr>}` | **they** transmitted at `txpwr` dBm, and we read it at `rssi` / `snr` |
+| `<ch>/<bw kHz>/<sf>` | the configuration it flew at |
+
+A triple is always *sent at, read as* — never one end's view twice. A reading
+that never came back is `?`, which is not the same as a zero: one says nobody
+reported, the other is a measurement.
+
+### The meeting line
+
+```
+Our hail tx{10 -58 12} 3/500/5: tx{10 -50 12} rx{14 -45 10} - sent 5/5, rcvd 2/2
+Their hail rx{14 -45 10} 3/500/5: rx{14 -45 10} tx{10 -50 12} - rcvd 2/2, sent 5/5
+```
+
+Whoever opened is named first and their leg is printed first, so the order on
+the line is the order on the air. `hail` means the meeting came from a
+PRIVSYNC's schedule and the triple after it is that frame; `rndv` means it came
+from a goodbye's rendezvous, which cost no frame and has no levels to report.
+The `<ch>/<bw>/<sf>` is what the trains actually flew at — the confirmed budget,
+not the slot's. Repairs are transmissions beyond the train and are named as such
+(`sent 3/3+1`) rather than pushing a count past its own total.
+
+**A leg that carried nothing is absent, not zeroed.** A side that sent no train
+gets no triple, and its count is left off the line entirely rather than printed
+as `sent 0/0` — the same rule as the `?` above: `0/0` reads as a measurement of
+something, and there was nothing to measure. A one-way meeting is therefore one
+triple and one count, and the `-` disappears with both.
+
 ## 2. The task
 
 One FreeRTOS task — **priority 1, 10 KB PSRAM stack** (larger than other
@@ -1059,10 +1110,9 @@ row binds the kHz display key rather than the Hz config key.
 The same gate carries two renames, each of which was one setting under two
 names: `afa` → `SUPE.afa` and `announce_interval` → `SUPE.announce_interval`.
 Each moves at its existing value rather than silently changing a node's
-behaviour, and the old key is deleted. It also deletes
-`SUPE.adaptive_txpower` outright rather than carrying it: `adaptive_txpwr`
-governs a strictly narrower thing (§15), so the old value would be an answer to
-a question nobody asked. Frequency and TX power carry no default
+behaviour, and the old key is deleted. It also deletes `SUPE.adaptive_txpower`:
+transmit power is not a setting (§15.4), so it is not an answer to a question
+anybody asks. Frequency and TX power carry no default
 (region/antenna — the user must pick); everything else defaults so an
 enable-toggle alone gets a radio up. The **RNode group is global, not per radio**
 — there is one endpoint for the device — and is seeded under the same gate with
@@ -1080,12 +1130,105 @@ does **not** touch any power pin — the board owns the LoRa rail.
 Every on-air frame is recorded for the LoRaMon viewers (browser + LCD). The
 storage subtree **is** the ring — no in-firmware record buffer, no ITS transfer:
 
+- **The neighbourhood, published.** `lora.<n>.peers.<slot>` =
+  `"<num>|<supe>|<tags…>|<names…>|…"`, one node per peer-table slot, rewritten on
+  the stats beat and deleted when a slot empties. `<num>` is the number `lora n`
+  prints beside the node, counted the way `lora n` counts it — used, not us, in
+  table order — so a viewer with no name to show falls back to it and a person
+  reading both surfaces sees the same `#4`. Tags are three-byte prefixes,
+  comma-joined and deduplicated — the whole set that resolves an address to this
+  node — and names are the first word of each announced LXMF name on its
+  destinations, comma-joined, duplicates dropped. Published
+  rather than derived, because the mapping lives in the peer table and nothing
+  outside this straddle can rebuild it: a viewer sees frames, not the announces
+  and proofs that clustered them into nodes. LoRaMon reads it to name the node
+  behind a frame's tag — on hover in the browser window, on tap in the LCD app;
+  a graph view is the reason it is a general key rather than a field on a
+  record.
+
 - **One node per frame.** `loraMonPush` (from the RX drain and each TxDone, so
   once per on-air frame → two per split RNS packet) writes
   `lora.<n>.packets.<ms>` = a packed string; direction is the leading token, snr
   is deci-dB:
-  - rx: `r|<rssi>|<snr>|<dur_ms>|<bytes>|<type>|<ch>`
-  - tx: `t|<txp>|<dur_ms>|<bytes>|<type>|<wait_ms>|<ch>|<own_ms>`
+  - rx: `r|<rssi>|<snr>|<dur_ms>|<bytes>|<type>|<ch>|<desc>|<cast>[|<tag>]`
+  - tx: `t|<txp>|<dur_ms>|<bytes>|<type>|<wait_ms>|<ch>|<own_ms>|<desc>|<cast>[|<tag>]`
+
+  `<desc>` says what the frame IS — a code, not a string, because every record
+  is a storage node and there may be thousands of them, so the name lives once
+  in each viewer's own table. The SUPE frames by name, then Reticulum's packet
+  type read off the bottom two bits of its first header byte. A CRC-failed frame
+  gets no description at all — reading a type out of bytes that failed their
+  checksum is reading noise.
+
+  **Which half of a split a frame is, the record stream works out for itself**
+  (`loraMonClassify`, one tracker per direction). `loraMonDescribe` and
+  `loraMonTagOf` both read the Reticulum header, so both want the head; nothing
+  in a frame says which half it is, and — decisively — **the reassembly state
+  cannot be asked**. A train's frames are buffered by the meeting and
+  reassembled only at its close, so at record time `splitPending` has not moved,
+  and on transmit `train_fire` stages every frame as `txFrame[0]`, so the
+  completion index cannot say either. Read that way, a tail's second byte is
+  payload, and `f[1] & 0x03` on arbitrary bytes yields a *confident* packet
+  type: a 467-byte transfer records as `data` followed by `announce`, on a
+  detour, where an announce cannot be. Trains are most of the traffic, so that
+  is most of the graph. The tracker applies the same seq-and-timeout rule
+  reassembly does, to the recorded stream instead.
+
+  A tail therefore reports two things. Its own description is `split`, which is
+  what a tail is; the **packet's** description is inherited from the head and is
+  what `<cast>` keys off, since an announce too big for one frame is a broadcast
+  in both halves and colouring the second as a unicast would say the packet
+  changed audience halfway through the air. The head's address is inherited the
+  same way.
+
+  `<tag>` is the three bytes naming the node the frame concerns, present only
+  when there is one to take. It is the same prefix the protocol classifies on
+  and the one every SUPE log line quotes, which is what lets a bar on a graph
+  and a line in a log be recognised as the same event; `lora.<n>.peers.*` above
+  is what turns it back into a node with a name. Inside a SUPE meeting the tag
+  is the **peer the meeting is with** (`supeMeetingTag`), not the address on the
+  frame: a train's frames carry whatever destination their payload was headed
+  for, and a viewer asking "who was this exchange with" wants one answer for the
+  whole train.
+
+  `<cast>` is who the frame was aimed at — `0` broadcast, `1` a unicast for us,
+  `2` a unicast for somebody else (`LMC_*`). The device decides it because a
+  viewer cannot: it turns on which addresses mean US, and that lives in the peer
+  table. It is what the viewers colour by, so it has to be on every record rather
+  than derived per frame at draw time.
+
+  **`<cast>` and `<tag>` are different questions and must be answered
+  separately.** Whose traffic this is decides the colour; who it is with is a
+  label for a person. Neither may be derived from the other: inside a meeting
+  the tag is the *peer*, which is never one of our own addresses, so resolving
+  the tag against the local rows says "somebody else's" about the bulk of our
+  own traffic. The three answers, in order:
+  - a description of `announce` or `ANNOUNCE2` → `LMC_BCAST`. Broadcast is a
+    property of the frame, not of an address, so it is read off `<desc>` and
+    `loraMonCastOf` never returns it.
+  - a frame belonging to a meeting of ours → `LMC_US`. A meeting has two parties
+    and we are one of them; this is known, not inferred, and it covers every
+    meeting frame that carries no address at all. The meeting is sampled **both
+    before and after the SUPE dispatch**, because the dispatch is what opens and
+    closes one: asking only after calls the closing frame somebody else's, and
+    asking only before does the same to the opener.
+  - otherwise `loraMonCastOf` on the frame's own address: a local row's
+    destination or identity, or a link we are an endpoint of, → `LMC_US`;
+    anything else, an address that resolves to nobody included, → `LMC_OTHER`.
+    Unknown is not the same as ours.
+
+  On transmit `LMC_US` cannot arise, so `LMC_OTHER` is what the graph reads as
+  "our unicast", and our own broadcast carries no tag at all — the address on it
+  is ours, and naming ourselves above a bar that is already ours by its colour
+  says nothing.
+
+  A **split packet's address lives in its head** and both halves record it, by
+  the same inheritance the description uses (see `loraMonClassify` above).
+
+  A received **PRIVSYNC names US** in its address field — it is a hail aimed at
+  this node — so its `<tag>` comes from the `sender_ident` it carries
+  (`loraMonSenderOf`) rather than from that field. That is what the field is for,
+  and it is why a hail on the graph is labelled with whoever sent it.
   `<ch>` is the channel the frame flew on, taken from `LoraRadio.chNow`, `0`
   being the hailing channel; a SUPE detour under a regime with a channel plan
   (§18, §19) is what puts anything else there.
@@ -1098,15 +1241,23 @@ storage subtree **is** the ring — no in-firmware record buffer, no ITS transfe
   Performance Enhancements (`plans/SUPE.md`), which covers its own frames (§19)
   as well as the 0x04 power request, and
   is the name both viewers' legends give it —
-  `2` a packet the attached RNode client originated (§17). The viewers colour
-  them yellow, red and orange. RX is classified by whether the own-protocol branch consumed
+  `2` a packet the attached RNode client originated (§17), `3` a frame whose CRC
+  failed. Only `3` reaches the viewers' colour: they colour by **direction and
+  audience**, not protocol — red is what this radio put on the air and blue what
+  arrived, light for a broadcast and dark for a frame with one addressee, grey
+  for somebody else's unicast, and purple for a CRC failure, which is neither,
+  since nothing in it was readable. `<type>` stays on the record because the
+  byte-count convention below turns on it. RX is classified by whether the own-protocol branch consumed
   the frame (so the tap runs before the record is written); TX by
   `LoraRadio.txType[]`, which is per-frame because a power request (§15.1) and
   the RNS packet it prefixes share one burst but not one protocol. The record's
-  byte count is payload bytes: a tx record strips the 1-byte seq/split header for
-  every type **except** `1`, which carries none — RNode-origin packets fly
-  through the same framing rnsd's do — while an rx record strips one
-  unconditionally, so an inbound type-`1` frame reads a byte short of the air.
+  byte count is payload bytes, and the rule is the same in both directions: the
+  1-byte seq/split header is stripped for every type **except** `1`, which
+  carries none — RNode-origin packets fly through the same framing rnsd's do.
+  It has to be the same both ways, because **the wire length is how a reader
+  reaches fields the record does not carry**: a THATSIT is `SUPE_THATSIT_BASE`
+  plus one checksum per train frame, so a byte off is a *frame* off, and a repair
+  round then reads as a resend of something already received.
   The per-frame trace is emitted here too, at **`log lora verbose`** rather than
   debug: debug is the decision trace and verbose is the frame trace (§19.8).
   (It replaced the RNS-header trace; `loraTracePacket` is kept but unwired.)
@@ -1139,7 +1290,22 @@ storage subtree **is** the ring — no in-firmware record buffer, no ITS transfe
   queue), because each may be blocked on the long cadence the old state
   allowed. On the falling edge the interface task drops each radio's whole
   `lora.<n>.packets` subtree — so there is no pre-open history; the graph
-  fills from open forward.
+  fills from open forward. **The in-flight dwell goes with it** — and that takes
+  a write on each task, because the two halves belong to different ones.
+  - `dwellKeyMs`, interface task, cleared in `loraMonClear`. A stay on one
+    channel is one record *extended in place*, so the key it extends has to still
+    exist; carried across the clear, the first stay after the next open rewrites
+    a node that was just deleted — at a timestamp from before the window opened,
+    and outside the FIFO that expires it.
+  - `dwellSince`, radio task, dropped when its own poll sees the watch flag
+    change (`dwellWatched`). A window that has just opened must start recording
+    the stay the radio is **already on**: waiting for the next retune leaves the
+    lane veiled until something happens to move the radio, so the background
+    appears to begin at the first traffic rather than at the moment the viewer
+    opened. Dropping the anchor rather than keeping it is what stops that first
+    span reaching back before the window; the poll takes a fresh one on the same
+    pass. Note the poll cannot be gated on `dwellSince` being set — only
+    `loraMonDwell` assigns it, so a gate like that never re-arms.
 - **The viewer's clock is the device's uptime, and uptime restarts.** Records are
   keyed by `millis()`, and the browser panel anchors "now" to the newest record
   and extrapolates from `Date.now()` between updates. That anchor is monotonic
@@ -1166,7 +1332,27 @@ storage subtree **is** the ring — no in-firmware record buffer, no ITS transfe
   the traffic on every channel's graph. The sampling itself is gated on the
   viewer too — see §18.3. Unlike the packet nodes there is no history to
   mirror — only the newest sample is published — so the series starts when the
-  window opens and a skipped beat simply reads as a gap.
+  window opens and a skipped beat simply reads as a gap. The hailing lane also
+  carries the **floor** drawn from it: one dotted line at the quietest usable
+  reading of the last minute, with its figure on a pill sitting ON the line, at
+  the right end and clear of the rx scale — the axis the number is quoting. A
+  minute rather than the window on screen, because it is a statement about
+  conditions now: zooming out to an hour must not turn it into the quietest
+  moment of that hour. The quietest rather than the mean, because a mean over a
+  channel carrying traffic measures the traffic.
+
+  **Two kinds of non-reading are dropped, and there is no floor at all when
+  nothing survives them** — a level nobody can vouch for is worse than none. A
+  zero is a beat that produced no reading. Anything at the register's weakest
+  rail (`NOISE_RAIL_DBM`, −127) is the *rail*, not the channel: the level is a
+  byte read as −value/2 dBm, so −127.5 is as quiet as it can say, and it says
+  that whenever the front end has nothing yet — which is exactly the first
+  minutes after a radio comes up, where a floor pinned at −128 dBm sat on the
+  bottom edge of the plot being wrong. It cannot be a measurement either:
+  thermal noise alone is about −123 dBm in 125 kHz before any receiver's own
+  noise figure, so no working front end reads below it. The pill is also clamped
+  whole inside the lane, since a line along an edge would otherwise cut it in
+  half.
 - **The interface task idles at the rollup cadence, not at 1 Hz.** Its 1 Hz
   maintenance beat (expiry, stats flush, airtime publication) runs while a
   viewer is open or a UI can pull stats (`uiTelemetryWanted`). Dark — no
@@ -1200,19 +1386,43 @@ put every one of those in the top band with nothing to tell them apart.
 The steps differ because the ranges do (128 dB against 40) and both have to land
 on the same band edges for one grid to serve them; the axis names stand in the
 pill strip over their own gutter, which is what pushes the pills inward.
-Direction is read off **the background**: over a transmit's time-on-air — and
-not over the wait before it, which is channel access, not transmission — the
-bands are repainted in a **reddish cast of the same gradient**. That frees
-colour to mean the frame's **protocol**: Reticulum yellow `#E8D040`, the RNode
-client orange `#E89040`, ours red `#E84040`. The caption carries **tx airtime**
-and **channel busy** (tx + rx — the radio is half duplex, so the two never
-overlap) plus a colour-keyed legend naming the three, since a colour with no key
-is a decoration. A tab row above the graph selects the radio on a multi-radio
+Colour says **direction and audience**, and nothing tints the background: red is
+what this radio put on the air and blue what arrived, light for a broadcast
+anyone may read (`#F08080` / `#80B8F0`) and dark for a frame with one addressee
+(`#B02020` / `#2060C0`); grey `#8A8A8A` is somebody else's unicast — on the air,
+but not our conversation — and purple `#8050C8` a frame whose CRC failed, which
+is neither, since nothing in it was readable. Protocol left the colour scheme
+when the records gained a description: a viewer that can be *asked* what a frame
+is has no need to spend its one visual channel saying it, and audience is the
+question a monitor is actually opened to answer. The caption carries **tx
+airtime** and **channel busy** (tx + rx — the radio is half duplex, so the two
+never overlap) plus a colour-keyed legend, since a colour with no key is a
+decoration. A tab row above the graph selects the radio on a multi-radio
 board (discovered from `lora.<n>.state`, hidden when there is only one);
 switching resets the zoom stack, because a span selected on one radio's traffic
 means nothing on another's. With a frequency-agility regime in force the browser
 stacks **one quarter-height graph per agile channel** under that main graph on
 the same time axis — see §18.6.
+
+**Pills.** A pill is a note stuck on the graph rather than part of it: cream,
+black text, rounded, in the smaller face. One style serves both the peer name on
+a train and the noise floor's figure, because two label styles for one job is one
+too many.
+
+Consecutive frames on a lane sharing a `<tag>` are one run — a train, or a lone
+hailing-channel frame, which is that run at length one — and the run gets the
+peer's name once. It sits **beside** the run,
+level with its top and a few pixels off its right end. Centred, the pill's offset
+from the frames it names changes with the run's width, so the same train's label
+lands somewhere different every time the view moves; anchored to one end it stays
+put. A run is named only where it is at least as wide as the label and the pill
+has room before the right gutter, so pills come and go as the view zooms — at a
+width where the text would dwarf what it labels, it is pointing at the wrong
+traffic. A gap longer than the widest slot spacing a schedule asks for ends a
+run, because past that they are two conversations that happened to be with the
+same node. The LCD draws them with a fixed pool of four floating labels (the
+canvas has no glyph blitter), widest run first: a view with more nameable runs
+than that has them shoulder to shoulder and unreadable anyway.
 
 The two viewers repaint differently, and the difference is visible. The browser
 rebuilds from storage at 1 Hz but repaints off `requestAnimationFrame` against an
@@ -1223,7 +1433,39 @@ differs — only how often it is drawn.
 **Zoom stack.** Touching/clicking the plot anchors a highlighted span. The
 anchor is stored as a **device time, not a pixel** — which is what makes holding
 still on a live graph *widen* the highlight: the anchor stays put while "now"
-advances, so it drifts left under a stationary pointer. Releasing pushes
+advances, so it drifts left under a stationary pointer.
+
+**Every lane carries a light-grey bezel around its plot area.** A lane the radio
+never visited is veiled end to end and has no traffic to give it shape, so
+without one it is a rectangle of dark against a dark window — indistinguishable
+from the gap between two lanes, and from no lane at all. The bezel is what says a
+graph is there and *empty* rather than absent, which is why it is drawn before
+the traffic as well as after: the case it exists for is the lane with nothing to
+plot, and that is exactly the case both viewers return early on. The noise floor
+stops at the gutters for the matching reason — a level drawn on the plot that
+runs on through the scales strikes out the very numbers it is read against.
+
+**The live edge stops short of "now" by `LAG_MS` (1.5 s).** The most recent
+moment is not a finished picture: a stay on one channel is one record that
+*grows*, so the background arrives a step at a time, and frame records are
+batched, so a packet lands in a column the graph has already drawn as empty.
+Both read as the graph correcting itself in public — blocks filling in at the
+right edge, bars appearing out of nowhere behind them. Holding the edge back past
+the slowest of those publishers shows only what has settled. On a plot whose
+shortest window is ten seconds, a second and a half of latency is not a cost
+anybody is watching for. Both viewers apply it in `view()`, so everything derived
+from the span — the hit test, the copy button, the airtime figures — agrees with
+what is drawn.
+
+**The hover hairline is the opposite, and deliberately so.** It is stored as a
+*fraction of the plot width* and turned into an instant at draw time, so on a
+live graph the line stands where the hand is and the frames slide under it. A
+selection is a span of time and must keep meaning the same span; a cursor is
+where you are pointing, and a time-anchored one walks off to the left while the
+mouse has not moved. That the instant it reports advances is the point — the
+pointer is asking what is there *now*, not holding a bookmark.
+
+Releasing pushes
 `{t0,t1}` on a zoom stack and the view becomes that fixed span; the window pills
 give way to a single **back** pill. A zoomed view stands still, so selecting
 inside it zooms further, pushing another level. Back pops one level, and
@@ -1309,16 +1551,29 @@ radio, `gp_alloc`'d at first `radioStart` and kept across config cycles and
   with LR data trimmed to the 64 ephemeral-key bytes (MTU signalling excluded),
   mapped to its dest; the LRPROOF (context 0xFF, dest = link_id) marks it
   established and — at hops 0 — attributes its signal to the dest, which is
-  thereby proven a direct neighbour. A link dialled *to* us records no hash for
-  its initiator, so `apNextHop4` cannot name the far end from the link's
-  destination — that destination is ours. It hands back the link identifier
-  instead, which resolves once a transaction has named who dialled and filed the
-  identifier on that node's row (`peersAddLink4`). Without that, our own traffic
-  on such a link carries `LORAQ_PEER_NONE` into the queue, and everything keyed
-  on the queued peer — the per-peer cap, the power controller, and the reverse
-  leg's scan — silently finds nothing. Mid-link traffic on an unseen link_id
+  thereby proven a direct neighbour. Mid-link traffic on an unseen link_id
   creates an *unresolved* entry. `ours` = we transmit on it at hops 0, or its
   LR dest is one of our hashes.
+
+  **Whose link it is, and the three ways of knowing.** A link identifier is the
+  address every frame of a session carries once it is up, and it belongs to
+  neither end's announced set — so unless it is filed on a node's row
+  (`peersAddLink4`) the whole session resolves to nobody: absent from `lora n`,
+  unnamed on a graph, and — worse — carrying `LORAQ_PEER_NONE` into the queue,
+  where everything keyed on the queued peer (the per-peer cap, the power
+  controller, the reverse leg's scan) silently finds nothing. The three handles:
+  - **We dialled.** The far end is whoever owns the destination we dialled, so
+    the LR at `isTx` files the identifier against that row directly. Every
+    inbound frame at hops 0 on such a link re-files it, which is also what
+    catches a link we only picked up mid-session.
+  - **It was dialled to us, as a detour's cargo.** A schedule belongs to one
+    pair and the frame came under it, so `fromPeer` names the dialler
+    (`supeCargoPeer`). Taken on the LR and on any later frame of the session,
+    since a responder gets no other handle.
+  - **It was dialled to us in the clear.** Anonymous, and stays that way: a link
+    request carries no sender, and the session's own identify step is encrypted
+    inside the link. `apNextHop4` hands back the identifier itself rather than a
+    node, which is the honest answer.
 - **Link quality (one byte).** Proof packets are addressed to the proved
   packet's truncated hash, so each elicitor we transmit (an LR, or an
   originated single-dest packet to a known direct neighbour — probes included)
@@ -1482,7 +1737,7 @@ one of them and wrong for the other by that much. The main channel resolves
 against the hailing configuration (`apOpenPower`); a granted step resolves
 against the step (`apOpenPowerAt`), on both sides of the transaction.
 
-### 15.2 Four tiers, best evidence first
+### 15.2 Three tiers, best evidence first
 
 Each is gated on `AP_FRESH_MS` (10 minutes). Stale evidence falls to the next
 tier, and a node we have heard nothing from opens at the configured `tx_power`.
@@ -1491,8 +1746,7 @@ tier, and a node we have heard nothing from opens at the configured `tx_power`.
 |---|---|---|
 | `AP_SRC_REPORT` | the peer stated the level our own frame landed at — GIMME reporting the PRIVSYNC and the HAVEDATA, the answering HAVEDATA reporting the train: the only measurements of the direction we transmit in | `SUPE_TARGET_MARGIN_DB` |
 | `AP_SRC_PAIR` | a frame heard here with the power the peer stated for it (§10's pairs, either the hailing one or the step one, whichever is fresher) | `+ AP_RECIP_MARGIN_DB` |
-| `AP_SRC_EST` | the same, against `s.lora.assumed_peer_txp` instead of a stated power | `+ AP_EST_MARGIN_DB` |
-| `AP_SRC_NONE` | none of the above is fresh | the configured `tx_power` |
+| `AP_SRC_NONE` | neither is fresh — **and every node outside SUPE, permanently**, since both tiers above need a power the peer stated | the configured `tx_power` |
 
 The reciprocal tiers cost their extra margin because ambient noise is **not**
 reciprocal even where path loss is: a node sitting beside an interferer needs
@@ -1540,41 +1794,28 @@ closing frame means only that an acknowledgement went missing — the train
 itself arrived — and it recurs, so a table-top pair ratcheted −9 dBm to 22 dBm
 over four minutes, each end climbing because the other had.
 
-### 15.4 The `EST` tier is the only thing `adaptive_txpwr` governs
+### 15.4 It runs against a SUPE node or not at all, and there is no setting
 
-Everything above it is fed by frames that state the power they went out at, and
-stating that power is what the protocol is *for* — a node cannot both speak it
-and decline to use what it says. So the measured tiers are not switchable.
+Both derived tiers are fed by frames that **state the power they went out at**,
+and stating that power is what the protocol is *for* — a node cannot both speak
+it and decline to use what it says. So there is nothing to switch, and no key.
 
-`s.lora.<n>.adaptive_txpwr` (default 1) reaches the `EST` tier alone, which is
-also the only tier a node that does not speak our air protocol can ever reach.
-There is no return measurement there to catch it being wrong, and nothing but a
-delivery proof will ever notice. It is therefore deliberately timid:
+A node outside the protocol therefore sits at `AP_SRC_NONE` permanently and is
+transmitted to at `tx_power`. That is not a gap to be filled by estimating from
+the level its frames arrive with here. Such an estimate is a guess in two
+directions at once — the path is measured the wrong way round and the peer's own
+power is assumed — and, decisively, **nothing can catch it being wrong**: there
+is no return measurement, and Reticulum's delivery proofs are far too sparse to
+serve, since nothing inside an established link elicits one.
 
-- **more evidence to start** — `AP_PASSIVE_MIN_SAMPLES` frames spread over at
-  least two bucket-ring slots, so one announce burst from a passing node cannot
-  move it, and `lastHeardMs` inside `AP_FRESH_MS`;
-- **half the surplus** — it claims `(cfgTxp − estimate) / 2`, so the timidity
-  scales with the size of the guess where a flat extra margin would not;
-- **a capped cut** — `AP_PASSIVE_CUT_MAX_DB`, or `AP_PASSIVE_CUT_BLIND_DB`
-  while `qProved == 0`, since for that peer the cut is unfalsifiable and will
-  stay that way;
-- **a walk, not a jump** — the estimate is a *target*, and the cut is bounded
-  by `apEstWalkDb`, which buys one dB per `AP_EST_WALK_FRAMES` frames heard from
-  that peer (`apHeard`, off `peersSample`). A peer the controller has never
-  adapted to opens at the configured power.
-
-The walk is the tier's own counter and not the ratchet's trim, because the two
-are paid for in different currency. The ratchet spends returned delivery
-signals, and a peer that speaks only Reticulum to us barely produces any —
-nothing inside an established link elicits a proof — so a walk bounded by the
-trim never leaves zero and this tier resolves to `tx_power` forever. Frames
-heard are the evidence the estimate is built from in the first place, they
-arrive whenever the peer is talking to us, and they stop arriving exactly when
-the link is in trouble. The walk holds still while a failure floor stands
-(walking under a floor buys nothing now and lands the power somewhere unproven
-when it decays) and halves rather than zeroes on a miss, so a decayed floor does
-not hand back the cut that just failed.
+The case that settles it is two such nodes facing each other. Each reads the
+other's surplus off its own receiver, each dials down, and neither has any way to
+say *too quiet* — the reciprocity assumption both are relying on is exactly what
+fails when both ends move. A link that would have worked at either end's
+configured power is walked into the ground by both of them at once, and the only
+signal that anything is wrong is traffic that stops. Transmitting at the
+configured power is the honest answer, and it is what a peer outside the protocol
+gets.
 
 ### 15.5 The answering side
 
@@ -1633,7 +1874,7 @@ the level.
   IRQ pin or the radio goes silent.
 - **Half-duplex: `splitPending` blocks all TX** until the second frame arrives or
   the 5 s timeout fires. Outbound bytes sit in the ITS stream buffer meanwhile —
-  don't drain them in a tight loop. It must **not** also stand the SUPE engine
+  don't drain them in a narrow loop. It must **not** also stand the SUPE engine
   down, and must not reach it as `rx_busy` either. Standing the engine down
   leaves its next event computed from a slot already past, so the deadline pins
   at zero and the main loop spins for the whole timeout while no schedule can
@@ -2102,7 +2343,7 @@ main channel (the hailing channel — where everyone camps)
   A→*  PRIVSYNC        6/9 B   "traffic for whoever holds this tag — you know
                                where to find me" (+ A's identity, sender_ident)
                                └─ carrier-sensed like any other transmission
-                               └─ its hash seeds the TIGHT schedule: slots at
+                               └─ its hash seeds the NARROW schedule: slots at
                                   +26 ms then every 40–63 ms to 400 ms, each
                                   with a derived channel and sync word; A
                                   speaks in even slots, B in odd
@@ -2138,7 +2379,7 @@ per slot (window `[t−guard, t+guard+preamble]`, extended only while the modem
 reports a frame mid-air); a speaker spends one short frame per owned slot and
 only attends with traffic queued; a busy channel at a slot is skipped —
 the appointment grants the peer's attention, never the spectrum. A missed slot
-scores NOTHING, in any direction. The one silence that scores is a tight
+scores NOTHING, in any direction. The one silence that scores is a narrow
 schedule we seeded expiring unmet: one strike on the absence ladder, because
 that seed flew carrier-sensed on the shared channel and its slots gave the
 peer several hundred milliseconds of chances. Delivery is whole and in
@@ -2177,12 +2418,10 @@ remains references them. What that removes along the way:
 - **The channel plan.** One channel — the configured carrier — so the RSSI beat
   reports one, `publishChannels` lists one, and every transmission's airtime
   feeds the APPC band directly instead of a per-channel ledger.
-- **Every measured power tier.** They are fed by frames that state the power
-  they went out at, and those frames are SUPE's. What survives is the `EST`
-  tier — `s.lora.<n>.adaptive_txpwr`, which this build still reads, since in a
-  build with no SUPE every peer is a peer that cannot tell us what it hears.
-  `apDerive` compiles without a sensitivity model, which only the measured
-  tiers need.
+- **Adaptive transmit power, entirely.** Both tiers are fed by frames that state
+  the power they went out at, and those frames are SUPE's; nothing survives them
+  (§15.4). Every peer is transmitted to at `tx_power`, which is what a build
+  with no SUPE would have had to do for every peer in any case.
 - **The settings.** Every SUPE row in `straddle.yaml` carries
   `when_kconfig: "!CONFIG_LORA_NO_SUPE"`, which gates the LCD pane row, the
   browser row and the `storageDefault()` at once — so the keys are **absent**
@@ -2191,10 +2430,10 @@ remains references them. What that removes along the way:
   text and `lora a` wording say only what this build does.
 
 The browser panel is one bundle serving either firmware and cannot read a
-Kconfig, so it asks the device: `hasSupe` tests whether
-`s.lora.0.SUPE.enable` came back at all, and hides the section and the LoRaMon
-legend's third colour when it did not. The LCD legend takes the `#if` directly,
-being compiled here.
+Kconfig, so it needs nothing to ask: the settings UI is built from the `s.lora.*`
+keys the device publishes, and a build without SUPE publishes none of them, so
+the section is simply not there. LoRaMon needs no test either — it colours by
+direction and audience, which every build has.
 
 ### 19.2 Where it lives
 
@@ -2235,7 +2474,7 @@ Host tests: `make -C esp-idf/test` runs the core checks and regenerates
 `golden.txt` + both vector files; `make -C esp-idf/test engine` steps whole
 meetings — seed to goodbye, the return leg, a repair round recovering a
 dropped frame, in-sequence delivery around a hole, the absence ladder on
-tight expiry, the no-evidence rules, and the seed-hash gate — against a stub
+narrow expiry, the no-evidence rules, and the seed-hash gate — against a stub
 host.
 
 ### 19.3 Frame dispatch
@@ -2281,8 +2520,8 @@ rather than opening at the ceiling. A minute imposed on the first finding
 outlives the conversation that provoked it, so the next attempt falls inside it
 too and a fault that would have cleared looks permanent to anyone retrying.
 
-**Which schedule gets a contested moment: the tight one.** `slotService` walks
-the table twice, tight before wide. A tight schedule was bought moments ago with
+**Which schedule gets a contested moment: the narrow one.** `slotService` walks
+the table twice, narrow before wide. A narrow schedule was bought moments ago with
 a frame on the shared channel by a party holding traffic, and its whole horizon
 is a few hundred milliseconds; a wide one is a standing appointment from a
 meeting already closed, three seconds long and quite possibly empty at both
@@ -2310,7 +2549,7 @@ though they were an idle horizon.
 inside a slot's window is not the same as hearing it — a receiver opened
 part-way through a frame has missed the preamble and hears nothing however
 strong the signal — so a run of small positives means the first-slot gap is
-short for this hardware's cold retune (`SUPE_TIGHT_T0_MS`), not a peer that has
+short for this hardware's cold retune (`SUPE_NARROW_T0_MS`), not a peer that has
 stopped speaking. `slotsLateOpen` counts them.
 
 **The peer is named by the PRIVSYNC, or not at all.** On the listening side
