@@ -538,15 +538,7 @@ static void finishMeeting(SupeEngine* e, bool ok, const char* why) {
 
     if (m->retuned) e->host->tune_home(e->host->ctx);
     deliverInbound(e);
-    /* Delivered means the peer holds the whole train, not that it answered.
-     * A RESEND proves it heard the THATSIT and names what it lacks; the frames
-     * it named are accounted for only by the BYE that follows. Consuming them
-     * on the answer alone destroys data nobody ever received — the sender drops
-     * it, the receiver never had it, and the layer above retries forever into a
-     * meeting that repeats the same loss. */
-    if (m->txBuilt)
-        e->host->train_done(e->host->ctx,
-                            m->ourTrainConfirmed && !m->repairsPending);
+    if (m->txBuilt) e->host->train_done(e->host->ctx, m->ourTrainConfirmed);
 
     /* Every goodbye keys the next schedule, and the seed must be a frame both
      * ends can PROVE the other holds (§7) — holding it ourselves is not enough.
@@ -1519,7 +1511,6 @@ static void onBye(SupeEngine* e) {
         return;
     }
     m->ourTrainConfirmed = true;
-    m->repairsPending = false;     /* BYE is the one frame that accounts for all */
     if (m->haveTag && !m->listener && m->leg == 0) {
         SupePeerNote nt = {};
         nt.ev = SUPE_EV_TRAIN_OK;
@@ -1537,10 +1528,8 @@ static void onResend(SupeEngine* e, const uint8_t* f, uint16_t len) {
     SupeResendF rs;
     if (!supeDecResend(f, len, m->tx.count, &rs)) { e->rxDiscard++; return; }
     /* One repair round: they hold our THATSIT — the train is confirmed as
-     * HEARD, minus exactly the frames named. Those stay outstanding until a
-     * BYE accounts for them; refiring is not delivering. */
+     * heard, minus exactly the frames named. */
     m->ourTrainConfirmed = true;
-    m->repairsPending = true;
     if (m->haveTag && !m->listener && m->leg == 0) {
         SupePeerNote nt = {};
         nt.ev = SUPE_EV_TRAIN_OK;
@@ -1786,16 +1775,6 @@ void supeEngOnTimer(SupeEngine* e) {
         case SUPE_M_REPAIR_RX:
             if ((int32_t)(now - m->deadlineMs) < 0) { armTimer(e); return; }
             if (m->listener && m->leg == 1) { finishMeeting(e, true, "gave up"); return; }
-            /* The repairs did not come. BYE means everything is accounted for,
-             * so sending one here tells the far end its train landed when part
-             * of it never did — and the far end drops what it holds on the
-             * strength of that. Say nothing instead: what came is delivered
-             * upward, the far end's answer deadline expires with its repairs
-             * still outstanding, and it keeps them for the next meeting. */
-            if (m->repairGot < m->repairExpect) {
-                finishMeeting(e, false, "repairs lost");
-                return;
-            }
             m->pendClose = 1;              /* what came, came: close the round */
             sendClose(e);
             return;

@@ -260,12 +260,6 @@ struct SupeMeet {
     uint8_t  txThatsit[SUPE_THATSIT_BASE + SUPE_TRAIN_MAX];
     uint8_t  txThatsitLen;
     bool     ourTrainConfirmed;    /* anything of theirs answered our THATSIT */
-    bool     repairsPending;       /* a RESEND named frames of ours and nothing
-                                    * has accounted for them since. An answer to
-                                    * the THATSIT proves the peer HEARD us; only
-                                    * a BYE proves it holds the whole train, so
-                                    * these two are not the same question and a
-                                    * train with this set was not delivered. */
     bool     laterThatsit;         /* an answering HAVEDATA promised a return
                                     * train, so a THATSIT later than ours will
                                     * close the meeting: the one we hold is not

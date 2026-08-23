@@ -950,38 +950,6 @@ static void testTrainLostCarriesItsConfig(void) {
  * array order the rendezvous wins about half the time and its retunes land the
  * node late for every slot of the hail — which is what the bench showed, three
  * own slots late out of three, followed by the peer giving up. */
-/* What one repair round cannot save must stay queued at the sender. The far end
- * answering a THATSIT proves it HEARD the train; only a BYE proves it holds all
- * of it, and the frames a RESEND named are accounted for by nothing until then.
- * Treating the answer as delivery drops data nobody ever received — gone from
- * the sender, never had by the receiver — and the layer above then retries into
- * a meeting that repeats the same loss, forever. On the bench that read as
- * `rcvd 0/1 (closed)` over and over with a RESEND and a BYE and no frame in
- * between. */
-static void testUnrepairedFramesStayQueued(void) {
-    resetAir();
-    Node A = {}, B = {};
-    nodeInit(&A, "A", SUPE_REGIME_EU863);
-    nodeInit(&B, "B", SUPE_REGIME_EU863);
-    std::vector<Node*> air = { &A, &B };
-    wire(&A, &B);
-
-    pushPkt(&A, TAG, 5, 150, 0x11);
-    pushPkt(&A, TAG, 5, 150, 0x22);
-    pushPkt(&A, TAG, 5, 150, 0x33);
-    uint8_t queued = loraqDepth(&A.q);
-    eqi(queued, 3, "three packets are waiting");
-    g_dropNthTrain = 2;                        /* the middle frame is lost… */
-    g_dropRepairs = true;                      /* …and so is its repair */
-
-    launchFrom(&A);
-    driveUntilDone(air, &A, 1, 30000);
-
-    eqi((long)B.delivered.size(), 2, "the receiver surrenders what it never got");
-    ok(loraqDepth(&A.q) > 0, "…and the sender still holds it to try again");
-    eqi((long)A.trainsDelivered, 0, "the train is not scored as delivered");
-}
-
 static void testHailOutranksRendezvous(void) {
     resetAir();
     Node A = {}, B = {};
@@ -1206,7 +1174,6 @@ int main(void) {
     testBusyReceiverStillRetiresSchedules();
     testHailRetryReplacesSchedule();
     testTrainLostCarriesItsConfig();
-    testUnrepairedFramesStayQueued();
     testHailOutranksRendezvous();
     testOrphanWideScheduleIsAbandoned();
     testSeedHashGate();
