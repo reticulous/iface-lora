@@ -2,6 +2,10 @@
 /* Included by lora_priv.h in dependency order; module code includes
  * lora_priv.h, not this file directly. */
 struct LoraRadio;
+/* Declared rather than included: a build with SUPE compiled out has no supe.h,
+ * and the ratchet's entry points still take one by pointer — they are called
+ * from the delivery paths, which are not gated on the protocol. */
+struct SupeCfg;
 
 /* ── adaptive TX power ──
  * Every frame whose first RF hop is a known node goes out at a power derived
@@ -22,7 +26,7 @@ struct LoraRadio;
  * A power that ignored the configuration would be tuned for one of them and
  * wrong for the other by the 15–20 dB that separates SF12/125k from SF5/500k.
  *
- * **Four tiers, best evidence first** (ApSource, in lora_peers.h):
+ * **Three tiers, best evidence first** (ApSource, in lora_peers.h):
  *
  *   REPORT  the peer stated the level our own frame landed at, in the MANIFEST
  *           that closes a detour. The only measurement of the us→them
@@ -32,13 +36,21 @@ struct LoraRadio;
  *           noise is not reciprocal even where path loss is, and a node sitting
  *           beside an interferer needs more from us than our own quiet receiver
  *           would suggest.
- *   EST     the same, against s.lora.assumed_peer_txp instead of a stated
- *           power — everything the peer never told us, plus a guess about the
- *           one thing that would have made it a measurement.
  *   NONE    nothing recent: the configured tx_power.
  *
  * Every tier is gated on AP_FRESH_MS. Stale evidence falls to the next tier,
  * and a node we have not heard from at all opens at the configured power.
+ *
+ * **Both tiers rest on a power the PEER stated, so this runs against a SUPE
+ * node or not at all.** There is no estimating tier and no switch to turn one
+ * on. A node that does not speak SUPE never states a power and never reports
+ * how ours landed, so any power derived for it would be a guess with no return
+ * measurement to catch it being wrong — and two such nodes facing each other is
+ * the case that breaks: each reads the other's surplus from its own receiver,
+ * each dials down, and neither has any way to say "too quiet". Reticulum's
+ * delivery proofs are far too sparse to close that loop; nothing inside an
+ * established link elicits one. Transmitting at the configured power is the
+ * only honest answer there, and it is what a peer outside the protocol gets.
  *
  * **The ratchet.** Up is immediate and large, down is slow and paid for. A
  * miss — no reverse MANIFEST, or a delivery proof that never came from a peer
@@ -67,45 +79,23 @@ struct LoraRadio;
  * margin to maximum and hold it there. Measured margin outranks the fact of a
  * miss, exactly as a measurement outranks a model everywhere else here.
  *
- * **The EST tier is deliberately timid**, and it is the only tier
- * `s.lora.<i>.adaptive_txpwr` governs. It is also the only tier a node that
- * does not speak our air protocol can ever reach, so there is no return
- * measurement to catch it being wrong and nothing but Reticulum's own delivery
- * proofs to notice. It therefore claims only half the surplus it thinks it
- * sees, caps the total cut, and — rather than opening at the estimate — treats
- * it as a target it has to walk to, one dB per AP_EST_WALK_FRAMES frames heard
- * from that peer.
- *
- * **The walk is paid for in frames heard, not in clean exchanges**, and that is
- * what makes the tier reachable at all. The ratchet's currency is a returned
- * delivery signal, which a peer that speaks only Reticulum to us produces
- * rarely — nothing inside an established link elicits a proof — so a walk
- * bounded by the ratchet would never leave zero and the tier would resolve to
- * the configured power forever. Frames heard are the same evidence the estimate
- * itself is built from, they arrive whenever the peer is talking to us at all,
- * and they stop arriving exactly when the link is in trouble. The walk holds
- * still while a failure floor stands, and halves on a miss rather than zeroing:
- * a floor decays, and a walk that came back to the same cut the moment it did
- * would oscillate on the floor's own period.
- * Everything above it is part of SUPE's own operation and is not switchable:
- * the protocol states a power in every frame it sends precisely so that both
- * ends can do this.
+ * **There is no setting.** This is part of SUPE's own operation, not a
+ * switchable courtesy — the protocol states a power in every frame it sends
+ * precisely so that both ends can do this, and a node that does not speak it is
+ * already served by the NONE tier.
  *
  * Never on a broadcast: an announce has no single next hop and must reach
  * everyone, so it always goes out at the configured tx_power. */
 #define AP_FRESH_MS        (10u * 60u * 1000u)  /* evidence older than this is
                                                  * not evidence */
 #define AP_RECIP_MARGIN_DB    5      /* added when the loss is reciprocal */
-#define AP_EST_MARGIN_DB      5      /* added again when the peer's power is a guess */
+#define AP_EST_MARGIN_DB      5      /* added when the peer's power is a guess
+                                      * rather than a stated one — the power
+                                      * request's estimate, and nothing else */
 #define AP_TRIM_MAX_DB        6      /* how far the ratchet may trim a MEASURED need */
-#define AP_PASSIVE_MIN_SAMPLES 5     /* recent frames before the EST tier will move */
-#define AP_PASSIVE_CUT_MAX_DB  10    /* the EST tier's total cut, proofs returning */
-#define AP_PASSIVE_CUT_BLIND_DB 6    /* and when nothing has ever come back */
 #define AP_MISS_MARGIN_DB     10  /* a miss with at least this much margin, by
                                    * the peer's OWN report of our frames, is not
                                    * a power failure and must not raise it */
-#define AP_EST_WALK_FRAMES    8      /* frames heard from a peer per dB the EST
-                                      * tier walks down */
 #define AP_MISS_QUIET_MS  (30u * 1000u) /* a delivery signal that never came is
                                       * evidence about POWER only if the peer
                                       * has also stopped being heard for this
@@ -139,9 +129,8 @@ struct LoraRadio;
  * sensitivity, none of which a transmitter can see.
  *
  * The frame only ever goes to a node that has spoken our air protocol to us,
- * which is what makes it part of that protocol rather than a switchable
- * courtesy: `adaptive_txpwr` does not reach it in either direction. To anyone
- * else it would be 35 ms of unparseable noise on a shared channel.
+ * which is what makes it part of that protocol. To anyone else it would be
+ * 35 ms of unparseable noise on a shared channel.
  *
  * Nothing under 20 B on air can be an RNS packet (HEADER_MINSIZE is 19 and we
  * add a framing byte), which is how our own air frames discriminate; a 4-byte
@@ -172,7 +161,7 @@ int8_t apOpenPower(LoraRadio* r, Neighbor* e);
  * delivery proof on plain traffic. */
 void   apFailed(LoraRadio* r, Neighbor* e, int8_t triedDbm, const SupeCfg* cfg);
 void   apSucceeded(LoraRadio* r, Neighbor* e);
-/* The EST tier's own clock: one frame heard from this node. */
+/* One frame heard from this node: retires a failure floor that has decayed. */
 void   apHeard(Neighbor* e, uint32_t now);
 #if !defined(CONFIG_LORA_NO_SUPE)
 /* The same, resolved where the frame is about to fly — a granted detour step. */

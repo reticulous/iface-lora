@@ -138,7 +138,7 @@ bool apPwrReqFor(LoraRadio* r, const uint8_t* pkt, size_t len, int8_t* out) {
      * to anyone else it is 35 ms of unparseable noise on a shared channel. That
      * is the RF_PROTO_NAME tag in `lora n`, set by a SUPE announcement, which
      * is what bootstraps eligibility — and what makes the request part of that
-     * protocol rather than something `adaptive_txpwr` governs. */
+     * protocol rather than a courtesy anyone can be offered. */
     else if (!e->ourProto)                why = "node has not spoken our protocol";
     else if (!peersEstimateCliff10(r, e, millis(), &cliff10, &samples, nullptr))
                                           why = "no recent signal to estimate from";
@@ -207,8 +207,6 @@ static bool apPathLoss10(const Neighbor* e, uint32_t now, int* loss10,
     *src = AP_SRC_PAIR;
     return true;
 }
-#endif  /* CONFIG_LORA_NO_SUPE */
-
 /* ─────────────── the derivation (§15) ─────────────── */
 
 /* The power to open toward a peer at a configuration, from the best evidence
@@ -220,17 +218,14 @@ static bool apPathLoss10(const Neighbor* e, uint32_t now, int* loss10,
  * all show up on the next transmission rather than at some settling time. What
  * IS stored is the ratchet's trim and the failure floor, which are what the
  * loop has learnt and no measurement can supply. */
-static int8_t apDerive(LoraRadio* r, Neighbor* e, int sensDeci, bool hailing) {
+static int8_t apDerive(LoraRadio* r, Neighbor* e, int sensDeci) {
     if (!e || peersIsLocal(e)) return r->cfgTxp;
     uint32_t now  = millis();
     int      want = r->cfgTxp;
     ApSource src  = AP_SRC_NONE;
-    bool     measured = false;
 
-#if !defined(CONFIG_LORA_NO_SUPE)
     int loss10 = 0;
-    measured = apPathLoss10(e, now, &loss10, &src);
-    if (measured) {
+    if (apPathLoss10(e, now, &loss10, &src)) {
         /* A measurement is worth acting on outright. The reciprocal one costs
          * a further margin because ambient noise is not reciprocal even where
          * path loss is. */
@@ -239,32 +234,6 @@ static int8_t apDerive(LoraRadio* r, Neighbor* e, int sensDeci, bool hailing) {
         want = ceilDeci(loss10 + sensDeci + margin * 10);
         int trim = e->apOffsetDb < AP_TRIM_MAX_DB ? e->apOffsetDb : AP_TRIM_MAX_DB;
         want -= trim;
-    }
-#else
-    (void)sensDeci;
-#endif
-    if (!measured && r->adaptive && hailing) {
-        /* The EST tier. Nothing here is a measurement of us: the peer's power
-         * is assumed and the direction is reversed, so it opens nothing — it
-         * only says how far down there might be room to walk. See the timidity
-         * note in lora_power.h. A detour never reaches this tier, because a
-         * peer that has granted one has told us a power. */
-        int      est10   = 0;
-        uint32_t samples = 0, buckets = 0;
-        if ((uint32_t)(now - e->lastHeardMs) <= AP_FRESH_MS &&
-            peersEstimateCliff10(r, e, now, &est10, &samples, &buckets) &&
-            samples >= AP_PASSIVE_MIN_SAMPLES && buckets >= 2) {
-            int target  = ceilDeci(est10) + AP_EST_MARGIN_DB;
-            int surplus = (int)r->cfgTxp - target;
-            if (surplus > 0) {
-                int cut = surplus / 2;          /* half of a guess, no more */
-                int cap = e->qProved ? AP_PASSIVE_CUT_MAX_DB
-                                     : AP_PASSIVE_CUT_BLIND_DB;
-                if (cut > cap)             cut = cap;
-                if (cut > e->apEstWalkDb)  cut = e->apEstWalkDb; /* walk, don't jump */
-                if (cut > 0) { want = (int)r->cfgTxp - cut; src = AP_SRC_EST; }
-            }
-        }
     }
 
     /* The floor is where this peer last broke, and it outranks every tier: a
@@ -289,16 +258,26 @@ static int8_t apDerive(LoraRadio* r, Neighbor* e, int sensDeci, bool hailing) {
  * flies: the hailing configuration's own sensitivity. */
 int8_t apOpenPower(LoraRadio* r, Neighbor* e) {
     if (!e) return r->cfgTxp;
-#if !defined(CONFIG_LORA_NO_SUPE)
     SupeCfg hail = { (uint8_t)r->cfgSf, (uint32_t)r->cfgBwHz, false, 0 };
-    return apDerive(r, e, supeSensitivityDeci(&hail), true);
-#else
-    /* With SUPE out there is no measured tier to serve and no sensitivity model
-     * linked in; the EST tier carries its own floor inside peersHeadroom10. */
-    return apDerive(r, e, 0, true);
-#endif
+    return apDerive(r, e, supeSensitivityDeci(&hail));
 }
 
+#else   /* ── CONFIG_LORA_NO_SUPE: no protocol, so no adapted power ── */
+
+/* Both tiers are fed by frames that state the power they went out at, and those
+ * frames are SUPE's — so with SUPE compiled out there is no evidence to derive
+ * from, and estimating from the level a peer's frames arrive with here is
+ * exactly what §15.4 refuses to do. Every peer gets the configured power. The
+ * ratchet's entry points stay, and do nothing: their callers are the delivery
+ * paths, which are not gated on the protocol. */
+int8_t apOpenPower(LoraRadio* r, Neighbor*) { return r->cfgTxp; }
+void   apFailed(LoraRadio*, Neighbor*, int8_t, const SupeCfg*) {}
+void   apSucceeded(LoraRadio*, Neighbor*) {}
+void   apHeard(Neighbor*, uint32_t) {}
+
+#endif  /* CONFIG_LORA_NO_SUPE */
+
+#if !defined(CONFIG_LORA_NO_SUPE)
 /* A miss raises the power fast — being wrong downward costs connectivity, so
  * recovery is immediate and large — and remembers where it broke, on a floor
  * that decays, so the loop settles above the cliff instead of oscillating
@@ -333,25 +312,19 @@ void apFailed(LoraRadio* r, Neighbor* e, int8_t triedDbm, const SupeCfg* cfg) {
     if (!apMissWasPower(e, triedDbm, cfg, &margin)) {
         /* Scored as a miss everywhere else; simply not read as a power one. */
         if (logIsDebug(TAG))
-            dbg("lora/%d adaptive: miss at %d dBm with %d dB of margin — "
-                "not a power failure, holding", r->idx, (int)triedDbm, margin);
+            dbg("lora/%d adaptive: hold %d dBm — miss with %d dB margin",
+                r->idx, (int)triedDbm, margin);
         return;
     }
     int floorDbm = (int)triedDbm + AP_FLOOR_STEP_DB;
     if (floorDbm > r->cfgTxp) floorDbm = r->cfgTxp;
     e->apOffsetDb = 0;
-    /* The EST tier's walk retreats rather than resetting: it was bought a frame
-     * at a time and the floor below is what actually holds the power up, but a
-     * walk left where it stood would reapply the cut that just failed the
-     * moment that floor decayed. */
-    if (e->apEstWalkDb > 0) e->apEstWalkDb = (int8_t)(e->apEstWalkDb / 2);
-    e->apEstHeard = 0;
     e->apFloorDbm = (int8_t)floorDbm;
     e->haveApFloor = true;
     e->apFloorDecayMs = millis() + AP_FLOOR_DECAY_MS;
     e->apSuccess = 0;
     if (logIsDebug(TAG))
-        dbg("lora/%d adaptive: power back up (floor %d dBm after a miss at %d)",
+        dbg("lora/%d adaptive: floor %d dBm — miss at %d",
             r->idx, (int)e->apFloorDbm, (int)triedDbm);
 }
 
@@ -365,42 +338,30 @@ void apSucceeded(LoraRadio* r, Neighbor* e) {
     e->apSuccess = 0;
     if (e->apOffsetDb < 40) {
         e->apOffsetDb = (int8_t)(e->apOffsetDb + 1);
-        if (logIsDebug(TAG))
-            dbg("lora/%d adaptive: power down a notch (trim %d dB after %d clean exchanges)",
-                r->idx, (int)e->apOffsetDb, AP_MIN_SAMPLES);
+        if (logIsVerbose(TAG))
+            verb("lora/%d adaptive: trim %d dB — %d clean",
+                 r->idx, (int)e->apOffsetDb, AP_MIN_SAMPLES);
     }
     if (e->haveApFloor && (int32_t)(millis() - e->apFloorDecayMs) >= 0)
         e->haveApFloor = false;
 }
 
-/* One frame heard from this node, which is what the EST tier's walk is paid in.
- * The cut it authorises is bounded by the walk, so this is the only thing that
- * lets that tier move at all for a peer whose traffic never returns a delivery
- * signal — and it stops of its own accord the moment the peer stops being
- * heard, which is the condition the tier must not walk through.
- *
- * A live failure floor holds the walk still. The floor already clamps the
- * power, so walking underneath it would buy nothing now and would land the
- * power somewhere unproven the moment it decayed. */
+/* Hearing a node lifts a failure floor that has served its decay. The floor is
+ * the one piece of adaptive state that outlives its evidence, so something has
+ * to retire it; a frame from the node is proof the link is there to be tried
+ * again. */
 void apHeard(Neighbor* e, uint32_t now) {
-    if (!e) return;
-    if (e->haveApFloor) {
-        if ((int32_t)(now - e->apFloorDecayMs) < 0) return;
-        e->haveApFloor = false;
-    }
-    if (++e->apEstHeard < AP_EST_WALK_FRAMES) return;
-    e->apEstHeard = 0;
-    if (e->apEstWalkDb < AP_PASSIVE_CUT_MAX_DB) e->apEstWalkDb++;
+    if (!e || !e->haveApFloor) return;
+    if ((int32_t)(now - e->apFloorDecayMs) >= 0) e->haveApFloor = false;
 }
 
-#if !defined(CONFIG_LORA_NO_SUPE)
 /* A granted step: the same evidence against a different floor. This is the
  * whole reason the tiers hold a path loss rather than a power — SF5/500k sits
  * some 15–20 dB above SF12/125k in sensitivity, and one number for both would
  * be tuned for one and wrong for the other by that much. */
 int8_t apOpenPowerAt(LoraRadio* r, Neighbor* e, const SupeCfg* cfg) {
     if (!e || !cfg) return r->cfgTxp;
-    return apDerive(r, e, supeSensitivityDeci(cfg), false);
+    return apDerive(r, e, supeSensitivityDeci(cfg));
 }
 
 /* The peer's account of our own transmission, from the MANIFEST that closes a
@@ -411,8 +372,8 @@ void apFileReport(LoraRadio* r, Neighbor* e, int16_t rssi, int8_t ourTxp) {
     e->apRptRssi = rssi;
     e->apRptTxp  = ourTxp;
     e->apRptMs   = millis();
-    if (logIsDebug(TAG))
-        dbg("lora/%d supe: peer read our %d dBm at %d dBm (loss %d dB)",
+    if (logIsVerbose(TAG))
+        verb("lora/%d supe: peer read our %d dBm at %d dBm (loss %d dB)",
             r->idx, (int)ourTxp, (int)rssi, (int)ourTxp - (int)rssi);
 }
 
@@ -436,8 +397,8 @@ void supeFilePair(LoraRadio* r, Neighbor* e, int16_t rssi, int8_t peerTxp,
         e->stepPairStep  = step;
         e->stepPairMs    = now;
     }
-    if (logIsDebug(TAG))
-        dbg("lora/%d supe: path-loss pair filed (%s): %d dBm heard, %d dBm sent",
+    if (logIsVerbose(TAG))
+        verb("lora/%d supe: path-loss pair filed (%s): %d dBm heard, %d dBm sent",
             r->idx, step == 0 ? "hailing" : "detour", (int)rssi, (int)peerTxp);
 }
 
