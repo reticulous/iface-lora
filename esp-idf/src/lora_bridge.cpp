@@ -64,9 +64,7 @@ bool registerWithRnsd(LoraRadio* r) {
      * cycle is what keeps it current. */
     reg.tx_power_known = 1;
     reg.tx_power_dbm   = r->cfgTxp;
-    reg.retain_announces = r->curRetainAnnounces;
-    reg.policy_manual = r->curPolicyManual;
-    reg.route_for     = r->curRouteFor;
+    reg.community_radius = r->curCommunityRadius;
     safeStrncpy(reg.ifac_netname, r->curIfacNetname, sizeof(reg.ifac_netname));
     safeStrncpy(reg.ifac_netkey,  r->curIfacNetkey,  sizeof(reg.ifac_netkey));
     /* ref = radio index — onRnsdDisconnect uses it to find the radio. */
@@ -314,9 +312,9 @@ static void handleRxDone(LoraRadio* r) {
          * from the second would call the bulk of our own traffic somebody
          * else's. */
         uint8_t rxCast = (rxWhole == LMD_RNS_ANNOUNCE || rxWhole == LMD_ANNOUNCE2)
-                             ? LMC_BCAST
-                             : inMeeting ? LMC_US    /* a meeting has two parties
-                                                      * and we are one of them */
+                             ? (uint8_t)LMC_BCAST
+                             : inMeeting ? (uint8_t)LMC_US /* a meeting has two parties
+                                                            * and we are one of them */
                                          : loraMonCastOf(r, addrTag);
 
         /* Who it is with. Inside a meeting the peer outranks the frame's own

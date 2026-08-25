@@ -43,31 +43,24 @@ browser_register:
 settings:
   - at:
       - { id: reticulum }
-      - { id: lora, label: "LoRa", short: "LoRa", order: 4 }
+      - { id: interfaces }
+    order: 4
     rows:
-      - section: "LoRa"
+      - heading: "LoRa"
       - caption: "Set frequency and bandwidth directly, pick a spreading factor and coding rate; the radio stays disabled until you enable it."
-      - switch: { label: "Enabled", key: "s.lora.0.enable", default: 0 }
+      - switch: { label: "Enable LoRa", key: "s.lora.0.enable", default: 0 }
       - section: "Radio"
       # Frequency/bandwidth are stored in Hz but entered here in MHz/kHz. These
       # rows bind ephemeral display keys, not s.lora.0.*; lora.cpp mirrors the Hz
       # config to them and converts edits back (so any value works, not presets).
       # Bandwidth's s.lora.0.bandwidth default is seeded in lora.cpp, not here.
-      - text: { label: "Frequency (MHz)", key: "lora.0.freq_mhz" }
-      - text: { label: "Bandwidth (kHz)", key: "lora.0.bw_khz" }
+      - text: { label: "Frequency", unit: "MHz", key: "lora.0.freq_mhz" }
+      - text: { label: "Bandwidth", unit: "kHz", key: "lora.0.bw_khz" }
+      - integer: { label: "Spreading Factor (SF)", key: "s.lora.0.spreading_factor",
+                   min: 5, max: 12, default: 7, buttons: true }
+      - caption: "Low is fast and short-range, high is slow and long-range. Not every radio will do SF5 or SF6 — check yours before relying on them."
       - dropdown:
-          label: "Spreading"
-          key: "s.lora.0.spreading_factor"
-          default: 7
-          options:
-            - { v: 7,  l: "SF7 (fast, short range)" }
-            - { v: 8,  l: "SF8" }
-            - { v: 9,  l: "SF9" }
-            - { v: 10, l: "SF10" }
-            - { v: 11, l: "SF11" }
-            - { v: 12, l: "SF12 (slow, long range)" }
-      - dropdown:
-          label: "Coding rate"
+          label: "Coding Rate"
           key: "s.lora.0.coding_rate"
           default: 5
           options:
@@ -81,17 +74,13 @@ settings:
       # (e.g. 27 on the Heltec V4) when it is, the bare SX126x's 22 when it is
       # not. A board that declares a FEM it cannot talk to therefore offers 22
       # rather than a figure nothing will deliver.
-      - slider:
+      - integer:
           label: "TX power"
+          unit: "dBm"
           key: "s.lora.0.tx_power"
           min: -9
           max: { key: "lora.0.tx_power_max", default: 22 }
-      # Dial the power down toward a peer that has never told us what it hears,
-      # from what its own frames arrive with here. The only part of adaptive
-      # power that is a choice: everything derived from a measurement belongs to
-      # the air protocol and runs regardless.
-      - switch: { label: "Adaptive TX power", key: "s.lora.0.adaptive_txpwr", default: 1 }
-      - slider: { label: "Preamble", key: "s.lora.0.preamble", min: 6, max: 32, default: 12 }
+      - integer: { label: "Preamble", key: "s.lora.0.preamble", min: 6, max: 32, default: 12 }
       - text:   { label: "Sync word", key: "s.lora.0.sync_word", default: "0x42" }
       # LNA boosted RX gain: ~+3 dB sensitivity for ~0.4 mA more RX
       # current. On by default; a flag on SX126x, the top gain level on
@@ -100,6 +89,8 @@ settings:
       # receive control that does nothing is worse than an absent one, since it
       # gets read as an explanation for whatever the radio is doing.
       - switch: { label: "RX boosted gain", key: "s.lora.0.rx_boosted_gain", default: 1 }
+        when_key: "lora.0.has_rx_boost"
+      - caption: "About 3 dB more sensitivity for a fraction of a milliamp more while listening. Worth having on unless the receiver is the thing you are trying to make last."
         when_key: "lora.0.has_rx_boost"
       # Analog front-end recalibration. An SX126x that has heard a strong signal
       # can leave its gain control latched and go deaf, and only powering the
@@ -116,39 +107,38 @@ settings:
             - { v: 300, l: "Every 5 min" }
             - { v: 900, l: "Every 15 min" }
         when_key: "lora.0.has_agc_reset"
-      # LoRa defaults to access_point: a radio segment is almost always the
-      # edge of the network, and this stops the node re-broadcasting the whole
-      # transport network's announces onto the slow RF link. full/gateway are
-      # still valid values on this key for anyone who deliberately wants a LoRa
-      # backbone — set s.lora.0.mode=gateway by hand — they're just kept out of
-      # the picker to avoid people footgunning their airtime.
-      - dropdown:
-          label: "Mode"
-          key: "s.lora.0.mode"
-          default: "access_point"
-          options:
-            - { v: "access_point", l: "Access point" }
-            - { v: "roaming",      l: "Roaming" }
-            - { v: "boundary",     l: "Boundary" }
-      - slider:
-          label: "Announce cap %"
-          key: "s.lora.0.announce_cap"
-          min: 1
-          max: 100
-          default: 2
-      # Transit policy. Auto is what this build always did: the policy is
-      # inferred from Mode above, and Route for is not read at all. Off auto,
-      # you are stating what this node IS to the nodes on this radio — a
-      # gateway that answers and searches for them, or a bare endpoint.
-      - switch:
-          label: "Set policy manually"
-          key: "s.lora.0.policy_manual"
-          default: 0
-      - caption: "Off = auto: the mode decides and the row below is ignored."
-      - switch:
-          label: "Route for"
-          key: "s.lora.0.route_for"
-          default: 0
+      - caption: "A strong signal can leave this radio's gain control latched and the receiver deaf, and only powering the front end down clears it. This is how often we do that."
+        when_key: "lora.0.has_agc_reset"
+      - advanced:
+          rows:
+            # LoRa defaults to access_point: a radio segment is almost always
+            # the edge of the network, and this stops the node re-broadcasting
+            # the whole transport network's announces onto the slow RF link.
+            # full/gateway are still valid values on this key for anyone who
+            # deliberately wants a LoRa backbone — set s.lora.0.mode=gateway by
+            # hand — they're just kept out of the picker to avoid people
+            # footgunning their airtime.
+            - dropdown:
+                label: "Interface mode"
+                key: "s.lora.0.mode"
+                default: "access_point"
+                options:
+                  - { v: "access_point", l: "Access point" }
+                  - { v: "roaming",      l: "Roaming" }
+                  - { v: "boundary",     l: "Boundary" }
+            - integer: { label: "Community Radius", key: "s.lora.0.community_radius", min: 0, max: 7, default: 3 }
+            - caption: "Nodes within this many hops on this radio are yours: their announces are kept and answered for, searches run on their behalf, and only their announces are re-broadcast onto the air. Everyone else is still heard and reachable on demand."
+            - integer:
+                label: "Announce cap"
+                unit: "%"
+                key: "s.lora.0.announce_cap"
+                min: 1
+                max: 100
+                default: 2
+            - section: "Interface access code (IFAC)"
+            - caption: "A network name + passphrase every peer on this interface must match, or traffic is dropped. Leave both blank for an open interface."
+            - text: { label: "IFAC network", key: "s.lora.0.ifac_netname" }
+            - text: { label: "IFAC passphrase", key: "s.lora.0.ifac_netkey", secret: true }
       # SUPE — unicast traffic leaves the shared channel for short private
       # high-rate detours, negotiated in one seven-byte frame, with rnsd
       # unmodified and unaware (plans/SUPE.md).
@@ -171,7 +161,7 @@ settings:
       # no engine to configure, so it gets no rows, no pane section and no keys
       # in storage — the same gate the code carries, from the same symbol.
       - { section: "SUPE", when_kconfig: "!CONFIG_LORA_NO_SUPE" }
-      - switch: { label: "Enable", key: "s.lora.0.SUPE.enable", default: 0 }
+      - switch: { label: "Enable SUPE", key: "s.lora.0.SUPE.enable", default: 0 }
         when_kconfig: "!CONFIG_LORA_NO_SUPE"
       - dropdown:
           label: "Regime"
@@ -190,25 +180,13 @@ settings:
       # swallowed when rnsd hands them over, and replayed on this beat. 0 turns
       # the beat off entirely, so the node announces only when `lora a` says so;
       # that is a real "never on its own", not a longer interval.
-      - slider:
+      - integer:
           label: "Announce interval (min)"
           key: "s.lora.0.SUPE.announce_interval"
           min: 0
           max: 240
           default: 30
         when_kconfig: "!CONFIG_LORA_NO_SUPE"
-      # RNode endpoint: an RNS RNodeInterface client attaches over USB serial,
-      # TCP 7633 and/or Bluetooth (rnode-ble contributes that row into this
-      # same section) and shares this radio segment. One switch per door;
-      # `.radio` is seeded in lora.cpp. TCP is a switch, not a port number —
-      # the client dials 7633 and nothing else.
-      - section: "RNode endpoint"
-      - switch: { label: "USB serial", key: "s.lora.rnode.serial", default: 1 }
-      - switch: { label: "TCP (port 7633)", key: "s.lora.rnode.tcp", default: 0 }
-      - section: "Access code"
-      - caption: "IFAC: a network name + passphrase every peer on this interface must match, or traffic is dropped. Leave both blank for an open interface."
-      - text: { label: "IFAC network", key: "s.lora.0.ifac_netname" }
-      - text: { label: "IFAC passphrase", key: "secrets.lora.0.ifac_netkey", secret: true }
       - section: "Status"
       # Every row here shows a string the radio publishes finished — the state
       # in words, the bitrate with its unit, the last reception's quality and
@@ -221,3 +199,18 @@ settings:
             - value: { label: "Bitrate", key: "lora.0.bitrate_text" }
             - value: { label: "Last RX", key: "lora.0.rx_text" }
             - value: { label: "Frames", key: "lora.0.traffic" }
+
+  # The RNode endpoint is its own thing: an RNS RNodeInterface client attaches
+  # over USB serial, TCP 7633 and/or Bluetooth (rnode-ble contributes the
+  # Bluetooth rows here) and shares this radio segment. It sat as a section of
+  # the LoRa pane, where it read as a radio setting; it is a door onto the
+  # radio, with its own transports to name, so it gets a menu.
+  - at:
+      - { id: reticulum }
+      - { id: rnode, label: "RNode", short: "RNode", order: 5 }
+    rows:
+      - title: "RNode"
+      - caption: "Lets an RNS client — Sideband, MeshChat, anything speaking RNodeInterface — attach to this device and share the radio."
+      - heading: "Connect via"
+      - switch: { label: "USB serial", key: "s.lora.rnode.serial", default: 1 }
+      - switch: { label: "TCP (port 7633)", key: "s.lora.rnode.tcp", default: 0 }

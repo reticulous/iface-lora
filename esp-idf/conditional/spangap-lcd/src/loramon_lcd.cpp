@@ -131,8 +131,12 @@ constexpr uint8_t PKT_BAD = 3;
 /* Who a frame was aimed at, as the device decided it (lora_mon.h's LMC_*). The
  * screen cannot work this out for itself: it turns on which addresses mean US,
  * and that lives in the peer table. */
-constexpr uint8_t CAST_BCAST = 0;
-constexpr uint8_t CAST_US    = 1;
+constexpr uint8_t CAST_BCAST   = 0;
+constexpr uint8_t CAST_US      = 1;
+/* Ours by a link identifier. Same colour as any other frame of ours — the
+ * distinction it draws is about naming the far end, which this screen does not
+ * do — but it has to be spelt out, or our own link traffic reads as overheard. */
+constexpr uint8_t CAST_US_LINK = 3;
 
 uint16_t C_TX_BCAST, C_TX_UNI, C_RX_BCAST, C_RX_US, C_RX_OTHER, C_BAD;
 uint16_t C_BLACK, C_SEL, C_SELEDGE, C_GRID, C_FLOOR, C_BEZEL;
@@ -516,7 +520,8 @@ void drawLane(uint32_t now, int y0, int h, uint8_t ch, bool main) {
         uint16_t col = r.type == PKT_BAD          ? C_BAD
                      : r.dir == 1                 ? (r.cast == CAST_BCAST ? C_TX_BCAST : C_TX_UNI)
                      : r.cast == CAST_BCAST       ? C_RX_BCAST
-                     : r.cast == CAST_US          ? C_RX_US : C_RX_OTHER;
+                     : (r.cast == CAST_US ||
+                        r.cast == CAST_US_LINK)   ? C_RX_US : C_RX_OTHER;
         /* Never thinner than two pixels: on an agile strip the proportional
          * term falls below one, and a frame that rounds away is a frame the
          * graph is lying about. */

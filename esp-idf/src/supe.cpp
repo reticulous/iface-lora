@@ -121,7 +121,7 @@ uint32_t supeBuildUnix(void) {
 }
 
 uint32_t supeExpiryUnix(void) {
-    return supeBuildUnix() + (uint32_t)SUPE_EXPIRY_DAYS * 86400u;
+    return (uint32_t)daysFromCivil(SUPE_EXPIRY_Y, SUPE_EXPIRY_M, SUPE_EXPIRY_D) * 86400u;
 }
 
 bool supeExpired(uint32_t nowUnix) {

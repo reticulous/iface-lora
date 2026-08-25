@@ -458,20 +458,18 @@ static bool radioStart(LoraRadio* r) {
     storageGetStr(sk(kb, sizeof kb, r->idx, "ifac_netname"), r->curIfacNetname, sizeof(r->curIfacNetname), "");
     {
         char skb[48];
-        snprintf(skb, sizeof skb, "secrets.lora.%d.ifac_netkey", r->idx);
+        snprintf(skb, sizeof skb, "s.lora.%d.ifac_netkey", r->idx);
         storageGetStr(skb, r->curIfacNetkey, sizeof(r->curIfacNetkey), "");
     }
     r->curIfacSize = (uint8_t)storageGetInt(sk(kb, sizeof kb, r->idx, "ifac_size"), 0);
     r->curAnnounceCap = (uint8_t)storageGetInt(sk(kb, sizeof kb, r->idx, "announce_cap"), RNS_IFACE_ANNOUNCE_CAP_DEFAULT);
-    /* On by default. This is the expensive edge: we are the sole custodian of
-     * the mesh on the other side of this radio, re-acquiring a neighbour costs
+    /* Default 3. This is the expensive edge: this node is custodian of the
+     * mesh on the other side of the radio, re-acquiring a neighbour costs
      * ~1.5 s of airtime, and a path response is a signed announce only a node
-     * still holding the original bytes can emit. */
-    r->curRetainAnnounces = (uint8_t)storageGetInt(sk(kb, sizeof kb, r->idx, "retain_announces"), 1);
-    /* Transit policy — auto by default, so a radio behaves exactly as before
-     * until its operator says what this node is to the nodes on it. */
-    r->curPolicyManual = (uint8_t)storageGetInt(sk(kb, sizeof kb, r->idx, "policy_manual"), 0);
-    r->curRouteFor     = (uint8_t)storageGetInt(sk(kb, sizeof kb, r->idx, "route_for"), 0);
+     * still holding the original bytes can emit — so nodes within the radius
+     * are served (stored, answered for, searched for) while a leak from
+     * another gateway or the wider network's churn stays out. */
+    r->curCommunityRadius = (uint8_t)storageGetInt(sk(kb, sizeof kb, r->idx, "community_radius"), 3);
 
     storageBegin();
     storageSet(rk(kb, sizeof kb, r->idx, "chip"), chipName(r->slot->chip));
@@ -838,7 +836,6 @@ static void loraTaskMain(void*) {
     /* The second CDC port only exists while the console is on `usb cdc`, so a
      * serial claim for it has to be re-applied when the transport changes. */
     NOW_AND_ON_CHANGE("sys.usb.serial_ports", { (void)key; (void)val; cfgArm(0); });
-    storageSubscribeChanges("secrets.lora", onCfgChange);  /* IFAC passphrase */
     for (int i = 0; i < kNumRadios; i++) {                  /* MHz/kHz pane fields */
         char kb[48];
         storageSubscribeChanges(rk(kb, sizeof kb, i, "freq_mhz"), onDisplayChange);
@@ -1047,13 +1044,15 @@ static void loraTaskMain(void*) {
                         LoraRadio* r = &s_radios[0];
 #if !defined(CONFIG_LORA_NO_SUPE)
                         warn("lora hot loop: 500 zero-deadline passes in %lu ms: "
-                             "supeD=%lu airD=%lu offer=%d ann=%d csma=%d q=%u "
+                             "supeD=%lu airD=%lu offer=%d ann=%d annSoon=%d "
+                             "csma=%d q=%u "
                              "txA=%d split=%d mtx=%d its=%u",
                              (unsigned long)(nowMs - winStartMs),
                              (unsigned long)supeNextDeadlineMs(r),
                              (unsigned long)airtimeNextDeadlineMs(r, nowMs),
                              r->supe ? (int)r->supe->eng.offerArmed : -1,
                              r->supe ? (int)r->supe->annPending : -1,
+                             r->supe ? (int)r->supe->annSoonPend : -1,
                              (int)r->csmaPhase, (unsigned)loraqDepth(&r->q),
                              (int)r->txActive, (int)r->splitPending,
                              (int)r->mtxReq,

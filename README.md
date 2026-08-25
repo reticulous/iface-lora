@@ -161,9 +161,7 @@ once, because the client is holding a 0.25 s validation window open.
 | `s.lora.<n>.agc_reset` | `300` | Seconds between recalibrations of the SX126x analog front end (`0` = off; SX126x only). An SX126x that has heard a strong signal can leave its receive gain latched at that setting and stop hearing, and neither standby nor a fresh receive resets it — only powering the front end down does. This beat does that, plus a full block calibration, on an otherwise idle radio; a busy radio defers to the next beat. It is the one periodic wake the radio task holds without a consumer asking for it, which is why the period is minutes rather than the minute other firmwares use: the cost is a wake plus a few ms of chip work, and the bound it buys is how long a latched receiver can stay deaf. |
 | `s.lora.<n>.ifac_netname` | `""` | IFAC network name. Empty = open (non-IFAC) interface. |
 | `s.lora.<n>.ifac_size` | `0` | IFAC access-code length in bytes (`0` = rnsd default). |
-| `s.lora.<n>.retain_announces` | `1` | Keep the announces heard on this radio, not just forward them. On by default: this node is the sole custodian of the mesh on the other side, re-acquiring a neighbour costs ~1.5 s of airtime, and only a node still holding a neighbour's original announce bytes can answer a path request for it. |
-| `s.lora.<n>.policy_manual` | `0` | Set this radio's transit policy by hand instead of inferring it from `mode`. Off = auto, which is stock behaviour and leaves `route_for` unread. Appears as "Set policy manually" in the settings pane. |
-| `s.lora.<n>.route_for` | `0` | Read only when `policy_manual = 1`. `1` = we provide transport for the nodes on this radio: we relay announces towards them, we search on their behalf, and their paths get `s.rnsd.path.ttl_custody` rather than the short access-point lifetime. `0` = we still talk to them as an endpoint, we just don't work for them. Answering a path request for a destination we already know is never gated by this. See `rns/README.md`. |
+| `s.lora.<n>.community_radius` | `3` | Community Radius: nodes within this many hops on this radio are served — their announces kept and answered for (only a node still holding a neighbour's original announce bytes can answer a path request for it, and re-acquiring one costs ~1.5 s of airtime), searches run on their behalf, and only their announces are re-broadcast onto the air. `0` = endpoint: on-demand only. See `rns/README.md`. |
 | `s.lora.<n>.SUPE.afa` | `0` | Frequency agility: the value **is** the regime number, not a flag, and it is the same number SUPE names. `0` is a regime with no channel plan — the configured frequency alone — so it reads identically as "no agility". `1` is the EU 863-870 MHz plan (nine 500 kHz channels under polite spectrum access). On its own the regime only puts channels up to be **measured and drawn**; what transmits on them is SUPE, below. **This is where the regime is set** — it appears as "Regime" in the SUPE section of the settings pane, since that is where you would look for it, but the key is the interface's own and predates SUPE. See INTERNALS §18. Live. |
 | `s.lora.<n>.SUPE.enable` | `0` | Speak **SUPE** on this interface: unicast traffic leaves the shared channel for private meetings at derived times, channels and sync words — one six-byte PRIVSYNC seeds a schedule of slots, the pair meets at the first one that works, and every meeting's goodbye seeds the next, so a busy pair touches the shared channel once — with `rnsd` unmodified and unaware. Off means the radio behaves exactly as it did, which is what makes it one thing to turn off when comparing. What the meetings can fly is `afa` above: regime `0` moves the spreading factor only, regime `1` moves frequency as well. **Inert on an interface with an access code** — IFAC masks the frame end to end, so the modem cannot read an address to match, and the boot log says so. Traffic to a peer that has not announced itself over SUPE is untouched, so a mixed segment needs no detection and no fallback. `lora [<n>] supe` shows what it has learned. See INTERNALS §19 and `plans/SUPE.md`. In development. **`lora [<n>] supe enable` / `disable` sets this**, and the radio acts on it where it is read rather than restarting: nothing about the modem changes, so it stays on the air, and it announces the change at once. A node with this off still **reads** SUPE — it keeps its picture of which neighbours speak it, what their radios can do and what the path loss is — and it announces that it does not speak it, which is what makes a neighbour drop its SUPE bit and go back to plain RNode framing. Silence would not do that: a node that stops speaking is indistinguishable from one that has gone away. |
 | `s.lora.<n>.SUPE.sender_ident` | `1` | Name this node in every PRIVSYNC. Three bytes and one symbol group, and it gives up the protocol's default anonymity — a listener in radio earshot learns who is talking to whom, which no Reticulum header discloses. It is on because the **return leg depends on it**: the tag a PRIVSYNC carries is the *listener's* address, so an unnamed seeker's traffic queued at the far end is indistinguishable from a stranger's and the answering HAVEDATA is never sent — every reply then buys its own meeting instead of riding the one already running. It also lets the far end file a link identifier our cargo creates against us rather than against nobody. `0` restores the anonymity and gives both up; either way this node still understands the longer frame from peers that send it. See `plans/SUPE.md` §4. In development. |
@@ -185,7 +183,7 @@ SF/BW/CR/preamble are set; `lora.<n>.state` reads `unconfigured` until then.
 | `lora.<n>.up` | `1` when the radio is on-air, else `0`. |
 | `lora.<n>.state` | `unconfigured` / `error` / `up` / `down` / `rnsd_unavailable`. |
 | `lora.<n>.chip` | Detected chip name, e.g. `SX1262`. |
-| `lora.<n>.tx_power_max` | Antenna-dBm ceiling this radio can actually reach **on the band it is tuned to**: the bare chip's own maximum for that port (`22` sub-GHz, `12` at 2.4 GHz), or the front-end module's rating on a board with one that was detected at boot or one the board declared. Republished on every begin, so it follows a carrier across 1500 MHz. `tx_power` is clamped to it, and **both** the browser panel and the LCD settings pane size their power slider from it — so a FEM board whose part did not answer offers 22 rather than a figure it cannot deliver. |
+| `lora.<n>.tx_power_max` | Antenna-dBm ceiling this radio can actually reach **on the band it is tuned to**: the bare chip's own maximum for that port (`22` sub-GHz, `12` at 2.4 GHz), or the front-end module's rating on a board with one that was detected at boot or one the board declared. Republished on every begin, so it follows a carrier across 1500 MHz. `tx_power` is clamped to it, and **both** the browser panel and the LCD settings pane take their power field's upper bound from it — so a FEM board whose part did not answer offers 22 rather than a figure it cannot deliver. |
 | `lora.<n>.bitrate_eff` | Effective bitrate registered with `rnsd`, bits/s (airtime-derived). |
 | `lora.<n>.stats.{tx_bytes,rx_bytes,tx_frames,rx_frames,crc_err,split_rx_timeout,tx_dropped,rssi_last,snr_last}` | Traffic counters (`tx_dropped` = frames shed by the LBT timeout) and last-RX RSSI/SNR. Published only when a UI can read them — see `uiTelemetryWanted()`. |
 | `lora.<n>.stats.{airtime_pct,cw_band}` | With `appc` on: percentage of the last ~15 s this radio spent transmitting, and the contention band (1–4) that percentage currently selects. Absent when `appc` is off. |
@@ -197,7 +195,7 @@ SF/BW/CR/preamble are set; `lora.<n>.state` reads `unconfigured` until then.
 
 ### Secrets
 
-`secrets.lora.<n>.ifac_netkey` — the IFAC passphrase (a secret; never synced to
+`s.lora.<n>.ifac_netkey` — the IFAC passphrase (a secret; never synced to
 the browser). With `ifac_netname` it puts the interface on an access-coded RNS
 network; `rnsd` derives the IFAC identity from the pair.
 
@@ -244,9 +242,9 @@ lora [<n>] a[nnounce]         repeat every announce this node originated, then
 lora [<n>] supe               what SUPE has learned and decided on this radio
                               which regime is in force and what its steps
                               resolve to, when this build's dialect expires
-                              (14 days from the build — past it a node stops
-                              speaking SUPE by itself rather than speaking a
-                              stale dialect at a network that has moved on),
+                              (a calendar date compiled in — past it a node
+                              stops speaking SUPE by itself rather than speaking
+                              a stale dialect at a network that has moved on),
                               the tag set of addresses that mean us, anything
                               currently held for someone else's detour, and the
                               counters: offers out, offers answered, probes,
@@ -486,7 +484,10 @@ The LoRa Settings panel (`browser/panels/LoraPanel.vue`, registered by
 `modules/lora.ts`) edits radio 0 — band, bandwidth, SF, coding rate, TX power,
 preamble, sync word, mode, the IFAC pair — and shows live state, chip, bitrate,
 last RSSI/SNR, and frame counts. The on-device LoRa pane is generated from this
-straddle's `settings:` block.
+straddle's `settings:` block. The **RNode endpoint** — which transports a client
+may attach over — is its own menu under Reticulum Mesh rather than a section of
+the radio pane: it is a way in to the radio, not a setting of it, and rnode-ble
+contributes its Bluetooth switch and settings there.
 
 **LoRaMon** (`browser/panels/LoraMonWindow.vue`, and the same app on the device
 LCD) is a launcher app rather than a settings pane: one graph per radio showing

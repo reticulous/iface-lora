@@ -37,6 +37,13 @@ struct SupeState {
     uint32_t annNextMs;
     bool     annPending;
     uint32_t annTryMs;
+    /* The coalescing window opened by a first-seen announce going on the air
+     * (supeAnnSoon). Held apart from annPending because it is a deadline and
+     * not a request: annPending means "send as soon as the channel is clear",
+     * and arming that directly would put an ANNOUNCE2 immediately behind every
+     * announce instead of one behind a burst of them. */
+    bool     annSoonPend;
+    uint32_t annSoonMs;
     /* next dialect-expiry re-check; rides passes other work causes, holds no
      * wake of its own */
     uint32_t expiryNextMs;
@@ -78,5 +85,14 @@ void     supeTagRelease(LoraRadio* r, const uint8_t* addr);
 void     supeProofRetFile(LoraRadio* r, const uint8_t phash[16], const uint8_t node4[4]);
 void     supeAnnArm(LoraRadio* r);
 void     supeAnnCancel(LoraRadio* r);
+/* An announce this interface had never put on air just went out — ours for a
+ * destination we had not announced before, or somebody else's that we relayed.
+ * Either way the picture the neighbourhood holds of the air has just changed,
+ * and the frame that says which identities and capabilities are ours is worth
+ * more now than at the next beat. Coalesced: the first such announce sets the
+ * deadline and everything inside the window folds into the one frame — a boot
+ * that announces six destinations, or a burst of relayed announces, costs one
+ * ANNOUNCE2 and not six. */
+void     supeAnnSoon(LoraRadio* r);
 uint8_t  supeOwnFamily(const LoraRadio* r);
 SupeCaps supeOwnCaps(const LoraRadio* r);

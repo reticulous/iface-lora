@@ -348,6 +348,11 @@ static void observeAnnounce(LoraRadio* r, const RnsHdr* h, bool isTx,
     }
 
     NeiDest* nd = peersAddDest(st, e, h->dest, now);
+    /* Before the counter moves: zero means this interface has never carried an
+     * announce for this destination. A dest row may already exist from a
+     * linkage frame or a claim, so it is the announce count and not the row
+     * that says whether the announcement itself is new. */
+    bool firstAnn = nd->announces == 0;
     memcpy(nd->nameHash, nameH, 10);
     nd->haveName = true;
     nd->announces++;
@@ -363,6 +368,14 @@ static void observeAnnounce(LoraRadio* r, const RnsHdr* h, bool isTx,
     }
     if (isTx) e->lastHeardMs = now;   /* keep the us row fresh; no rx signal */
     else      peersSample(e, rssi, snr10, now);
+    /* An announce this radio had never put on air just went out — a
+     * destination of ours announcing for the first time, or somebody else's
+     * that we relayed. Say who we are behind it, once the burst has passed. */
+#if !defined(CONFIG_LORA_NO_SUPE)
+    if (isTx && firstAnn) supeAnnSoon(r);
+#else
+    (void)firstAnn;
+#endif
 }
 
 /* ── the per-packet observation tap ── */

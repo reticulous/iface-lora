@@ -182,15 +182,18 @@ const C_PILL_FG = '#000000'
 
 interface Rec { t: number; dir: number; dur: number; bytes: number; rssi: number; snr10: number; txp: number; type: number; wait: number; own: number; ch: number; desc: number; cast: number; tag: string }
 
-/* How far two frames with the same tag may sit apart and still be one train.
- * Just past the widest slot spacing a schedule ever asks for, so a train stays
- * whole across its longest legitimate gap and two separate conversations with
- * one node do not get named as if they were a single stretch of air. */
-const TRAIN_GAP_MS = 400
+/* How far two dwell records may sit apart and still be one stay on a channel.
+ * The device already merges a stay into one record and breaks it on every
+ * frame, so the pieces of one slot are adjacent to the millisecond and this is
+ * only slack against the beat's quantisation. Anything wider means the radio
+ * left and came back, which is a second slot however the first was labelled. */
+const SLOT_JOIN_MS = 20
 
 /* Who a frame was aimed at, as the device decided it — the browser cannot, since
  * it turns on which addresses mean US and that lives in the peer table. */
-const CAST_BCAST = 0, CAST_US = 1, CAST_OTHER = 2
+const CAST_BCAST = 0, CAST_US = 1, CAST_OTHER = 2, CAST_US_LINK = 3
+/* Ours either way — the split is about whether the far end is nameable at all. */
+const isOurs = (c: number) => c === CAST_US || c === CAST_US_LINK
 
 /* Direction and audience, which is what the colour says. A CRC failure is
  * neither: nothing in it was readable, so it gets its own hue rather than a
@@ -199,7 +202,7 @@ function colourOf(rec: Rec): string {
   if (rec.type === 3) return C_BAD
   if (rec.dir === 1) return rec.cast === CAST_BCAST ? C_TX_BCAST : C_TX_UNI
   if (rec.cast === CAST_BCAST) return C_RX_BCAST
-  return rec.cast === CAST_US ? C_RX_US : C_RX_OTHER
+  return isOurs(rec.cast) ? C_RX_US : C_RX_OTHER
 }
 
 /* What a frame is, indexed by the code the device writes into the record. The
@@ -485,6 +488,9 @@ function drawOne(cv: HTMLCanvasElement | null, ch: number, main: boolean) {
    * A gap in the series is a beat carrier sense took the radio for. It is left
    * empty on purpose: the bar would otherwise be drawn from a reading that
    * described the transmission we were queued behind. */
+  /* The line goes down here, under the traffic; its pill is held back and drawn
+   * with the other pills, above the division grid (see the pill layer below). */
+  let floorY: number | null = null, floorLabel = ''
   if (main) {
     const nf = noiseFloor(ch)
     if (nf != null) {
@@ -498,36 +504,16 @@ function drawOne(cv: HTMLCanvasElement | null, ch: number, main: boolean) {
       ctx.setLineDash([2 * dpr, 3 * dpr])
       ctx.beginPath(); ctx.moveTo(gl, y); ctx.lineTo(w - gr, y); ctx.stroke()
       ctx.restore()
-      /* The pill sits ON the line, so the number and the level it describes are
-       * one object rather than a legend to cross-reference — and at the right
-       * end of it, where the rx axis it is quoting runs, held clear of the
-       * scale itself. Same cream note as a train pill: both are labels stuck on
-       * the graph, and two label styles for one job is one too many. */
-      const label = `noise floor ${Math.round(nf)} dBm`
-      ctx.font = `${9 * dpr}px 'SF Mono','Menlo','Consolas',monospace`
-      const tw = ctx.measureText(label).width
-      const ph = 12 * dpr, pad = 4 * dpr, rad = 4 * dpr
-      const pw = tw + pad * 2
-      const px = w - gr - 8 * dpr - pw
-      /* Kept whole inside the lane even where the line runs along an edge: half
-       * a pill is unreadable, and the line itself already says which level it
-       * belongs to. */
-      let py = y - ph / 2
-      if (py < 0) py = 0
-      if (py + ph > h) py = h - ph
-      ctx.beginPath()
-      ctx.roundRect(px, py, pw, ph, rad)
-      ctx.fillStyle = C_PILL_BG
-      ctx.fill()
-      ctx.fillStyle = C_PILL_FG
-      ctx.textBaseline = 'middle'
-      ctx.fillText(label, px + pad, py + ph / 2)
+      floorY = y
+      floorLabel = `noise floor ${Math.round(nf)} dBm`
     }
   }
 
   /* Frozen view only: a live one slides, and a grid on absolute time would
-   * crawl across it. Lines are laid on round multiples of the step, under the
-   * frames so a bar always wins the pixels it lands on. */
+   * crawl across it. Lines are laid on round multiples of the step, and drawn
+   * FIRST — below the traffic, below the pills, below everything else the lane
+   * carries. It is the ruling on the paper: part of the background, never
+   * crossing anything drawn on top of it. */
   if (zoomed.value) {
     const step = divStepMs(ms / Math.max(1, span / dpr))
     /* The label quotes the main graph's grid — an agile channel is a quarter
@@ -589,57 +575,106 @@ function drawOne(cv: HTMLCanvasElement | null, ch: number, main: boolean) {
     ctx.fillRect(xs, y, bw, th)
   }
 
-  /* Who a run of frames was with, named once above the run.
+  /* The noise floor's figure, held back from its line so it lands in the pill
+   * layer. It sits ON the line, so the number and the level it describes are
+   * one object rather than a legend to cross-reference — and at the right end
+   * of it, where the rx axis it is quoting runs, held clear of the scale
+   * itself. Same cream note as a peer pill: both are labels stuck on the graph,
+   * and two label styles for one job is one too many. */
+  if (floorY != null) {
+    ctx.font = `${9 * dpr}px 'SF Mono','Menlo','Consolas',monospace`
+    const ph = 12 * dpr, pad = 4 * dpr, rad = 4 * dpr
+    const pw = ctx.measureText(floorLabel).width + pad * 2
+    const px = w - gr - 8 * dpr - pw
+    /* Kept whole inside the lane even where the line runs along an edge: half a
+     * pill is unreadable, and the line itself already says which level it
+     * belongs to. */
+    let py = floorY - ph / 2
+    if (py < 0) py = 0
+    if (py + ph > h) py = h - ph
+    ctx.beginPath()
+    ctx.roundRect(px, py, pw, ph, rad)
+    ctx.fillStyle = C_PILL_BG
+    ctx.fill()
+    ctx.fillStyle = C_PILL_FG
+    ctx.textBaseline = 'middle'
+    ctx.fillText(floorLabel, px + pad, py + ph / 2)
+  }
+
+  /* Who the lane is with, named where the answer starts and where it changes.
    *
-   * Every frame of a SUPE train carries the same tag, and a single frame on the
-   * hailing channel is that run at length one — so the same rule covers both.
-   * Consecutive frames sharing a tag are one run; a gap longer than the widest
-   * schedule spacing ends it, because past that they are two conversations that
-   * happened to be with the same node.
+   * A pill is LEFT-ALIGNED on the moment it becomes true and stands until the
+   * next one contradicts it — the same reading as a name on a timeline, and the
+   * reason it is anchored to a point rather than fitted to a run: a run's width
+   * changes with the zoom, so a label fitted to one moves every time the view
+   * does, and a label that will not fit disappears entirely from traffic that
+   * is plainly there.
    *
-   * It sits BESIDE the run — level with its top, a few pixels off its right end
-   * — and never over it. Centred, the pill's offset from the frames it names
-   * changes with the run's width, so the same train's label lands somewhere
-   * different every time the view moves; anchored to one end it stays put.
-   * Nothing is hidden behind it either way.
+   * The two channel kinds fall out of ONE rule — mark wherever the attribution
+   * changes — because they carry the answer in different records, and they
+   * differ only in which side of the mark the pill sits:
    *
-   * Drawn only where the run is at least as wide as the label and the pill has
-   * room before the right gutter. Appearing and disappearing as the view zooms
-   * is the intended behaviour: at a width where the label would dwarf what it
-   * labels, it is pointing at the wrong traffic. */
+   *   - the hailing channel has no meetings, so only frames are tagged: the
+   *     first attributable frame on screen gets a pill (nothing precedes it in
+   *     view to have established the name), and after that every change does.
+   *     The pill starts AT the frame — the traffic runs on to the right of it,
+   *     and the name is the head of that run.
+   *   - a detour channel is attended in slots, and a slot belongs to its peer
+   *     for its whole width even if nothing arrives in it. The dwell carries
+   *     that, so a slot is named on its own beginning rather than on whichever
+   *     frame happened to be first inside it, and an empty slot is still named.
+   *     The pill sits just BEFORE the slot opens, clear of it: a window is a
+   *     bounded thing with its own left edge, and a label laid over that edge
+   *     hides where the window starts — which on a lane whose whole point is
+   *     "we were listening from here to here" is the one thing not to cover.
+   *
+   * A dwell additionally starts a new pill when it does not continue the
+   * previous stay, so two consecutive slots with the SAME peer read as two
+   * slots. A frame never does: an untagged frame between two of a peer's
+   * frames — somebody else's broadcast, overheard — is not a change of who
+   * this lane is with, and clearing the run on it would re-label the same
+   * conversation every time the air was shared.
+   *
+   * A pill that would collide with the one before it, or run past the right
+   * gutter, is dropped rather than moved: a name that has slid off the moment
+   * it belongs to is worse than no name. */
   {
     ctx.font = `${9 * dpr}px 'SF Mono','Menlo','Consolas',monospace`
     const ph = 12 * dpr, pad = 4 * dpr, rad = 4 * dpr, gap = 4 * dpr
-    let runTag = '', x0 = 0, x1 = 0, endMs = 0
-    const flush = () => {
-      if (!runTag) return
-      const label = peerLabel(runTag)
-      const tw = ctx.measureText(label).width
-      const pw = tw + pad * 2
-      const px = x1 + gap
-      if (pw <= x1 - x0 && px + pw <= w - gr) {
-        ctx.beginPath()
-        ctx.roundRect(px, 1 * dpr, pw, ph, rad)
-        ctx.fillStyle = C_PILL_BG
-        ctx.fill()
-        ctx.fillStyle = C_PILL_FG
-        ctx.textBaseline = 'middle'
-        ctx.fillText(label, px + pad, 1 * dpr + ph / 2)
-      }
-      runTag = ''
-    }
+    /* `before` = the mark opens a listening window, so the pill goes to its
+     * left; otherwise the mark is a frame and the pill starts on it. */
+    const marks: { t: number; tag: string; before: boolean }[] = []
+    let cur = '', prevEnd = -Infinity
     for (const rec of recsCh) {
-      if (rec.dir === 2) continue
       const e = rec.t + rec.dur
-      if (e < lo || rec.t > hi) continue
-      if (!rec.tag) { flush(); continue }
-      if (rec.tag !== runTag || rec.t - endMs > TRAIN_GAP_MS) {
-        flush()
-        runTag = rec.tag; x0 = xAt(rec.t)
+      if (e < lo || rec.t > hi) continue     /* on screen: the first one in view
+                                              * is the first that can be named */
+      if (rec.tag) {
+        const slot = rec.dir === 2
+        const newSlot = slot && rec.t - prevEnd > SLOT_JOIN_MS
+        if (rec.tag !== cur || newSlot) {
+          marks.push({ t: rec.t, tag: rec.tag, before: slot })
+          cur = rec.tag
+        }
       }
-      x1 = xAt(e); endMs = e
+      prevEnd = e
     }
-    flush()
+    let lastRight = -Infinity
+    for (const mk of marks) {
+      const label = peerLabel(mk.tag)
+      if (!label) continue
+      const pw = ctx.measureText(label).width + pad * 2
+      const px = mk.before ? xAt(mk.t) - gap - pw : xAt(mk.t)
+      if (px < gl || px < lastRight + gap || px + pw > w - gr) continue
+      ctx.beginPath()
+      ctx.roundRect(px, 1 * dpr, pw, ph, rad)
+      ctx.fillStyle = C_PILL_BG
+      ctx.fill()
+      ctx.fillStyle = C_PILL_FG
+      ctx.textBaseline = 'middle'
+      ctx.fillText(label, px + pad, 1 * dpr + ph / 2)
+      lastRight = px + pw
+    }
   }
 
   /* On every lane, not just the one under the pointer: the stack shares one
@@ -688,8 +723,10 @@ function drawOne(cv: HTMLCanvasElement | null, ch: number, main: boolean) {
        * the number `lora n` gives them, or — only when the tag resolves to
        * nobody at all — the six hex characters themselves. The tag is what a log
        * line quotes, so it is the fallback rather than a prefix on every pill:
-       * once there is a name, the hex is the part nobody reads. */
-      const who = peerLabel(hit.tag)
+       * once there is a name, the hex is the part nobody reads. The hover has
+       * room for the cast as well, which is what turns the one unresolvable
+       * address there is a reason for into `inbound link`. */
+      const who = peerLabel(hit.tag, hit.cast)
       const label = [name, `${hit.bytes}B`, who].filter(Boolean).join(' · ')
       ctx.font = `${10 * dpr}px 'SF Mono','Menlo','Consolas',monospace`
       const tw = ctx.measureText(label).width
@@ -823,12 +860,19 @@ const peerByTag = ref<Map<string, Peer>>(new Map())
 
 /* What to call a node on screen: its name if anything announced one, and the
  * number `lora n` gives it otherwise — so the graph and the console agree, and
- * an unnamed node is still something you can refer to. */
-function peerLabel(tag: string): string {
+ * an unnamed node is still something you can refer to.
+ *
+ * Pass `cast` where there is room to say more than a name. A tag that resolves
+ * to nobody is usually a gap, but on a link the device says is ours it is not:
+ * a link request carries no sender and its identify step is encrypted inside
+ * the session, so the far end of a link dialled TO us is anonymous for the
+ * link's whole life. Six hex characters with nothing behind them read as a
+ * failure; saying which kind of address it is answers the question instead. */
+function peerLabel(tag: string, cast?: number): string {
   if (!tag) return ''
   const p = peerByTag.value.get(tag)
-  if (!p) return tag                      /* a tag that resolves to nobody */
-  return p.names.length ? p.names.join(',') : `#${p.num}`
+  if (p) return p.names.length ? p.names.join(',') : `#${p.num}`
+  return cast === CAST_US_LINK ? `${tag} · inbound link` : tag
 }
 
 function rebuildPeers() {
@@ -885,8 +929,11 @@ function parseRec(t: number, s: string): Rec | null {
   if (p[0] === 't') return { t, dir: 1, txp: +p[1], dur: +p[2], bytes: +p[3], rssi: 0, snr10: 0, type: +(p[4] ?? 0), wait: +(p[5] ?? 0), ch: +(p[6] ?? 0), own: +(p[7] ?? 0), desc: +(p[8] ?? 0), cast: +(p[9] ?? 0), tag: p[10] ?? '' }
   /* A dwell: the radio was tuned here and listening for this long. Not a frame
    * — it carries no level and is never drawn as one; it is what tells a lane
-   * apart from a lane nobody was watching. */
-  if (p[0] === 'a') return { t, dir: 2, ch: +p[1], dur: +p[2], bytes: 0, rssi: 0, snr10: 0, txp: 0, type: 0, wait: 0, own: 0, desc: 0, cast: 0, tag: '' }
+   * apart from a lane nobody was watching. Its tag, where it has one, is the
+   * meeting whose slot the stay is: the slot belongs to that peer for its whole
+   * width, and on a detour channel it is the ONLY thing that says so, since a
+   * slot may pass with nothing arriving in it. */
+  if (p[0] === 'a') return { t, dir: 2, ch: +p[1], dur: +p[2], bytes: 0, rssi: 0, snr10: 0, txp: 0, type: 0, wait: 0, own: 0, desc: 0, cast: 0, tag: p[3] ?? '' }
   return null
 }
 

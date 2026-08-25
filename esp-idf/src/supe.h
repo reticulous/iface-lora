@@ -188,12 +188,20 @@ const SupeChan* supeRegimeChans(uint8_t regime, int* count);
  * falls back to plain main-channel operation, so an obsolete dialect leaves the
  * air by itself instead of having to be spoken forever.
  *
- * At this stage of development no build may set an expiry more than fourteen
- * days ahead of its own build date (SUPE.md §3). The offset is a table constant
- * and the date is the build's own timestamp, so neither is ever hand-maintained
- * and a node that has gone quiet by expiry says so rather than looking like a
- * radio fault. */
-#define SUPE_EXPIRY_DAYS  14
+ * At this stage of development the expiry is a CALENDAR DATE, stated here and
+ * moved by hand (SUPE.md §3). A date rather than an offset from the build
+ * because what matters is that every node on a channel stops speaking the same
+ * dialect at the same moment: with an offset, two nodes flashed a week apart
+ * expire a week apart, and the older one spends that week talking to nobody
+ * while looking like a radio fault. A date they were both built with retires
+ * the dialect on both at once.
+ *
+ * The cost is that it has to be advanced deliberately, and that a build made
+ * after it is born expired — which is the right failure: it is loud, it is
+ * immediate, and it says the dialect needs a decision rather than a reflash. */
+#define SUPE_EXPIRY_Y  2026
+#define SUPE_EXPIRY_M  9
+#define SUPE_EXPIRY_D  10
 
 /** Unix seconds of this build, from the compiler's own __DATE__/__TIME__. */
 uint32_t supeBuildUnix(void);
@@ -247,7 +255,13 @@ double supeAirtimeSeconds(int sf, int bw_hz, int cr_denom, int preamble,
 /* ─────────────── timing constants (SUPE.md §14.7) ─────────────── */
 #define SUPE_TURNAROUND_MS   25  /* the longest a node may take to answer */
 #define SUPE_RETUNE_GAP_MS    1  /* the synthesizer, not the software */
-#define SUPE_TRAIN_GAP_MS     2  /* the receiver-flip interval inside a train */
+/* The receiver-flip interval (SUPE.md §14.7): rx-done serviced, the frame read
+ * out and dispatched, receive re-armed, before the next preamble flies. It is
+ * what deferSend parks a send for and the per-frame pad in a train's budgeted
+ * length. Between two frames of one train it is not parked but PAID — the
+ * frame is fired from tx-done, and servicing that costs the peer's rx side the
+ * same interval to do the same work (see supeEngOnTxDone). */
+#define SUPE_TRAIN_GAP_MS     2
 #define SUPE_GUARD_MS        10  /* slop on every deadline inside a meeting */
 
 /* A slot's own slop, and it is NOT the deadline guard. Inside a meeting the

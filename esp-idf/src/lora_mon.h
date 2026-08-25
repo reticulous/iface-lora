@@ -49,6 +49,8 @@ struct LoraMonState {
     uint32_t   dwellEndMs;
     uint16_t   dwellDur;
     uint8_t    dwellCh;
+    uint8_t    dwellTag[3];          /* the meeting whose slot this stay is, if
+                                      * any — a change of peer ends the run */
 };
 
 /* ─────────────── lora_mon: telemetry ─────────────── */
@@ -99,10 +101,13 @@ void loraMonClassify(LoraRadio* r, uint8_t dir, const uint8_t* f, size_t len,
                      uint8_t type, uint32_t now,
                      uint8_t* desc, uint8_t* whole, uint8_t tag[3]);
 
-/* Who SENT a frame, where the frame says so, and false where it does not. Only
- * PRIVSYNC does: it carries the sender's identity prefix precisely because the
- * node it names in its address field is the node being hailed, not the one
- * hailing. A received hail concerns the sender — the address on it is us. */
+/* Who SENT a frame, where the frame says so, and false where it does not. Two
+ * SUPE frames do. PRIVSYNC carries the sender's identity prefix precisely
+ * because the node it names in its address field is the node being hailed, not
+ * the one hailing: a received hail concerns the sender, since the address on it
+ * is us. ANNOUNCE2 has no address field at all and its payload IS the sender's
+ * identities, so without this an announcement — the frame that introduces a
+ * node — is the one frame on the graph attributed to nobody. */
 bool loraMonSenderOf(const uint8_t* f, size_t len, uint8_t type, uint8_t out[3]);
 
 /* Whose traffic an address is: ours, or somebody else's. Never broadcast —
@@ -116,6 +121,15 @@ enum : uint8_t {
     LMC_BCAST = 0,   /* aimed at everyone — an announce */
     LMC_US,          /* unicast, and the address is one of ours */
     LMC_OTHER,       /* unicast for somebody else, overheard */
+    /* Ours too, but by a LINK identifier rather than by a destination or an
+     * identity — split out because it is the one case where being unable to
+     * name the far end is a fact and not a gap. A link request carries no
+     * sender and its identify step is encrypted inside the session, so a link
+     * DIALLED TO US has an anonymous far end for its whole life; a link we
+     * dialled has the identifier filed on the peer's row, so it resolves and
+     * this never shows. A viewer that finds no name behind one of these can say
+     * *inbound link* instead of leaving six hex characters unexplained. */
+    LMC_US_LINK,
 };
 uint8_t loraMonCastOf(LoraRadio* r, const uint8_t tag[3]);
 

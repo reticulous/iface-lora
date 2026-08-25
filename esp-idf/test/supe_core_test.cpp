@@ -399,13 +399,16 @@ static void testSchedule(void) {
 /* ─────────────── expiry ─────────────── */
 
 static void testExpiry(void) {
-    uint32_t built = supeBuildUnix();
+    uint32_t built  = supeBuildUnix();
+    uint32_t expires = supeExpiryUnix();
     ok(built > 1750000000u, "the build timestamp is plausible");
-    eqi((long)(supeExpiryUnix() - built), (long)SUPE_EXPIRY_DAYS * 86400,
-        "the expiry is fourteen days past the build");
+    /* 2026-09-10T00:00:00Z. Stated as the number so the test fails when the
+     * date moves without the test being looked at. */
+    eqi((long)expires, 1788998400L, "the expiry is the stated calendar date");
+    ok(expires > built, "this build was made before its own expiry");
     ok(!supeExpired(built), "a fresh build is not expired");
-    ok(!supeExpired(built + 13 * 86400), "thirteen days on it is still current");
-    ok(supeExpired(built + 15 * 86400), "fifteen days on it is not");
+    ok(!supeExpired(expires - 86400), "the day before, it is still current");
+    ok(supeExpired(expires), "on the day, it is not");
     ok(!supeExpired(0), "an unresolved clock does not read as expired");
 }
 

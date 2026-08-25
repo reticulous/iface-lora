@@ -1825,8 +1825,25 @@ void supeEngOnTxDone(SupeEngine* e, bool ok) {
         }
         case SUPE_M_TRAIN_TX:
         case SUPE_M_REPAIR_TX:
-            if (txNextIdx(m) != 0xFF) { enterTrainWait(e, SUPE_TRAIN_GAP_MS); return; }
-            /* fall through the same completion logic fireNext carries */
+            /* The next frame of the train goes out from HERE, not from a
+             * deadline. A train is meant to be back to back, and PARKING one
+             * gap does not cost one gap: the wait is posted to the platform's
+             * scheduler, so the frame waits for a timer to expire, for the
+             * timer's task to run, for the radio task to wake, and for a whole
+             * pass of its loop — several times the gap itself, all of it dead
+             * air inside an appointment the peer is holding open.
+             *
+             * The flip interval §14.7 asks for is still there; it is simply
+             * paid rather than parked. Our tx-done and the peer's rx-done land
+             * at the same instant, and both sides then do the same order of
+             * work — service the interrupt, move a frame over SPI, re-arm —
+             * before this call reaches the radio. It is the same path and the
+             * same spacing the two halves of a split RNS packet already fly at,
+             * where the receiver does identically the same work between them.
+             *
+             * Only this send skips the park. fireNext carries the end-of-train
+             * case too, and the sends that follow the PEER's transmission —
+             * where the flip is genuinely in front of us — still defer. */
             fireNext(e);
             return;
         case SUPE_M_THATSIT_TX:

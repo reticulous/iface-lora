@@ -5,6 +5,9 @@
  */
 #include "lora_priv.h"
 
+#include <cstdarg>
+#include <string>
+
 #if defined(CONFIG_LORA0_CS_PIN)
 
 /* ─────────────── the two tasks ───────────────
@@ -113,10 +116,30 @@ static bool loraPeersWatched(void) {
  *
  * On-device viewers do NOT read this. They are inside the same binary as the
  * peer table and ask it directly (see loraPeerSummary in lora.h); serialising a
- * fact so the same firmware can parse it back is a round trip for nothing. */
+ * fact so the same firmware can parse it back is a round trip for nothing.
+ *
+ * Built in a std::string and not a fixed buffer, because the tag set has no
+ * useful bound: a node reached over links accrues one tag per link identifier
+ * (NEI_HASHES_MAX of them, shared, and they land on whoever is actually being
+ * talked to), and tags precede the names. Cut off at a buffer's end, that peer
+ * — the ONLY one whose traffic a viewer is hovering — loses its names and its
+ * later fields, and the tags that fell off resolve to nobody at all: exactly
+ * the node the record exists to name shows as `#4` or as raw hex. */
+static void appendf(std::string& s, const char* fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+static void appendf(std::string& s, const char* fmt, ...) {
+    char b[32];                       /* one field, never a whole record */
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(b, sizeof b, fmt, ap);
+    va_end(ap);
+    s += b;
+}
+
 static void publishPeers(LoraRadio* r) {
     if (!r->nei) return;
-    char k[48], v[224];
+    char k[48];
+    std::string v;
     uint32_t now = millis();
     /* The number `lora n` prints beside a node, counted the same way it counts:
      * used, not us, in table order. A viewer that has no name to show falls
@@ -142,45 +165,37 @@ static void publishPeers(LoraRadio* r) {
             addTag(h4);
         }
 
-        int o = snprintf(v, sizeof v, "%d|", num);
+        v.clear();
+        appendf(v, "%d|", num);
 #if !defined(CONFIG_LORA_NO_SUPE)
-        o += snprintf(v + o, sizeof v - (size_t)o, "%d|", e->supeSeen ? 1 : 0);
+        appendf(v, "%d|", e->supeSeen ? 1 : 0);
 #else
-        o += snprintf(v + o, sizeof v - (size_t)o, "0|");
+        v += "0|";
 #endif
-        for (int j = 0; j < nt && o < (int)sizeof v - 8; j++)
-            o += snprintf(v + o, sizeof v - (size_t)o, "%s%02x%02x%02x",
-                          j ? "," : "", tg[j][0], tg[j][1], tg[j][2]);
-        o += snprintf(v + o, sizeof v - (size_t)o, "|");
+        for (int j = 0; j < nt; j++)
+            appendf(v, "%s%02x%02x%02x", j ? "," : "", tg[j][0], tg[j][1], tg[j][2]);
+        v += '|';
         {
             char names[NEI_NAME_MAX * 3];
             peersNodeNames(e, names, sizeof names);
-            o += snprintf(v + o, sizeof v - (size_t)o, "%s", names);
+            v += names;
         }
         /* What has been learned about it. Path loss is the one number a graph
          * actually wants — it is symmetric, it does not move when either end
          * changes power, and it is what an edge length should be drawn from. */
-        o += snprintf(v + o, sizeof v - (size_t)o, "|");
-        if (e->havePair)
-            o += snprintf(v + o, sizeof v - (size_t)o, "%d",
-                          (int)e->pairTxp - (int)e->pairRssi);
-        o += snprintf(v + o, sizeof v - (size_t)o, "|");
-        if (e->haveSig)
-            o += snprintf(v + o, sizeof v - (size_t)o, "%d", (int)e->rssiMax);
-        o += snprintf(v + o, sizeof v - (size_t)o, "|");
-        if (e->haveSig)
-            o += snprintf(v + o, sizeof v - (size_t)o, "%d", (int)e->snrMax10);
-        o += snprintf(v + o, sizeof v - (size_t)o, "|");
-        if (e->haveQuality)
-            o += snprintf(v + o, sizeof v - (size_t)o, "%u", (unsigned)e->quality);
-        o += snprintf(v + o, sizeof v - (size_t)o, "|%u|%s%s",
-                      (unsigned)((now - e->lastHeardMs) / 1000),
-                      e->transit ? "T" : "", e->roaming ? "R" : "");
+        v += '|';
+        if (e->havePair) appendf(v, "%d", (int)e->pairTxp - (int)e->pairRssi);
+        v += '|';
+        if (e->haveSig)  appendf(v, "%d", (int)e->rssiMax);
+        v += '|';
+        if (e->haveSig)  appendf(v, "%d", (int)e->snrMax10);
+        v += '|';
+        if (e->haveQuality) appendf(v, "%u", (unsigned)e->quality);
+        appendf(v, "|%u|%s%s", (unsigned)((now - e->lastHeardMs) / 1000),
+                e->transit ? "T" : "", e->roaming ? "R" : "");
 #if !defined(CONFIG_LORA_NO_SUPE)
-        o += snprintf(v + o, sizeof v - (size_t)o, "|");
-        if (e->supeSeen)
-            snprintf(v + o, sizeof v - (size_t)o, "%u",
-                     (unsigned)e->supeCaps.topStep);
+        v += '|';
+        if (e->supeSeen) appendf(v, "%u", (unsigned)e->supeCaps.topStep);
 #endif
         storageSet(k, v);
     }
@@ -258,10 +273,11 @@ static void loraMonExpire(LoraRadio* r, uint32_t now) {
  *
  *   r|rssi|snr|dur|bytes|type|ch|desc|cast[|tag]
  *   t|txp|dur|bytes|type|wait|ch|own|desc|cast[|tag]
- *   a|ch|dur
+ *   a|ch|dur[|tag]
  *
  * The last is a DWELL: the radio was tuned to that channel and listening for
- * that long, ending where the next one begins. The leading token is the
+ * that long, ending where the next one begins. Its tag is the meeting whose
+ * slot the stay is — present only inside one. The leading token is the
  * direction; snr is deci-dB; ch is the channel, 0 being the reticulum hailing
  * channel; desc is what the frame is (LMD_*); cast is who it was aimed at
  * (LMC_*); tag is six hex characters naming the peer, absent when unknown.
@@ -286,12 +302,22 @@ static void loraMonRecordOne(LoraRadio* r, const IfMsg* m) {
      * there and keeps a whole idle hour as a single record. */
     if (m->dir == 2) {
         LoraMonState& mo = r->mon;
+        /* The tag is part of what makes two spans one stay: a meeting ending
+         * and another beginning on the same channel is two slots belonging to
+         * two peers, and a viewer that draws one label per slot has to see the
+         * boundary. */
         if (mo.dwellKeyMs && mo.dwellCh == m->ch && mo.dwellEndMs == m->t_ms &&
+            memcmp(mo.dwellTag, m->tag, 3) == 0 &&
             (uint32_t)mo.dwellDur + m->dur_ms <= 0xFFFF) {
             mo.dwellDur = (uint16_t)(mo.dwellDur + m->dur_ms);
             mo.dwellEndMs = m->t_ms + m->dur_ms;
             snprintf(key, sizeof key, "lora.%d.packets.%u", r->idx, (unsigned)mo.dwellKeyMs);
             snprintf(val, sizeof val, "a|%u|%u", (unsigned)mo.dwellCh, (unsigned)mo.dwellDur);
+            if (mo.dwellTag[0] | mo.dwellTag[1] | mo.dwellTag[2]) {
+                size_t o = strlen(val);
+                snprintf(val + o, sizeof val - o, "|%02x%02x%02x",
+                         mo.dwellTag[0], mo.dwellTag[1], mo.dwellTag[2]);
+            }
             storageSet(key, val);
             return;                      /* the FIFO already holds this node */
         }
@@ -299,6 +325,7 @@ static void loraMonRecordOne(LoraRadio* r, const IfMsg* m) {
         mo.dwellCh    = m->ch;
         mo.dwellDur   = m->dur_ms;
         mo.dwellEndMs = m->t_ms + m->dur_ms;
+        memcpy(mo.dwellTag, m->tag, 3);
     } else {
         /* Any frame ends the run: the next dwell starts a record of its own, so
          * a span never reads as covering traffic that happened inside it. */
@@ -318,8 +345,10 @@ static void loraMonRecordOne(LoraRadio* r, const IfMsg* m) {
                          (unsigned)m->desc, (unsigned)m->cast);
     /* The tag rides last and only when there is one. Six characters on every
      * record of a thousand is worth not spending on zeros, and a viewer that
-     * finds the field absent has the same answer as one that finds it empty. */
-    if (m->dir != 2 && (m->tag[0] | m->tag[1] | m->tag[2])) {
+     * finds the field absent has the same answer as one that finds it empty.
+     * A dwell carries one too — it is a meeting's slot, and the slot belongs to
+     * the peer for its whole width whether or not a frame landed in it. */
+    if (m->tag[0] | m->tag[1] | m->tag[2]) {
         size_t o = strlen(val);
         snprintf(val + o, sizeof val - o, "|%02x%02x%02x",
                  m->tag[0], m->tag[1], m->tag[2]);
@@ -400,12 +429,25 @@ void loraMonTagOf(const uint8_t* f, size_t len, uint8_t type, uint8_t out[3]) {
     if (len >= 1 + 2 + 3) memcpy(out, f + 1 + 2, 3);
 }
 
-/* PRIVSYNC's sender_ident, which sits behind the tag, the power and the salt.
- * It is optional on the wire — a hail from a node with nothing to say about
- * itself omits it — so the length is what says whether there is one. */
+/* The two SUPE frames that name their own sender.
+ *
+ * PRIVSYNC's sender_ident sits behind the tag, the power and the salt. It is
+ * optional on the wire — a hail from a node with nothing to say about itself
+ * omits it — so the length is what says whether there is one.
+ *
+ * ANNOUNCE2 is nothing BUT a statement of who is speaking: the identities are
+ * its payload, and the first of them is the one annIngest resolves the frame's
+ * node through, so it is the one that resolves through a published tag set too
+ * (it is that row's node4, one of its idents, or the front of one of its
+ * destinations, whichever the row was found by). */
 bool loraMonSenderOf(const uint8_t* f, size_t len, uint8_t type, uint8_t out[3]) {
-    if (!f || type != LORA_PKT_OURS || len < SUPE_PRIVSYNC_ID_LEN) return false;
-    if (f[0] != SUPE_T_PRIVSYNC) return false;
+    if (!f || type != LORA_PKT_OURS || len < 1) return false;
+    if (f[0] == SUPE_T_ANNOUNCE2) {
+        if (len < SUPE_ANN2_BASE + SUPE_ID_LEN) return false;
+        memcpy(out, f + SUPE_ANN2_BASE, SUPE_TAG_LEN);
+        return true;
+    }
+    if (f[0] != SUPE_T_PRIVSYNC || len < SUPE_PRIVSYNC_ID_LEN) return false;
     memcpy(out, f + SUPE_PRIVSYNC_LEN, SUPE_TAG_LEN);
     return true;
 }
@@ -469,10 +511,12 @@ uint8_t loraMonCastOf(LoraRadio* r, const uint8_t tag[3]) {
     }
     /* A link we are an endpoint of carries our traffic even though its
      * identifier belongs to neither side's announced set. `ours` is the whole
-     * test — we only ever track links we are one end of. */
+     * test — we only ever track links we are one end of. Answered apart from
+     * the rows above so a viewer can tell an unnameable far end from a missing
+     * one; see LMC_US_LINK. */
     for (int i = 0; i < NEI_LINKS_MAX; i++) {
         NeiLink* L = &r->nei->links[i];
-        if (L->used && L->ours && memcmp(L->linkId, tag, 3) == 0) return LMC_US;
+        if (L->used && L->ours && memcmp(L->linkId, tag, 3) == 0) return LMC_US_LINK;
     }
     return LMC_OTHER;
 }
@@ -574,6 +618,14 @@ void loraMonDwell(LoraRadio* r, uint32_t now) {
     m.kind = IFM_MON;  m.radio = (uint8_t)r->idx;
     m.dir  = 2;        m.ch    = ch;
     m.t_ms = start;    m.dur_ms = (uint16_t)span;
+    /* Whose slot this stay is. A meeting's slots belong to one peer for their
+     * whole width whether or not a frame ever lands in them, and that is the
+     * only place the fact exists: a viewer looking at a detour channel sees a
+     * lane that may be entirely empty, and "we were listening HERE, for THEM"
+     * is not derivable from frames that did not arrive. */
+#if !defined(CONFIG_LORA_NO_SUPE)
+    supeMeetingTag(r, m.tag);
+#endif
     if (!ifPost(&m)) r->mon.monDropped++;
 }
 

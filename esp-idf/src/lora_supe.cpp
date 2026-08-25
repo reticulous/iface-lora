@@ -15,6 +15,12 @@
  * announce, so the first one is worth having promptly. */
 #define SUPE_ANN_FIRST_MS    15000
 
+/* How long a first-seen announce going on the air holds the ANNOUNCE2 behind
+ * it (supeAnnSoon). Long enough that the announces a boot or a route change
+ * produces arrive as one burst and are answered by one frame; short enough
+ * that the answer still belongs to the event that caused it. */
+#define SUPE_ANN_SOON_MS     10000
+
 /* The absence ladder's verdict (SUPE.md §12): after three narrow schedules
  * expired unmet the peer is absent this long, and its traffic is dropped
  * rather than transmitted into the void. */
@@ -814,6 +820,15 @@ void supeAnnCancel(LoraRadio* r) {
     if (r->supe) r->supe->annPending = false;
 }
 
+void supeAnnSoon(LoraRadio* r) {
+    if (!supeMounted(r)) return;
+    SupeState* ss = r->supe;
+    /* Already inside a window, or already about to speak: fold in. */
+    if (ss->annSoonPend || ss->annPending) return;
+    ss->annSoonPend = true;
+    ss->annSoonMs   = millis() + SUPE_ANN_SOON_MS;
+}
+
 static uint32_t supeAnnGap(const LoraRadio* r) {
     uint32_t base = (uint32_t)r->annIntervalMin * 60u * 1000u;
     if (!base) return 0;
@@ -829,6 +844,9 @@ static void supeAnnBeat(LoraRadio* r, uint32_t now);
 static void supeAnnSend(LoraRadio* r) {
     SupeState* ss = r->supe;
     ss->annPending = false;
+    /* Whatever opened a coalescing window is answered by this frame, however
+     * the frame came to be sent. */
+    ss->annSoonPend = false;
     auto retrySoon = [&]() {
         ss->annNextMs = millis() + SUPE_ANN_FIRST_MS;
         if (logIsDebug(TAG))
@@ -864,6 +882,14 @@ static void supeAnnSend(LoraRadio* r) {
  * One short frame per interval is a cheap price for that convergence. */
 static void supeAnnBeat(LoraRadio* r, uint32_t now) {
     SupeState* ss = r->supe;
+    /* The coalescing window closed: the announces that opened it are on the
+     * air, so say who we are. Ahead of the interval check because this is the
+     * same request arriving early — an announcement sent here paces the beat
+     * like any other (supeAnnSend), so the interval is not also served. */
+    if (ss->annSoonPend && (int32_t)(now - ss->annSoonMs) >= 0) {
+        ss->annSoonPend = false;
+        supeAnnArm(r);
+    }
     if (!ss->annPending && !r->annReplay && r->annIntervalMin &&
         !ss->eng.expired && (int32_t)(now - ss->annNextMs) >= 0)
         supeAnnArm(r);
@@ -1076,6 +1102,15 @@ uint32_t supeNextDeadlineMs(LoraRadio* r) {
     }
     if (ss->annPending) { if (slotMs < best) best = slotMs; }
     else if (r->annIntervalMin && ss->eng.m.phase == SUPE_M_IDLE) soon(ss->annNextMs);
+    /* Paced like annPending once it comes due, not `soon(0)`. supePoll returns
+     * ahead of the beat while a transmit is in flight or an announce replay is
+     * running, so a window that has expired can stay unserviced for a while —
+     * and a deadline of zero over that stretch is the main loop spinning on a
+     * request nothing is in a position to grant. */
+    if (ss->annSoonPend) {
+        if ((int32_t)(now - ss->annSoonMs) >= 0) { if (slotMs < best) best = slotMs; }
+        else soon(ss->annSoonMs);
+    }
     {
         uint32_t d = airtimeNextDeadlineMs(r, now);
         if (d < best) best = d;

@@ -51,7 +51,7 @@ contributes:
   periodic front-end recalibration that keeps a latched gain control from
   deafening the receiver.
 - **IFAC plumbing** — reading `s.lora.<n>.ifac_netname` / `ifac_size` and the
-  `secrets.lora.<n>.ifac_netkey` secret and handing them to `rnsd` in the
+  `s.lora.<n>.ifac_netkey` secret and handing them to `rnsd` in the
   `rnsd_iface_t` connect payload; `rnsd` does the actual access-code crypto.
 - **LoRaMon** (§12) — a per-on-air-frame recorder whose storage subtree *is* the
   ring, plus the browser and LCD viewers that plot power, signal and protocol on
@@ -590,6 +590,29 @@ the standing cost is the chip's standby delta plus the board's TCXO current, the
 larger of the two by an order of magnitude. SX126x only; other families have no
 equivalent in RadioLib and keep the gaps they have.
 
+**A train's next frame is fired from tx-done, not from a deadline.** Both chains
+now leave by the same door: a split's second half from `serviceRadio`'s TxDone
+branch, and a train's next frame from `supeEngOnTxDone` calling `fireNext`
+directly (`SUPE_M_TRAIN_TX` / `SUPE_M_REPAIR_TX`) — which reaches the radio
+through `txRearmRx` → `supeAfterTx`, the recursive SUPE lock making the nesting
+legal. Parking the frame on `SUPE_TRAIN_GAP_MS` instead did **not** cost one
+gap: the wait went to the platform's scheduler, so the frame waited out an
+`esp_timer` one-shot (floored at 1 ms), the timer task's turn, `loraNudge`
+waking the radio task, and a whole pass of its loop before `supePoll` reached
+the engine — several times the gap itself, every millisecond of it dead air
+inside an appointment the peer is holding open.
+
+The flip interval §14.7 asks for is still there; it is **paid rather than
+parked**. Our TxDone and the peer's RxDone land at the same instant and both
+sides then do the same order of work — service the interrupt, move a frame over
+SPI, re-arm — before the next carrier appears. It is the spacing the two halves
+of a split already fly at, where the receiver does identically the same work
+between them. `SUPE_TRAIN_GAP_MS` stays in the budgeted train lengths, where
+over-estimating is the safe direction, and stays parked for `deferSend`: a send
+that follows the *peer's* transmission has the flip genuinely in front of it,
+and firing those at zero gap is what once lost THATSITs and closing answers
+while whole trains arrived intact.
+
 **Ingress is gated on the meeting, not on the radio.** `drainOneOutbound`
 pulls from rnsd and the RNode client (`queueFill`) *above* the `txActive` and
 `supeHoldsRadio` returns and *below* the meeting one. The distinction is the
@@ -926,14 +949,14 @@ The two deadlines are computed in `radioStart` from the live modem parameters
   announces may use; `point_to_point` is left 0 (LoRa is a shared radio medium
   with hidden nodes, so announces are still re-broadcast for peers out of range
   of the origin — see `rns/INTERNALS.md` §1.1.1);
-- `retain_announces` from `s.lora.<n>.retain_announces` (default 1) — an
-  announce heard here is worth *keeping*, not merely forwarding: this node is
-  the sole custodian of the mesh on the other side of the radio, re-acquiring a
-  neighbour costs ~1.5 s of airtime, and a path response is a signed announce
-  that only a node still holding the original bytes can emit (see
-  `rns/INTERNALS.md` §1.1.2);
+- `community_radius` from `s.lora.<n>.community_radius` (default 3) — an
+  announce from within the radius is worth *keeping*, not merely forwarding:
+  this node is the custodian of the mesh on the other side of the radio,
+  re-acquiring a neighbour costs ~1.5 s of airtime, and a path response is a
+  signed announce that only a node still holding the original bytes can emit
+  (see `rns/INTERNALS.md` §1.1.2);
 - IFAC fields from `s.lora.<n>.ifac_netname` / `ifac_size` and
-  `secrets.lora.<n>.ifac_netkey`.
+  `s.lora.<n>.ifac_netkey`.
 
 The ITS connect **ref is the radio index**, so `onRnsdDisconnect(ref)` finds the
 radio and clears its handle; the task loop re-registers on the next turn if the
@@ -1138,7 +1161,15 @@ storage subtree **is** the ring — no in-firmware record buffer, no ITS transfe
   reading both surfaces sees the same `#4`. Tags are three-byte prefixes,
   comma-joined and deduplicated — the whole set that resolves an address to this
   node — and names are the first word of each announced LXMF name on its
-  destinations, comma-joined, duplicates dropped. Published
+  destinations, comma-joined, duplicates dropped. **The record is built in a
+  `std::string` and has no length cap**, because the tag set has none worth
+  betting on: a node reached over links accrues one tag per link identifier
+  (`NEI_HASHES_MAX` of them, shared across the table, and they land on whoever
+  is actually being talked to), and the tags precede the names. Cut at a fixed
+  buffer's end, the peer that loses its names and its trailing fields is by
+  construction the one whose traffic a viewer is hovering, and the tags that
+  fell off resolve to nobody — the busiest node on the graph reads as `#4` or
+  as raw hex while the quiet ones read fine. Published
   rather than derived, because the mapping lives in the peer table and nothing
   outside this straddle can rebuild it: a viewer sees frames, not the announces
   and proofs that clustered them into nodes. LoRaMon reads it to name the node
@@ -1152,6 +1183,24 @@ storage subtree **is** the ring — no in-firmware record buffer, no ITS transfe
   is deci-dB:
   - rx: `r|<rssi>|<snr>|<dur_ms>|<bytes>|<type>|<ch>|<desc>|<cast>[|<tag>]`
   - tx: `t|<txp>|<dur_ms>|<bytes>|<type>|<wait_ms>|<ch>|<own_ms>|<desc>|<cast>[|<tag>]`
+  - dwell: `a|<ch>|<dur_ms>[|<tag>]`
+
+  A **dwell** is not a frame: it is the radio tuned to that channel and
+  listening for that long, written by `loraMonDwell` on every retune and once
+  per maintenance beat, and extended in place while the stay continues so an
+  idle hour is one record and not one per beat. It is what lets a lane say where
+  the radio *was*, which no frame record can — a lane with nothing in it means
+  both "nobody spoke" and "we were not listening", and those are the two answers
+  a channel view exists to separate.
+
+  **A dwell's `<tag>` is the meeting whose slot the stay is** (`supeMeetingTag`,
+  sampled as the record is posted), and it is the reason a detour channel can be
+  labelled at all: a slot belongs to its peer for its whole width whether or not
+  a frame ever lands in it, and nothing else on the record stream says so. The
+  tag is part of what makes two spans one stay — a meeting ending and another
+  beginning on the same channel is two slots belonging to two peers, and the
+  extend-in-place check compares it alongside the channel so the boundary
+  survives into the viewer.
 
   `<desc>` says what the frame IS — a code, not a string, because every record
   is a storage node and there may be thousands of them, so the name lives once
@@ -1192,7 +1241,8 @@ storage subtree **is** the ring — no in-firmware record buffer, no ITS transfe
   whole train.
 
   `<cast>` is who the frame was aimed at — `0` broadcast, `1` a unicast for us,
-  `2` a unicast for somebody else (`LMC_*`). The device decides it because a
+  `2` a unicast for somebody else, `3` a unicast for us by a **link identifier**
+  rather than by a destination or an identity (`LMC_*`). The device decides it because a
   viewer cannot: it turns on which addresses mean US, and that lives in the peer
   table. It is what the viewers colour by, so it has to be on every record rather
   than derived per frame at draw time.
@@ -1213,9 +1263,19 @@ storage subtree **is** the ring — no in-firmware record buffer, no ITS transfe
     closes one: asking only after calls the closing frame somebody else's, and
     asking only before does the same to the opener.
   - otherwise `loraMonCastOf` on the frame's own address: a local row's
-    destination or identity, or a link we are an endpoint of, → `LMC_US`;
-    anything else, an address that resolves to nobody included, → `LMC_OTHER`.
-    Unknown is not the same as ours.
+    destination or identity → `LMC_US`; a link we are an endpoint of →
+    `LMC_US_LINK`; anything else, an address that resolves to nobody included,
+    → `LMC_OTHER`. Unknown is not the same as ours.
+
+  `LMC_US_LINK` is ours by every colouring rule — both viewers paint it as our
+  own traffic — and is split out for one reason: it is where an unresolvable
+  `<tag>` is a **fact rather than a gap**. A link request carries no sender and
+  the session's identify step is encrypted inside it, so the far end of a link
+  **dialled to us** is anonymous for the link's whole life; there is nothing to
+  file it under and nothing later supplies it (a link *we* dialled has its
+  identifier filed on the peer's row by `neiLink`, so it resolves and this never
+  shows). Six hex characters with nothing behind them read as a failure of the
+  peer table, so the browser's hover says `inbound link` beside them instead.
 
   On transmit `LMC_US` cannot arise, so `LMC_OTHER` is what the graph reads as
   "our unicast", and our own broadcast carries no tag at all — the address on it
@@ -1225,10 +1285,18 @@ storage subtree **is** the ring — no in-firmware record buffer, no ITS transfe
   A **split packet's address lives in its head** and both halves record it, by
   the same inheritance the description uses (see `loraMonClassify` above).
 
-  A received **PRIVSYNC names US** in its address field — it is a hail aimed at
-  this node — so its `<tag>` comes from the `sender_ident` it carries
-  (`loraMonSenderOf`) rather than from that field. That is what the field is for,
-  and it is why a hail on the graph is labelled with whoever sent it.
+  **Two SUPE frames name their own sender**, and their `<tag>` comes from that
+  rather than from an address field (`loraMonSenderOf`). A received **PRIVSYNC
+  names US** in its address field — it is a hail aimed at this node — so the
+  `sender_ident` it carries is what the hail concerns; that is what the field is
+  for, and it is why a hail on the graph is labelled with whoever sent it. An
+  **ANNOUNCE2** has no address field at all: its payload *is* the sender's
+  identities, and the first of them is the one `annIngest` resolves the frame's
+  node through — so it is the one that resolves through a published tag set too,
+  being that row's `node4`, one of its idents, or the front of one of its
+  destinations, whichever the row was found by. Without it the announcement —
+  the frame that introduces a node — would be the one frame on the graph
+  attributed to nobody.
   `<ch>` is the channel the frame flew on, taken from `LoraRadio.chNow`, `0`
   being the hailing channel; a SUPE detour under a regime with a channel plan
   (§18, §19) is what puts anything else there.
@@ -1409,20 +1477,45 @@ black text, rounded, in the smaller face. One style serves both the peer name on
 a train and the noise floor's figure, because two label styles for one job is one
 too many.
 
-Consecutive frames on a lane sharing a `<tag>` are one run — a train, or a lone
-hailing-channel frame, which is that run at length one — and the run gets the
-peer's name once. It sits **beside** the run,
-level with its top and a few pixels off its right end. Centred, the pill's offset
-from the frames it names changes with the run's width, so the same train's label
-lands somewhere different every time the view moves; anchored to one end it stays
-put. A run is named only where it is at least as wide as the label and the pill
-has room before the right gutter, so pills come and go as the view zooms — at a
-width where the text would dwarf what it labels, it is pointing at the wrong
-traffic. A gap longer than the widest slot spacing a schedule asks for ends a
-run, because past that they are two conversations that happened to be with the
-same node. The LCD draws them with a fixed pool of four floating labels (the
-canvas has no glyph blitter), widest run first: a view with more nameable runs
-than that has them shoulder to shoulder and unreadable anyway.
+**In the browser a peer pill is LEFT-ALIGNED on the moment its name becomes
+true**, and stands until the next one contradicts it — the same reading as a
+name on a timeline. Anchored to a point and not fitted to a run: a run's width
+changes with the zoom, so a label fitted to one moves every time the view does,
+and a label that will not fit vanishes from traffic that is plainly there.
+
+One rule places them — **mark wherever the attribution changes** — and the two
+kinds of channel fall out of it because they carry the answer in different
+records:
+
+- The **hailing channel** holds no meetings, so only frames are tagged: the
+  first attributable frame *on screen* gets a pill (nothing preceding it in view
+  established the name) and after that every change does. The pill starts **at**
+  the frame — the traffic runs on to its right, and the name is the head of that
+  run.
+- A **detour channel** is attended in slots, and a slot belongs to its peer for
+  its whole width even when nothing arrives in it. The dwell's `<tag>` carries
+  that, so a slot is named on its own beginning rather than on whichever frame
+  happened to be first inside it, and a slot that passed in silence is still
+  named. The pill sits just **before** the slot opens, clear of it: a listening
+  window is a bounded thing with its own left edge, and a label laid over that
+  edge hides where the window starts — the one thing not to cover on a lane
+  whose whole point is *we were listening from here to here*. A slot whose pill
+  has no room to its left (the view's own edge, or the pill before it) goes
+  unnamed rather than sliding inward.
+
+A dwell additionally opens a new pill when it does not continue the previous
+stay (`SLOT_JOIN_MS` of slack against beat quantisation), so two consecutive
+slots with the *same* peer read as two slots. A frame never does: an untagged
+frame between two of a peer's frames — somebody else's broadcast, overheard — is
+not a change of who the lane is with, and clearing the run on it would re-label
+the same conversation every time the air was shared. A pill that would collide
+with the one before it, or run past the right gutter, is dropped rather than
+moved: a name that has slid off the moment it belongs to is worse than no name.
+
+The LCD still labels **runs** — consecutive frames sharing a `<tag>` — with a
+fixed pool of four floating labels (the canvas has no glyph blitter), widest run
+first: a view with more nameable runs than that has them shoulder to shoulder
+and unreadable anyway.
 
 The two viewers repaint differently, and the difference is visible. The browser
 rebuilds from storage at 1 Hz but repaints off `requestAnimationFrame` against an
@@ -1487,7 +1580,11 @@ window uses the firmware's published rollup.
 **Timescale, frozen views only.** A zoomed view stands still, so it carries a
 grid: **1-px vertical lines in `#242424`, the darkest tone of the band
 gradient**, on round multiples of one division — dark enough to read as part of
-the background rather than as something drawn over it. The span and what a
+the background rather than as something drawn over it, and drawn **first** —
+below the traffic, below the pills, below everything else a lane carries. It is
+the ruling on the paper: part of the background, never crossing anything drawn
+on top of it. The span
+and what a
 division is worth are stated beside the back pill in both viewers. A live view
 gets none — the grid is anchored to absolute time and would
 crawl across a sliding graph. The division is the smallest **1-2-5-10** step at
@@ -2339,6 +2436,8 @@ main channel (the hailing channel — where everyone camps)
 
   A→*  SUPE_ANNOUNCE2  5+4n B   who I am, what my radio does, at what power
                                └─ once per SUPE.announce_interval, jittered
+                               └─ and 10 s behind any announce this radio had
+                                  never put on air, coalesced (supeAnnSoon)
 
   A→*  PRIVSYNC        6/9 B   "traffic for whoever holds this tag — you know
                                where to find me" (+ A's identity, sender_ident)
@@ -2397,7 +2496,8 @@ to the layers above.
 | `s.lora.<n>.SUPE.afa` | the regime number (§18). The regime IS the statement of what is permissible on which channels, so SUPE names the interface's own frequency-agility key |
 | no access code | IFAC masks the frame from the flags byte on, so the modem cannot read an address and has nothing to match; `radioStart` says so once |
 
-Each regime version expires fourteen days after the build (`supeExpired`); past
+Each regime version expires on the calendar date the build carries — 2026-09-10
+at the time of writing, `SUPE_EXPIRY_Y/M/D` in `supe.h` (`supeExpired`); past
 it the node neither sends nor accepts frames naming it and says so once.
 
 #### 19.1.1 Building without SUPE (`CONFIG_LORA_NO_SUPE`)
@@ -2599,12 +2699,20 @@ transaction, so with zero packets queued it never fires.
 
 ## 20. Known gaps in the LCD viewer
 
-The browser LoRaMon carries the current feature set; the LCD app lags it in two
-places. Both are deliberate deferrals rather than oversights, recorded here so
-the intent survives.
+The browser LoRaMon carries the current feature set; the LCD app lags it in
+three places. All are deliberate deferrals rather than oversights, recorded here
+so the intent survives.
 
 **The two wait marks are browser-only.** `own_ms` (§12) is drawn dotted beside
 the solid contention run in the browser; the LCD reads the older six-field form
 and draws contention alone. Harmless — the field is appended, so an indexing
 parser ignores it — but the LCD therefore cannot distinguish a busy channel from
 a busy radio.
+
+**Peer pills still label runs, not moments.** The browser anchors a pill to the
+instant a name becomes true and takes a detour channel's name off the dwell, so
+a silent slot is still named (§ Pills). The LCD keeps the older rule — one label
+per run of same-tag frames, widest four drawn — because its label pool is fixed
+and its canvas has no glyph blitter, so "one per attribution change" needs a
+different placement pass rather than the same code. Consequence: on a detour
+lane the LCD names a slot only if something arrived in it.
