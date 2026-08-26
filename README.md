@@ -149,11 +149,12 @@ once, because the client is holding a 0.25 s validation window open.
 | `s.lora.<n>.enable` | `0` | Bring this radio up. Live — toggling it starts/stops the radio. |
 | `s.lora.<n>.frequency` | *(none)* | Carrier frequency in **Hz**. No default — region/antenna dependent, user must pick. |
 | `s.lora.<n>.bandwidth` | `125000` | Bandwidth in **Hz** (125/250/500 kHz; SX128x also 203/406/812/1625 kHz). |
-| `s.lora.<n>.spreading_factor` | `7` | Spreading factor, 5–12. |
+| `s.lora.<n>.spreading_factor` | `7` | Spreading factor. The top is 12; the bottom is the **part's**, published as `lora.<n>.sf_min` and enforced on both surfaces — 5 on everything except the SX127x, which reaches neither SF5 (the chip has none) nor SF6 (it wants an implicit header, and this interface's frames are variable length), so its floor is 7. A lower value is clamped with a warning rather than refused. |
 | `s.lora.<n>.coding_rate` | `5` | Coding-rate denominator, 5–8 (`5` = 4/5). |
-| `s.lora.<n>.tx_power` | *(none)* | TX power in dBm at the **antenna**, up to `lora.<n>.tx_power_max` (22 on a bare chip sub-GHz, 12 at 2.4 GHz, higher through a front-end module — 27 on the Heltec V4, 30 sub-GHz / 20 at 2.4 GHz on the Meshnology W12). No default — antenna dependent. A value above the ceiling is clamped with a warning. The radio also states this figure to rnsd at registration, so a reticulous peer's rx report can quote it back and turn a bare RSSI into a path loss; the configured value goes out, not the adaptive per-peer one, because that is a readout and not a term in any loop. |
+| `s.lora.<n>.tx_power` | *(none)* | **Maximum** TX power in dBm at the **antenna**, up to `lora.<n>.tx_power_max` (22 on a bare chip sub-GHz, 12 at 2.4 GHz, higher through a front-end module — 27 on the Heltec V4, 30 sub-GHz / 20 at 2.4 GHz on the Meshnology W12). No default — antenna dependent. A value above the ceiling is clamped with a warning. It is a ceiling and not a level: with SUPE on, a frame to a peer whose signal has been measured goes out at whatever reaches it, which `apDerive` clamps to this and is often well below (§15). With SUPE off nothing derives anything and every frame goes out at exactly this. The radio also states this figure to rnsd at registration, so a reticulous peer's rx report can quote it back and turn a bare RSSI into a path loss; the configured value goes out, not the adaptive per-peer one, because that is a readout and not a term in any loop. |
 | `s.lora.<n>.preamble` | `12` | Preamble length in symbols, 6–32. |
 | `s.lora.<n>.sync_word` | `"0x42"` | Sync word, a string parsed as hex or decimal (`0x42` is the Reticulum-on-LoRa convention). |
+| `s.lora.<n>.announce_interval` | `30` | **Minutes** between everything this node says about itself on this radio, and the one answer to that question: the Reticulum announces `rnsd` replays onto `lora/<n>` (pinned to it — no other interface spends airtime), and SUPE's own ANNOUNCE2, the frame publishing this node's identity hashes, what its radio can do and the power the frame went out at. Jittered ±10 %, so a fleet powered up together drifts apart. `0` turns the beat off entirely: the node then says who it is only when an application changes what it advertises, when the pane's **Announce now** is pressed, or on `lora [<n>] a`. It is not a longer interval, it is none. Relayed announces are somebody else's traffic and are unaffected. Live — no radio cycle. |
 | `s.lora.<n>.mode` | `"gateway"` | RNS interface mode: `full`, `gateway`, `access_point`, `roaming`, `boundary`. |
 | `s.lora.<n>.lbt` | `1` | Listen-before-talk: CSMA/CA carrier-sense before each transmit. `0` = blind transmit (no sensing). Live. On a quiet, single-node band you can turn it off to skip the sensing; on a shared band leave it on. |
 | `s.lora.<n>.appc` | `1` | Adaptive p-persistent CSMA — see below. Sizes the random backoff by how much of the recent past *this radio* spent transmitting, instead of growing it on collisions. Only has an effect while `lbt` is on. `0` reverts to the exponential-backoff regime. Live. |
@@ -165,11 +166,11 @@ once, because the client is holding a 0.25 s validation window open.
 | `s.lora.<n>.SUPE.afa` | `0` | Frequency agility: the value **is** the regime number, not a flag, and it is the same number SUPE names. `0` is a regime with no channel plan — the configured frequency alone — so it reads identically as "no agility". `1` is the EU 863-870 MHz plan (nine 500 kHz channels under polite spectrum access). On its own the regime only puts channels up to be **measured and drawn**; what transmits on them is SUPE, below. **This is where the regime is set** — it appears as "Regime" in the SUPE section of the settings pane, since that is where you would look for it, but the key is the interface's own and predates SUPE. See INTERNALS §18. Live. |
 | `s.lora.<n>.SUPE.enable` | `0` | Speak **SUPE** on this interface: unicast traffic leaves the shared channel for private meetings at derived times, channels and sync words — one six-byte PRIVSYNC seeds a schedule of slots, the pair meets at the first one that works, and every meeting's goodbye seeds the next, so a busy pair touches the shared channel once — with `rnsd` unmodified and unaware. Off means the radio behaves exactly as it did, which is what makes it one thing to turn off when comparing. What the meetings can fly is `afa` above: regime `0` moves the spreading factor only, regime `1` moves frequency as well. **Inert on an interface with an access code** — IFAC masks the frame end to end, so the modem cannot read an address to match, and the boot log says so. Traffic to a peer that has not announced itself over SUPE is untouched, so a mixed segment needs no detection and no fallback. `lora [<n>] supe` shows what it has learned. See INTERNALS §19 and `plans/SUPE.md`. In development. **`lora [<n>] supe enable` / `disable` sets this**, and the radio acts on it where it is read rather than restarting: nothing about the modem changes, so it stays on the air, and it announces the change at once. A node with this off still **reads** SUPE — it keeps its picture of which neighbours speak it, what their radios can do and what the path loss is — and it announces that it does not speak it, which is what makes a neighbour drop its SUPE bit and go back to plain RNode framing. Silence would not do that: a node that stops speaking is indistinguishable from one that has gone away. |
 | `s.lora.<n>.SUPE.sender_ident` | `1` | Name this node in every PRIVSYNC. Three bytes and one symbol group, and it gives up the protocol's default anonymity — a listener in radio earshot learns who is talking to whom, which no Reticulum header discloses. It is on because the **return leg depends on it**: the tag a PRIVSYNC carries is the *listener's* address, so an unnamed seeker's traffic queued at the far end is indistinguishable from a stranger's and the answering HAVEDATA is never sent — every reply then buys its own meeting instead of riding the one already running. It also lets the far end file a link identifier our cargo creates against us rather than against nobody. `0` restores the anonymity and gives both up; either way this node still understands the longer frame from peers that send it. See `plans/SUPE.md` §4. In development. |
-| `s.lora.<n>.SUPE.announce_interval` | `30` | Minutes between this node's own SUPE announcements — the frame publishing its identity hashes, what its radio can do, and the power the frame went out at, so a listener turns its own reading into a path loss. It governs nothing a Reticulum announce does: those air when `rnsd` hands them over (INTERNALS §14). `0` turns the beat off entirely, so the node announces only when `lora a` says so; it is not a longer interval, it is none. Relayed announces are somebody else's traffic and are unaffected. **This replaced `announce_interval`**; an existing setting is carried across on upgrade. Live. |
 | `s.lora.assumed_peer_txp` | `22` | TX power (dBm) credited to a peer whose own power we don't know, for the estimate shown as `EST` in `lora n` — which is what the **power request** (0x04) asks a peer to transmit at, and nothing else: our own power toward a peer is never estimated (see INTERNALS §15.4). Assuming high errs safe. Set it to match a bench node parked at a low `tx_power`, whose announces go out at *that* power — otherwise the estimate is off by the difference. |
 | `s.lora.rnode.radio` | `0` | Which radio the RNode endpoint exposes — see [Using the device as an RNode](#using-the-device-as-an-rnode). Changing it while a client is attached disconnects it. |
 | `s.lora.rnode.serial` | `1` | The serial door: the endpoint rides the highest serial port that exists — the console port normally, the second CDC port after `usb cdc`. On by default because it costs nothing until a client speaks (see below). Live. |
 | `s.lora.rnode.tcp` | `0` | The TCP door, on port 7633 — a switch, not a port number: an RNS client dials 7633 and nothing else. Off by default: a listener on the network is a decision, not a side effect. Live. |
+| `s.lora.rnode.upnp` | `0` | **Accessible from internet** — ask the router to forward port 7633 in from the WAN, so a client outside the LAN can attach. The flag rides the endpoint's registration with `spangap-net` as `publicFacing`, and [upnp](../upnp) is what acts on it; the switch appears under the TCP door only in a build that stages upnp, and only while that door is open. Off by default — the other two doors reach as far as the desk this device is on, this one reaches the whole internet. Live. |
 | `s.lora.rnode.ble` | `1` | The Bluetooth door, when `reticulous/rnode-ble` is in the build (which owns it — see its README). Live. |
 | `s.lora.version` | — | Internal defaults-seeding gate; not a user setting. |
 
@@ -183,6 +184,8 @@ SF/BW/CR/preamble are set; `lora.<n>.state` reads `unconfigured` until then.
 | `lora.<n>.up` | `1` when the radio is on-air, else `0`. |
 | `lora.<n>.state` | `unconfigured` / `error` / `up` / `down` / `rnsd_unavailable`. |
 | `lora.<n>.chip` | Detected chip name, e.g. `SX1262`. |
+| `lora.<n>.sf_min` | Lowest spreading factor this slot's part can actually run through this framing — `5` everywhere, `7` on the SX127x. A board fact (the slot names the chip, the chip names the family), so it is published at init, long before the radio is touched, and both surfaces take the SF field's lower bound from it. |
+| `lora.<n>.announce_now` | Command sentinel: the pane's **Announce now** button. Asks `rnsd` to replay every hosted destination's announce onto this radio and sends SUPE's ANNOUNCE2 beside it. Self-clearing; written with edge semantics so a second press registers. |
 | `lora.<n>.tx_power_max` | Antenna-dBm ceiling this radio can actually reach **on the band it is tuned to**: the bare chip's own maximum for that port (`22` sub-GHz, `12` at 2.4 GHz), or the front-end module's rating on a board with one that was detected at boot or one the board declared. Republished on every begin, so it follows a carrier across 1500 MHz. `tx_power` is clamped to it, and **both** the browser panel and the LCD settings pane take their power field's upper bound from it — so a FEM board whose part did not answer offers 22 rather than a figure it cannot deliver. |
 | `lora.<n>.bitrate_eff` | Effective bitrate registered with `rnsd`, bits/s (airtime-derived). |
 | `lora.<n>.stats.{tx_bytes,rx_bytes,tx_frames,rx_frames,crc_err,split_rx_timeout,tx_dropped,rssi_last,snr_last}` | Traffic counters (`tx_dropped` = frames shed by the LBT timeout) and last-RX RSSI/SNR. Published only when a UI can read them — see `uiTelemetryWanted()`. |
@@ -325,10 +328,15 @@ So **a quiet `log lora debug` does not mean nothing is transmitting** — it mea
 nothing is deciding. Use verbose, or `lora <n>` (whose `tx_frames`/`tx_bytes`
 counters are independent of logging), or open LoRaMon.
 
-Note also that **announces this node originates are buffered, not transmitted**
-when `rnsd` or an attached client hands them over: they go out on the
-`SUPE.announce_interval` beat, or immediately on `lora [<n>] a[nnounce]`. So an
-`lxmf announce` produces no RF until one of those happens — see INTERNALS §14.
+Note also that an application asking to announce produces **no RF of its own**.
+`RNSD_DEST_ANNOUNCE` sets that destination's stored announce with `rnsd`; the
+bytes reach this radio on its own `announce_interval` beat, when somebody
+presses the pane's **Announce now**, or in the sweep `rnsd` runs a minute after
+any application changes what it advertises. So an `lxmf announce` shows up here
+within the minute rather than at once — see INTERNALS §14 and
+[rns/INTERNALS.md §4.1](../rns/INTERNALS.md). What DOES go out immediately is a
+frame the radio originates: `lora [<n>] a[nnounce]` replays this radio's own
+buffer of announces it has already carried.
 
 ## Listen-before-talk and APPC
 
@@ -399,6 +407,12 @@ is no network stack and only the serial door exists). Set `s.lora.rnode.tcp = 1`
 
 The port number is not configurable on the client side — it dials 7633
 regardless of what you write after the host — so give the host only.
+
+To reach the door from outside the LAN, set `s.lora.rnode.upnp = 1` as well
+(**Accessible from internet**, under the TCP switch in the pane): the router is
+then asked to forward 7633 in. It needs the [upnp](../upnp) straddle in the
+build and a router that honours the request; the client's host then becomes the
+device's public address rather than its LAN one.
 
 From inside the build container the door is reachable at
 `host.docker.internal:7633` — the workspace bridge fronts the port because the

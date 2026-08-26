@@ -48,7 +48,7 @@
 
 #if defined(CONFIG_LORA0_CS_PIN)
 
-#define LORA_VERSION         9
+#define LORA_VERSION         10
 #define RNS_MTU              500
 #define RNODE_MAX_PAYLOAD    254
 #define RNODE_FLAG_SPLIT     0x01
@@ -375,11 +375,16 @@ struct LoraRadio {
     TickType_t      rxHeldTick;
 
     uint32_t        cfgFreqHz;       /* configured carrier — the hailing channel */
+    /* rnsdAnnounceBeat state for this radio: when the Reticulum announces rnsd
+     * holds are next replayed onto lora/<i>. Zero re-arms it, which is what a
+     * bring-up wants — the registration replay has just said who we are. */
+    uint32_t        annBeatNextMs;
 #if !defined(CONFIG_LORA_NO_SUPE)
     uint8_t         afa;             /* s.lora.<i>.afa: the regime number, 0 = no agility */
-    uint16_t        annIntervalMin;  /* s.lora.<i>.SUPE.announce_interval, minutes;
-                                      * 0 = manual only. Paces the whole announce
-                                      * beat: SUPE's own ANNOUNCE2 */
+    uint16_t        annIntervalMin;  /* s.lora.<i>.announce_interval, minutes; 0 =
+                                      * manual only. The same key the Reticulum
+                                      * announce beat reads — one question, one
+                                      * answer — read here for SUPE's ANNOUNCE2 */
 #endif
     /* The channel the radio is tuned to right now, so a record and its airtime
      * credit both land where the frame actually flew. Held here rather than

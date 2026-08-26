@@ -204,7 +204,7 @@ LoRaMon viewer is open (§18.3), SUPE's airtime verdict only while the window
 holds agile airtime (§19.6), proof expectations only while one is outstanding.
 With nothing pending the task blocks on `itsPoll(portMAX_DELAY)` and the SoC
 light-sleeps until DIO1 or an inbound message; with SUPE enabled a long-period
-wake is added by the announce beat (`SUPE.announce_interval`, default 30 min).
+wake is added by the announce beat (`announce_interval`, default 30 min).
 This is a battery invariant, not an optimisation: a beat added to this task is a
 per-second CPU+SPI wake on every deployed node, so anything periodic must gate
 itself on whether its consumer exists.
@@ -1125,15 +1125,18 @@ are 32-bit, so a 2.4 GHz value would overflow regardless.
 ## 11. Defaults seeding
 
 `loraInit` registers the `lora` CLI and spawns the task. It seeds per-radio
-defaults under a `s.lora.version` gate (`LORA_VERSION = 6`) for radios **1..**
+defaults under a `s.lora.version` gate (`LORA_VERSION = 10`) for radios **1..**
 only — radio 0's defaults come from this straddle's `settings:` block in
 `straddle.yaml`, **except** `s.lora.0.bandwidth`, seeded here because its pane
 row binds the kHz display key rather than the Hz config key.
 
-The same gate carries two renames, each of which was one setting under two
-names: `afa` → `SUPE.afa` and `announce_interval` → `SUPE.announce_interval`.
-Each moves at its existing value rather than silently changing a node's
-behaviour, and the old key is deleted. It also deletes `SUPE.adaptive_txpower`:
+The same gate carries a rename that was one setting under two names: `afa` →
+`SUPE.afa`, the regime being SUPE's own. It moves at its existing value rather
+than silently changing a node's behaviour, and the old key is deleted.
+`announce_interval` sits beside it at interface level and is **not** a SUPE key:
+it paces the Reticulum announces rnsd replays onto this interface whether or not
+SUPE is compiled in, and ANNOUNCE2 when it is — one question, one answer. It
+also deletes `SUPE.adaptive_txpower`:
 transmit power is not a setting (§15.4), so it is not an answer to a question
 anybody asks. Frequency and TX power carry no default
 (region/antenna — the user must pick); everything else defaults so an
@@ -1795,7 +1798,12 @@ carry is unreachable rather than avoided.
 
 - **An announce is the daemon's decision and its timing is part of what it
   decided.** Nothing intercepts one, so nothing can delay somebody else's
-  routing decision by holding it — `plans/SUPE.md` §9.
+  routing decision by holding it — `plans/SUPE.md` §9. What this radio DOES own
+  is how often it asks rnsd to say who we are again: `announce_interval` drives
+  `rnsdAnnounceBeat`, which asks rnsd for a replay pinned to `lora/<n>`
+  (rns/INTERNALS §4.1). That is a request for the daemon's own bytes on our
+  schedule, not an interception of somebody else's packet — the difference is
+  whose announce is being held, and the answer here is nobody's.
 - **Nothing is transmitted in order to measure.** A node's transmit power
   toward a peer comes from traffic that was going to happen anyway: every frame
   a detour sends states the power it went out at, so ordinary exchanges yield a
@@ -2049,6 +2057,7 @@ Protocol reference:
 | `s.lora.rnode.radio`  | 0 | which radio the endpoint exposes |
 | `s.lora.rnode.serial` | 1 | the serial door (highest existing port, in-band trigger) |
 | `s.lora.rnode.tcp`    | 0 | the TCP door on port 7633 — a switch, not a port number |
+| `s.lora.rnode.upnp`   | 0 | that door published to the internet — net's `publicFacing` flag |
 | `s.lora.rnode.ble`    | 1 | the Bluetooth door, read by `reticulous/rnode-ble` |
 
 Global, not per radio: there is one endpoint for the device, and **one switch
@@ -2070,10 +2079,13 @@ nothing else — its `TCPConnection.TARGET_PORT` is hardcoded, and a
 
 `rnodeApplyTransports()` runs from the coalesced apply pass (§9) and does three
 things: drops the session if its own door was switched off or the endpoint
-rebound to another radio; registers the TCP endpoint with net **once** and then drives the listener
-by writing `s.net.rnode_port` (net polls its `s.net.*` keys from `epOpenAll` and
-opens or closes the socket from there — the two-step shape sshd uses); and
-claims or releases the serial port — the highest one `sys.usb.serial_ports`
+rebound to another radio; registers the TCP endpoint with net — **once**, plus a
+re-send whenever `s.lora.rnode.upnp` moves, because that switch travels as the
+registration's `publicFacing` flag and nowhere else (net keys endpoints by
+`nvsKey`, so the re-send updates the one already there) — and then drives the
+listener by writing `s.net.rnode_port` (net polls its `s.net.*` keys from
+`epOpenAll` and opens or closes the socket from there — the two-step shape sshd
+uses); and claims or releases the serial port — the highest one `sys.usb.serial_ports`
 reports, with the KISS FEND (`0xC0`) as the claim's in-band trigger, so the
 claim is dormant until a client speaks. The Bluetooth door needs nothing here:
 it dials in from its own straddle like any other client. The task subscribes to
@@ -2085,6 +2097,15 @@ spangap-net into this component's `REQUIRES` when that straddle is staged: the
 radio itself needs no network stack, so on a net-less build the door compiles
 away and the serial one still works. `straddle.yaml` therefore does not `require:`
 spangap-net — an optional door must not make a whole network stack mandatory.
+
+The same pass publishes `lora.rnode.tcp_on` from the TCP switch: the pane's rows
+that are only about that door (today the internet-reachable switch and its
+caption) gate on that ephemeral key rather than on `s.lora.rnode.tcp` itself,
+the same way `rnode-ble`'s rows gate on `ble.rnode.enabled`. Forwarding a door
+that is shut would be an offer of nothing, and the row says so by not being
+there. Nothing here knows what a port mapper is: the switch is
+`when_kconfig`-gated on `CONFIG_SPANGAP_UPNP` in `straddle.yaml`, and the flag
+means the same thing to net whether or not one is in the build.
 
 ### 17.2 One session, three doors
 
@@ -2435,7 +2456,7 @@ channel, with rnsd unmodified and unaware. The wire sequence, in full:
 main channel (the hailing channel — where everyone camps)
 
   A→*  SUPE_ANNOUNCE2  5+4n B   who I am, what my radio does, at what power
-                               └─ once per SUPE.announce_interval, jittered
+                               └─ once per announce_interval, jittered
                                └─ and 10 s behind any announce this radio had
                                   never put on air, coalesced (supeAnnSoon)
 

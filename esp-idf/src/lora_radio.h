@@ -89,6 +89,23 @@ static inline bool radioHasRxBoost(LoraFamily f) {
 }
 static inline bool radioHasAgcReset(LoraFamily f) { return f == FAM_SX126X; }
 
+/* The lowest spreading factor this interface can actually run on a part, which
+ * is a board fact — the slot names the chip and the chip names the family — and
+ * so is publishable before the radio has been touched.
+ *
+ * 5 everywhere except the SX127x, which reaches neither of the bottom two: it
+ * has no SF5 at all, and its SF6 demands an implicit header, meaning a fixed
+ * payload length agreed off the air. This interface's frames are variable
+ * length by construction (a self-contained 1-byte header, split across up to
+ * two frames), so there is no length to fix and SF6 is out with it. SUPE's
+ * ladder excludes both on that family for the same two reasons (supe.cpp
+ * §14.6), so the main channel and the detours agree on the floor.
+ *
+ * The number bounds the operator's setting on both surfaces and clamps what
+ * reaches the modem — without it an SF5 typed on an SX127x board is simply
+ * refused by the chip, and the radio never comes up. */
+static inline uint8_t radioMinSf(LoraFamily f) { return f == FAM_SX127X ? 7 : 5; }
+
 void    radioIrqCache(LoraRadio* r);
 int16_t radioStartRx(LoraRadio* r);
 bool    radioRxInProgress(LoraRadio* r);

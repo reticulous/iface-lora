@@ -267,6 +267,22 @@ static bool radioStart(LoraRadio* r) {
         return false;
     }
 
+    /* The bottom of the range is the PART's, not the standard's: an SX127x
+     * reaches neither SF5 nor SF6 through this framing (radioMinSf). Clamped
+     * with a warning rather than refused — the same treatment tx_power gets
+     * above its ceiling, and for the same reason: a number the operator typed
+     * for another board should cost them a line in the log, not a radio that
+     * will not come up. */
+    {
+        uint8_t sfMin = radioMinSf(chipFamily(r->slot->chip));
+        if (sf < sfMin) {
+            warn("lora/%d %s cannot run SF%d, using SF%u",
+                 r->idx, chipName(r->slot->chip), sf, (unsigned)sfMin);
+            sf = sfMin;
+            storageSet(sk(kb, sizeof kb, r->idx, "spreading_factor"), sf);
+        }
+    }
+
     /* RadioLib takes frequency in MHz and bandwidth in kHz; TCXO in volts. */
     float freq_mhz = (float)freq_hz / 1.0e6f;
     float bw_khz   = (float)bw_hz   / 1.0e3f;
@@ -398,11 +414,11 @@ static bool radioStart(LoraRadio* r) {
      * the regime table. An unknown number resolves to no agile channels, the
      * safe reading of a value this firmware cannot understand. */
     r->afa = (uint8_t)storageGetInt(sk(kb, sizeof kb, r->idx, "SUPE.afa"), 0);
-    /* One interval for everything this node says about itself on its own
-     * schedule. Today that is SUPE's ANNOUNCE2 alone; the announce replay it
-     * used to pace is now on demand only (`lora a`). */
+    /* One interval for everything this node says about itself on this radio:
+     * SUPE's ANNOUNCE2 here, and the Reticulum announces rnsd replays onto this
+     * interface on the same beat (rnsdAnnounceBeat, in the task loop). */
     r->annIntervalMin = (uint16_t)storageGetInt(
-        sk(kb, sizeof kb, r->idx, "SUPE.announce_interval"), ANN_INTERVAL_DEF);
+        sk(kb, sizeof kb, r->idx, "announce_interval"), ANN_INTERVAL_DEF);
     publishChannels(r);
 #endif
 
@@ -577,15 +593,37 @@ static void applyConfig(LoraRadio* r) {
 static volatile bool s_supeEnDirty = false;
 #endif
 
+/* "Announce now" presses, one bit per radio. Set by the sentinel (which runs on
+ * whichever task wrote the key) and consumed by the radio task, which is the
+ * only context allowed to arm SUPE's ANNOUNCE2 beside it. */
+static volatile uint32_t s_annNowMask = 0;
+
 static void onCfgChange(const char* key, const char* /*val*/) {
-    /* SUPE's enable switch is not a radio setting: nothing about the modem
-     * changes, only whether this node speaks the protocol. Sending it through
-     * the settle window would take the radio off the air for ten seconds to
-     * change a boolean, and the toggle exists precisely so a node can be taken
-     * out of SUPE mid-debug without disturbing anything else. It has its own
-     * subscription below. */
-    if (key && strstr(key, ".SUPE.enable")) return;
+    /* Two keys under s.lora.<i> that are not radio settings: nothing about the
+     * modem depends on either, and sending them through the settle window
+     * would take the radio off the air for ten seconds to change a number.
+     *
+     *   SUPE.enable        — only whether this node SPEAKS the protocol. The
+     *                        toggle exists precisely so a node can be taken out
+     *                        of SUPE mid-debug without disturbing anything
+     *                        else. It has its own subscription below.
+     *   announce_interval  — read live by both beats that use it, so there is
+     *                        nothing to re-apply. */
+    if (key && (strstr(key, ".SUPE.enable") || strstr(key, ".announce_interval"))) return;
     cfgArmSettle();
+}
+
+/* "Announce now" button, one sentinel per radio. Flags the radio task rather
+ * than acting here: the rnsd side would be safe from any task, but SUPE's
+ * ANNOUNCE2 goes out beside it and only the radio task may arm that. */
+static void onAnnounceNow(const char* key, const char* val) {
+    if (!val || atoi(val) == 0) return;   /* the edge write's leading 0 is not a press */
+    storageUnset(key);
+    int idx = 0;
+    if (sscanf(key, "lora.%d.announce_now", &idx) != 1) return;
+    if (idx < 0 || idx >= kNumRadios) return;
+    s_annNowMask |= (1u << idx);
+    if (s_task) xTaskNotifyGive(s_task);
 }
 
 /* ─────────── unit bridge: Hz storage ↔ human display keys ───────────
@@ -840,6 +878,7 @@ static void loraTaskMain(void*) {
         char kb[48];
         storageSubscribeChanges(rk(kb, sizeof kb, i, "freq_mhz"), onDisplayChange);
         storageSubscribeChanges(rk(kb, sizeof kb, i, "bw_khz"),   onDisplayChange);
+        storageSubscribeChanges(rk(kb, sizeof kb, i, "announce_now"), onAnnounceNow);
     }
 #if !defined(CONFIG_LORA_NO_SUPE)
     /* Speaking SUPE or not, applied where it is read rather than through a
@@ -973,6 +1012,33 @@ static void loraTaskMain(void*) {
                 r->splitTimeouts++;
             }
             if (r->running && r->rnsdHandle < 0 && r->enabled) registerWithRnsd(r);
+            /* Say who we are on the air, on this radio's own schedule: rnsd
+             * replays every hosted destination's announce onto lora/<i>,
+             * pinned, and spends no other interface's airtime doing it. SUPE's
+             * ANNOUNCE2 rides the same interval from its own beat (lora_supe),
+             * because it is the same question — which is why the key is read
+             * here, live, and handed to both rather than re-applied through a
+             * radio cycle. */
+            {
+                char ib[48];
+                int iv = storageGetInt(sk(ib, sizeof ib, i, "announce_interval"),
+                                       ANN_INTERVAL_DEF);
+#if !defined(CONFIG_LORA_NO_SUPE)
+                r->annIntervalMin = (uint16_t)(iv > 0 ? iv : 0);
+#endif
+                char pfx[16];
+                snprintf(pfx, sizeof pfx, "lora/%d", i);
+                if (s_annNowMask & (1u << i)) {
+                    s_annNowMask &= ~(1u << i);
+                    info("lora/%d announce requested", i);
+                    rnsdIfaceAnnounceNow(pfx);
+#if !defined(CONFIG_LORA_NO_SUPE)
+                    supeAnnSoon(r);   /* our own SUPE announcement beside it */
+#endif
+                } else if (r->running && r->rnsdHandle >= 0) {
+                    rnsdAnnounceBeat(&r->annBeatNextMs, iv, pfx);
+                }
+            }
             peersExpire(r, millis());
             /* A long stay on one channel is drawn as it accrues rather than
              * only when it ends, so a viewer opened mid-session sees where the
@@ -1129,13 +1195,17 @@ void LoraService::onInit() {
          * radios 1.. on multi-radio boards. */
         storageBegin();
         storageDefault(sk(kb, sizeof kb, 0, "bandwidth"), 125000);         /* 125 kHz */
+        /* How often this radio says who it is — not a SUPE key: it paces the
+         * Reticulum announces rnsd replays onto this interface whether or not
+         * SUPE is compiled in, and ANNOUNCE2 when it is. Radio 0's copy comes
+         * from the pane row; radios 1.. are seeded here. */
+        for (int i = 1; i < kNumRadios; i++)
+            storageDefault(sk(kb, sizeof kb, i, "announce_interval"), ANN_INTERVAL_DEF);
 #if !defined(CONFIG_LORA_NO_SUPE)
         /* Frequency agility: the regime number, 0 = none. Radio 0's copy comes
          * from the pane row; radios 1.. are seeded in the loop below. */
-        for (int i = 1; i < kNumRadios; i++) {
+        for (int i = 1; i < kNumRadios; i++)
             storageDefault(sk(kb, sizeof kb, i, "SUPE.afa"), 0);
-            storageDefault(sk(kb, sizeof kb, i, "SUPE.announce_interval"), ANN_INTERVAL_DEF);
-        }
 #endif
 #if !defined(CONFIG_LORA_NO_SUPE)
         /* SUPE. Everything under the prefix defaults **on**, and `enable` is the
@@ -1149,27 +1219,13 @@ void LoraService::onInit() {
          * answer to one question. */
         for (int i = 1; i < kNumRadios; i++)
             storageDefault(sk(kb, sizeof kb, i, "SUPE.enable"), 0);
-        /* Migration: a move rather than a merge. The run these pace — the
-         * announce replay and ANNOUNCE2 — is this straddle's own air protocol
-         * from end to end, so the keys belong with the rest of it. Each is
-         * carried across at its existing value rather than silently changing a
-         * node's behaviour, and the old name is deleted.
-         *
-         *   afa                → SUPE.afa
-         *   announce_interval  → SUPE.announce_interval
-         *
-         * A copy seeded under the SUPE name by an interim build is left alone;
-         * the operator's own value wins over a default either way. */
+        /* The regime is SUPE's own, so its key sits with the rest of SUPE's;
+         * `afa` on its own was the interface-level name it had before. */
         for (int i = 0; i < kNumRadios; i++) {
             int oldAfa = storageGetInt(sk(kb, sizeof kb, i, "afa"), -1);
             if (oldAfa >= 0) {
                 storageSet(sk(kb, sizeof kb, i, "SUPE.afa"), oldAfa);
                 storageDeleteTree(sk(kb, sizeof kb, i, "afa"));
-            }
-            int oldAnn = storageGetInt(sk(kb, sizeof kb, i, "announce_interval"), -1);
-            if (oldAnn >= 0) {
-                storageSet(sk(kb, sizeof kb, i, "SUPE.announce_interval"), oldAnn);
-                storageDeleteTree(sk(kb, sizeof kb, i, "announce_interval"));
             }
         }
 #endif  /* CONFIG_LORA_NO_SUPE */
@@ -1195,6 +1251,7 @@ void LoraService::onInit() {
         storageDefault("s.lora.rnode.radio",  0);
         storageDefault("s.lora.rnode.serial", 1);
         storageDefault("s.lora.rnode.tcp",    0);
+        storageDefault("s.lora.rnode.upnp",   0);
         storageDefault("s.lora.rnode.ble",    1);
         for (int i = 1; i < kNumRadios; i++) {
             storageDefault(sk(kb, sizeof kb, i, "enable"), 0);
@@ -1234,6 +1291,9 @@ void LoraService::onInit() {
                    radioHasRxBoost(fam) ? "1" : "");
         storageSet(rk(cb, sizeof cb, i, "has_agc_reset"),
                    radioHasAgcReset(fam) ? "1" : "");
+        /* The SF field's lower bound, so the pane offers what this part can
+         * actually run rather than the range the standard defines. */
+        storageSet(rk(cb, sizeof cb, i, "sf_min"), (int)radioMinSf(fam));
     }
 
     /* Seed the ephemeral MHz/kHz display keys up front, so the settings pane

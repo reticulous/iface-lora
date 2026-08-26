@@ -56,9 +56,13 @@ settings:
       # Bandwidth's s.lora.0.bandwidth default is seeded in lora.cpp, not here.
       - text: { label: "Frequency", unit: "MHz", key: "lora.0.freq_mhz" }
       - text: { label: "Bandwidth", unit: "kHz", key: "lora.0.bw_khz" }
+      # The floor is the part's, not the standard's: an SX127x reaches neither
+      # SF5 nor SF6 through this framing, and lora.cpp publishes what its slot's
+      # chip can actually run (radioMinSf) so the field offers exactly that.
       - integer: { label: "Spreading Factor (SF)", key: "s.lora.0.spreading_factor",
-                   min: 5, max: 12, default: 7, buttons: true }
-      - caption: "Low is fast and short-range, high is slow and long-range. Not every radio will do SF5 or SF6 — check yours before relying on them."
+                   min: { key: "lora.0.sf_min", default: 5 },
+                   max: 12, default: 7, buttons: true }
+      - caption: "Low is fast and short-range, high is slow and long-range."
       - dropdown:
           label: "Coding Rate"
           key: "s.lora.0.coding_rate"
@@ -74,12 +78,18 @@ settings:
       # (e.g. 27 on the Heltec V4) when it is, the bare SX126x's 22 when it is
       # not. A board that declares a FEM it cannot talk to therefore offers 22
       # rather than a figure nothing will deliver.
+      # "Maximum", because that is what the number is: with SUPE on, every
+      # frame to a peer we have heard from goes out at a power derived for that
+      # peer, and this is the ceiling that derivation is clamped to (INTERNALS
+      # §15). With SUPE off nothing derives anything and every frame goes out
+      # at exactly this — a maximum that happens always to be reached.
       - integer:
-          label: "TX power"
+          label: "Maximum TX power"
           unit: "dBm"
           key: "s.lora.0.tx_power"
           min: -9
           max: { key: "lora.0.tx_power_max", default: 22 }
+      - caption: "The most this radio will ever transmit at, measured at the antenna. Frames to a peer whose signal we have measured go out at whatever reaches it, which is often well below this."
       - integer: { label: "Preamble", key: "s.lora.0.preamble", min: 6, max: 32, default: 12 }
       - text:   { label: "Sync word", key: "s.lora.0.sync_word", default: "0x42" }
       # LNA boosted RX gain: ~+3 dB sensitivity for ~0.4 mA more RX
@@ -90,8 +100,14 @@ settings:
       # gets read as an explanation for whatever the radio is doing.
       - switch: { label: "RX boosted gain", key: "s.lora.0.rx_boosted_gain", default: 1 }
         when_key: "lora.0.has_rx_boost"
-      - caption: "About 3 dB more sensitivity for a fraction of a milliamp more while listening. Worth having on unless the receiver is the thing you are trying to make last."
+      - caption: "About 3 dB more sensitivity for a fraction of a milliamp more while listening. For optimal gain, this might need to be turned off if your hardware uses a pre-amplifier."
         when_key: "lora.0.has_rx_boost"
+      # Shown only where the detected front end amplifies on receive
+      # (femInit publishes the key): with an LNA already in front, the chip's
+      # own boost may buy nothing and costs some large-signal headroom, so the
+      # honest advice is to try both. Nobody has measured it on this tree.
+      - caption: "This board's front end has a receive amplifier of its own, so you may (or may not) actually receive slightly more with this turned off. Try it out."
+        when_key: "lora.0.fem_rx_lna"
       # Analog front-end recalibration. An SX126x that has heard a strong signal
       # can leave its gain control latched and go deaf, and only powering the
       # front end down resets it — so this beat is the one periodic wake the
@@ -109,6 +125,18 @@ settings:
         when_key: "lora.0.has_agc_reset"
       - caption: "A strong signal can leave this radio's gain control latched and the receiver deaf, and only powering the front end down clears it. This is how often we do that."
         when_key: "lora.0.has_agc_reset"
+      # One interval for everything this node says about itself on this radio:
+      # the Reticulum announces rnsd replays onto it, and SUPE's own ANNOUNCE2.
+      # "How often does this node tell the neighbourhood who it is" is one
+      # question and gets one answer — two keys of the same name and the same
+      # default were only ever going to be set inconsistently. It is not a SUPE
+      # setting and not an application's: applications keep their announce
+      # current with rnsd and never schedule anything, because on a radio the
+      # cost of saying it is airtime and only the radio knows that.
+      - section: "Announces"
+      - integer: { label: "Announce interval", unit: "min", key: "s.lora.0.announce_interval", min: 0, max: 1440, default: 30 }
+      - caption: "How often this node tells the air who it is. Every minute of this is airtime nobody else can use, so it is deliberately slow. 0 = only when something changes or you press the button."
+      - button: { label: "Announce now", do: { set: { key: "lora.0.announce_now", value: 1, edge: true } } }
       - advanced:
           rows:
             # LoRa defaults to access_point: a radio segment is almost always
@@ -171,22 +199,6 @@ settings:
             - { v: 0, l: "0 — Single channel" }
             - { v: 1, l: "1 — EU 863-870, nine channels" }
         when_kconfig: "!CONFIG_LORA_NO_SUPE"
-      # Paces everything this node says about itself on its own schedule: the
-      # buffered-announce replay, the radio check behind it, and SUPE's own
-      # ANNOUNCE2. All three are this straddle's air protocol, which is why the
-      # key sits here rather than beside the radio settings.
-      #
-      # Note this DOES delay Reticulum's own announces — they are buffered and
-      # swallowed when rnsd hands them over, and replayed on this beat. 0 turns
-      # the beat off entirely, so the node announces only when `lora a` says so;
-      # that is a real "never on its own", not a longer interval.
-      - integer:
-          label: "Announce interval (min)"
-          key: "s.lora.0.SUPE.announce_interval"
-          min: 0
-          max: 240
-          default: 30
-        when_kconfig: "!CONFIG_LORA_NO_SUPE"
       - section: "Status"
       # Every row here shows a string the radio publishes finished — the state
       # in words, the bitrate with its unit, the last reception's quality and
@@ -214,3 +226,14 @@ settings:
       - heading: "Connect via"
       - switch: { label: "USB serial", key: "s.lora.rnode.serial", default: 1 }
       - switch: { label: "TCP (port 7633)", key: "s.lora.rnode.tcp", default: 0 }
+      # Only in builds that stage upnp, and only while the TCP door is open —
+      # the gate is the ephemeral key lora_rnode.cpp publishes from the switch,
+      # not the switch's own key. Default off: the serial and Bluetooth doors
+      # are on the operator's desk, but this one puts the radio on the public
+      # internet, and that is a decision rather than a convenience.
+      - switch: { label: "Accessible from internet", key: "s.lora.rnode.upnp", default: 0 }
+        when_kconfig: "CONFIG_SPANGAP_UPNP"
+        when_key: lora.rnode.tcp_on
+      - caption: "Turn this on to add this port to the list of ports forwarded to this device via UPnP."
+        when_kconfig: "CONFIG_SPANGAP_UPNP"
+        when_key: lora.rnode.tcp_on

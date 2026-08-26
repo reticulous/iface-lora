@@ -105,6 +105,15 @@ void femInit(LoraRadio* r)
     r->femType   = FEM_NONE;
     r->maxTxDbm  = LORA_CHIP_MAX_DBM_LF;   /* bare chip, sub-GHz; femBandSelect refines it */
 
+    /* Whether the front end amplifies on RECEIVE, for the gain row's caption to
+     * gate on: the KCT8103L's RX path runs through its own LNA, the GC1109's
+     * bypasses the part, and a declared one is switched by the radio's DIOs
+     * with nothing here able to say which it does. Set empty on every path
+     * first, so the key answers the question rather than being absent on the
+     * boards that never reach the sense. */
+    char kb[48];
+    storageSet(rk(kb, sizeof kb, r->idx, "fem_rx_lna"), "");
+
     /* A declared front end has nothing to detect and nothing to drive: its
      * control lines are the radio's own DIOs, programmed from the board's
      * LORAn_LR_RFSW_* masks once the chip answers (lora_radio.cpp). All this
@@ -165,6 +174,7 @@ void femInit(LoraRadio* r)
     }
     r->femType  = kct ? FEM_KCT8103L : FEM_GC1109;
     r->maxTxDbm = CONFIG_LORA_TX_POWER_MAX;   /* the board's declared FEM ceiling */
+    if (kct) storageSet(rk(kb, sizeof kb, r->idx, "fem_rx_lna"), "1");
 
     /* RadioLib owns the enable + direction pins from here: it pinModes them at
      * begin() and applies kFemModeTable on every mode change. The light-sleep

@@ -26,6 +26,11 @@ RnodeState s_rnode;
  * (`s.lora.rnode.ble` is read by rnode-ble, which owns that door.) */
 static bool rnodeSerialOn(void) { return storageGetInt("s.lora.rnode.serial", 1) != 0; }
 static bool rnodeTcpOn(void)    { return storageGetInt("s.lora.rnode.tcp",    0) != 0; }
+/* Whether the TCP door should also be open from outside the LAN — carried to
+ * net as the endpoint's publicFacing flag, which is all a port mapper reads.
+ * Off by default: the other two doors reach as far as the desk this device is
+ * on, and this one reaches the whole internet. */
+static bool rnodeUpnpOn(void)   { return storageGetInt("s.lora.rnode.upnp",   0) != 0; }
 
 static bool rnodeDoorOn(uint8_t door) {
     switch (door) {
@@ -244,8 +249,12 @@ static void rnodeFrame(void) {
     case RN_CMD_SF: {
         if (S.len < 1) break;
         int sf = S.buf[0];
-        if (sf < 5 || sf > 12) {
-            warn("lora/%d rnode: spreading factor %d out of range, ignored", S.radio, sf);
+        /* The floor is this part's, not the standard's — see radioMinSf. A
+         * stock client offers SF5..12 whatever the radio underneath is. */
+        int sfMin = radioMinSf(chipFamily(s_radios[S.radio].slot->chip));
+        if (sf < sfMin || sf > 12) {
+            warn("lora/%d rnode: spreading factor %d out of range (%d..12), ignored",
+                 S.radio, sf, sfMin);
             break;
         }
         storageBegin();
@@ -395,25 +404,36 @@ void rnodeApplyTransports(void) {
     /* TCP, in the two steps net's endpoint model asks for: register once, then
      * drive the listener by writing the port — net's own s.net.* subscriber
      * opens and closes the socket from there. Port 7633 is the only port a
-     * stock client can dial. */
+     * stock client can dial.
+     *
+     * The registration is re-sent when the internet-reachable switch moves,
+     * because that flag lives in the registration and nowhere else: net keys
+     * endpoints by name, so a re-send updates the one already there. */
     static bool registered = false;
-    if (!registered) {
+    static bool regPublic  = false;
+    bool wantPublic = rnodeUpnpOn();
+    if (!registered || regPublic != wantPublic) {
         net_port_msg_t reg = {};
-        reg.itsPort     = RNODE_ITS_PORT;
-        reg.tcpNoDelay  = 1;
-        reg.keepAlive   = 1;
-        reg.backlog     = 1;
-        reg.defaultPort = 0;          /* never auto-open; gated by the key below */
+        reg.itsPort      = RNODE_ITS_PORT;
+        reg.tcpNoDelay   = 1;
+        reg.keepAlive    = 1;
+        reg.backlog      = 1;
+        reg.publicFacing = wantPublic ? 1 : 0;
+        reg.defaultPort  = 0;         /* never auto-open; gated by the key below */
         safeStrncpy(reg.nvsKey, "rnode_port", sizeof(reg.nvsKey));
-        if (itsSendAux("net", NET_PORT_REG_PORT, &reg, sizeof(reg), pdMS_TO_TICKS(500)))
+        if (itsSendAux("net", NET_PORT_REG_PORT, &reg, sizeof(reg), pdMS_TO_TICKS(500))) {
             registered = true;
-        else
+            regPublic  = wantPublic;
+        } else {
             warn("lora rnode: net endpoint registration failed");
+        }
     }
     if (registered) {
         int want = rnodeTcpOn() ? RNODE_TCP_PORT : 0;
         if (storageGetInt("s.net.rnode_port", -1) != want) storageSet("s.net.rnode_port", want);
     }
+    /* The pane's gate for everything that is only about the TCP door. */
+    storageSet("lora.rnode.tcp_on", rnodeTcpOn() ? 1 : 0);
 #endif
 
     /* Serial: the door rides the highest serial port that exists right now —
