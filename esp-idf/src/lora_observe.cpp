@@ -192,28 +192,15 @@ static void rnsPacketHash(const RnsHdr* h, const uint8_t* p, size_t len,
     memcpy(out, sha, 16);
 }
 
-/* Known app.aspect name-hashes, to label dest rows. Computed once (name_hash =
- * SHA-256(expanded name)[:10], matching µR's Destination::expand_name). */
-static const char* const kRnsNames[] = {
-    "lxmf.delivery", "lxmf.propagation", "nomadnetwork.node",
-    "rnstransport.probe", "rnsh",
-};
-static constexpr int kRnsNameCount = (int)(sizeof(kRnsNames) / sizeof(kRnsNames[0]));
-static uint8_t s_rnsNameHash[kRnsNameCount][10];
-
-void rnsNamesInit(void) {
-    for (int i = 0; i < kRnsNameCount; i++) {
-        uint8_t sha[RNSD_HASH_LEN];
-        rnsdSha256((const uint8_t*)kRnsNames[i], strlen(kRnsNames[i]), sha);
-        memcpy(s_rnsNameHash[i], sha, 10);
-    }
-}
-
+/* The aspect behind an announce's name hash. rnsd owns the dictionary — it sees
+ * every announce on every medium, and a name hash is one-way, so the table of
+ * names this firmware speaks is the only way back. Keeping a second copy here
+ * is how `lora n` came to print a raw hash for netgraph.discovery while every
+ * other medium named it: the copy was never updated. There is one table now. */
 const char* rnsNameLabel(const uint8_t nameHash[10]) {
-    for (int i = 0; i < kRnsNameCount; i++)
-        if (memcmp(s_rnsNameHash[i], nameHash, 10) == 0) return kRnsNames[i];
-    return nullptr;
+    return rnsdAspectLabel(nameHash);
 }
+
 
 /* Display name out of an announce's app_data. LXMF wraps it in msgpack
  * (optionally behind a 32-byte ratchet); NomadNet and very old clients send raw

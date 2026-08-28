@@ -36,6 +36,7 @@
 #include "lora_priv.h"
 
 #include "lora_fem.h"
+#include "netgraph.h"     /* netgraphContributeIface — our `if` line's tail */
 
 #if defined(CONFIG_LORA0_CS_PIN)
 
@@ -904,7 +905,6 @@ static void loraTaskMain(void*) {
     itsServerOnConnect(RNODE_ITS_PORT, onRnodeConnect);
     itsServerOnRecv(RNODE_ITS_PORT, onRnodeRecv);
     itsServerOnDisconnect(RNODE_ITS_PORT, onRnodeDisconnect);
-    rnsNamesInit();          /* app.aspect name-hash dictionary for `lora neighbors` */
     storageSubscribeChanges("s.lora", onCfgChange);   /* covers the rnode group too */
     /* The second CDC port only exists while the console is on `usb cdc`, so a
      * serial claim for it has to be re-applied when the transport changes. */
@@ -1193,6 +1193,32 @@ static void loraTaskMain(void*) {
     }
 }
 
+/* ── netgraph: what a radio says about itself ──
+ *
+ * The tail of this radio's `if` line in the node's network-graph record:
+ * `<MHz>|<SF>|<kHz>|<CR>` and `|s` when SUPE is on. CONFIGURATION ONLY — never
+ * RSSI, never a negotiated budget, never a counter. Those move constantly, and
+ * a record that moved with them would keep every digest in the community
+ * permanently mismatched; the test for a field is whether a change to it
+ * deserves waking the whole mesh, and a spreading factor does. */
+static size_t loraNetgraphDetail(const char* iface_name, char* out, size_t outsz) {
+    int idx = -1;
+    const char* slash = strchr(iface_name, '/');
+    if (slash) idx = atoi(slash + 1);
+    if (idx < 0 || idx >= kNumRadios) return 0;
+
+    char kb[48], freq[24], bw[24];
+    storageGetStr(rk(kb, sizeof kb, idx, "freq_mhz"), freq, sizeof freq, "");
+    storageGetStr(rk(kb, sizeof kb, idx, "bw_khz"),   bw,   sizeof bw,   "");
+    int sf = storageGetInt(sk(kb, sizeof kb, idx, "spreading_factor"), 0);
+    int cr = storageGetInt(sk(kb, sizeof kb, idx, "coding_rate"), 0);
+    bool supe = storageGetInt(sk(kb, sizeof kb, idx, "SUPE.enable"), 0) != 0;
+
+    int n = snprintf(out, outsz, "%s|%d|%s|%d%s", freq, sf, bw, cr, supe ? "|s" : "");
+    if (n < 0) return 0;
+    return (size_t)n < outsz ? (size_t)n : outsz - 1;
+}
+
 /* ── RNS lifecycle hooks (registered with the orchestrator; see rnsServiceRegister) ── */
 static void loraStart(void) {
     s_stop = false;
@@ -1333,6 +1359,13 @@ void LoraService::onInit() {
 
     cliRegisterCmd("lora", cliLora);
 
+    rnsdPillColor("lora", LORA_PILL_COLOR, LORA_PILL_ORDER, LORA_PILL_TITLE);
+
+    /* Contribute this class's configuration to the network-graph record. We
+     * hand over FIELDS; netgraph composes the line and we never see a record —
+     * the same division of labour as rnsdPillSet one layer up. */
+    netgraphContributeIface("lora", loraNetgraphDetail);
+
     /* Register with the RNS orchestrator instead of self-spawning: rnsStart()
      * calls loraStart() (which spawns loraTaskMain) once rnsd is up and past its
      * boot window, and rnsStop() calls loraStop(). The larger 10 KB PSRAM stack
@@ -1414,7 +1447,11 @@ void loraNameForTag(int radio, const char* tag, char* out, size_t outLen) {
 
 void LoraService::onInit() {
     /* iface-lora staged but inert: no LoRa pins configured for this board.
-     * RadioLib links out; set CONFIG_LORA_COUNT and the pins to enable. */
+     * RadioLib links out; set CONFIG_LORA_COUNT and the pins to enable.
+     *
+     * The colour is still published. A board with no radio at all still draws
+     * the community's LoRa links on its network graph, and they are still LoRa. */
+    rnsdPillColor("lora", LORA_PILL_COLOR, LORA_PILL_ORDER, LORA_PILL_TITLE);
 }
 
 bool loraPeerSummary(int, lora_peer_summary*) { return false; }

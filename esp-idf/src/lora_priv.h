@@ -171,6 +171,17 @@ struct ChanLedger;
 #endif
 struct Neighbor;
 
+/* ─────────────── the medium's colour ───────────────
+ *
+ * Shared between the pill (lora_mon.cpp, published while a radio is enabled)
+ * and the palette entry (lora.cpp's onInit, published from boot regardless).
+ * The distinction matters because the network graph draws LoRa links between
+ * OTHER nodes on a device with no radio switched on, and those lines are still
+ * LoRa — a colour is a property of the medium, a pill of this node. */
+#define LORA_PILL_COLOR "ffd400"
+#define LORA_PILL_ORDER 4
+#define LORA_PILL_TITLE "LoRa"
+
 /* ─────────────── storage key helpers (per radio) ─────────────── */
 
 static inline const char* sk(char* b, size_t n, int i, const char* leaf) {

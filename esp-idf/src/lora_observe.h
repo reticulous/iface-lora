@@ -37,6 +37,8 @@ bool        rnsParse(const uint8_t* p, size_t len, RnsHdr* h);
 void        peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
                        int16_t rssi, int16_t snr10, uint8_t txOrigin,
                        uint16_t fromPeer);
-void        rnsNamesInit(void);
+/** The aspect behind an announce's name hash, or null where this firmware does
+ *  not speak it. Thin pass-through to rnsd's dictionary, which every medium
+ *  shares — see rnsdAspectLabel. */
 const char* rnsNameLabel(const uint8_t nameHash[10]);
 void        loraHex(char* out, const uint8_t* d, size_t n);

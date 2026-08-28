@@ -256,7 +256,7 @@ void publishPill(void) {
         on = true;
         peers += peersOtherCount(r->nei);
     }
-    if (on) rnsdPillSet("lora", 'L', peers, "ffd400", 4);
+    if (on) rnsdPillSet("lora", 'L', peers, LORA_PILL_COLOR, LORA_PILL_ORDER);
     else    rnsdPillClear("lora");
 }
 
