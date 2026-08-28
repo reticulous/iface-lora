@@ -12,12 +12,17 @@ struct LoraRadio;
 #define NEI_DT_LINK     3
 #define NEI_CTX_LRPROOF 0xFF
 #define NEI_ECPUBSIZE   64          /* LR ephemeral keys; link_id hashes only these */
+#define NEI_RATCHETSIZE 32          /* announce ratchet, present iff ctxflag */
 
 /* Decoded RNS wire header (layout described at loraTracePacket in
  * lora_observe.cpp). */
 struct RnsHdr {
     uint8_t        hops, ptype, dtype, ctx;
     bool           hdr2;
+    /* Header byte 0 bit 0x20. On an announce it is the one thing that says
+     * whether a ratchet sits between random_hash and the signature — the field
+     * itself is unmarked. */
+    bool           ctxflag;
     const uint8_t* transportId;   /* HEADER_2 only, else null */
     const uint8_t* dest;
     const uint8_t* data;

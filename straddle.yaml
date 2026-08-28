@@ -49,20 +49,31 @@ settings:
       - heading: "LoRa"
       - caption: "Set frequency and bandwidth directly, pick a spreading factor and coding rate; the radio stays disabled until you enable it."
       - switch: { label: "Enable LoRa", key: "s.lora.0.enable", default: 0 }
-      - section: "Radio"
+      # Everything below is gated on that switch. A disabled radio has no
+      # frequency worth setting, no announce beat to schedule and no status to
+      # read, and a pane that offers all of it anyway invites an operator to
+      # tune a radio that is not listening. The three rows that already carry a
+      # gate keep theirs: lora.cpp folds the enable state into `row_*` so each
+      # stays a single truthy/empty key (a `when_key` is one key, and the
+      # firmware is where two facts become one gate).
+      - { section: "Radio", when_key: "s.lora.0.enable" }
       # Frequency/bandwidth are stored in Hz but entered here in MHz/kHz. These
       # rows bind ephemeral display keys, not s.lora.0.*; lora.cpp mirrors the Hz
       # config to them and converts edits back (so any value works, not presets).
       # Bandwidth's s.lora.0.bandwidth default is seeded in lora.cpp, not here.
       - text: { label: "Frequency", unit: "MHz", key: "lora.0.freq_mhz" }
+        when_key: "s.lora.0.enable"
       - text: { label: "Bandwidth", unit: "kHz", key: "lora.0.bw_khz" }
+        when_key: "s.lora.0.enable"
       # The floor is the part's, not the standard's: an SX127x reaches neither
       # SF5 nor SF6 through this framing, and lora.cpp publishes what its slot's
       # chip can actually run (radioMinSf) so the field offers exactly that.
       - integer: { label: "Spreading Factor (SF)", key: "s.lora.0.spreading_factor",
                    min: { key: "lora.0.sf_min", default: 5 },
                    max: 12, default: 7, buttons: true }
+        when_key: "s.lora.0.enable"
       - caption: "Low is fast and short-range, high is slow and long-range."
+        when_key: "s.lora.0.enable"
       - dropdown:
           label: "Coding Rate"
           key: "s.lora.0.coding_rate"
@@ -72,6 +83,7 @@ settings:
             - { v: 6, l: "4/6" }
             - { v: 7, l: "4/7" }
             - { v: 8, l: "4/8" }
+        when_key: "s.lora.0.enable"
       # Max is the ceiling this radio can actually reach at the antenna, which
       # only the device knows: femInit detects whether the board's front-end
       # module is really there and publishes the answer — the part's rating
@@ -89,25 +101,30 @@ settings:
           key: "s.lora.0.tx_power"
           min: -9
           max: { key: "lora.0.tx_power_max", default: 22 }
+        when_key: "s.lora.0.enable"
       - caption: "The most this radio will ever transmit at, measured at the antenna. Frames to a peer whose signal we have measured go out at whatever reaches it, which is often well below this."
+        when_key: "s.lora.0.enable"
       - integer: { label: "Preamble", key: "s.lora.0.preamble", min: 6, max: 32, default: 12 }
+        when_key: "s.lora.0.enable"
       - text:   { label: "Sync word", key: "s.lora.0.sync_word", default: "0x42" }
+        when_key: "s.lora.0.enable"
       # LNA boosted RX gain: ~+3 dB sensitivity for ~0.4 mA more RX
       # current. On by default; a flag on SX126x, the top gain level on
-      # LR2021. Both rows are gated on what the slot's chip answers to
-      # (radioHasRxBoost / radioHasAgcReset publish the keys at init): a
-      # receive control that does nothing is worse than an absent one, since it
-      # gets read as an explanation for whatever the radio is doing.
+      # LR2021. Both rows ride `lora.0.row_rx_boost`, which lora.cpp publishes
+      # truthy only when the slot's chip answers to the control AND the radio is
+      # switched on: a receive control that does nothing is worse than an absent
+      # one, since it gets read as an explanation for whatever the radio is
+      # doing — and a radio that is off is the plainest case of that.
       - switch: { label: "RX boosted gain", key: "s.lora.0.rx_boosted_gain", default: 1 }
-        when_key: "lora.0.has_rx_boost"
+        when_key: "lora.0.row_rx_boost"
       - caption: "About 3 dB more sensitivity for a fraction of a milliamp more while listening. For optimal gain, this might need to be turned off if your hardware uses a pre-amplifier."
-        when_key: "lora.0.has_rx_boost"
-      # Shown only where the detected front end amplifies on receive
-      # (femInit publishes the key): with an LNA already in front, the chip's
-      # own boost may buy nothing and costs some large-signal headroom, so the
+        when_key: "lora.0.row_rx_boost"
+      # Shown only where the detected front end amplifies on receive (femInit
+      # senses it on the pin): with an LNA already in front, the chip's own
+      # boost may buy nothing and costs some large-signal headroom, so the
       # honest advice is to try both. Nobody has measured it on this tree.
       - caption: "This board's front end has a receive amplifier of its own, so you may (or may not) actually receive slightly more with this turned off. Try it out."
-        when_key: "lora.0.fem_rx_lna"
+        when_key: "lora.0.row_fem_note"
       # Analog front-end recalibration. An SX126x that has heard a strong signal
       # can leave its gain control latched and go deaf, and only powering the
       # front end down resets it — so this beat is the one periodic wake the
@@ -122,9 +139,9 @@ settings:
             - { v: 60,  l: "Every minute" }
             - { v: 300, l: "Every 5 min" }
             - { v: 900, l: "Every 15 min" }
-        when_key: "lora.0.has_agc_reset"
+        when_key: "lora.0.row_agc_reset"
       - caption: "A strong signal can leave this radio's gain control latched and the receiver deaf, and only powering the front end down clears it. This is how often we do that."
-        when_key: "lora.0.has_agc_reset"
+        when_key: "lora.0.row_agc_reset"
       # One interval for everything this node says about itself on this radio:
       # the Reticulum announces rnsd replays onto it, and SUPE's own ANNOUNCE2.
       # "How often does this node tell the neighbourhood who it is" is one
@@ -133,11 +150,15 @@ settings:
       # setting and not an application's: applications keep their announce
       # current with rnsd and never schedule anything, because on a radio the
       # cost of saying it is airtime and only the radio knows that.
-      - section: "Announces"
+      - { section: "Announces", when_key: "s.lora.0.enable" }
       - integer: { label: "Announce interval", unit: "min", key: "s.lora.0.announce_interval", min: 0, max: 1440, default: 30 }
+        when_key: "s.lora.0.enable"
       - caption: "How often this node tells the air who it is. Every minute of this is airtime nobody else can use, so it is deliberately slow. 0 = only when something changes or you press the button."
+        when_key: "s.lora.0.enable"
       - button: { label: "Announce now", do: { set: { key: "lora.0.announce_now", value: 1, edge: true } } }
-      - advanced:
+        when_key: "s.lora.0.enable"
+      - when_key: "s.lora.0.enable"
+        advanced:
           rows:
             # LoRa defaults to access_point: a radio segment is almost always
             # the edge of the network, and this stops the node re-broadcasting
@@ -188,9 +209,10 @@ settings:
       # Every row here is gated on CONFIG_LORA_NO_SUPE: a build without SUPE has
       # no engine to configure, so it gets no rows, no pane section and no keys
       # in storage — the same gate the code carries, from the same symbol.
-      - { section: "SUPE", when_kconfig: "!CONFIG_LORA_NO_SUPE" }
+      - { section: "SUPE", when_kconfig: "!CONFIG_LORA_NO_SUPE", when_key: "s.lora.0.enable" }
       - switch: { label: "Enable SUPE", key: "s.lora.0.SUPE.enable", default: 0 }
         when_kconfig: "!CONFIG_LORA_NO_SUPE"
+        when_key: "s.lora.0.enable"
       - dropdown:
           label: "Regime"
           key: "s.lora.0.SUPE.afa"
@@ -199,11 +221,13 @@ settings:
             - { v: 0, l: "0 — Single channel" }
             - { v: 1, l: "1 — EU 863-870, nine channels" }
         when_kconfig: "!CONFIG_LORA_NO_SUPE"
-      - section: "Status"
+        when_key: "s.lora.0.enable"
+      - { section: "Status", when_key: "s.lora.0.enable" }
       # Every row here shows a string the radio publishes finished — the state
       # in words, the bitrate with its unit, the last reception's quality and
       # the frame counters as one line each.
-      - info:
+      - when_key: "s.lora.0.enable"
+        info:
           rows:
             - value: { label: "State", key: "lora.0.state_text" }
             - value: { label: "Chip", key: "lora.0.chip" }

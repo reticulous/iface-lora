@@ -110,6 +110,11 @@ struct Neighbor {
     uint8_t  advHashes;
     bool     roaming;
     bool     ourProto;              /* has spoken our air protocol to us */
+    /* rnsd has been told this row exists (RNSD_IFACE_AUX_PEER). Cleared on
+     * allocation, on a merge, and on every announce — an announce may have
+     * changed the name the row is labelled by, and a re-declaration is how that
+     * reaches rnsd. */
+    bool     rnsdDecl;
     /* Adaptive TX power, as last resolved: what `lora <n>` prints, and nothing
      * else. The number is derived per frame at the configuration the frame is
      * about to fly at (lora_power.cpp), so nothing may read it back as state. */
@@ -278,6 +283,14 @@ struct NeiState {
     NeiSeen  seen[NEI_SEEN_MAX];
     uint8_t  seenNext;
     uint32_t sinceMs;               /* millis() at first allocation */
+    /* Which row the packet peersObserve() just walked was attributed to, so the
+     * caller can tell rnsd who transmitted it before handing it on. Valid only
+     * until the next peersObserve; a shared medium usually cannot say, and
+     * `lastObsValid` false is that answer. */
+    uint16_t lastObs;
+    bool     lastObsValid;
+    uint8_t  radio;                 /* slot index, so a row can name its own
+                                     * interface (`lora/<n>`) to rnsd */
 };
 
 typedef void (*PeersVisitFn)(Neighbor* e, int num, void* ud);
@@ -290,6 +303,22 @@ static inline bool peersIsLocal(const Neighbor* e) { return e->isUs || e->isRnod
 /* The stable id a queued packet carries for its peer: the row's index. */
 static inline uint16_t peersIdOf(const NeiState* st, const Neighbor* e) {
     return (uint16_t)(e - st->nei);
+}
+
+/* The row's index as rnsd's 16-byte ORIGIN KEY — what says, to a straddle that
+ * cannot read this table, which node transmitted a packet. The row index is the
+ * right thing to key on because it IS this table's notion of one node: every
+ * join the table makes (an announce identity, a 0x03 linkage, a SUPE
+ * association) ends in one row, so a key derived from it groups exactly as
+ * `lora n` groups. Merges are hooked, so a row absorbed into another withdraws
+ * its key rather than leaving rnsd holding a node that no longer exists.
+ *
+ * Offset by one: an all-zero key is rnsd's "the sender is unknown", and slot 0
+ * is a real row. */
+static inline void peersRnsdKey(uint16_t slot, uint8_t out[16]) {
+    for (int i = 0; i < 16; i++) out[i] = 0;
+    out[0] = (uint8_t)((slot + 1) >> 8);
+    out[1] = (uint8_t)(slot + 1);
 }
 
 /* The row that id names, or null for LORAQ_PEER_NONE and anything out of range
@@ -349,6 +378,10 @@ int       peersKnownHashes(const NeiState* st, const Neighbor* e);
  * when nothing has announced a name. */
 void      peersNodeNames(const Neighbor* e, char* out, size_t outLen);
 void      peersExpire(LoraRadio* r, uint32_t now);
+/* How many OTHER nodes this radio has observed — us and the rnode endpoint
+ * excluded, since neither is a neighbour. The number `lora n` heads its listing
+ * with and the one the status-bar pill shows. */
+int       peersOtherCount(const NeiState* st);
 Neighbor* peersWalk(NeiState* st, int want, PeersVisitFn fn, void* ud);
 bool      peersNodeFirst4(const Neighbor* e, uint8_t out[4]);
 bool      peersEstimateCliff10(const LoraRadio* r, const Neighbor* e,
@@ -356,3 +389,11 @@ bool      peersEstimateCliff10(const LoraRadio* r, const Neighbor* e,
                              uint32_t* buckets);
 void      peersInit(LoraRadio* r);
 void      peersAbandonPends(LoraRadio* r);
+
+/* Tell rnsd this row is a node on `lora/<n>`, or that it has stopped being one.
+ * The declaration is what puts a LoRa node in the SHARED neighbourhood as one
+ * node rather than as a scatter of unattributed destinations — a shared radio
+ * has no per-packet sender to hand over, so the clustering this table already
+ * did is the attribution. Fire-and-forget from the radio task. */
+void      peersRnsdDeclare (NeiState* st, Neighbor* e);
+void      peersRnsdWithdraw(NeiState* st, const Neighbor* e);

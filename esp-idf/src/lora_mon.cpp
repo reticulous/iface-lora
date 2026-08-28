@@ -240,6 +240,26 @@ void publishStats(LoraRadio* r) {
     storageEnd();
 }
 
+/* The status-bar pill: `L` and how many other nodes this radio hears — the same
+ * number `lora n` heads its listing with, summed over every slot, because the
+ * pill names the MEDIUM and a board with two radios still has one LoRa
+ * neighbourhood. Published while any slot is enabled, at 0 as readily as at 3:
+ * "enabled and hearing nobody" is exactly what an operator needs to see, and it
+ * is not the same as no pill at all. rnsd owns the keys and both status lines
+ * read them; the letter and the colour are this straddle's to state. */
+void publishPill(void) {
+    int peers = 0;
+    bool on = false;
+    for (int i = 0; i < kNumRadios; i++) {
+        LoraRadio* r = &s_radios[i];
+        if (!r->enabled) continue;
+        on = true;
+        peers += peersOtherCount(r->nei);
+    }
+    if (on) rnsdPillSet("lora", 'L', peers, "ffd400", 4);
+    else    rnsdPillClear("lora");
+}
+
 /* ─────────────── LoRaMon: recording, windows, publish, ITS server ─────────────── */
 
 /* True while a LoRaMon viewer (web or LCD) is open — gates recording. */
@@ -914,6 +934,13 @@ static void loraIfTaskMain(void*) {
                 statsSig = sig;
                 for (int i = 0; i < kNumRadios; i++) publishStats(&s_radios[i]);
             }
+
+            /* The pill rides this beat rather than the stats gate above: a
+             * neighbour appearing or ageing out moves no byte counter, and the
+             * enable switch moves none either. rnsdPillSet writes the same
+             * values idempotently, so a beat that changes nothing costs the
+             * storage actor one deduped op. */
+            publishPill();
 
             /* LoRaMon expiry — 1 Hz while a viewer is open, so nodes age out of
              * the 1 h window even on an idle channel. */

@@ -58,6 +58,12 @@ bool registerWithRnsd(LoraRadio* r) {
     reg.ifac_size = r->curIfacSize;
     reg.announce_cap = r->curAnnounceCap;
     reg.rx_signal = 1;   /* inbound data frames carry the 4-byte RSSI/SNR prefix */
+    /* And, ahead of it, the 16-byte key of the node that transmitted — the peer
+     * table's own row, so rnsd's shared neighbourhood groups a node's
+     * destinations exactly as `lora n` does instead of listing each separately.
+     * A radio cannot name the sender of a packet it merely overheard; those
+     * carry an all-zero key, which is rnsd's "unknown". */
+    reg.rx_origin = 1;
     /* Configured antenna power, for the rx-report proof to quote back to a peer
      * so it can read the path loss off our signal. The configured figure, not the
      * adaptive per-peer one: this is a readout, and re-registration on the config
@@ -97,18 +103,25 @@ static void onRnsdDisconnect(int ref) {
  * to rnsd whole (itsSendOwned). On backpressure the call returns 0 and we
  * still own the block — that is the drop point, not a retry loop. */
 static void rnsdInject(LoraRadio* r, const uint8_t* data, size_t len,
-                       int16_t rssi, int16_t snr10) {
+                       int16_t rssi, int16_t snr10, const uint8_t* origin) {
     if (r->rnsdHandle < 0) return;
     if (len > RNS_MTU + 16) len = RNS_MTU + 16;     /* defensive clamp */
-    uint8_t* f = (uint8_t*)malloc(4 + len);
+    /* Origin key first, then the signal header — the order rnsd strips them in.
+     * The key is present on every frame whether or not the sender could be
+     * named, so the offsets are fixed; all-zero says "unknown". */
+    const size_t PRE = RNSD_NODE_KEY_LEN + 4;
+    uint8_t* f = (uint8_t*)malloc(PRE + len);
     if (!f) return;
-    f[0] = (uint8_t)(rssi  >> 8); f[1] = (uint8_t)rssi;
-    f[2] = (uint8_t)(snr10 >> 8); f[3] = (uint8_t)snr10;
-    memcpy(f + 4, data, len);
+    if (origin) memcpy(f, origin, RNSD_NODE_KEY_LEN);
+    else        memset(f, 0, RNSD_NODE_KEY_LEN);
+    uint8_t* s = f + RNSD_NODE_KEY_LEN;
+    s[0] = (uint8_t)(rssi  >> 8); s[1] = (uint8_t)rssi;
+    s[2] = (uint8_t)(snr10 >> 8); s[3] = (uint8_t)snr10;
+    memcpy(f + PRE, data, len);
     /* Zero timeout: this runs on the radio task, in the receive path, between
      * train packets — blocking here is the receiver going deaf. Backpressure
      * is the drop point, not a retry loop; the layers above own recovery. */
-    if (itsSendOwned(r->rnsdHandle, f, 4 + len, 0) == 0) {
+    if (itsSendOwned(r->rnsdHandle, f, PRE + len, 0) == 0) {
         free(f);
         warn("lora/%d rnsd ITS send dropped (%u B)", r->idx, (unsigned)len);
     }
@@ -137,7 +150,19 @@ static void deliverInbound(LoraRadio* r, const uint8_t* data, size_t len,
      * our own air protocol reach here, so the client sees exactly the Reticulum
      * traffic — with the signal this radio measured for it. */
     rnodeForwardData(r, data, len, /*withStats=*/true);
-    rnsdInject(r, data, len, rssi, snr);
+    /* Who transmitted it, where the tap above could say. An announce is the one
+     * frame it can — it verified the signature and joined the destination to a
+     * row — and announces are the only frames rnsd's neighbourhood is built
+     * from, so that is exactly the coverage needed. */
+    NeiState* st = r->nei;
+    uint8_t origin[RNSD_NODE_KEY_LEN];
+    bool haveOrigin = st && st->lastObsValid;
+    if (haveOrigin) {
+        Neighbor* e = peersById(st, st->lastObs);
+        if (e && !e->rnsdDecl) peersRnsdDeclare(st, e);
+        peersRnsdKey(st->lastObs, origin);
+    }
+    rnsdInject(r, data, len, rssi, snr, haveOrigin ? origin : nullptr);
 }
 
 /* Re-arm continuous RX and re-enable the level-triggered DIO1 (the trampoline
@@ -611,7 +636,7 @@ void beginTx(LoraRadio* r, const uint8_t* data, size_t len, uint8_t origin,
      * packet, because it is about to be on air and all three share the
      * channel. Our own transmissions carry no measured signal, so the client's
      * copy goes without stat frames. */
-    if (origin == LORA_ORIG_RNODE) rnsdInject(r, data, len, RNODE_INJ_RSSI, RNODE_INJ_SNR10);
+    if (origin == LORA_ORIG_RNODE) rnsdInject(r, data, len, RNODE_INJ_RSSI, RNODE_INJ_SNR10, nullptr);
     else                           rnodeForwardData(r, data, len, /*withStats=*/false);
 
     /* Per-frame LoRaMon records + the `log lora debug` line are emitted at each
@@ -665,7 +690,7 @@ bool stageTx(LoraRadio* r, const uint8_t* data, size_t len, uint8_t origin,
     r->txStageFromRnode = (origin == LORA_ORIG_RNODE);
 
     /* Segment fan-out at stage time — the airtime this rides in. */
-    if (origin == LORA_ORIG_RNODE) rnsdInject(r, data, len, RNODE_INJ_RSSI, RNODE_INJ_SNR10);
+    if (origin == LORA_ORIG_RNODE) rnsdInject(r, data, len, RNODE_INJ_RSSI, RNODE_INJ_SNR10, nullptr);
     else                           rnodeForwardData(r, data, len, /*withStats=*/false);
     return true;
 }

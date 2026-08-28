@@ -571,9 +571,44 @@ static bool anyRadioOnAir(void) {
     return false;
 }
 
+/* Which of the pane's conditional rows apply RIGHT NOW — the `when_key` gates
+ * the LoRa settings block reads. Each folds two facts into the one truthy/empty
+ * value a gate is: what this slot's part can do, and whether the radio is
+ * switched on at all. Composed here rather than compared in each UI, which is
+ * the same rule as the state wording and the traffic line.
+ *
+ * A control that does nothing is worse than an absent one — it gets read as an
+ * explanation for whatever the radio is doing — and a receive control on a
+ * radio that is not receiving is exactly that.
+ *
+ * Whether the front end amplifies on receive is SENSED on the pin rather than
+ * declared, so the note about it can only be gated once femInit has answered.
+ * It always has by the time this matters: femInit runs for every slot as the
+ * radio task starts, ahead of the cfgArm that brings applyConfig — and
+ * applyConfig is the only thing that can make a gate truthy. */
+static void loraPublishRowGates(LoraRadio* r) {
+    LoraFamily fam = chipFamily(r->slot->chip);
+    char cb[48];
+    storageBegin();
+    storageSet(rk(cb, sizeof cb, r->idx, "row_rx_boost"),
+               r->enabled && radioHasRxBoost(fam) ? "1" : "");
+    storageSet(rk(cb, sizeof cb, r->idx, "row_agc_reset"),
+               r->enabled && radioHasAgcReset(fam) ? "1" : "");
+    storageSet(rk(cb, sizeof cb, r->idx, "row_fem_note"),
+               r->enabled && r->femType == FEM_KCT8103L ? "1" : "");
+    storageEnd();
+}
+
 static void applyConfig(LoraRadio* r) {
     char kb[48];
     r->enabled = storageGetInt(sk(kb, sizeof kb, r->idx, "enable"), 0) != 0;
+    /* The status-bar pill answers to the SWITCH, not to the beat: turning the
+     * last radio off parks the interface task, so a pill left to the beat would
+     * stay on screen showing the neighbourhood of a radio that is no longer
+     * listening. The pane's conditional rows go the same way — a disabled radio
+     * offers none of them. */
+    publishPill();
+    loraPublishRowGates(r);
 
     if (!r->enabled) {
         if (r->running) {
@@ -1281,19 +1316,15 @@ void LoraService::onInit() {
         s_radios[i].idx        = i;
         s_radios[i].slot       = &kSlots[i];
         s_radios[i].rnsdHandle = -1;
-        /* What this slot's chip actually answers to, for the pane rows to gate
-         * on (`when_key`). A board fact, known from the slot alone, so it is
-         * published here rather than waiting for the radio to come up — the
-         * settings pane is readable long before that. */
-        LoraFamily fam = chipFamily(kSlots[i].chip);
-        char cb[48];
-        storageSet(rk(cb, sizeof cb, i, "has_rx_boost"),
-                   radioHasRxBoost(fam) ? "1" : "");
-        storageSet(rk(cb, sizeof cb, i, "has_agc_reset"),
-                   radioHasAgcReset(fam) ? "1" : "");
         /* The SF field's lower bound, so the pane offers what this part can
-         * actually run rather than the range the standard defines. */
-        storageSet(rk(cb, sizeof cb, i, "sf_min"), (int)radioMinSf(fam));
+         * actually run rather than the range the standard defines. A board
+         * fact, known from the slot alone, so it is published here rather than
+         * waiting for the radio to come up — the pane is readable long before
+         * that. */
+        char cb[48];
+        storageSet(rk(cb, sizeof cb, i, "sf_min"),
+                   (int)radioMinSf(chipFamily(kSlots[i].chip)));
+        loraPublishRowGates(&s_radios[i]);
     }
 
     /* Seed the ephemeral MHz/kHz display keys up front, so the settings pane

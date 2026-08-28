@@ -141,6 +141,9 @@ void loraMonPush(LoraRadio* r, uint8_t dir, uint32_t t_ms, uint16_t dur_ms,
  * on every retune and on the maintenance beat — see the note at the record. */
 void loraMonDwell(LoraRadio* r, uint32_t now);
 void publishStats(LoraRadio* r);
+/* The `L<n>` status-bar pill for the whole medium — every slot's neighbours
+ * added up, published while any slot is enabled. */
+void publishPill(void);
 void publishChannels(LoraRadio* r);
 void publishState(LoraRadio* r, const char* state);
 void rssiSamplePoll(LoraRadio* r);

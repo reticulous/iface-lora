@@ -286,10 +286,14 @@ static void cliAgo(char* b, size_t n, uint32_t now, uint32_t then) {
     else                snprintf(b, n, "%uh", (unsigned)(s / 3600));
 }
 
-struct CliPrintCtx { LoraRadio* r; uint32_t now; bool verbose; };
+/* `local` selects which half of the table this pass prints: the neighbourhood,
+ * or this device's own rows. They are two different subjects and the walk hands
+ * them out in one sequence, so the filter is here. */
+struct CliPrintCtx { LoraRadio* r; uint32_t now; bool verbose; bool local; };
 
 static void cliPrintNode(Neighbor* e, int num, void* ud) {
     CliPrintCtx* c = (CliPrintCtx*)ud;
+    if (peersIsLocal(e) != c->local) return;
     char hex[33], ago[16], lbl[8];
     if (e->isRnode)   safeStrncpy(lbl, "rnode", sizeof lbl);
     else if (e->isUs) safeStrncpy(lbl, "us", sizeof lbl);
@@ -307,15 +311,15 @@ static void cliPrintNode(Neighbor* e, int num, void* ud) {
             loraHex(hex, nd->hash, 16);
             char nh[21] = "";
             if (nd->haveName && !asp) loraHex(nh, nd->nameHash, 10);
-            cliPrintf("  %-5s%s %s", first ? lbl : "", hex,
+            cliPrintf(RNSD_PEER_ROW_FMT "%s %s", first ? lbl : "", hex,
                       asp ? asp : (nd->haveName ? nh : "-"));
             if (nd->name[0]) cliPrintf("  \"%s\"", nd->name);
-            if (c->verbose) {
-                cliAgo(ago, sizeof ago, c->now, nd->lastMs);
-                if (nd->announces) cliPrintf("  ann %u", (unsigned)nd->announces);
-                cliPrintf("  %s ago", ago);
-            }
-            cliPrintf("\n");
+            /* When it was last heard is not detail — it is what says whether a
+             * row is a neighbour or a memory, so it rides every row here as it
+             * does on every other medium's. -v adds the count behind it. */
+            cliAgo(ago, sizeof ago, c->now, nd->lastMs);
+            if (c->verbose && nd->announces) cliPrintf("  ann %u", (unsigned)nd->announces);
+            cliPrintf("  %s ago\n", ago);
             first = false;
         }
     }
@@ -328,17 +332,17 @@ static void cliPrintNode(Neighbor* e, int num, void* ud) {
         uint8_t h4[4];
         if (!peersHashAt(c->r->nei, e, l, h4)) break;
         NeiHash* h = peersHashFind(c->r->nei, h4, 4);
-        cliPrintf("  %-5s%02x%02x%02x%02x........................ (link%s)\n",
+        cliPrintf(RNSD_PEER_ROW_FMT "%02x%02x%02x%02x........................ (link%s)\n",
                   first ? lbl : "", h4[0], h4[1], h4[2], h4[3],
                   h && h->timedOut ? ", timed out" : "");
         first = false;
     }
     if (first) {   /* nothing but a bare node key */
         if (e->haveNode4)
-            cliPrintf("  %-5s%02x%02x%02x%02x........................ (not seen yet)\n",
+            cliPrintf(RNSD_PEER_ROW_FMT "%02x%02x%02x%02x........................ (not seen yet)\n",
                       lbl, e->node4[0], e->node4[1], e->node4[2], e->node4[3]);
         else
-            cliPrintf("  %-5s(no hash seen)\n", lbl);
+            cliPrintf(RNSD_PEER_ROW_FMT "(no hash seen)\n", lbl);
     }
 
     /* The identity prefixes this node answers to, for a SUPE node only — what
@@ -370,7 +374,7 @@ static void cliPrintNode(Neighbor* e, int num, void* ud) {
         for (int k = 0; k < e->nIds && ni < (int)(sizeof tg / sizeof tg[0]); k++)
             if (!known(e->ids[k])) memcpy(tg[ni++], e->ids[k], 3);
         if (ni) {
-            cliPrintf("  %-5sident", "");
+            cliPrintf(RNSD_PEER_ROW_FMT "ident", "");
             for (int i2 = 0; i2 < ni; i2++)
                 cliPrintf(" %02x%02x%02x", tg[i2][0], tg[i2][1], tg[i2][2]);
             cliPrintf("\n");
@@ -439,26 +443,26 @@ static void cliPrintNode(Neighbor* e, int num, void* ud) {
                      e->apSrc == AP_SRC_REPORT ? "" : "~", (int)e->apPwr);
             add(t);
         }
-        if (o) cliPrintf("       ( %s )\n", f);
+        if (o) cliPrintf(RNSD_PEER_ROW_PAD "( %s )\n", f);
     }
 
     if (c->verbose) {
         for (int n = 0; n < e->nIds; n++) {
             loraHex(hex, e->ids[n], 16);
-            cliPrintf("       id:%s\n", hex);
+            cliPrintf(RNSD_PEER_ROW_PAD "id:%s\n", hex);
         }
         if (e->haveSig) {
             cliAgo(ago, sizeof ago, c->now, e->lastHeardMs);
-            cliPrintf("       rssi %d..%d dBm  snr %.1f..%.1f dB  heard %s ago\n",
+            cliPrintf(RNSD_PEER_ROW_PAD "rssi %d..%d dBm  snr %.1f..%.1f dB  heard %s ago\n",
                       (int)e->rssiMin, (int)e->rssiMax,
                       (double)e->snrMin10 / 10.0, (double)e->snrMax10 / 10.0, ago);
         }
         if (e->haveQuality)
-            cliPrintf("       q %u/255 (%u/%u proofs)%s\n",
+            cliPrintf(RNSD_PEER_ROW_PAD "q %u/255 (%u/%u proofs)%s\n",
                       (unsigned)e->quality, (unsigned)e->qProved, (unsigned)e->qSent,
                       e->provesData ? "  proves-data" : "");
         if (e->haveAdv)
-            cliPrintf("       hashes %d/%u\n", peersKnownHashes(c->r->nei, e),
+            cliPrintf(RNSD_PEER_ROW_PAD "hashes %d/%u\n", peersKnownHashes(c->r->nei, e),
                       (unsigned)e->advHashes);
         uint32_t absNow = c->now / NEI_BUCKET_MS;
         uint32_t cnt = 0; int64_t rs = 0, ss = 0;
@@ -469,7 +473,7 @@ static void cliPrintNode(Neighbor* e, int num, void* ud) {
             }
         }
         if (cnt)
-            cliPrintf("       1h: %u pkt  avg %d dBm %.1f dB\n",
+            cliPrintf(RNSD_PEER_ROW_PAD "1h: %u pkt  avg %d dBm %.1f dB\n",
                       (unsigned)cnt, (int)(rs / (int64_t)cnt),
                       (double)ss / (double)cnt / 10.0);
     }
@@ -484,32 +488,39 @@ static void cliPrintNeighbors(int i, bool verbose) {
         return;
     }
     uint32_t now = millis();
-    int nUs = 0, nRnode = 0, nNodes = 0, nLinks = 0;
+    int nUs = 0, nRnode = 0, nLinks = 0;
+    int nNodes = peersOtherCount(st);
     for (int k = 0; k < NEI_MAX; k++) {
         Neighbor* e = &st->nei[k];
         if (!e->used) continue;
         if (e->isRnode)   nRnode++;
         else if (e->isUs) nUs++;
-        else              nNodes++;
     }
     for (int k = 0; k < NEI_LINKS_MAX; k++)
         if (st->links[k].used) nLinks++;
 
-    /* The local rows are named rather than counted: there is at most one of
-     * each, and which of them exist is the interesting part. */
-    const char* local = nUs && nRnode ? " and us + rnode"
-                      : nUs           ? " and us"
-                      : nRnode        ? " and rnode" : "";
     char ago[16];
     cliAgo(ago, sizeof ago, now, st->sinceMs);
-    cliPrintf("lora/%d neighbors: %d other%s%s, %d open link%s (observing %s)\n\n",
-              i, nNodes, nNodes == 1 ? "" : "s", local,
+    cliPrintf("lora/%d neighbors: %d other%s, %d open link%s (observing %s)\n\n",
+              i, nNodes, nNodes == 1 ? "" : "s",
               nLinks, nLinks == 1 ? "" : "s", ago);
     if (r->curIfacSize)
         cliPrintf("  note: ifac enabled — frames are masked, passive parse sees nothing\n\n");
 
-    CliPrintCtx ctx = { r, now, verbose };
+    CliPrintCtx ctx = { r, now, verbose, /*local=*/false };
     peersWalk(st, -1, cliPrintNode, &ctx);
+    if (!nNodes) cliPrintf("  (none heard yet)\n\n");
+
+    /* This device's own rows last, under their own heading. They are what the
+     * radio hears itself saying, not who is out there, and mixing them into the
+     * numbered list invites reading `us` as a neighbour. There is at most one of
+     * each, so neither is numbered — a number is something to aim the radio at,
+     * and neither of these is addressable. */
+    if (nUs || nRnode) {
+        cliPrintf("this device%s:\n\n", nRnode ? " (and the attached RNode client)" : "");
+        ctx.local = true;
+        peersWalk(st, -1, cliPrintNode, &ctx);
+    }
 
     if (!verbose) return;
     for (int k = 0; k < NEI_LINKS_MAX; k++) {
@@ -758,9 +769,11 @@ static void cliSupe(int idx, const char* sub, const char* arg) {
 #endif  /* CONFIG_LORA_NO_SUPE */
 
 
-static bool cliIsNeighbors(const char* t) {
-    return cliVerbIs(t, "neighbors", 1) || cliVerbIs(t, "neighbours", 1);
-}
+/* The verb's spelling and its abbreviations live in rnsd, so every interface
+ * answers to the same word. What that word PRINTS here is this radio's own
+ * table, which knows more per peer than the shared one can (node identities,
+ * observed links, negotiated power). */
+static bool cliIsNeighbors(const char* t) { return rnsdIsNeighborsVerb(t); }
 
 /* Pointer into `orig` just past the first `skip` whitespace-separated tokens,
  * with the remaining text kept verbatim (embedded spaces included). Returns null

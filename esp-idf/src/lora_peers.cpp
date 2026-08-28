@@ -62,6 +62,9 @@ Neighbor* peersAlloc(NeiState* st, uint32_t now) {
         if (!victim || (int32_t)(victim->lastHeardMs - e->lastHeardMs) > 0) victim = e;
     }
     if (!victim) return nullptr;
+    /* A reused slot is a different node under the same rnsd key, so the one
+     * rnsd holds has to go before this row becomes somebody else. */
+    if (victim->used && victim->rnsdDecl) peersRnsdWithdraw(st, victim);
     memset(victim, 0, sizeof(*victim));
     victim->used = true;
     victim->lastHeardMs = now;
@@ -400,6 +403,11 @@ void peersMergeInto(NeiState* st, Neighbor* dst, Neighbor* src) {
             *eb = *db;
         }
     }
+    /* Two rows became one, so the node rnsd holds for the absorbed one is a
+     * node that no longer exists — withdraw it, and re-declare the survivor,
+     * whose label may have gained a name from what it just absorbed. */
+    if (src->rnsdDecl) peersRnsdWithdraw(st, src);
+    dst->rnsdDecl = false;
     src->used = false;
 }
 
@@ -423,6 +431,16 @@ void peersExpire(LoraRadio* r, uint32_t now) {
      * row itself stays: a frame recorded an hour ago still has to resolve
      * through it, and LoRaMon reads back exactly that far. */
     peersHashAge(st, now);
+}
+
+int peersOtherCount(const NeiState* st) {
+    if (!st) return 0;
+    int n = 0;
+    for (int i = 0; i < NEI_MAX; i++) {
+        const Neighbor* e = &st->nei[i];
+        if (e->used && !peersIsLocal(e)) n++;
+    }
+    return n;
 }
 
 /* ── cooperative hash linkage (0x02 / 0x03) ──
@@ -632,7 +650,53 @@ void peersInit(LoraRadio* r) {
     if (!ns) return;
     memset(ns, 0, sizeof(NeiState));
     ns->sinceMs = millis();
+    ns->radio   = (uint8_t)r->idx;
     r->nei = ns;
+}
+
+/* ── the shared neighbourhood: this table's clustering, handed to rnsd ──
+ *
+ * rnsd builds one neighbourhood for every medium out of announces, and groups a
+ * node's destinations by asking the interface who transmitted them. A
+ * point-to-point medium answers that for free — there is only one peer. A radio
+ * cannot, per packet: everything is overheard. But this table has already done
+ * the harder version of the same join — announce identities, 0x03 linkages, a
+ * SUPE association all end in ONE row — so the row is the answer, and these two
+ * calls are how it crosses over.
+ *
+ * Zero timeout, result ignored: this runs on the radio task in the receive
+ * path, where blocking is the receiver going deaf. A dropped declaration costs
+ * one announce interval — the next announce re-declares. */
+static void peersRnsdAux(NeiState* st, const Neighbor* e, bool up, const char* label) {
+    if (!st) return;
+    rnsd_iface_peer_t m = {};
+    m.op = RNSD_IFACE_AUX_PEER;
+    m.up = up ? 1 : 0;
+    snprintf(m.iface, sizeof m.iface, "lora/%u", (unsigned)st->radio);
+    peersRnsdKey(peersIdOf(st, e), m.key);
+    if (label) safeStrncpy(m.label, label, sizeof m.label);
+    itsSendAux("rnsd", RNSD_PORT_IFACE, &m, sizeof m, 0);
+}
+
+void peersRnsdDeclare(NeiState* st, Neighbor* e) {
+    if (!st || !e || !e->used || peersIsLocal(e)) return;
+    /* The label is what rnsd shows before an announce names the node, and what
+     * identifies it on a graph regardless: the names its destinations announced,
+     * else the node key the air identifies it by. */
+    char label[NEI_NAME_MAX * 2];
+    peersNodeNames(e, label, sizeof label);
+    if (!label[0]) {
+        if (e->haveNode4)
+            snprintf(label, sizeof label, "%02x%02x%02x%02x",
+                     e->node4[0], e->node4[1], e->node4[2], e->node4[3]);
+        else label[0] = '\0';
+    }
+    peersRnsdAux(st, e, true, label);
+    e->rnsdDecl = true;
+}
+
+void peersRnsdWithdraw(NeiState* st, const Neighbor* e) {
+    peersRnsdAux(st, e, false, nullptr);
 }
 
 /* RF is going down: outstanding proofs can't return — drop them, uncounted. */

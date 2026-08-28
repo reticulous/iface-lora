@@ -1622,7 +1622,14 @@ radio, `gp_alloc`'d at first `radioStart` and kept across config cycles and
 - **The identity join is cryptographic.** For an announce at hops 0 the entry
   is accepted only after (a) `dest == H(name_hash ‖ H(pubkey)[:16])[:16]` and
   (b) the announce signature verifies (`rnsdVerify`, inline-safe on the lora
-  task). Dest hashes announced under one key cluster under one identity;
+  task). Both reads depend on the header's **context flag** (byte 0 bit
+  `0x20`), the only thing that says whether a 32-byte ratchet sits between
+  `random_hash` and the signature — the field itself is unmarked, and every
+  destination rnsd hosts for a consumer announces one, so a parser that assumes
+  the ratchet away verifies nothing but `rnstransport.probe`. The ratchet is
+  part of the signed data and is skipped, not stored: this table clusters
+  addresses, and key rotation is rnsd's business.
+  Dest hashes announced under one key cluster under one identity;
   known `app.aspect` name-hashes (dictionary in `kNeiNames`) label the rows.
   Our own tx announces feed the identical path and mark the entry `us` — "we"
   need no privileged source. A tx announce that came from the RNode client marks
@@ -1693,17 +1700,40 @@ radio, `gp_alloc`'d at first `radioStart` and kept across config cycles and
   frame whose transmitter is named: the rebroadcaster stamps its own identity
   hash as the HEADER_2 `transport_id` (how path tables learn `first_hop`). It
   samples that neighbour's envelope/rollup, keyed by identity so the node's
-  own hops-0 announces join the same row, and tags the row `transit`. This is
-  unverified (the announce signature covers the originator, not the relayer) —
-  the same trust rnsd's path table places in the field. On a pure-transport
-  neighbourhood this is usually the first row that appears; without it a node
-  whose whole horizon is relays sees an empty table. The same frame identifies
+  own hops-0 announces join the same row, and tags the row `transit`.
+  **Only against a row that already exists**, though: the field is unverified
+  (the announce signature covers the originator, not the relayer), which is
+  enough to attribute a signal to a node we have otherwise met and not enough to
+  MINT one. A row conjured from it holds nothing but that claim — no
+  destination, no announce, nothing the node ever signed — and shows up in the
+  neighbourhood as a peer that may not exist, most often as a second row for a
+  relayer already listed under its own announces. Unattributed, the frame counts
+  in the anonymous-transit row below, which is what that row is for; once the
+  relayer announces for itself the row is real and every later rebroadcast
+  attributes to it. The same frame identifies
   *us* symmetrically: a rebroadcast we transmit stamps our own transport
   identity as transport_id, which becomes (or merges into) a `us … transit`
   row — the identity this node is known by on the air when it relays.
+- **Handing the clustering to rnsd.** rnsd builds one neighbourhood for every
+  medium and groups a node's destinations by asking the interface who
+  transmitted them — free on a point-to-point medium, impossible per packet on a
+  radio. But an ANNOUNCE is the one frame this table can name outright: it
+  verified the signature and joined the destination to a row, and announces are
+  the only frames rnsd's neighbourhood is built from. So the interface registers
+  with `rx_origin` and prefixes each forwarded frame with `peersRnsdKey()` — the
+  row index, offset by one so an all-zero key stays rnsd's "unknown" — and
+  declares the row with `RNSD_IFACE_AUX_PEER`. The ROW is the right key because
+  it is this table's notion of one node: every join it makes ends in one, so the
+  shared listing (and NetGraph) group exactly as `lora n` does. `peersMergeInto`
+  withdraws the absorbed row's key and re-declares the survivor, and `peersAlloc`
+  withdraws before reusing a slot, so rnsd never holds a node this table no
+  longer has. Everything is fire-and-forget at zero timeout — it runs on the
+  radio task in the receive path, and a dropped declaration costs one announce
+  interval, since every announce re-declares.
 - **Anonymous transit.** Every rx frame at wire hops ≥ 1 was transmitted by an
   in-range transport node even when nothing names it (HEADER_1 relays, relayed
-  proofs, a silent access-point bridge). Those sample one aggregate
+  proofs, a silent access-point bridge, and a rebroadcast announce whose
+  `transport_id` we do not already know). Those sample one aggregate
   "unidentified transit" row per radio (count, envelope, last-heard) —
   anonymous transmitters can't be told apart, so no per-node split is claimed.
   Additionally, the truncated packet hash is hops/transport_id-invariant, so a

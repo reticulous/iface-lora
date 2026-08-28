@@ -166,6 +166,7 @@ bool rnsParse(const uint8_t* p, size_t len, RnsHdr* h) {
     h->hops    = p[1];
     h->ptype   = p[0] & 0x03;
     h->dtype   = (p[0] >> 2) & 0x03;
+    h->ctxflag = (p[0] & 0x20) != 0;
     h->transportId = h->hdr2 ? p + 2 : nullptr;
     h->dest    = p + 2 + (h->hdr2 ? 16 : 0);
     h->ctx     = p[hdrEnd - 1];
@@ -268,14 +269,20 @@ static void observeAnnounce(LoraRadio* r, const RnsHdr* h, bool isTx,
                         int16_t rssi, int16_t snr10, uint32_t now,
                         uint8_t txOrigin) {
     NeiState* st = r->nei;
-    /* pubkey(64) | name_hash(10) | random_hash(10) | signature(64) | app_data */
-    if (h->dataLen < 64 + 10 + 10 + 64) return;
+    /* pubkey(64) | name_hash(10) | random_hash(10) | [ratchet(32)] |
+     * signature(64) | app_data. The ratchet is present iff the header's
+     * context flag is set, and every destination rnsd hosts for a consumer
+     * announces one — so a parser that assumes it away sees nothing but the
+     * transport probe. */
+    const size_t   ratLen = h->ctxflag ? NEI_RATCHETSIZE : 0;
+    if (h->dataLen < 64 + 10 + 10 + ratLen + 64) return;
     const uint8_t* pub    = h->data;
     const uint8_t* nameH  = h->data + 64;
     const uint8_t* randH  = h->data + 74;
-    const uint8_t* sig    = h->data + 84;
-    const uint8_t* appD   = h->data + 148;
-    size_t         appLen = h->dataLen - 148;
+    const uint8_t* rat    = ratLen ? h->data + 84 : nullptr;
+    const uint8_t* sig    = h->data + 84 + ratLen;
+    const uint8_t* appD   = h->data + 148 + ratLen;
+    size_t         appLen = h->dataLen - 148 - ratLen;
 
     /* The join is cryptographic or it is nothing: identity = H(pubkey)[:16],
      * the dest must equal H(name_hash ‖ identity)[:16], and the announce
@@ -289,12 +296,14 @@ static void observeAnnounce(LoraRadio* r, const RnsHdr* h, bool isTx,
     memcpy(mat + 10, idh, 16);
     rnsdSha256(mat, 26, sha);
     if (memcmp(sha, h->dest, 16) != 0) return;
-    static uint8_t sd[16 + 64 + 10 + 10 + RNS_MTU];   /* signed_data; lora task only */
+    /* signed_data; lora task only */
+    static uint8_t sd[16 + 64 + 10 + 10 + NEI_RATCHETSIZE + RNS_MTU];
     size_t o = 0;
     memcpy(sd + o, h->dest, 16); o += 16;
     memcpy(sd + o, pub, 64);     o += 64;
     memcpy(sd + o, nameH, 10);   o += 10;
     memcpy(sd + o, randH, 10);   o += 10;
+    if (rat) { memcpy(sd + o, rat, NEI_RATCHETSIZE); o += NEI_RATCHETSIZE; }
     memcpy(sd + o, appD, appLen); o += appLen;
     if (!rnsdVerify(pub, sd, o, sig)) return;
 
@@ -368,6 +377,20 @@ static void observeAnnounce(LoraRadio* r, const RnsHdr* h, bool isTx,
     }
     if (isTx) e->lastHeardMs = now;   /* keep the us row fresh; no rx signal */
     else      peersSample(e, rssi, snr10, now);
+    if (!isTx && !peersIsLocal(e)) {
+        /* THE ATTRIBUTION. An announce is the one frame whose transmitter this
+         * table can name outright — it verified the signature and joined the
+         * destination to a row — and it is the only frame rnsd's neighbourhood
+         * is built from. So this is where a shared radio can tell rnsd what
+         * every point-to-point medium gets for free: which node these
+         * destinations belong to. Every join this table makes ends in this one
+         * row, so grouping by it groups exactly as `lora n` does. */
+        st->lastObs = peersIdOf(st, e);
+        st->lastObsValid = true;
+        /* The name may have moved with this announce, and re-declaring is how
+         * that reaches rnsd's label. */
+        e->rnsdDecl = false;
+    }
     /* An announce this radio had never put on air just went out — a
      * destination of ours announcing for the first time, or somebody else's
      * that we relayed. Say who we are behind it, once the burst has passed. */
@@ -385,6 +408,10 @@ void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
                        uint16_t fromPeer) {
     NeiState* st = r->nei;
     if (!st) return;
+    /* Nothing attributed until something is. The caller reads this back to tell
+     * rnsd who transmitted the packet it is about to hand on, and an unparsed or
+     * merely overheard frame must not inherit the last one's answer. */
+    st->lastObsValid = false;
     RnsHdr h;
     if (!rnsParse(p, len, &h)) return;
     uint32_t now = millis();
@@ -421,10 +448,13 @@ void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
         sn->ms = now ? now : 1;
 
         /* A relayed frame's transmitter is an in-range transport node even
-         * when nothing names it. Rebroadcast announces (HEADER_2) are
-         * attributed to their named transit row below; everything else
-         * relayed lands in the aggregate anonymous-transit row. */
-        if (h.hops >= 1 && !(h.ptype == NEI_PT_ANNOUNCE && h.hdr2)) {
+         * when nothing names it. A rebroadcast announce (HEADER_2) is
+         * attributed to the relayer's own row below — but only when we already
+         * know that identity from something it signed; when we do not, it lands
+         * here with every other relayed frame. */
+        bool attributed = h.ptype == NEI_PT_ANNOUNCE && h.hdr2 && !isTx &&
+                          peersFindByIdentity(st, h.transportId) != nullptr;
+        if (h.hops >= 1 && !attributed) {
             NeiAnon* a = &st->anon;
             if (!a->haveSig || rssi < a->rssiMin)    a->rssiMin  = rssi;
             if (!a->haveSig || rssi > a->rssiMax)    a->rssiMax  = rssi;
@@ -456,13 +486,17 @@ void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
              * so its own hops-0 announces (if any) land in the same row. The
              * announce signature covers the originator, not the relayer, so
              * this is unverified — the same trust the path table places in it. */
+            /* Only against a row that already exists. The announce signature
+             * covers the ORIGINATOR, not the relayer, so the transport_id is an
+             * unverified claim about who transmitted — enough to attribute a
+             * signal to a node we have otherwise met, not enough to mint one.
+             * A row conjured from it holds nothing but that claim: no
+             * destination, no announce, nothing it ever signed, and it appears
+             * in the neighbourhood as a node that may not exist. Unattributed,
+             * the frame counts in the anonymous-transit row above, which is
+             * exactly what that row is for. Once the relayer announces for
+             * itself the row is real, and every later rebroadcast attributes. */
             Neighbor* e = peersFindByIdentity(st, h.transportId);
-            if (!e) {
-                e = peersAlloc(st, now);
-                if (e) {
-                    peersAddId(e, h.transportId);
-                }
-            }
             if (e && !e->isUs) {
                 e->transit = true;
                 peersSample(e, rssi, snr10, now);
