@@ -36,17 +36,21 @@ const uint8_t* apNextHop4(LoraRadio* r, const uint8_t* pkt, size_t len) {
     if (h.hdr2) return h.transportId;                 /* relayed: the next hop names itself */
     if (h.ptype == NEI_PT_PROOF || h.dtype == NEI_DT_LINK) {
         /* Link traffic and link proofs are addressed to the link_id, so the
-         * peer is the link's destination — and only when that destination is
-         * someone else. An inbound dial records no hash for its initiator, so
-         * a link they opened to us resolves to nothing. A delivery proof is
+         * peer is the link's destination — but only where that destination is
+         * both someone else's and a node we can actually reach in one hop. A
+         * link to a destination behind a gateway runs through the gateway, and
+         * its destination names nobody on this segment. A delivery proof is
          * addressed to a packet hash and simply misses the link table. */
         NeiLink* L = peersLinkFind(st, h.dest);
-        if (L && L->haveDest && !peersDestIsLocal(st, L->dest)) return L->dest;
-        /* A link dialled TO us carries no hash for its initiator, so there is no
-         * destination to name the far end with — but the identifier itself is
-         * filed on that node's row once a transaction has named who dialled
-         * (peersAddLink4), so hand back the identifier and let the table
-         * resolve it. Both directions of a session then reach the same peer,
+        if (L && L->haveDest && !peersDestIsLocal(st, L->dest) &&
+            peersFindByDest(st, L->dest)) return L->dest;
+        /* Otherwise the identifier itself: it is filed on the first hop's row
+         * (peersAddLink4) — the gateway a relayed link runs through, or the
+         * node a transaction named as the dialler of a link opened to us — so
+         * hand it back and let the table resolve it. A link dialled TO us in
+         * the clear carries no hash for its initiator and matches nothing,
+         * which is the honest answer. Both directions of a session then reach
+         * the same peer,
          * which is what the per-peer cap, the power controller and the reverse
          * leg's scan all key on. A delivery proof addressed to a packet hash
          * falls through here too and simply matches nothing, as before. */

@@ -27,6 +27,9 @@ struct SupeState {
     uint16_t txTLen[SUPE_TRAIN_MAX];
     uint8_t* txTPkt[SUPE_TRAIN_MAX]; /* the queue heap block each frame was cut
                                       * from — how a delivered close consumes */
+    bool     txTRelease[SUPE_TRAIN_MAX]; /* firing this frame finishes an RNode
+                                      * client's packet with the radio, so it
+                                      * carries that client's queue release */
     uint8_t  txTCount;
     uint8_t  rxT[SUPE_TRAIN_MAX][1 + RNODE_MAX_PAYLOAD];
     uint16_t rxTLen[SUPE_TRAIN_MAX];

@@ -359,7 +359,9 @@ void      peersMergeInto(NeiState* st, Neighbor* dst, Neighbor* src);
  * rows. Adding when the table is full evicts the least recently used, and a
  * dead row goes before a live one. */
 NeiHash*  peersHashFind(NeiState* st, const uint8_t* b, int len);
-void      peersHashAdd(NeiState* st, Neighbor* e, const uint8_t hash[16], uint32_t now);
+/* Only the leading four bytes are read, so a four-byte identity off the air is
+ * as good a key here as a full hash. */
+void      peersHashAdd(NeiState* st, Neighbor* e, const uint8_t* hash, uint32_t now);
 void      peersHashDrop(NeiState* st, const uint8_t b4[4]);
 void      peersHashTouch(NeiState* st, const uint8_t b4[4], uint32_t now);
 /* Mark every hash that has been silent past NEI_LINK_QUIET_MS. */

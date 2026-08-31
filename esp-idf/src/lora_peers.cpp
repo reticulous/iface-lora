@@ -238,7 +238,7 @@ NeiHash* peersHashFind(NeiState* st, const uint8_t* b, int len) {
     return nullptr;
 }
 
-void peersHashAdd(NeiState* st, Neighbor* e, const uint8_t hash[16], uint32_t now) {
+void peersHashAdd(NeiState* st, Neighbor* e, const uint8_t* hash, uint32_t now) {
     if (!st || !e) return;
     /* A hash a node already owns as a destination needs no stub — the invariant
      * is that it is one or the other, never both. */

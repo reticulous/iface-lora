@@ -74,8 +74,14 @@ bool registerWithRnsd(LoraRadio* r) {
     safeStrncpy(reg.ifac_netname, r->curIfacNetname, sizeof(reg.ifac_netname));
     safeStrncpy(reg.ifac_netkey,  r->curIfacNetkey,  sizeof(reg.ifac_netkey));
     /* ref = radio index — onRnsdDisconnect uses it to find the radio. */
+    /* The ack budget has to clear a flash write, not just a scheduling hop.
+     * rnsd acks on its own task, and a storage flush suspends both cores' cache
+     * for as long as the program windows take — measured at 300 ms on an
+     * ordinary save and over 800 ms during the config write that follows a
+     * flash, which is precisely when this registration runs. Half a second was
+     * under the worst case it is guaranteed to meet. */
     r->rnsdHandle = itsConnect("rnsd", RNSD_PORT_IFACE, &reg, sizeof(reg),
-                               pdMS_TO_TICKS(500), r->idx,
+                               pdMS_TO_TICKS(3000), r->idx,
                                onRnsdRecv, onRnsdDisconnect);
     if (r->rnsdHandle < 0) {
         warn("lora/%d rnsd register failed", r->idx);

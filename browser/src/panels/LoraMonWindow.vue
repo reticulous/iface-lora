@@ -643,7 +643,7 @@ function drawOne(cv: HTMLCanvasElement | null, ch: number, main: boolean) {
     const ph = 12 * dpr, pad = 4 * dpr, rad = 4 * dpr, gap = 4 * dpr
     /* `before` = the mark opens a listening window, so the pill goes to its
      * left; otherwise the mark is a frame and the pill starts on it. */
-    const marks: { t: number; tag: string; before: boolean }[] = []
+    const marks: { t: number; tag: string; before: boolean; cast: number }[] = []
     let cur = '', prevEnd = -Infinity
     for (const rec of recsCh) {
       const e = rec.t + rec.dur
@@ -653,7 +653,7 @@ function drawOne(cv: HTMLCanvasElement | null, ch: number, main: boolean) {
         const slot = rec.dir === 2
         const newSlot = slot && rec.t - prevEnd > SLOT_JOIN_MS
         if (rec.tag !== cur || newSlot) {
-          marks.push({ t: rec.t, tag: rec.tag, before: slot })
+          marks.push({ t: rec.t, tag: rec.tag, before: slot, cast: rec.cast })
           cur = rec.tag
         }
       }
@@ -661,7 +661,7 @@ function drawOne(cv: HTMLCanvasElement | null, ch: number, main: boolean) {
     }
     let lastRight = -Infinity
     for (const mk of marks) {
-      const label = peerLabel(mk.tag)
+      const label = peerLabel(mk.tag, mk.cast)
       if (!label) continue
       const pw = ctx.measureText(label).width + pad * 2
       const px = mk.before ? xAt(mk.t) - gap - pw : xAt(mk.t)
@@ -872,7 +872,13 @@ function peerLabel(tag: string, cast?: number): string {
   if (!tag) return ''
   const p = peerByTag.value.get(tag)
   if (p) return p.names.length ? p.names.join(',') : `#${p.num}`
-  return cast === CAST_US_LINK ? `${tag} · inbound link` : tag
+  /* An address of this node's own resolves to nobody here on purpose: the
+   * published table is the NEIGHBOURHOOD, and we are not in it. Every frame
+   * addressed to us carries one, so without this the commonest tag on the pane
+   * is six characters of hex — and the device already said which kind it is. */
+  if (cast === CAST_US)      return 'us'
+  if (cast === CAST_US_LINK) return `${tag} · inbound link`
+  return tag
 }
 
 function rebuildPeers() {

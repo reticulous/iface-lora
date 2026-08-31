@@ -202,51 +202,14 @@ const char* rnsNameLabel(const uint8_t nameHash[10]) {
 }
 
 
-/* Display name out of an announce's app_data. LXMF wraps it in msgpack
- * (optionally behind a 32-byte ratchet); NomadNet and very old clients send raw
- * UTF-8. We only need the first element, so this is a deliberately small subset
- * of the parser lxmf/ carries — iface-lora talks to rnsd alone and must not
- * depend on a consumer straddle. */
-static void rnsParseName(const uint8_t* p, size_t n, char* out, size_t outsz) {
-    out[0] = '\0';
-    if (!p || !n) return;
-
-    auto plausible = [&](size_t off, size_t len) {
-        if (off >= n || !len) return false;
-        for (size_t k = 0; k < len && off + k < n; k++) {
-            uint8_t b = p[off + k];
-            if (b == 0x7F || (b < 0x20 && b != '\t' && b != '\n' && b != '\r')) return false;
-        }
-        return true;
-    };
-    auto copy = [&](const uint8_t* q, size_t len) {
-        if (len >= outsz) len = outsz - 1;
-        memcpy(out, q, len);
-        out[len] = '\0';
-    };
-    /* msgpack array whose first element is the name (str/bin/nil). */
-    auto tryArray = [&](size_t i) {
-        if (i >= n) return false;
-        uint8_t b = p[i++];
-        if (b >= 0x90 && b <= 0x9F) { if (!(b & 0x0F)) return false; }
-        else if (b == 0xDC) { if (i + 2 > n) return false; i += 2; }
-        else return false;
-        if (i >= n) return false;
-        uint8_t t = p[i++];
-        size_t len;
-        if (t == 0xC0) return true;                       /* nil name — valid, empty */
-        else if (t >= 0xA0 && t <= 0xBF) len = t & 0x1F;   /* fixstr */
-        else if (t == 0xD9 || t == 0xC4) { if (i >= n) return false; len = p[i++]; }
-        else if (t == 0xDA || t == 0xC5) { if (i + 2 > n) return false; len = ((size_t)p[i] << 8) | p[i+1]; i += 2; }
-        else return false;
-        if (i + len > n) return false;
-        copy(p + i, len);
-        return true;
-    };
-    if (n >= 34 && tryArray(32)) return;
-    if (tryArray(0)) return;
-    if (n > 32 && plausible(32, n - 32)) { copy(p + 32, n - 32); return; }
-    if (plausible(0, n)) copy(p, n);
+/* Display name out of an announce's app_data — rnsd's decoder, for the same
+ * reason the aspect dictionary above is: app_data is bytes an application chose
+ * and a name is only what survives being checked as text, so the node that sees
+ * every announce on every medium owns the rule. A second copy here drifts, and
+ * a drifted copy shows a different name on this pane than on every other
+ * surface of the same device. */
+static inline void rnsParseName(const uint8_t* p, size_t n, char* out, size_t outsz) {
+    rnsdAnnounceName(p, n, out, outsz);
 }
 
 
@@ -519,7 +482,7 @@ void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
         break;
 
     case NEI_PT_LINKREQ: {
-        if (h.dtype != NEI_DT_SINGLE || h.hops != 0) break;   /* relayed LR: transit, out of scope */
+        if (h.dtype != NEI_DT_SINGLE) break;
         uint8_t lid[16];
         rnsPacketHash(&h, p, len, true, lid);
         NeiLink* L = peersLinkEnsure(st, lid, now);
@@ -529,19 +492,36 @@ void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
         L->lastMs = now;
         L->frames++;
         if (isTx) {
-            L->ours = true;
-            /* We initiated: the LRPROOF will be addressed to the link_id.
-             * Counted only if the dest is already a known direct neighbour. */
-            Neighbor* e = peersFindByDest(st, h.dest);
-            peersPendAdd(st, lid, h.dest, true, e && !e->isUs, now);
-            /* WE dialled, so the node at the far end is the one whose
-             * destination we dialled — the identifier belongs on its row. Every
-             * later frame of the session is addressed to that identifier and to
-             * no destination at all, so without this the whole session resolves
-             * to nobody: it is absent from `lora n` and unnamed on a graph. */
-            if (e && !peersIsLocal(e)) peersAddLink4(st, e, lid, now);
-            /* A link identifier we terminate. Held for as long as the link
-             * plausibly lives; a link that goes quiet takes its entry with it. */
+            if (h.hops == 0) {
+                L->ours = true;
+                /* We initiated: the LRPROOF will be addressed to the link_id.
+                 * Counted only if the dest is already a known direct
+                 * neighbour — proof is end-to-end, quality is first-hop. */
+                Neighbor* d = peersFindByDest(st, h.dest);
+                peersPendAdd(st, lid, h.dest, true, d && !d->isUs, now);
+            }
+            /* The identifier belongs on the row of the FIRST HOP, which is the
+             * node we dialled only when we dialled a neighbour. A destination
+             * behind a gateway is dialled *through* it: the request goes out in
+             * transport and its first address field names the relay, while the
+             * destination names a node nothing here can reach. Every later
+             * frame of the session is addressed to the identifier and to no
+             * destination at all, so a session filed on no row resolves to
+             * nobody — absent from `lora n`, unnamed on a graph, and carrying
+             * LORAQ_PEER_NONE into the queue, where the per-peer cap, the power
+             * controller and SUPE all find nothing and the whole session stays
+             * on the shared channel.
+             *
+             * Relaying somebody else's request files it too, and against the
+             * node we relay it TO: the return direction arrives addressed to
+             * the identifier rather than to our transport identity, and this is
+             * one hop earlier than the first frame that carries it. */
+            Neighbor* nh = h.hdr2 ? peersFindBy4(st, h.transportId)
+                                  : peersFindByDest(st, h.dest);
+            if (nh && !peersIsLocal(nh)) peersAddLink4(st, nh, lid, now);
+            /* A link identifier we terminate or relay for. Held for as long as
+             * the link plausibly lives; a link that goes quiet takes its entry
+             * with it. */
 #if !defined(CONFIG_LORA_NO_SUPE)
             supeTagAdd(r, lid, /*perm=*/false, SUPE_LINK_TTL_MS);
 #endif
@@ -565,9 +545,9 @@ void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
 #endif
                 /* And, when the request came out of a transaction, whose link
                  * it is. A link request carries no sender, so a link dialled to
-                 * us is normally anonymous and our whole side of the session —
-                 * the proof first — flies plainly until a MANIFEST for the link
-                 * identifier eventually files capabilities against it. Arriving
+                 * us in the clear is anonymous and stays that way: our whole
+                 * side of the session — the proof first — flies plainly for
+                 * want of a node to meet. Arriving
                  * as a detour's cargo, it is not anonymous at all: the node that
                  * asked for the detour is the node that dialled. Filing the
                  * identifier on its row makes the very first frame back

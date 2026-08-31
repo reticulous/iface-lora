@@ -896,7 +896,18 @@ static void loraTaskMain(void*) {
     /* Server before client: the first init call sizes this task's shared inbox,
      * and the server's needs are the larger of the two. */
     itsServerInit();
-    itsClientInit(kNumRadios);
+    /* One conn per radio, plus headroom for a connect that is being reaped.
+     *
+     * A registration whose ack does not arrive in time is not a registration
+     * that failed to happen: itsConnect cancels it and returns -1, but the
+     * CANCEL is a message rnsd processes when it next runs, and rnsd is exactly
+     * the task that was too busy to ack. So for a moment the slot is still
+     * occupied by a conn nobody wants, and a retry with no spare slot is
+     * refused — "has 1/1 client conns already" — leaving the radio
+     * unregistered until something else shakes it loose. Sized to the radios
+     * and it happens on the first boot after a flash, when the config write
+     * stalls the storage actor past the ack budget. */
+    itsClientInit(kNumRadios + 2);
     /* The RNode endpoint. Both net (a TCP client) and the core serial machinery
      * (a serial client) connect here; onRnodeConnect tells them apart by the
      * connect payload's length. maxHandles=1 plus the explicit reject there is

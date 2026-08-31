@@ -273,6 +273,14 @@ static bool hTrainBuild(void* ctx, uint16_t peerId,
             memcpy(fr + 1, p->bytes + (half ? first : 0), nb);
             ss->txTLen[ss->txTCount] = (uint16_t)(1 + nb);
             ss->txTPkt[ss->txTCount] = p->bytes;
+            /* The RNode client's queue is released when its packet is finished
+             * with the radio, and a client running flow control transmits
+             * nothing more until that release arrives. On the plain path that
+             * is transmit-done; here it is the last frame the packet was cut
+             * into, since a split's halves are one packet to the client. */
+            ss->txTRelease[ss->txTCount] =
+                (p->flags & LORAQ_ORIG_MASK) == LORAQ_ORIG_RNODE &&
+                half == (uint8_t)(need - 1);
             out->lens[out->count] = (uint16_t)(1 + nb);
             out->csum[out->count] = supeCrc8(fr, 1 + nb);
             ss->txTCount++;
@@ -293,7 +301,10 @@ static bool hTrainFire(void* ctx, uint8_t idx, int8_t dbm) {
     r->txFrameCount   = 1;
     r->txFrameSent    = 0;
     r->txPayloadBytes = (size_t)(len - 1);
-    r->txFromRnode    = false;
+    /* Spent on the first firing: a repair round resends the same frame, and a
+     * second release would let the client put two packets in flight. */
+    r->txFromRnode      = ss->txTRelease[idx];
+    ss->txTRelease[idx] = false;
     r->txWaitMs       = 0;
     r->txOwnMs        = 0;
     r->txWaitPend     = false;
@@ -728,10 +739,13 @@ static void annIngest(LoraRadio* r, const uint8_t* f, size_t len, int16_t rssi) 
      * quietly, misses, and the ratchet raises the power until it does not. A
      * self-correcting error against a permanent one. */
     Neighbor* keep = nullptr;
+    uint8_t   orphan[SUPE_ANN2_MAX];      /* ids this table could not place */
+    uint8_t   nOrphan = 0;
     for (int i = 0; i < a.count; i++) {
         Neighbor* e = peersFindByIdent4(r->nei, a.ids[i]);
         if (!e) e = peersFindBy4(r->nei, a.ids[i]);
         if (!e) e = peersFindClaim4(r->nei, a.ids[i]);
+        if (!e && i > 0 && nOrphan < SUPE_ANN2_MAX) orphan[nOrphan++] = (uint8_t)i;
         /* Never met: this frame IS the introduction — it carries the identities
          * and the capabilities together — so keep it rather than wait out an
          * announce interval for the next one. Only four bytes of each identity
@@ -788,6 +802,24 @@ static void annIngest(LoraRadio* r, const uint8_t* f, size_t len, int16_t rssi) 
                 r->idx, a.ids[i][0], a.ids[i][1], a.ids[i][2],
                 (unsigned)a.caps.fam, (unsigned)a.caps.topStep,
                 (int)a.caps.maxPwrDbm);
+    }
+    /* An identity in this frame that no announce ever named is filed on the
+     * node anyway, as a hash that means it.
+     *
+     * THE TRANSPORT IDENTITY IS THE ONE THAT MATTERS, and it is the one no
+     * announce can name: it is a key of its own, distinct from the identity a
+     * node's destinations hang off, and it is never announced. It appears on
+     * the air in exactly two places — the first address field of every packet
+     * relayed towards it, which is what makes it a tag, and this frame, which
+     * is what makes it attributable. A node's own row holds it (it learns it
+     * from its own relaying), so its announcement carries it; dropping it here
+     * for want of a row to match leaves every packet in transit through that
+     * neighbour resolving to nobody, and transit is most of what a gateway
+     * carries. The addresses a node announces resolve on their own and never
+     * reach this. */
+    if (keep) {
+        for (uint8_t o = 0; o < nOrphan; o++)
+            peersHashAdd(r->nei, keep, a.ids[orphan[o]], now);
     }
     if (matched == 0 && logIsDebug(TAG))
         dbg("lora/%d supe: announcement from %02x%02x%02x matches no known node",

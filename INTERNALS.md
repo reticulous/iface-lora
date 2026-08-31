@@ -963,6 +963,18 @@ radio and clears its handle; the task loop re-registers on the next turn if the
 radio is still enabled. If registration fails but the radio is on-air, the state
 goes `rnsd_unavailable` and the loop keeps retrying — RF stays up.
 
+**The ack budget has to clear a flash write, not a scheduling hop.** rnsd acks
+on its own task, and a storage flush suspends both cores' cache for as long as
+the program windows take — measured at 300 ms on an ordinary save and over
+800 ms during the config write that follows a flash, which is precisely when
+this registration runs. The connect waits 3 s. And `itsClientInit` is sized to
+the radios **plus two**: a registration whose ack does not arrive in time is not
+a registration that failed to happen — `itsConnect` cancels it and returns -1,
+but the CANCEL is a message rnsd processes when it next runs, and rnsd is the
+task that was too busy to ack. For that moment the slot is still held by a conn
+nobody wants, and a retry with no spare slot is refused ("has 1/1 client conns
+already"), leaving the radio unregistered until something else shakes it loose.
+
 rnsd is one of **three** endpoints on a radio segment, not the only one. The
 others are the radio itself and — when configured — an attached RNode client
 (§17). A packet entering from any one is presented to the other two, and the
@@ -1647,16 +1659,33 @@ radio, `gp_alloc`'d at first `radioStart` and kept across config cycles and
   the key a SUPE claim is filed under — and `peersMergeInto` folds the two.
   Claims never cross the us/them boundary: an unauthenticated assertion must not
   reach our own row.
+- **The transport identity is a key of its own, and nothing announces it.** A
+  node's Transport instance holds its own identity, separate from the one its
+  destinations hang off, and Reticulum never announces it: it appears on the air
+  only as the first address field of a packet in transport — which is to say, as
+  the tag of every packet relayed *towards* that node. So the announce join
+  cannot supply it, and a relayed announce's claim to it is unverifiable, which
+  is why `observeAnnounce` refuses to mint a row from one. The one place it
+  arrives attributably is a **SUPE announcement**: a node learns its own
+  transport identity from the announces it relays (its `isTx`+HEADER_2 branch)
+  and lists it with the rest, so `annIngest` files every announced identity that
+  matches no row of its own as a hash meaning that node. Without that, a
+  neighbour's transport identity is knowable to nobody, every packet in transit
+  through it resolves to `LORAQ_PEER_NONE`, and transit — most of what a gateway
+  carries — never leaves the shared channel.
 - **Two lookups, deliberately different.** `peersFindBy4` answers "which node is
-  this next hop", searching `node4`, destinations and link identifiers — the
-  three things a packet is ever addressed to. `tagNode` (in `lora_supe`) answers
-  that *and* "which node does this sender identity name", so it searches stored
-  identities too. No packet is ever addressed to an identity, so widening
-  `peersFindBy4` to match them would only ever fire on a four-byte collision;
-  the asymmetry is the point.
-- **Links.** An LR at hops 0 yields `link_id = H([flags&0x0F] ‖ raw[2:])[:16]`
-  with LR data trimmed to the 64 ephemeral-key bytes (MTU signalling excluded),
-  mapped to its dest; the LRPROOF (context 0xFF, dest = link_id) marks it
+  this next hop", searching `node4`, destinations and the hash store —
+  link identifiers and the transport identity above. `tagNode` (in `lora_supe`)
+  answers that *and* "which node does this sender identity name", so it searches
+  `ids[]` too. The transport identity is the only identity a packet is ever
+  addressed to, and it reaches `peersFindBy4` through the hash store rather than
+  through `ids[]`; widening the search to `ids[]` would otherwise only ever fire
+  on a four-byte collision, so the asymmetry stays.
+- **Links.** An LR yields `link_id = H([flags&0x0F] ‖ raw[2:])[:16]` with LR
+  data trimmed to the 64 ephemeral-key bytes (MTU signalling excluded), mapped
+  to its dest. The hashed part excludes hops and the transport id, so every hop
+  of a relayed request derives the same identifier — which is what lets a relay
+  file the link at all. The LRPROOF (context 0xFF, dest = link_id) marks it
   established and — at hops 0 — attributes its signal to the dest, which is
   thereby proven a direct neighbour. Mid-link traffic on an unseen link_id
   creates an *unresolved* entry. `ours` = we transmit on it at hops 0, or its
@@ -1668,11 +1697,17 @@ radio, `gp_alloc`'d at first `radioStart` and kept across config cycles and
   (`peersAddLink4`) the whole session resolves to nobody: absent from `lora n`,
   unnamed on a graph, and — worse — carrying `LORAQ_PEER_NONE` into the queue,
   where everything keyed on the queued peer (the per-peer cap, the power
-  controller, the reverse leg's scan) silently finds nothing. The three handles:
-  - **We dialled.** The far end is whoever owns the destination we dialled, so
-    the LR at `isTx` files the identifier against that row directly. Every
-    inbound frame at hops 0 on such a link re-files it, which is also what
-    catches a link we only picked up mid-session.
+  controller, the reverse leg's scan) silently finds nothing. What it is filed
+  against is the **first hop**, never the far end of the path — the two are the
+  same node only on a link to a direct neighbour. The three handles:
+  - **We dialled, or we relay.** Any LR at `isTx` files the identifier against
+    the row of the node it goes to: the transport id when the request is in
+    transport (a destination behind a gateway is dialled *through* it), else the
+    dialled destination when that destination is a neighbour. A relayed request
+    counts — the return direction arrives addressed to the identifier rather
+    than to our transport identity, one hop before any frame that carries it.
+    Every inbound frame at hops 0 on a link we initiated re-files it, which is
+    also what catches a link we only picked up mid-session.
   - **It was dialled to us, as a detour's cargo.** A schedule belongs to one
     pair and the frame came under it, so `fromPeer` names the dialler
     (`supeCargoPeer`). Taken on the LR and on any later frame of the session,
@@ -1778,9 +1813,12 @@ lora/0 neighbors: 2 others and us, 0 open links (observing 17m)
 
 One numbered block per node — `us` first, then `1`, `2`, … — and **one line per
 hash**: full hash, aspect label, then the announced display name in quotes where
-the announce carried one. `neiParseName` extracts that name locally (LXMF's
-msgpack, optionally behind a 32-byte ratchet, and NomadNet's raw UTF-8);
-iface-lora talks only to rnsd, so it cannot borrow lxmf/'s fuller parser. The
+the announce carried one. That name and that aspect label both come out of
+rnsd — `rnsdAnnounceName` and `rnsdAspectLabel` — rather than out of a decoder
+of our own: app_data is bytes an application chose, a name is only what survives
+being checked as text, and the node that sees every announce on every medium
+owns the rule. A second copy here would drift, and a drifted copy shows a
+different name on this pane than on every other surface of the same device. The
 transport hash leads each block, being the one hash every node has. A hash
 linked to a node but never heard directly prints as
 `<first-4>........ (not seen yet)`.
@@ -2279,6 +2317,14 @@ went on air.
 `txRearmRx`, which is exactly where the client's frame is finished with the
 radio, and also when the LBT timeout sheds it. Harmless with the client's flow
 control off, **mandatory** with it on.
+
+**A SUPE train carries the release too.** On the plain path the release rides
+transmit-done; inside a train the packet has been cut into frames, and a split's
+halves are one packet as far as the client is concerned — so `txTRelease` marks
+the *last* frame a client packet was cut into, and `hTrainFire` moves that flag
+onto `txFromRnode` as it fires. It is spent on the first firing: a repair round
+resends the same frame, and a second release would let the client put two
+packets in flight.
 
 `nextDeadline()`'s outbound clause separates gating from availability for the
 same reason the drain does: an rnode packet is pending without any rnsd handle,
