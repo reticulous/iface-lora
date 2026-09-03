@@ -13,6 +13,24 @@
  * (overview at AP_FRESH_MS, in lora_power.h) */
 static int8_t apClamp(LoraRadio* r, int want);
 
+/* Adaptive power is part of SUPE's operation, so it runs exactly while this
+ * node speaks SUPE. Announcement ingest never stops — a node with the protocol
+ * switched off keeps reading its neighbours' announcements, which is what lets
+ * the switch be thrown back without rediscovering everyone — so the evidence a
+ * derivation needs is still arriving and still fresh. Acting on it would be
+ * this node going on speaking a protocol it has just announced it does not
+ * speak: dialling frames down to a number no configured tx_power explains,
+ * answering a peer's 0x04 request and asking for one of its own. Off means
+ * every frame goes out at tx_power. */
+bool apEnabled(const LoraRadio* r) {
+#if defined(CONFIG_LORA_NO_SUPE)
+    (void)r;
+    return false;
+#else
+    return supeReady(r);
+#endif
+}
+
 /* Deci-dB to whole dB, rounded UP: the half decibel we would save by rounding
  * the other way is not worth the frame it costs. */
 static int ceilDeci(int deci) {
@@ -76,9 +94,10 @@ static bool apLinkSuggest(LoraRadio* r, const RnsHdr* h, int8_t* out) {
 /* The power this frame goes out at: a peer's explicit request first, then the
  * next-hop node's own derivation, else the configured tx_power. This frame is
  * about to fly on the main channel, so the derivation is at the hailing
- * configuration. */
+ * configuration. With SUPE off nothing derives anything and every frame goes
+ * out at exactly tx_power. */
 int8_t apTxPower(LoraRadio* r, const uint8_t* pkt, size_t len) {
-    if (!r->nei) return r->cfgTxp;
+    if (!r->nei || !apEnabled(r)) return r->cfgTxp;
     RnsHdr h;
     if (rnsParse(pkt, len, &h) && h.ptype != NEI_PT_ANNOUNCE) {
         int8_t want;
@@ -137,7 +156,11 @@ bool apPwrReqFor(LoraRadio* r, const uint8_t* pkt, size_t len, int8_t* out) {
     int      cliff10 = 0;
     uint32_t samples = 0;
     Neighbor* e = peersFindBy4(r->nei, h.dest);
-    if (!e || peersIsLocal(e))              why = "dest hash is on no node row";
+    /* The request is a SUPE frame, so a node that has announced it does not
+     * speak SUPE does not send one — whatever its peers still say about
+     * themselves. */
+    if (!apEnabled(r))                      why = "SUPE is off on this radio";
+    else if (!e || peersIsLocal(e))         why = "dest hash is on no node row";
     /* Only a node that has spoken our air protocol to us will parse the frame;
      * to anyone else it is 35 ms of unparseable noise on a shared channel. That
      * is the RF_PROTO_NAME tag in `lora n`, set by a SUPE announcement, which

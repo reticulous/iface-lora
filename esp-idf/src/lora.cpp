@@ -36,7 +36,9 @@
 #include "lora_priv.h"
 
 #include "lora_fem.h"
+#if CONFIG_STRADDLE_NETGRAPH
 #include "netgraph.h"     /* netgraphContributeIface — our `if` line's tail */
+#endif
 
 #if defined(CONFIG_LORA0_CS_PIN)
 
@@ -202,6 +204,7 @@ static IRAM_ATTR void loraRadioIsr(void) {
 /* ─────────────── radio control ─────────────── */
 
 static void radioStop(LoraRadio* r) {
+    if (!r->radio) return;   /* never came up — see radioStart */
 #if !defined(CONFIG_LORA_NO_SUPE)
     /* Take SUPE's lock before touching the chip, not after. Every `s.lora.*`
      * write arrives here on its way to a restart, and a SUPE transaction step
@@ -241,6 +244,9 @@ static void radioStop(LoraRadio* r) {
 }
 
 static bool radioStart(LoraRadio* r) {
+    /* No radio object means its HAL never got a bus (see the construction loop):
+     * there is nothing to configure and nothing to talk to. */
+    if (!r->radio) return false;
     char kb[48];
     int freq_hz  = storageGetInt(sk(kb, sizeof kb, r->idx, "frequency"), 0);
     int bw_hz    = storageGetInt(sk(kb, sizeof kb, r->idx, "bandwidth"), 0);
@@ -420,7 +426,6 @@ static bool radioStart(LoraRadio* r) {
      * interface on the same beat (rnsdAnnounceBeat, in the task loop). */
     r->annIntervalMin = (uint16_t)storageGetInt(
         sk(kb, sizeof kb, r->idx, "announce_interval"), ANN_INTERVAL_DEF);
-    publishChannels(r);
 #endif
 
     /* Adaptive TX power. Determinations already made live in the neighbour
@@ -466,6 +471,11 @@ static bool radioStart(LoraRadio* r) {
     r->supeOn = supeWanted && canRun;
     if (canRun && !supeInit(r)) r->supeOn = false;
 #endif
+    /* After the SUPE switch and outside its guard: the published list is the
+     * channels traffic can actually land on, and only a node that speaks SUPE
+     * detours off the hailing one — but a build without SUPE still has a
+     * hailing channel to name, and the viewers label channel 0 from this. */
+    publishChannels(r);
     /* Each store allocates once and keeps its history across config cycles. */
     loraMonInit(r);
     annInit(r);
@@ -658,7 +668,7 @@ static void onAnnounceNow(const char* key, const char* val) {
     int idx = 0;
     if (sscanf(key, "lora.%d.announce_now", &idx) != 1) return;
     if (idx < 0 || idx >= kNumRadios) return;
-    s_annNowMask |= (1u << idx);
+    s_annNowMask = s_annNowMask | (1u << idx);
     if (s_task) xTaskNotifyGive(s_task);
 }
 
@@ -960,6 +970,18 @@ static void loraTaskMain(void*) {
                                CONFIG_LORA_SCK_PIN, CONFIG_LORA_MOSI_PIN,
                                CONFIG_LORA_MISO_PIN, r->slot->cs);
         r->hal->init();
+        /* A HAL that did not come up is a radio that cannot be talked to, and
+         * building the rest of the stack on it is how a shortage of internal
+         * DMA memory (the bus wants descriptors; WiFi and BLE got there first)
+         * turns into a panic inside the SPI driver rather than a line in the
+         * log. Shelve the radio and carry on: the device is still a device. */
+        if (!r->hal->ready()) {
+            err("lora/%d: SPI bus unavailable — radio disabled", i);
+            delete r->hal;
+            r->hal  = nullptr;
+            r->found = 0;      /* absent, as far as the rest of the straddle is concerned */
+            continue;
+        }
 
         r->mod   = new Module(r->hal, r->slot->cs, r->slot->dio1,
                               r->slot->rst, r->slot->busy);
@@ -1075,7 +1097,7 @@ static void loraTaskMain(void*) {
                 char pfx[16];
                 snprintf(pfx, sizeof pfx, "lora/%d", i);
                 if (s_annNowMask & (1u << i)) {
-                    s_annNowMask &= ~(1u << i);
+                    s_annNowMask = s_annNowMask & ~(1u << i);
                     info("lora/%d announce requested", i);
                     rnsdIfaceAnnounceNow(pfx);
 #if !defined(CONFIG_LORA_NO_SUPE)
@@ -1126,6 +1148,10 @@ static void loraTaskMain(void*) {
                     rr->supeOn = want;
                     info("lora/%d SUPE %s — announcing it", rr->idx,
                          want ? "enabled" : "disabled");
+                    /* The agile lanes come and go with the switch, so the list
+                     * the viewers draw from is republished here as well as at
+                     * config apply — this path never reaches one. */
+                    publishChannels(rr);
                     supeAnnArm(rr);
                 }
             }
@@ -1211,7 +1237,12 @@ static void loraTaskMain(void*) {
  * RSSI, never a negotiated budget, never a counter. Those move constantly, and
  * a record that moved with them would keep every digest in the community
  * permanently mismatched; the test for a field is whether a change to it
- * deserves waking the whole mesh, and a spreading factor does. */
+ * deserves waking the whole mesh, and a spreading factor does.
+ *
+ * netgraph is an optional straddle, so the whole contribution compiles away
+ * when it is not in the build — a radio has nothing to say about itself if
+ * nobody is composing a record. */
+#if CONFIG_STRADDLE_NETGRAPH
 static size_t loraNetgraphDetail(const char* iface_name, char* out, size_t outsz) {
     int idx = -1;
     const char* slash = strchr(iface_name, '/');
@@ -1229,6 +1260,7 @@ static size_t loraNetgraphDetail(const char* iface_name, char* out, size_t outsz
     if (n < 0) return 0;
     return (size_t)n < outsz ? (size_t)n : outsz - 1;
 }
+#endif  /* CONFIG_STRADDLE_NETGRAPH */
 
 /* ── RNS lifecycle hooks (registered with the orchestrator; see rnsServiceRegister) ── */
 static void loraStart(void) {
@@ -1375,7 +1407,9 @@ void LoraService::onInit() {
     /* Contribute this class's configuration to the network-graph record. We
      * hand over FIELDS; netgraph composes the line and we never see a record —
      * the same division of labour as rnsdPillSet one layer up. */
+#if CONFIG_STRADDLE_NETGRAPH
     netgraphContributeIface("lora", loraNetgraphDetail);
+#endif
 
     /* Register with the RNS orchestrator instead of self-spawning: rnsStart()
      * calls loraStart() (which spawns loraTaskMain) once rnsd is up and past its

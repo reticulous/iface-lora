@@ -36,8 +36,13 @@ endif()
 
 include(${CMAKE_CURRENT_LIST_DIR}/spangap_requires.cmake)
 # Conditional sources: esp-idf/conditional/<name>/ is compiled only when <name>
-# is staged. The on-device LoRa Settings pane lives in conditional/spangap-lcd/
-# and registers via the when:-gated loraLcdRegister hook — no #if anywhere.
+# is staged. The mono-OLED radio page lives in conditional/tinylcd/ and
+# registers via the when:-gated LoraTinyPage service entry — no #if needed.
+#
+# The LoRaMon viewers are their own straddle (reticulous/loramon). What stays
+# here is the recorder, gated on CONFIG_STRADDLE_LORAMON inside lora_mon.cpp
+# rather than by a slice dir, because the radio task calls into it and a source
+# file that simply vanished would leave those calls unresolved.
 idf_component_register(
     SRCS
         ${LORA_SRCS}

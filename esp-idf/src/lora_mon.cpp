@@ -2,6 +2,21 @@
  * lora_mon — telemetry: the radio→interface record queue, the LoRaMon
  * per-frame ring and its storage nodes, the stats flush, the channel-RSSI
  * series, and the interface task that owns every storage write.
+ *
+ * Half of this file is the LoRaMon recorder, and the only thing that ever reads
+ * what it writes is the loramon straddle — the LCD app and the browser window.
+ * So it is gated on that straddle being staged (CONFIG_STRADDLE_LORAMON), the
+ * same way SUPE is gated on CONFIG_LORA_NO_SUPE: `--without loramon` and the
+ * per-frame nodes, the neighbourhood rows, the channel-RSSI series, the rolling
+ * hour, the 1 Hz sample beat and the expiry FIFO (16 KB per radio) are all
+ * absent from the image rather than merely idle. What is left is the stats
+ * flush, the status pill, the channel list and the state keys — what the
+ * settings pane and the status bar read, which have their own audience.
+ *
+ * Nothing outside this file needs the gate: every call site the rest of the
+ * straddle makes (loraMonPush, loraMonDwell, rssiSamplePoll) already asks
+ * loraMonOpen() first, and with no viewer in the build that is a constant
+ * false.
  */
 #include "lora_priv.h"
 
@@ -74,8 +89,17 @@ static QueueHandle_t s_ifq = nullptr;
 /* Cached so the radio task can gate recording — and the sampling beat — on it
  * without a storage read of its own. Updated by the watch-key subscription the
  * moment a viewer opens or closes, and refreshed at each maintenance beat as a
- * belt against a missed callback. */
+ * belt against a missed callback.
+ *
+ * With no viewer straddle in the build it is a constant, and every gate that
+ * reads it — here, in loraMonPush, in loraMonDwell, in rssiSamplePoll, in
+ * nextDeadline — folds away with it. That is what keeps the gate out of the
+ * radio task's code: a call site asks the same question either way. */
+#if CONFIG_STRADDLE_LORAMON
 static volatile bool s_monWatched = false;
+#else
+static constexpr bool s_monWatched = false;
+#endif
 
 /* The radio task's read of it: true while a LoRaMon viewer (web or LCD) is
  * open. What hangs off this is not just recording but wake cycles — see
@@ -90,6 +114,7 @@ static bool ifPost(const IfMsg* m) {
     return xQueueSend(s_ifq, m, 0) == pdTRUE;
 }
 
+#if CONFIG_STRADDLE_LORAMON
 /* True while something is actually reading the neighbourhood — today the web
  * LoRaMon's packet hover, tomorrow a graph view. Its own key, not LoRaMon's:
  * these are different appetites. LoRaMon wants frames and can run on an LCD
@@ -200,6 +225,7 @@ static void publishPeers(LoraRadio* r) {
         storageSet(k, v);
     }
 }
+#endif  /* CONFIG_STRADDLE_LORAMON — the neighbourhood publisher */
 
 void publishStats(LoraRadio* r) {
     /* Skip the churn on a headless, WiFi-down node — nothing pulls these keys
@@ -211,7 +237,9 @@ void publishStats(LoraRadio* r) {
      * round-trips to the storage task every second; under an inbound-message
      * burst those pile up on the storage op port and stall the radio task. */
     storageBegin();
+#if CONFIG_STRADDLE_LORAMON
     if (loraPeersWatched()) publishPeers(r);
+#endif
     storageSet(rk(b, sizeof b, r->idx, "stats.tx_bytes"),  (int)(r->txBytes & 0x7fffffff));
     storageSet(rk(b, sizeof b, r->idx, "stats.rx_bytes"),  (int)(r->rxBytes & 0x7fffffff));
     storageSet(rk(b, sizeof b, r->idx, "stats.tx_frames"), (int)(r->txFrames & 0x7fffffff));
@@ -260,7 +288,11 @@ void publishPill(void) {
     else    rnsdPillClear("lora");
 }
 
-/* ─────────────── LoRaMon: recording, windows, publish, ITS server ─────────────── */
+/* ─────────────── LoRaMon: recording, windows, publish ───────────────
+ *
+ * Everything from here to the close of this region exists to feed the loramon
+ * straddle's two viewers, and is in the image only when one of them is. */
+#if CONFIG_STRADDLE_LORAMON
 
 /* True while a LoRaMon viewer (web or LCD) is open — gates recording. */
 static bool loraMonWatched(void) {
@@ -408,6 +440,7 @@ static void loraMonRecord(LoraRadio* r, const IfMsg* m) {
     s_monPend[s_monPendN++] = *m;
     if (s_monPendN >= MON_BATCH_MAX) monFlushPending();
 }
+#endif  /* CONFIG_STRADDLE_LORAMON — the recorder's storage half */
 
 /* Record one on-air frame. RADIO TASK: the in-RAM rollups, the debug line, and
  * a hand-off to the interface task for the storage node. Nothing here touches
@@ -572,8 +605,10 @@ void loraMonPush(LoraRadio* r, uint8_t dir, uint32_t t_ms, uint16_t dur_ms,
                         uint16_t bytes, int16_t rssi, int16_t snr10, int8_t txp,
                         uint8_t type, uint16_t wait_ms, uint16_t own_ms,
                         uint8_t desc, const uint8_t tag[3], uint8_t cast) {
+#if CONFIG_STRADDLE_LORAMON
     /* Airtime rollup runs whether or not a viewer is open — the hour it covers
-     * is longer than a viewer is typically up, so it can't be built on demand. */
+     * is longer than a viewer is typically up, so it can't be built on demand.
+     * It is still only ever read by a viewer, so it goes when they do. */
     {
         uint32_t absIdx = t_ms / AIR_BUCKET_MS;
         AirBucket* b = &r->mon.air[absIdx % AIR_BUCKETS];
@@ -588,7 +623,10 @@ void loraMonPush(LoraRadio* r, uint8_t dir, uint32_t t_ms, uint16_t dur_ms,
      * detour would silently stop shortening its own future waits. */
     if (dir) r->mon.txAir[r->chNow < LORA_CH_MAX ? r->chNow : LORA_CH_HAIL]
                  .add((float)dur_ms / 1000.0f);
-    /* The per-frame trace is verbose, not debug. Two levels, one discipline:
+#endif
+    /* The per-frame trace is verbose, not debug. It is also the one thing here
+     * that is not the viewer's — a frame log stands on its own — so it stays in
+     * a build with no LoRaMon in it. Two levels, one discipline:
      * debug carries decisions and verbose carries frames, so at debug a detour
      * reads as a short story — offer, HERE, MANIFEST, train, home — with no
      * frame dumps between the lines, and at verbose the same story is
@@ -649,6 +687,7 @@ void loraMonDwell(LoraRadio* r, uint32_t now) {
     if (!ifPost(&m)) r->mon.monDropped++;
 }
 
+#if CONFIG_STRADDLE_LORAMON
 /* Publish the rolling one-hour airtime, per mille, per direction. The apps
  * compute every shorter window from the frame records; the hour needs more
  * history than a viewer holds, so it is the one figure the device publishes. */
@@ -689,6 +728,7 @@ static void loraMonClear(LoraRadio* r) {
      * being closed would be a cross-task write for nothing. */
     r->mon.dwellKeyMs = 0;
 }
+#endif  /* CONFIG_STRADDLE_LORAMON — the hour and the subtree drop */
 
 /* Publish the channel list the regime puts in force:
  * `lora.<n>.chans` = "<freqHz>,<bwHz>|…", index = channel, 0 = hailing.
@@ -704,14 +744,22 @@ static void loraMonClear(LoraRadio* r) {
  * noise reading there. The RSSI series is only a backdrop under that traffic,
  * and this radio publishes one (rssiSamplePoll), so the agile lanes draw their
  * frames against a plain background. Trimming this list to what is measured
- * would take the detour traffic off the screen with it. */
+ * would take the detour traffic off the screen with it.
+ *
+ * **Two conditions, not one.** A regime names channels this node MAY use; it
+ * does not say that it will. Only a SUPE detour ever leaves the hailing
+ * channel, so with the protocol off no frame can reach an agile lane however
+ * high the regime number is set — and drawing the lanes anyway gives a viewer
+ * a screen of graphs that are empty by construction and no way to tell that
+ * from a quiet band. The published list is what this radio can actually put
+ * traffic on. */
 void publishChannels(LoraRadio* r) {
     char val[24 * LORA_CH_MAX];
     int  w = snprintf(val, sizeof val, "%u,%u",
                       (unsigned)r->cfgFreqHz, (unsigned)r->cfgBwHz);
 #if !defined(CONFIG_LORA_NO_SUPE)
     int n = 0;
-    const RegimeChan* ch = regimeChans(r->afa, &n);
+    const RegimeChan* ch = r->supeOn ? regimeChans(r->afa, &n) : nullptr;
     for (int i = 0; i < n && i + 1 < LORA_CH_MAX && w > 0 && w < (int)sizeof val; i++)
         w += snprintf(val + w, sizeof val - w, "|%u,%u",
                       (unsigned)ch[i].freqHz, (unsigned)ch[i].bwHz);
@@ -829,6 +877,7 @@ void rssiSamplePoll(LoraRadio* r) {
 static TaskHandle_t  s_ifTask   = nullptr;
 static volatile bool s_ifParked = false;
 
+#if CONFIG_STRADDLE_LORAMON
 /* Publish the newest channel-RSSI sample as one key per radio:
  * `lora.<n>.rssi` = "<ms>|<ch0 dBm>". The device timestamp is in the value
  * rather than the key so a viewer can tell a fresh reading from a repeated one
@@ -848,10 +897,13 @@ static void loraPublishRssi(LoraRadio* r, const IfMsg* m) {
                  : snprintf(val + w, sizeof val - w, "|%d", (int)m->chRssi[i]);
     storageSet(rk(kb, sizeof kb, r->idx, "rssi"), val);
 }
+#endif  /* CONFIG_STRADDLE_LORAMON — the channel-RSSI series */
 
 static void loraIfTaskMain(void*) {
     info("[%s-if] task up", TAG);
+#if CONFIG_STRADDLE_LORAMON
     bool       prevWatch = false;
+#endif
     TickType_t lastBeat  = 0;
     TickType_t lastShift = 0;
     uint64_t   statsSig   = 0;
@@ -876,6 +928,7 @@ static void loraIfTaskMain(void*) {
 
             IfMsg m;
             if (s_ifq && xQueueReceive(s_ifq, &m, wait) == pdTRUE) {
+#if CONFIG_STRADDLE_LORAMON
                 if (m.radio < kNumRadios) {
                     LoraRadio* r = &s_radios[m.radio];
                     if (m.kind == IFM_MON)       loraMonRecord(r, &m);
@@ -884,8 +937,10 @@ static void loraIfTaskMain(void*) {
                 /* A lull is a flush point: mid-storm the batch cap governs,
                  * and the lone frame of a quiet minute publishes right away. */
                 if (uxQueueMessagesWaiting(s_ifq) == 0) monFlushPending();
+#endif
             }
 
+#if CONFIG_STRADDLE_LORAMON
             /* A close acts on the wake that carried it, not on the next beat —
              * unwatched, the next beat may be minutes out, and the packets
              * subtree would sit there the whole wait. */
@@ -894,13 +949,16 @@ static void loraIfTaskMain(void*) {
                 for (int i = 0; i < kNumRadios; i++) loraMonClear(&s_radios[i]);
             }
             prevWatch = s_monWatched;
+#endif
 
             /* Checked whether or not a record arrived: a steady stream of them
              * must not be able to starve expiry and the stats flush. */
             now = xTaskGetTickCount();
             if ((int32_t)(now - due) < 0) continue;
             lastBeat = now;
+#if CONFIG_STRADDLE_LORAMON
             monFlushPending();      /* nothing pending outlives a beat */
+#endif
 
             /* Age every one-hour running total in the system, ours included.
              * One call covers them all; they linked themselves up at
@@ -912,6 +970,7 @@ static void loraIfTaskMain(void*) {
                 Rolling1h::shiftAll();
             }
 
+#if CONFIG_STRADDLE_LORAMON
             /* Belt for the cached watch flag — the change subscription is the
              * prompt path. A transition it reveals is handled like any other:
              * a close drops the published subtree. */
@@ -920,6 +979,7 @@ static void loraIfTaskMain(void*) {
             if (prevWatch && !w)
                 for (int i = 0; i < kNumRadios; i++) loraMonClear(&s_radios[i]);
             prevWatch = w;
+#endif
 
             /* Stats: counters only move on a tx/rx event, so publish only when
              * the sum of them has changed since the last beat. */
@@ -942,6 +1002,7 @@ static void loraIfTaskMain(void*) {
              * storage actor one deduped op. */
             publishPill();
 
+#if CONFIG_STRADDLE_LORAMON
             /* LoRaMon expiry — 1 Hz while a viewer is open, so nodes age out of
              * the 1 h window even on an idle channel. */
             if (w) {
@@ -951,12 +1012,15 @@ static void loraIfTaskMain(void*) {
                     loraPublishAirtime(&s_radios[i], nowMs);
                 }
             }
+#endif
         }
 
         /* rns stop: the radio task parks too, so nothing more will be queued.
          * Drop whatever is still in flight and park on the same flag. */
         if (s_ifq) xQueueReset(s_ifq);
+#if CONFIG_STRADDLE_LORAMON
         s_monWatched = false;
+#endif
         s_ifParked = true;
         while (s_stop) vTaskDelay(pdMS_TO_TICKS(LORA_IF_PARK_POLL_MS));
         s_ifParked = false;
@@ -969,7 +1033,9 @@ static void loraIfTaskMain(void*) {
  * resumes (or stops holding) the RSSI beat, the interface task re-blocks on
  * the cadence the new state calls for. */
 static void onWatchChange(const char* /*key*/, const char* /*val*/) {
+#if CONFIG_STRADDLE_LORAMON
     s_monWatched = loraMonWatched();
+#endif
     IfMsg m = {};
     m.kind  = IFM_KICK;
     m.radio = 0xFF;              /* matches no radio: wake, dispatch nothing */
@@ -987,8 +1053,14 @@ void loraMonStart(void) {
     if (!s_ifTask) {
         s_ifTask = spawnTask(loraIfTaskMain, "lora-if", 4096, nullptr, 1,
                              CORE_SECONDARY_NO_LCD, STACK_PSRAM);
+#if CONFIG_STRADDLE_LORAMON
         storageSubscribeChanges("sys.stats.web_loramon", onWatchChange);
         storageSubscribeChanges("sys.stats.lcd_loramon", onWatchChange);
+#endif
+        /* Not a viewer's key: the stats flush and the pill are held back on a
+         * node no UI can reach (uiTelemetryWanted), so the interface task has
+         * to be woken when one comes into reach. That is true with or without
+         * LoRaMon in the build. */
         storageSubscribeChanges("wifi.sta.up",           onWatchChange);
         storageSubscribeChanges("wifi.ap.up",            onWatchChange);
     }
@@ -996,12 +1068,16 @@ void loraMonStart(void) {
 
 bool loraMonParked(void) { return s_ifParked; }
 
-/* LoRaMon expiry FIFO: allocated once, kept across config cycles. */
+#if CONFIG_STRADDLE_LORAMON
+/* LoRaMon expiry FIFO: allocated once, kept across config cycles. 16 KB per
+ * radio, which is the single largest thing the viewer costs a node that never
+ * opens one — hence the gate rather than a lazy allocation on first watch. */
 void loraMonInit(LoraRadio* r) {
     if (r->mon.pktMs) return;
     r->mon.pktMs   = (uint32_t*)gp_alloc((size_t)LORA_MON_CAP * sizeof(uint32_t));
     r->mon.pktCap  = r->mon.pktMs ? LORA_MON_CAP : 0;
     r->mon.pktHead = r->mon.pktCount = 0;
 }
+#endif
 
 #endif  /* CONFIG_LORA0_CS_PIN */

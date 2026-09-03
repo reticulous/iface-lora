@@ -148,6 +148,13 @@ void publishChannels(LoraRadio* r);
 void publishState(LoraRadio* r, const char* state);
 void rssiSamplePoll(LoraRadio* r);
 bool loraMonOpen(void);          /* a LoRaMon viewer (web or LCD) is open */
-void loraMonInit(LoraRadio* r);
 void loraMonStart(void);
 bool loraMonParked(void);
+#if CONFIG_STRADDLE_LORAMON
+/* The expiry FIFO, allocated once per radio. Only the recorder fills it, so
+ * with no viewer straddle staged there is nothing to allocate and the call is
+ * a no-op rather than a #if at the config-apply site. */
+void loraMonInit(LoraRadio* r);
+#else
+inline void loraMonInit(LoraRadio*) {}
+#endif

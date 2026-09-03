@@ -265,9 +265,13 @@ static void handleRxDone(LoraRadio* r) {
     bool ours = false;
     if (pktLen == PWRREQ_LEN && frame[0] == LORA_MAGIC_PWRREQ) {
         /* A power request binds to the frame it prefixes by adjacency alone, so
-         * it is parked here and spent by the very next RNS frame either way. */
+         * it is parked here and spent by the very next RNS frame either way.
+         * Only while we speak SUPE: the frame is still ours to classify — that
+         * is what keeps it out of split framing and gives it its LoRaMon
+         * colour — but a node that has announced it does not speak the protocol
+         * transmits at tx_power and has nothing to park it for. */
         r->apRxSuggest     = (int8_t)frame[1];
-        r->apRxSuggestPend = (int8_t)frame[1] != PWRREQ_NO_TXP;
+        r->apRxSuggestPend = apEnabled(r) && (int8_t)frame[1] != PWRREQ_NO_TXP;
         ours = true;
     }
 

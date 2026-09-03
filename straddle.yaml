@@ -13,29 +13,25 @@ name: reticulous/iface-lora
 prefix: rns_lora
 version: 0.0.0
 firmware: esp-idf
-browser: browser
 platforms: [idf]
 requires:
   - reticulous/rns
+# The radio brings its viewer: LoRaMon, the per-on-air-frame graph, on the LCD
+# and in the browser. Soft, so a build can drop it with --without loramon and
+# keep the radio; when it is absent the whole per-frame publishing half of this
+# straddle compiles out with it (CONFIG_STRADDLE_LORAMON — see lora_mon.cpp).
+# The requires: back-edge from loramon onto this straddle is the benign
+# additional_installs cycle.
+additional_installs:
+  - reticulous/loramon
 # Boot-registered Service: LoraService::onInit() self-registers with rnsd via
 # ITS; `requires: reticulous/rns` puts rnsd ahead of it in dependency-topo
 # order, so its port surface is up first.
 services:
   - { class: LoraService, header: lora.h }
-  # LoRaMon LCD viewer: an LcdApp, so this entry installs its launcher tile and
-  # runs its boot wiring. when:-gated on spangap-lcd — the whole class lives under
-  # conditional/spangap-lcd/, so without the lcd straddle staged neither the
-  # trampoline nor the class compiles.
-  - { class: LoraMonApp, header: loramon_app.h, when: spangap/spangap-lcd }
   # Mono-OLED page: radio state, peers/links, last-frame RSSI/SNR. Lives under
   # conditional/tinylcd/, compiled only when tinylcd is staged.
   - { class: LoraTinyPage, header: lora_tiny.h, when: spangap/tinylcd }
-
-# Browser-side UI registration (parallel to init: above) — auto-wired into
-# the buildable SPA via straddles.gen.ts; no web-interface edit needed.
-browser_register:
-  - call: registerLora
-    module: modules/lora
 
 # Declarative settings: both surfaces + radio-0 storage defaults generated from
 # this block. Radio 0 only; radios 1.. are seeded by the loop in lora.cpp.

@@ -79,10 +79,14 @@ struct SupeCfg;
  * margin to maximum and hold it there. Measured margin outranks the fact of a
  * miss, exactly as a measurement outranks a model everywhere else here.
  *
- * **There is no setting.** This is part of SUPE's own operation, not a
- * switchable courtesy — the protocol states a power in every frame it sends
- * precisely so that both ends can do this, and a node that does not speak it is
- * already served by the NONE tier.
+ * **There is no setting of its own, and it follows SUPE's.** This is part of
+ * SUPE's operation, not a switchable courtesy — the protocol states a power in
+ * every frame it sends precisely so that both ends can do this, and a node that
+ * does not speak it is already served by the NONE tier. Which is also why
+ * `SUPE.enable=0` stops it dead (apEnabled): announcement ingest carries on
+ * across that switch, so the evidence keeps arriving, and a node still deriving
+ * from it would be speaking a protocol it has just announced it does not speak.
+ * Off means every frame goes out at the configured tx_power.
  *
  * Never on a broadcast: an announce has no single next hop and must reach
  * everyone, so it always goes out at the configured tx_power. */
@@ -151,6 +155,9 @@ struct SupeCfg;
                                   * chips clamp up from it */
 
 /* ─────────────── lora_power: adaptive transmit power ─────────────── */
+/* Is the controller running at all? It has no key of its own: it runs exactly
+ * while this node speaks SUPE, and follows that switch. */
+bool apEnabled(const LoraRadio* r);
 const uint8_t* apNextHop4(LoraRadio* r, const uint8_t* pkt, size_t len);
 int8_t apTxPower(LoraRadio* r, const uint8_t* pkt, size_t len);
 void   apApplyPower(LoraRadio* r, int8_t txp);

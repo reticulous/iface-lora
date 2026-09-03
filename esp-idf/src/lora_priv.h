@@ -440,9 +440,11 @@ struct LoraRadio {
     bool            supeNameSender;  /* s.lora.<i>.SUPE.sender_ident */
 #endif
 
-    /* Adaptive TX power (overview at AP_FRESH_MS, in lora_power.h). No switch:
-     * every power derived rests on one the PEER stated, which only a SUPE node
-     * ever does, so outside the protocol there is nothing to govern. */
+    /* Adaptive TX power (overview at AP_FRESH_MS, in lora_power.h). No switch
+     * of its own: every power derived rests on one the PEER stated, which only
+     * a SUPE node ever does, so outside the protocol there is nothing to
+     * govern — and it runs only while this node itself speaks SUPE, which is
+     * supeOn above. */
     /* A 0x04 power request just received, awaiting the frame it prefixes. The
      * frame carries no binding field — it binds by adjacency alone — so this is
      * consumed or discarded by the very next rx frame, never held. */

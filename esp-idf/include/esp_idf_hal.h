@@ -44,6 +44,12 @@ public:
     void init() override;
     void term() override;
 
+    /** Whether init() got a bus AND a device on it. RadioLib's `init()` cannot
+     *  report failure — it returns void — so ask afterwards: a radio driven
+     *  through a HAL that never came up talks to nothing, and the SPI driver's
+     *  own failure paths are not all survivable. */
+    bool ready() const { return _inited; }
+
     /* RadioLibHal — GPIO */
     void     pinMode(uint32_t pin, uint32_t mode) override;
     void     digitalWrite(uint32_t pin, uint32_t value) override;

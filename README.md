@@ -36,15 +36,17 @@ A node-side announce, an LXMF message, a NomadNet page fetch — anything `rnsd`
 routes — can leave over LoRa with no extra wiring. iface-lora has **no compile-
 time link to any consumer**; it only talks to `rnsd`.
 
-It also tells the network graph what a radio *is*: `netgraphContributeIface`
-registers the tail of this class's `if` line —
-`<MHz>|<SF>|<kHz>|<CR>`, plus `|s` where SUPE is on — so a node reading the
-community's graph can see the settings behind a LoRa link it will never hear
-itself. Fields only; netgraph composes the line and this straddle never sees a
-record. **Configuration only**: RSSI, negotiated budgets and counters move
-constantly, and a record that moved with them would keep every digest in the
-community permanently mismatched. See
-[rns/README](../rns/README.md#an-interface-contributes-its-own-fields).
+Where the optional [netgraph](../netgraph) straddle is in the build, it also
+tells the network graph what a radio *is*: `netgraphContributeIface` registers
+the tail of this class's `if` line — `<MHz>|<SF>|<kHz>|<CR>`, plus `|s` where
+SUPE is on — so a node reading the community's graph can see the settings behind
+a LoRa link it will never hear itself. Fields only; netgraph composes the line
+and this straddle never sees a record. **Configuration only**: RSSI, negotiated
+budgets and counters move constantly, and a record that moved with them would
+keep every digest in the community permanently mismatched. The whole
+contribution sits behind `CONFIG_STRADDLE_NETGRAPH` and compiles away without
+it. See
+[netgraph/README](../netgraph/README.md#an-interface-contributes-its-own-fields).
 
 iface-lora **starts automatically** when the straddle is in the build and at
 least one radio is configured (`CONFIG_LORA_COUNT > 0`). With
@@ -139,6 +141,12 @@ panel, and the LCD pane); runtime state and telemetry are published under
 defaults come from this straddle's `settings:` block; radios 1.. are seeded by
 `loraInit`.
 
+Four of the telemetry keys below — `packets.<ms>`, `peers.<slot>`, `rssi` and
+`air1h.{rx,tx}` — exist for the [loramon](../loramon) viewers and for nothing
+else. They are absent from a build made with `--without loramon`, not merely
+idle in one: the code that writes them is gated on `CONFIG_STRADDLE_LORAMON`.
+Each row says so.
+
 **Changes settle for ten seconds before they are applied.** Editing a radio is
 rarely one write — a frequency, a bandwidth and a spreading factor arrive
 seconds apart as you work down the pane — and between them the radio would be
@@ -201,12 +209,12 @@ SF/BW/CR/preamble are set; `lora.<n>.state` reads `unconfigured` until then.
 | `lora.<n>.bitrate_eff` | Effective bitrate registered with `rnsd`, bits/s (airtime-derived). |
 | `lora.<n>.stats.{tx_bytes,rx_bytes,tx_frames,rx_frames,crc_err,split_rx_timeout,tx_dropped,rssi_last,snr_last}` | Traffic counters (`tx_dropped` = frames shed by the LBT timeout) and last-RX RSSI/SNR. Published only when a UI can read them — see `uiTelemetryWanted()`. |
 | `lora.<n>.stats.{airtime_pct,cw_band}` | With `appc` on: percentage of the last ~15 s this radio spent transmitting, and the contention band (1–4) that percentage currently selects. Absent when `appc` is off. |
-| `lora.<n>.packets.<ms>` | LoRaMon: one node per on-air frame, keyed by start-ms — a packed string `r\|rssi\|snr\|dur\|bytes\|type\|ch\|desc\|cast[\|tag]` (rx) or `t\|txp\|dur\|bytes\|type\|wait\|ch\|own\|desc\|cast[\|tag]` (tx); `snr` is deci-dB, `type` is `0` Reticulum / `1` this straddle's own air protocol, SUPE (Spectrum Utilization and Performance Enhancements) / `2` traffic from an attached RNode client / `3` a frame whose CRC failed, `bytes` is payload bytes — everything but SUPE carries a 1-byte seq/split header on air and has it stripped, SUPE carries none and is recorded whole, in **both** directions — and the last two are what the frame waited before its first bit went on air, split because they are different facts: `wait` is what the **channel** cost (DIFS/backoff against somebody else's traffic) and `own` is what **we** cost ourselves (the radio held by an announce replay or a SUPE detour, a split still landing, or a deliberate pre-offer delay). Both are carried by the first frame of a burst only, and drawn in the viewers as a tick where the frame first wanted the air, then a mid-height run up to the bar — **dotted for ours, solid for contention**, in that order, so the pair reads left to right as the frame experienced it. Conflated, a busy channel and a busy radio look identical, and only one of them is somebody else's fault. `desc` names what the frame is — a code rather than a string, since there may be thousands of these and the name belongs in the viewer's table rather than on every record; `cast` is who it was aimed at (`0` broadcast, `1` unicast for us, `2` unicast for somebody else), which the device has to decide because a viewer cannot — it turns on which addresses mean US, and that lives in the peer table — and which is what both viewers colour by. `cast` and `tag` answer different questions and neither is derived from the other: a meeting frame is *with* the peer and *for* us, so resolving its tag against our own addresses would call our own traffic somebody else's. Broadcast is read off `desc`, a frame belonging to one of our meetings is ours by construction, and only what is left is looked up. Then `tag` is the three bytes naming the node it concerns, present only where there is one to take, and inside a SUPE meeting naming the **peer the meeting is with** rather than the address on the frame, so a whole train answers "who was this with" the same way. Together with `lora.<n>.peers.*` those are what let a bar on the graph say `HAVEDATA · 88B · tdeck` on hover — the tag itself appears only where it resolves to nobody, since once there is a name the hex is the part nobody reads — and what puts a peer's name in a pill beside a whole train once the view is zoomed wide enough to hold it. Written only while the LoRaMon app is open (`sys.stats.{web,lcd}_loramon`) and deleted past 1 h. See INTERNALS §12. |
-| `lora.<n>.peers.<slot>` | The neighbourhood, one node per peer-table slot: `"<num>\|<supe>\|<tags…>\|<names…>\|<loss>\|<rssi>\|<snr>\|<q>\|<heard_s>\|<flags>\|<budget>"`, a field left empty where it is not known. `num` is the number `lora n` prints beside the node, so a viewer with no name to show falls back to the same `#4` the console does. Tags are the three-byte prefixes that resolve an address to this node, comma-joined and deduplicated; names are the first word of each announced LXMF name on its destinations. Published rather than derived, because the clustering lives in the peer table and nothing outside this straddle can rebuild it — a viewer sees frames, not the announces and proofs that grouped them. Written only while a web reader says it is looking (`sys.stats.web_peers`) and deleted when a slot empties. Read by LoRaMon, which names the node behind a frame's tag; and there for graph views. On-device surfaces do not read it — they are in the same binary as the peer table and ask it directly (`loraNameForTag`), since serialising a fact so the same firmware can parse it back is a round trip for nothing. |
+| `lora.<n>.packets.<ms>` | LoRaMon: one node per on-air frame, keyed by start-ms — a packed string `r\|rssi\|snr\|dur\|bytes\|type\|ch\|desc\|cast[\|tag]` (rx) or `t\|txp\|dur\|bytes\|type\|wait\|ch\|own\|desc\|cast[\|tag]` (tx); `snr` is deci-dB, `type` is `0` Reticulum / `1` this straddle's own air protocol, SUPE (Spectrum Utilization and Performance Enhancements) / `2` traffic from an attached RNode client / `3` a frame whose CRC failed, `bytes` is payload bytes — everything but SUPE carries a 1-byte seq/split header on air and has it stripped, SUPE carries none and is recorded whole, in **both** directions — and the last two are what the frame waited before its first bit went on air, split because they are different facts: `wait` is what the **channel** cost (DIFS/backoff against somebody else's traffic) and `own` is what **we** cost ourselves (the radio held by an announce replay or a SUPE detour, a split still landing, or a deliberate pre-offer delay). Both are carried by the first frame of a burst only, and drawn in the viewers as a tick where the frame first wanted the air, then a mid-height run up to the bar — **dotted for ours, solid for contention**, in that order, so the pair reads left to right as the frame experienced it. Conflated, a busy channel and a busy radio look identical, and only one of them is somebody else's fault. `desc` names what the frame is — a code rather than a string, since there may be thousands of these and the name belongs in the viewer's table rather than on every record; `cast` is who it was aimed at (`0` broadcast, `1` unicast for us, `2` unicast for somebody else), which the device has to decide because a viewer cannot — it turns on which addresses mean US, and that lives in the peer table — and which is what both viewers colour by. `cast` and `tag` answer different questions and neither is derived from the other: a meeting frame is *with* the peer and *for* us, so resolving its tag against our own addresses would call our own traffic somebody else's. Broadcast is read off `desc`, a frame belonging to one of our meetings is ours by construction, and only what is left is looked up. Then `tag` is the three bytes naming the node it concerns, present only where there is one to take, and inside a SUPE meeting naming the **peer the meeting is with** rather than the address on the frame, so a whole train answers "who was this with" the same way. Together with `lora.<n>.peers.*` those are what let a bar on the graph say `HAVEDATA · 88B · tdeck` on hover — the tag itself appears only where it resolves to nobody, since once there is a name the hex is the part nobody reads — and what puts a peer's name in a pill beside a whole train once the view is zoomed wide enough to hold it. Written only with [loramon](../loramon) staged, and then only while one of its apps is open (`sys.stats.{web,lcd}_loramon`); deleted past 1 h. See INTERNALS §12. |
+| `lora.<n>.peers.<slot>` | The neighbourhood, one node per peer-table slot: `"<num>\|<supe>\|<tags…>\|<names…>\|<loss>\|<rssi>\|<snr>\|<q>\|<heard_s>\|<flags>\|<budget>"`, a field left empty where it is not known. `num` is the number `lora n` prints beside the node, so a viewer with no name to show falls back to the same `#4` the console does. Tags are the three-byte prefixes that resolve an address to this node, comma-joined and deduplicated; names are the first word of each announced LXMF name on its destinations. Published rather than derived, because the clustering lives in the peer table and nothing outside this straddle can rebuild it — a viewer sees frames, not the announces and proofs that grouped them. Written only with [loramon](../loramon) staged, and then only while a web reader says it is looking (`sys.stats.web_peers`); deleted when a slot empties. Read by LoRaMon, which names the node behind a frame's tag; and there for graph views. On-device surfaces do not read it — they are in the same binary as the peer table and ask it directly (`loraNameForTag`), since serialising a fact so the same firmware can parse it back is a round trip for nothing. |
 | `rns.pill.lora.*` | The top status line's LoRa pill (yellow `ffd400`, order 4, titled "LoRa"), written through rnsd: `L` and the number of other nodes heard, summed over every slot — a board with two radios still has one LoRa neighbourhood. Published while any slot is enabled, at 0 as readily as at 3, and taken down by the switch rather than by the beat (turning the last radio off parks the interface task). The colour and the title are published from boot regardless, because the network graph draws LoRa links between other nodes on a board whose own radio is off. See [rns/README](../rns/README.md#status-line-pills). |
 | `lora.<n>.chans` | The channel list the regime puts in force: `<freqHz>,<bwHz>` per channel, `\|`-separated, index = channel, `0` = the configured (hailing) frequency. A single entry means no agility, which is how a viewer knows not to draw the extra graphs. Rewritten on a config apply. |
-| `lora.<n>.rssi` | The newest channel-RSSI sample set: `<ms>\|<ch0 dBm>\|<ch1 dBm>\|…`, one field per channel in `chans`, taken once a second **while a LoRaMon app is open** — with no viewer the radio is not sampled at all, so an idle node holds no per-second wake for it. The timestamp is in the value so a viewer can tell a fresh reading from a repeat; a channel that could not be measured this beat is an **empty field**, and a beat skipped entirely (the radio was busy, or the configured channel was not quiet enough to leave) republishes nothing at all — both read as gaps. Live only: no history is kept on the device. See INTERNALS §18.3. |
-| `lora.<n>.air1h.{rx,tx}` | Rolling one-hour airtime, **per mille**, per direction. The only airtime figure the device aggregates — viewers compute shorter windows from the frame records themselves. Updated at 1 Hz while a LoRaMon app is open; the underlying rollup runs regardless. |
+| `lora.<n>.rssi` | The newest channel-RSSI sample set: `<ms>\|<ch0 dBm>\|<ch1 dBm>\|…`, one field per channel in `chans`, taken once a second **while a LoRaMon app is open** — with no viewer the radio is not sampled at all, so an idle node holds no per-second wake for it. The timestamp is in the value so a viewer can tell a fresh reading from a repeat; a channel that could not be measured this beat is an **empty field**, and a beat skipped entirely (the radio was busy, or the configured channel was not quiet enough to leave) republishes nothing at all — both read as gaps. Live only: no history is kept on the device. Absent, along with the sampling beat itself, without [loramon](../loramon) staged. See INTERNALS §18.3. |
+| `lora.<n>.air1h.{rx,tx}` | Rolling one-hour airtime, **per mille**, per direction. The only airtime figure the device aggregates — viewers compute shorter windows from the frame records themselves. Updated at 1 Hz while a LoRaMon app is open; the underlying rollup runs whether or not one is, because the hour it covers is longer than a viewer is typically up. Both go with [loramon](../loramon) when it is not staged — nothing else reads the rollup. |
 
 ### Secrets
 
@@ -360,7 +368,9 @@ Two levels, and the split is deliberate:
 
 So **a quiet `log lora debug` does not mean nothing is transmitting** — it means
 nothing is deciding. Use verbose, or `lora <n>` (whose `tx_frames`/`tx_bytes`
-counters are independent of logging), or open LoRaMon.
+counters are independent of logging), or open [LoRaMon](../loramon). The
+per-frame verbose line is the one part of the recorder that survives a
+`--without loramon` build — a frame log stands on its own.
 
 Note also that an application asking to announce produces **no RF of its own**.
 `RNSD_DEST_ANNOUNCE` sets that destination's stored announce with `rnsd`; the
@@ -528,27 +538,31 @@ Details, and the protocol reasoning behind them, are in
 
 ## Browser
 
-The LoRa Settings panel (`browser/panels/LoraPanel.vue`, registered by
-`modules/lora.ts`) edits radio 0 — band, bandwidth, SF, coding rate, TX power,
-preamble, sync word, mode, the IFAC pair — and shows live state, chip, bitrate,
-last RSSI/SNR, and frame counts. The on-device LoRa pane is generated from this
-straddle's `settings:` block. The **RNode endpoint** — which transports a client
+The LoRa Settings panel edits radio 0 — band, bandwidth, SF, coding rate, TX
+power, preamble, sync word, mode, the IFAC pair — and shows live state, chip,
+bitrate, last RSSI/SNR, and frame counts. Both it and the on-device LoRa pane
+are generated from this straddle's `settings:` block; there is no hand-written
+panel component. The **RNode endpoint** — which transports a client
 may attach over — is its own menu under Reticulum Mesh rather than a section of
 the radio pane: it is a way in to the radio, not a setting of it, and rnode-ble
 contributes its Bluetooth switch and settings there.
 
-**LoRaMon** (`browser/panels/LoraMonWindow.vue`, and the same app on the device
-LCD) is a launcher app rather than a settings pane: one graph per radio showing
-every frame that went over the air, placed by transmit power or received signal
-on a dBm axis and coloured by protocol, over a window from ten seconds to an
-hour. Drag across the plot to zoom into a span; the back pill leaves it again.
-Recording only runs while one of the two apps is open, and the graph starts
-empty — see [INTERNALS §12](INTERNALS.md).
+This straddle has no browser half of its own: the settings pane is generated,
+and **LoRaMon** — the per-on-air-frame graph, in the browser and on the device
+LCD — is its own straddle, [loramon](../loramon).
 
 ## Dependencies
 
 - [rns](../rns) — `rnsd` must be ahead of iface-lora in init order so
   `RNSD_PORT_IFACE` is open when a radio registers (`requires:` enforces it).
+- [loramon](../loramon) — the LoRaMon viewers, staged by default
+  (`additional_installs:`) and droppable with `--without loramon`. It is the
+  only reader of the per-frame recorder here, so dropping it compiles the whole
+  recording half out (`CONFIG_STRADDLE_LORAMON`): no per-frame nodes, no
+  neighbourhood rows, no channel-RSSI series, no rolling hour, no 1 Hz sample
+  beat, and no 16 KB-per-radio expiry FIFO. The radio is otherwise unchanged,
+  and the stats, pill, channel-list and state keys stay — the settings pane and
+  the status bar read those.
 - No `spangap-net` dependency — LoRa is bare-radio, no IP stack.
 
 ## What it does NOT own

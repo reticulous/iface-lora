@@ -21,6 +21,7 @@
 #include "spi_helper.h"  /* spiHelperInitBus — spangap-core shared SPI bus owner */
 
 #include "esp_timer.h"
+#include "esp_memory_utils.h"   /* esp_ptr_dma_capable — is this buffer DMA-able? */
 #include "freertos/task.h"
 #include "hal/gpio_ll.h"   /* gpio_ll_intr_disable — IRAM-inline, safe with cache off */
 
@@ -53,7 +54,14 @@ void EspIdfHal::init()
     bus.quadhd_io_num = -1;
     bus.max_transfer_sz = 0;
     esp_err_t r = spiHelperInitBus(_host, &bus);
-    if (r != ESP_OK) return;
+    if (r != ESP_OK) {
+        /* Out of memory is the usual reason, and it is not this radio's fault:
+         * the bus wants DMA descriptors from the internal heap, and whoever
+         * comes up last finds whatever WiFi and BLE left. Leave _inited false —
+         * the caller checks ready() and shelves the radio rather than driving a
+         * bus that isn't there. */
+        return;
+    }
 
     spi_device_interface_config_t dev = {};
     dev.clock_speed_hz = _sxClockHz;
@@ -218,21 +226,59 @@ void EspIdfHal::spiBeginTransaction()
     if (_spiDev) spi_device_acquire_bus(_spiDev, portMAX_DELAY);
 }
 
+/* ---- the DMA bounce, and why a radio needs one ----
+ *
+ * RadioLib's buffers are wherever RadioLib lives, which on a PSRAM part is
+ * PSRAM — and PSRAM is not DMA-capable memory as far as the SPI driver is
+ * concerned. Handed one, the driver quietly allocates an internal DMA buffer
+ * FOR EVERY TRANSFER, copies into it, transfers, and frees it again: an
+ * allocation in the scarcest heap on the chip, at the rate a radio talks to its
+ * modem. It survives right up until the moment that heap is tight — WiFi coming
+ * up, say — and then it does not fail cleanly: the driver's ISR-safe path
+ * returns ESP_ERR_NO_MEM to a caller that does not check it and memcpys from
+ * the NULL it was handed. LoadProhibited, EXCVADDR 0, inside memcpy, eleven
+ * seconds into a boot, blamed on whatever else happened to be new.
+ *
+ * So we own the bounce instead of renting it per transfer: one buffer each way,
+ * internal, DMA-capable, cache-line aligned, allocated once and never again,
+ * sized for the longest thing RadioLib sends (a full 255-byte packet plus its
+ * command bytes). A pointer that is ALREADY DMA-capable skips the copy
+ * entirely, so a caller that hands us good memory pays nothing.
+ *
+ * Serialization is RadioLib's: every transfer sits inside its
+ * spiBeginTransaction/spiEndTransaction pair, which takes the shared-bus lock,
+ * so two radios cannot be inside this at once. */
+static constexpr size_t kBounceLen = 288;
+alignas(64) static DRAM_ATTR uint8_t s_bounceTx[kBounceLen];
+alignas(64) static DRAM_ATTR uint8_t s_bounceRx[kBounceLen];
+
 void EspIdfHal::spiTransfer(uint8_t* out, size_t len, uint8_t* in)
 {
     if (!_spiDev || len == 0) {
         if (in && len) std::memset(in, 0, len);
         return;
     }
+    const uint8_t* tx = out;
+    uint8_t*       rx = in;
+    const bool bounce = len <= kBounceLen &&
+                        ((out && !esp_ptr_dma_capable(out)) ||
+                         (in  && !esp_ptr_dma_capable(in)));
+    if (bounce) {
+        if (out) { std::memcpy(s_bounceTx, out, len); tx = s_bounceTx; }
+        if (in)  { rx = s_bounceRx; }
+    }
+
     spi_transaction_t t = {};
     t.length    = len * 8;
-    t.tx_buffer = out;
-    t.rx_buffer = in;
+    t.tx_buffer = tx;
+    t.rx_buffer = rx;
     esp_err_t r = spi_device_polling_transmit(_spiDev, &t);
     if (r != ESP_OK) {
         warn("spi xfer (%u B) failed: %s", (unsigned)len, esp_err_to_name(r));
         if (in) std::memset(in, 0, len);
+        return;
     }
+    if (in && rx == s_bounceRx) std::memcpy(in, s_bounceRx, len);
 }
 
 void EspIdfHal::spiEndTransaction()
