@@ -86,8 +86,8 @@ static void testTypeBytes(void) {
     ok(supeIsFramingByte(0xC0) && supeIsFramingByte(0xC1), "0xC0/0xC1 are framing bytes");
     ok(supeIsFramingByte(0xD0) && supeIsFramingByte(0xD1), "0xD0/0xD1 are framing bytes");
     ok(!supeIsTypeByte(0xC0) && !supeIsTypeByte(0xD1), "framing bytes are not type bytes");
-    ok(supeIsTypeByte(SUPE_T_PRIVSYNC) && supeIsTypeByte(SUPE_T_ANNOUNCE2) &&
-       supeIsTypeByte(SUPE_T_HAVEDATA) && supeIsTypeByte(SUPE_T_GIMME) &&
+    ok(supeIsTypeByte(SUPE_T_HAIL) && supeIsTypeByte(SUPE_T_ANNOUNCE) &&
+       supeIsTypeByte(SUPE_T_HAVE) && supeIsTypeByte(SUPE_T_GIMME) &&
        supeIsTypeByte(SUPE_T_THATSIT) && supeIsTypeByte(SUPE_T_BYE) &&
        supeIsTypeByte(SUPE_T_RESEND),
        "every assigned type is a type byte");
@@ -97,12 +97,12 @@ static void testTypeBytes(void) {
             ok((b & 0x0F) > 1, "no type byte is reachable by the framing");
     /* Values assigned densely from 0xC2; nothing is held out beyond what the
      * framing rule excludes. */
-    eqi(SUPE_T_PRIVSYNC, 0xC2, "PRIVSYNC is 0xC2");
+    eqi(SUPE_T_HAIL, 0xC2, "HAIL is 0xC2");
     eqi(SUPE_T_RESEND, 0xC8, "RESEND is 0xC8, the last assigned value");
 }
 
-static void testAnn2Codec(void) {
-    SupeAnn2 a = {};
+static void testAnnCodec(void) {
+    SupeAnn a = {};
     a.regime = SUPE_REGIME_SINGLE;
     a.version = 0;
     a.caps.fam = SUPE_FAM_SX126X;
@@ -114,116 +114,91 @@ static void testAnn2Codec(void) {
     memcpy(a.ids, ids, sizeof ids);
 
     uint8_t f[SUPE_MAX_FRAME];
-    size_t n = supeEncAnn2(f, sizeof f, &a);
-    eqi((long)n, SUPE_ANN2_BASE + 2 * SUPE_ID_LEN, "two identities encode to 13 bytes");
-    eqi(f[0], SUPE_T_ANNOUNCE2, "the type byte is 0xC3");
-    golden("announce2.regime0.2ids", f, n);
+    size_t n = supeEncAnn(f, sizeof f, &a);
+    eqi((long)n, SUPE_ANN_BASE + 2 * SUPE_ID_LEN, "two identities encode to 13 bytes");
+    eqi(f[0], SUPE_T_ANNOUNCE, "the type byte is 0xC3");
+    golden("announce.regime0.2ids", f, n);
 
-    SupeAnn2 d = {};
-    ok(supeDecAnn2(f, n, &d), "the announcement decodes");
+    SupeAnn d = {};
+    ok(supeDecAnn(f, n, &d), "the announcement decodes");
     eqi(d.count, 2, "both identities survive");
     ok(memcmp(d.ids[0], ids[0], 4) == 0 && memcmp(d.ids[1], ids[1], 4) == 0,
        "byte for byte");
     eqi(d.caps.maxPwrDbm, 22, "maximum power round-trips");
     eqi(d.pwrDbm, 14, "the frame's own power round-trips");
-    ok(!supeDecAnn2(f, n - 1, &d), "a truncated announcement is discarded");
-    ok(!supeDecAnn2(f, n + 1, &d), "a padded one too");
+    ok(!supeDecAnn(f, n - 1, &d), "a truncated announcement is discarded");
+    ok(!supeDecAnn(f, n + 1, &d), "a padded one too");
 
     a.count = 1;
-    n = supeEncAnn2(f, sizeof f, &a);
-    golden("announce2.regime0.1id", f, n);
+    n = supeEncAnn(f, sizeof f, &a);
+    golden("announce.regime0.1id", f, n);
 
     /* "I do not speak SUPE" — the one announcement that is not about a dialect.
      * It must decode without being checked against a regime table it is not
-     * claiming membership of, and it must still carry the identities, because a
-     * neighbour dropping its SUPE bit for this node still wants to know which
-     * node that is. */
+     * claiming membership of, and it must still carry the identities. */
     a.regime = SUPE_REGIME_NONE;
     a.version = 0;
-    n = supeEncAnn2(f, sizeof f, &a);
+    n = supeEncAnn(f, sizeof f, &a);
     ok(n > 0, "the renunciation encodes");
     eqi((long)(f[1] >> 4), SUPE_REGIME_NONE, "the regime nibble carries it");
-    golden("announce2.notspeaking.1id", f, n);
-    ok(supeDecAnn2(f, n, &d), "…and decodes without a regime table entry");
+    golden("announce.notspeaking.1id", f, n);
+    ok(supeDecAnn(f, n, &d), "…and decodes without a regime table entry");
     eqi(d.regime, SUPE_REGIME_NONE, "…as the renunciation");
     eqi(d.count, 1, "…still naming the node");
     ok(memcmp(d.ids[0], ids[0], 4) == 0, "…by its identity");
-    /* A version nibble means nothing here, so it may not be a reason to drop
-     * the frame: a node that has stopped speaking has no dialect to agree on. */
     f[1] = (uint8_t)((SUPE_REGIME_NONE << 4) | 0x0D);
-    ok(supeDecAnn2(f, n, &d), "any version decodes — there is no dialect to match");
-    /* An unknown REAL regime is still refused: that one IS a dialect claim. */
+    ok(supeDecAnn(f, n, &d), "any version decodes — there is no dialect to match");
     f[1] = 0x9F;
-    ok(!supeDecAnn2(f, n, &d), "an unknown regime is still discarded");
+    ok(!supeDecAnn(f, n, &d), "an unknown regime is still discarded");
 }
 
-static void testPrivsyncCodec(void) {
-    SupePrivsync p = {};
-    p.regime = SUPE_REGIME_EU863;
-    p.version = 0;
+static void testHailCodec(void) {
+    SupeHail h = {};
+    h.regime = SUPE_REGIME_EU863;
+    h.version = 0;
     uint8_t tag[3] = { 0xd1, 0x0d, 0x51 };
-    memcpy(p.tag, tag, 3);
-    p.pwrDbm = -9;
-    uint8_t f[SUPE_PRIVSYNC_ID_LEN];
-    size_t n = supeEncPrivsync(f, sizeof f, &p);
-    eqi((long)n, SUPE_PRIVSYNC_LEN, "the anonymous form is seven bytes");
-    eqi(f[0], SUPE_T_PRIVSYNC, "the type byte is 0xC2");
-    golden("privsync.regime1.anon", f, n);
-    SupePrivsync d = {};
-    ok(supeDecPrivsync(f, n, &d), "it decodes");
+    memcpy(h.tag, tag, 3);
+    h.pwrDbm = -9;
+    h.salt = 0x5a;
+    h.budgetCeil = 8;
+    h.count = 3;
+    h.lenByte = supeEncLen(450);
+    uint8_t f[SUPE_HAIL_ID_LEN];
+    size_t n = supeEncHail(f, sizeof f, &h);
+    eqi((long)n, SUPE_HAIL_LEN, "the anonymous form is ten bytes");
+    eqi(f[0], SUPE_T_HAIL, "the type byte is 0xC2");
+    golden("hail.regime1.anon", f, n);
+    SupeHail d = {};
+    ok(supeDecHail(f, n, &d), "it decodes");
     ok(!d.haveIdent, "…as anonymous");
-    eqi(d.pwrDbm, -9, "the stated power round-trips — the seed is a measurement");
+    eqi(d.pwrDbm, -9, "the stated power round-trips — the hail is a measurement");
     ok(memcmp(d.tag, tag, 3) == 0, "the tag round-trips");
-    eqi(d.salt, p.salt, "the salt round-trips — every seed is unique");
+    eqi(d.salt, 0x5a, "the salt round-trips — every seed is unique");
+    eqi(d.budgetCeil, 8, "the proposed ceiling rides");
+    eqi(d.count, 3, "the train's count rides");
+    eqi(d.lenByte, supeEncLen(450), "…and its length at the ceiling");
 
-    p.haveIdent = true;
+    h.haveIdent = true;
     uint8_t id[3] = { 0xa1, 0xa2, 0xa3 };
-    memcpy(p.ident, id, 3);
-    n = supeEncPrivsync(f, sizeof f, &p);
-    eqi((long)n, SUPE_PRIVSYNC_ID_LEN, "the named form is ten bytes");
-    golden("privsync.regime1.ident", f, n);
-    ok(supeDecPrivsync(f, n, &d) && d.haveIdent && memcmp(d.ident, id, 3) == 0,
+    memcpy(h.ident, id, 3);
+    n = supeEncHail(f, sizeof f, &h);
+    eqi((long)n, SUPE_HAIL_ID_LEN, "the named form is thirteen bytes");
+    golden("hail.regime1.ident", f, n);
+    ok(supeDecHail(f, n, &d) && d.haveIdent && memcmp(d.ident, id, 3) == 0,
        "the sender identity rides the frame length");
-    ok(!supeDecPrivsync(f, 8, &d), "a length outside the enumerated set is discarded");
+    ok(!supeDecHail(f, 11, &d), "a length outside the enumerated set is discarded");
     f[1] = 0x9F;                       /* regime 9: not one this build holds */
-    ok(!supeDecPrivsync(f, n, &d), "an unknown regime is discarded");
-}
+    ok(!supeDecHail(f, n, &d), "an unknown regime is discarded");
 
-static void testHaveDataCodec(void) {
-    SupeHaveData h = {};
-    uint8_t hash[3] = { 0xde, 0xad, 0x01 };
-    memcpy(h.hash, hash, 3);
-    h.pwrDbm = 2;
-    h.budget = 8;
-    h.count = 5;
-    h.lenByte = supeEncLen(200);
-    uint8_t f[SUPE_HAVEDATA_ANS_BASE + SUPE_MASK_MAX];
-    size_t n = supeEncHaveData(f, sizeof f, &h);
-    eqi((long)n, SUPE_HAVEDATA_LEN, "the opening form is eight bytes");
-    golden("havedata.open.5frames", f, n);
-    SupeHaveData d = {};
-    ok(supeDecHaveData(f, n, 0, &d), "it decodes with no peer train in hand");
-    ok(!d.answering, "…as the opening form");
-    eqi(d.budget, 8, "the proposed ceiling rides");
-    eqi(d.count, 5, "the count rides");
-    eqi(d.pwrDbm, 2, "the meeting power rides");
-
-    /* The answering form: its length is enumerable only from the peer train's
-     * count, which both sides hold. */
-    h.answering = true;
-    h.trainRssi = -88;
-    h.trainSnrQ = supeEncSnrQ(45);
-    h.maskLen = supeMaskLen(7);
-    h.mask[0] = 0x22;                  /* frames 1 and 5 of theirs are missing */
-    n = supeEncHaveData(f, sizeof f, &h);
-    eqi((long)n, SUPE_HAVEDATA_ANS_BASE + 1, "answering: 10 bytes + one mask byte");
-    golden("havedata.answer.mask22", f, n);
-    ok(supeDecHaveData(f, n, 7, &d) && d.answering, "it decodes against count 7");
-    eqi(d.trainRssi, -88, "the train's worst reading rides");
-    eqi(d.mask[0], 0x22, "the repair request rides");
-    ok(!supeDecHaveData(f, n, 0, &d),
-       "the answering form is not decodable without the peer count");
-    ok(!supeDecHaveData(f, n, 12, &d), "…or against the wrong one");
+    /* A hail-back: a count of zero, and nothing else about it is special. */
+    h.regime = SUPE_REGIME_SINGLE;
+    h.count = 0;
+    h.lenByte = 0;
+    n = supeEncHail(f, sizeof f, &h);
+    golden("hail.regime0.hailback", f, n);
+    ok(supeDecHail(f, n, &d) && d.count == 0, "a hail-back decodes with a count of zero");
+    h.count = SUPE_TRAIN_MAX + 1;
+    ok(supeEncHail(f, sizeof f, &h) == 0, "a count past the train cap refuses");
 }
 
 static void testGimmeCodec(void) {
@@ -232,28 +207,61 @@ static void testGimmeCodec(void) {
     memcpy(g.hash, hash, 3);
     g.pwrDbm = 0;
     g.budget = 6;
-    g.havePsHeard = true;
-    g.psRssi = -95;
-    g.psSnrQ = supeEncSnrQ(60);
-    g.hdRssi = -70;
-    g.hdSnrQ = supeEncSnrQ(90);
+    g.countCeil = 12;
+    g.heardRssi = -95;
+    g.heardSnrQ = supeEncSnrQ(60);
     uint8_t f[SUPE_GIMME_LEN];
     size_t n = supeEncGimme(f, sizeof f, &g);
-    eqi((long)n, SUPE_GIMME_LEN, "the narrow form is ten bytes");
-    golden("gimme.narrow.budget6", f, n);
+    eqi((long)n, SUPE_GIMME_LEN, "GIMME is nine bytes, always");
+    golden("gimme.budget6", f, n);
     SupeGimme d = {};
-    ok(supeDecGimme(f, n, &d) && d.havePsHeard, "it decodes as the narrow form");
-    eqi(d.psRssi, -95, "the PRIVSYNC reading rides — the headroom the budget ran on");
-    eqi(d.hdRssi, -70, "the HAVEDATA reading rides — the freshest pair there is");
+    ok(supeDecGimme(f, n, &d), "it decodes");
+    eqi(d.heardRssi, -95, "the reading of the frame it answers rides");
     eqi(d.budget, 6, "the confirmed budget rides");
+    eqi(d.countCeil, 12, "the count ceiling rides — a RAM promise");
+    ok(!supeDecGimme(f, 8, &d), "a length outside the enumerated set is discarded");
+    ok(!supeDecGimme(f, 10, &d), "…either way");
+}
 
-    g.havePsHeard = false;
-    n = supeEncGimme(f, sizeof f, &g);
-    eqi((long)n, SUPE_GIMME_WIDE_LEN, "the wide form is eight bytes");
-    golden("gimme.wide.budget6", f, n);
-    ok(supeDecGimme(f, n, &d) && !d.havePsHeard,
-       "a wide schedule was seeded by a goodbye — no PRIVSYNC to report");
-    ok(!supeDecGimme(f, 9, &d), "a length outside the enumerated set is discarded");
+static void testHaveCodec(void) {
+    SupeHave h = {};
+    uint8_t hash[3] = { 0xde, 0xad, 0x01 };
+    memcpy(h.g.hash, hash, 3);
+    h.g.pwrDbm = 2;
+    h.g.budget = 8;
+    h.g.countCeil = 12;
+    h.g.heardRssi = -70;
+    h.g.heardSnrQ = supeEncSnrQ(90);
+    h.count = 5;
+    h.lenByte = supeEncLen(200);
+    uint8_t f[SUPE_HAVE_ANS_BASE + SUPE_MASK_MAX];
+    size_t n = supeEncHave(f, sizeof f, &h);
+    eqi((long)n, SUPE_HAVE_LEN, "the opening form is eleven bytes — GIMME with a train behind it");
+    golden("have.open.5frames", f, n);
+    SupeHave d = {};
+    ok(supeDecHave(f, n, 0, &d), "it decodes with no peer train in hand");
+    ok(!d.answering, "…as the opening form");
+    eqi(d.g.budget, 8, "the proposed ceiling rides");
+    eqi(d.count, 5, "the count rides");
+    eqi(d.g.pwrDbm, 2, "the meeting power rides");
+    eqi(d.g.heardRssi, -70, "the reading rides — GIMME's fields are HAVE's first nine");
+
+    /* The answering form: its length is enumerable only from the peer train's
+     * count, which both sides hold. */
+    h.answering = true;
+    h.g.heardRssi = -88;
+    h.g.heardSnrQ = supeEncSnrQ(45);
+    h.maskLen = supeMaskLen(7);
+    h.mask[0] = 0x22;                  /* frames 1 and 5 of theirs are missing */
+    n = supeEncHave(f, sizeof f, &h);
+    eqi((long)n, SUPE_HAVE_ANS_BASE + 1, "answering: 11 bytes + one mask byte");
+    golden("have.answer.mask22", f, n);
+    ok(supeDecHave(f, n, 7, &d) && d.answering, "it decodes against count 7");
+    eqi(d.g.heardRssi, -88, "the train's worst reading rides");
+    eqi(d.mask[0], 0x22, "the repair request rides");
+    ok(!supeDecHave(f, n, 0, &d),
+       "the answering form is not decodable without the peer count");
+    ok(!supeDecHave(f, n, 12, &d), "…or against the wrong one");
 }
 
 static void testThatsitCodec(void) {
@@ -357,16 +365,27 @@ static void testSchedule(void) {
     SupeSchedD s;
     supeDeriveSchedule(d0, d1, /*wide=*/false, /*nChans=*/9, &s);
     ok(memcmp(s.hash3, d0, 3) == 0, "the wire id is D0's first three bytes");
-    ok(s.nSlots >= 6, "a narrow schedule holds several slots");
+    eqi(s.nSlots, 2, "a narrow schedule holds exactly two slots");
     eqi(s.slot[0].tMs, SUPE_NARROW_T0_MS,
-        "the first narrow slot is one turnaround + retune after the epoch");
+        "the first narrow slot is one seed gap after the epoch");
     for (int k = 0; k < s.nSlots; k++) {
         ok(s.slot[k].tMs <= SUPE_NARROW_HORIZON_MS, "slots stay inside the horizon");
         ok(s.slot[k].chan >= 1 && s.slot[k].chan <= 9, "channels come from the raster");
         if (k) {
             int gap = s.slot[k].tMs - s.slot[k - 1].tMs;
-            ok(gap >= 40 && gap <= 63, "narrow spacing is 40 + (j mod 24)");
+            ok(gap >= 100 && gap <= 123, "narrow spacing is 100 + (j mod 24)");
+            ok(s.slot[k].chan != s.slot[0].chan, "the second slot is never on the first's channel");
         }
+    }
+    /* Every seed, not just this one: the second channel differs. */
+    for (int seed = 0; seed < 64; seed++) {
+        uint8_t x0[32], x1[32];
+        fillDigest(x0, (uint8_t)(seed * 5 + 1));
+        fillDigest(x1, (uint8_t)(seed * 11 + 3));
+        SupeSchedD t;
+        supeDeriveSchedule(x0, x1, false, 9, &t);
+        ok(t.nSlots == 2 && t.slot[1].chan != t.slot[0].chan,
+           "two slots on two channels, for every seed");
     }
 
     SupeSchedD w;
@@ -380,11 +399,17 @@ static void testSchedule(void) {
         ok(w.slot[k].tMs <= SUPE_WIDE_HORIZON_MS, "…inside the 3 s horizon");
     }
 
-    /* Regime 0: no channel raster, every slot on the hailing frequency. */
+    /* No channel raster: the derivation still runs (the vectors cover it),
+     * every slot on channel 0 — regime 0 itself derives no schedule (§7). */
     SupeSchedD r0;
     supeDeriveSchedule(d0, d1, false, 0, &r0);
     for (int k = 0; k < r0.nSlots; k++)
-        eqi(r0.slot[k].chan, SUPE_CH_HAIL, "regime 0 slots stay on channel 0");
+        eqi(r0.slot[k].chan, SUPE_CH_HAIL, "with no raster, slots stay on channel 0");
+    ok(!supeRegimeHasPlan(SUPE_REGIME_SINGLE) && supeRegimeHasPlan(SUPE_REGIME_EU863),
+       "regime 0 has no plan, regime 1 has one");
+    eqi(supeListenSfLow(SUPE_FAM_LR2021, 7), 5, "family 4 listens down to SF5 from SF7");
+    eqi(supeListenSfLow(SUPE_FAM_LR2021, 9), 6, "…and to SF6 from SF9: four detectors");
+    eqi(supeListenSfLow(SUPE_FAM_SX126X, 7), 7, "every other family listens at the hailing SF");
 
     /* Determinism: the same digests derive the same schedule, byte for byte. */
     SupeSchedD again;
@@ -404,7 +429,7 @@ static void testExpiry(void) {
     ok(built > 1750000000u, "the build timestamp is plausible");
     /* 2026-09-10T00:00:00Z. Stated as the number so the test fails when the
      * date moves without the test being looked at. */
-    eqi((long)expires, 1788998400L, "the expiry is the stated calendar date");
+    eqi((long)expires, 1791590400L, "the expiry is the stated calendar date");
     ok(expires > built, "this build was made before its own expiry");
     ok(!supeExpired(built), "a fresh build is not expired");
     ok(!supeExpired(expires - 86400), "the day before, it is still current");
@@ -630,10 +655,10 @@ int main(int argc, char** argv) {
     testQuantisation();
     testLevels();
     testTypeBytes();
-    testAnn2Codec();
-    testPrivsyncCodec();
-    testHaveDataCodec();
+    testAnnCodec();
+    testHailCodec();
     testGimmeCodec();
+    testHaveCodec();
     testThatsitCodec();
     testByeResendCodec();
     testCrc8();

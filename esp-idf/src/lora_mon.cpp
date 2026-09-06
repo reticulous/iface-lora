@@ -21,6 +21,7 @@
 #include "lora_priv.h"
 
 #include <cstdarg>
+#include <ctime>
 #include <string>
 
 #if defined(CONFIG_LORA0_CS_PIN)
@@ -226,6 +227,107 @@ static void publishPeers(LoraRadio* r) {
     }
 }
 #endif  /* CONFIG_STRADDLE_LORAMON — the neighbourhood publisher */
+
+/* SUPE's per-peer measurements, one record per peer-table slot, every
+ * LORA_MEAS_MS while the table holds anyone — for a reader outside this binary
+ * that holds a destination hash and wants to know the link to it: lxmf's Ping
+ * and its contact bars, the web contact list. The measurement is a path loss
+ * (§15.1): a level read here against the power the other side stated for it,
+ * in each direction one exists for. `loss_from` is them→us, the fresher of the
+ * hailing pair and the step pair; `loss_to` is us→them, the peer's own account
+ * of how our frame landed. A field is absent when it is not known — only a
+ * SUPE peer states a power — and a slot that empties is deleted. A reader
+ * resolves a peer by the first six hex characters of its destination hash in
+ * `tags`.
+ *
+ *   lora.<n>.meas.<slot>.tags       6-hex prefixes the node answers to
+ *   lora.<n>.meas.<slot>.name       announced first-word names
+ *   lora.<n>.meas.<slot>.loss_to    dB, us→them          .to_ts    unix s of that reading
+ *   lora.<n>.meas.<slot>.loss_from  dB, them→us          .from_ts  unix s of that reading
+ *   lora.<n>.meas.<slot>.rssi       dBm, strongest heard .snr      dB×10, best heard
+ *   lora.<n>.meas.<slot>.peer_txp   dBm the peer stated  .txp      dBm we last sent to it at
+ *   lora.<n>.meas.<slot>.heard_ts   unix s last heard
+ *
+ * Separate fields rather than a packed string: the readers are other firmware
+ * tasks and the browser, each after one or two of them, and storage deduplicates
+ * an unchanged value, so a beat that measured nothing new costs the storage
+ * actor almost nothing. Timestamps rather than ages for the same reason — an
+ * age changes on every beat, a timestamp only when something was heard. */
+static void publishMeas(LoraRadio* r) {
+    if (!r->nei) return;
+    char k[48];
+    uint32_t nowMs = millis();
+    time_t   nowS  = time(nullptr);
+    auto tsOf = [&](uint32_t ms) { return (int)(nowS - (time_t)((nowMs - ms) / 1000u)); };
+    for (int i = 0; i < NEI_MAX; i++) {
+        Neighbor* e = &r->nei->nei[i];
+        snprintf(k, sizeof k, "lora.%d.meas.%d", r->idx, i);
+        if (!e->used || peersIsLocal(e)) { storageDeleteTree(k); continue; }
+        std::string base = k;
+
+        uint8_t tg[NEI_DESTS_MAX + NEI_IDS_MAX + 1][3];
+        int nt = 0;
+        auto addTag = [&](const uint8_t* b) {
+            for (int j = 0; j < nt; j++) if (memcmp(tg[j], b, 3) == 0) return;
+            if (nt < (int)(sizeof tg / sizeof tg[0])) memcpy(tg[nt++], b, 3);
+        };
+        if (e->haveNode4) addTag(e->node4);
+        for (int d = 0; d < e->nDests; d++) addTag(e->dests[d].hash);
+        for (int q = 0; q < e->nIds; q++)   addTag(e->ids[q]);
+        std::string tags;
+        for (int j = 0; j < nt; j++) {
+            char t[8];
+            snprintf(t, sizeof t, "%s%02x%02x%02x", j ? "," : "", tg[j][0], tg[j][1], tg[j][2]);
+            tags += t;
+        }
+        char names[NEI_NAME_MAX * 3];
+        peersNodeNames(e, names, sizeof names);
+
+        auto setOr = [&](const char* f, bool have, int v) {
+            std::string key = base + "." + f;
+            if (have) storageSet(key.c_str(), v);
+            else      storageUnset(key.c_str());
+        };
+        int      lossFrom = 0;
+        uint32_t fromMs   = 0;
+        bool     haveFrom = peersLossFrom(e, &lossFrom, &fromMs);
+
+        storageBegin();
+        storageSet((base + ".tags").c_str(), tags);
+        storageSet((base + ".name").c_str(), names);
+        setOr("loss_from", haveFrom,        lossFrom);
+        setOr("from_ts",   haveFrom,        haveFrom ? tsOf(fromMs) : 0);
+        setOr("loss_to",   e->haveApRpt,    (int)e->apRptTxp - (int)e->apRptRssi);
+        setOr("to_ts",     e->haveApRpt,    e->haveApRpt ? tsOf(e->apRptMs) : 0);
+        setOr("rssi",      e->haveSig,      e->rssiMax);
+        setOr("snr",       e->haveSig,      e->snrMax10);
+        setOr("peer_txp",  e->havePair,     e->pairTxp);
+        setOr("txp",       e->haveApLastTxp, e->apLastTxp);
+        setOr("heard_ts",  e->lastHeardMs != 0, e->lastHeardMs ? tsOf(e->lastHeardMs) : 0);
+        storageEnd();
+    }
+}
+
+/* True while any radio's table holds a neighbour worth publishing. */
+static bool measWanted(void) {
+    for (int i = 0; i < kNumRadios; i++) {
+        LoraRadio* r = &s_radios[i];
+        if (r->nei && peersOtherCount(r->nei) > 0) return true;
+    }
+    return false;
+}
+
+/* The traffic the measurements can have changed on: frames in and out, over
+ * every radio. A measurement is made of frames — nothing is transmitted in
+ * order to measure — so an unchanged sum means the last publication still
+ * stands, and the 15 s beat is armed only while this differs from the sum at
+ * the last publication. A quiet neighbourhood costs no wake at all. */
+static uint64_t measTrafficSig(void) {
+    uint64_t sig = 0;
+    for (int i = 0; i < kNumRadios; i++)
+        sig += s_radios[i].rxFrames + s_radios[i].txFrames;
+    return sig;
+}
 
 void publishStats(LoraRadio* r) {
     /* Skip the churn on a headless, WiFi-down node — nothing pulls these keys
@@ -472,10 +574,10 @@ void loraMonTagOf(const uint8_t* f, size_t len, uint8_t type, uint8_t out[3]) {
     out[0] = out[1] = out[2] = 0;
     if (!f || len < 1) return;
     if (type == LORA_PKT_OURS) {
-        /* PRIVSYNC is the one that names a peer: type, regime/version, then the
+        /* HAIL is the one that names a peer: type, regime/version, then the
          * tag it is asking about. The meeting frames name a schedule, not a
          * node, so they have none to give. */
-        if (f[0] == SUPE_T_PRIVSYNC && len >= 2 + SUPE_TAG_LEN)
+        if (f[0] == SUPE_T_HAIL && len >= 2 + SUPE_TAG_LEN)
             memcpy(out, f + 2, SUPE_TAG_LEN);
         return;
     }
@@ -484,24 +586,24 @@ void loraMonTagOf(const uint8_t* f, size_t len, uint8_t type, uint8_t out[3]) {
 
 /* The two SUPE frames that name their own sender.
  *
- * PRIVSYNC's sender_ident sits behind the tag, the power and the salt. It is
+ * HAIL's sender_ident sits behind the tag, the power and the salt. It is
  * optional on the wire — a hail from a node with nothing to say about itself
  * omits it — so the length is what says whether there is one.
  *
- * ANNOUNCE2 is nothing BUT a statement of who is speaking: the identities are
+ * ANNOUNCE is nothing BUT a statement of who is speaking: the identities are
  * its payload, and the first of them is the one annIngest resolves the frame's
  * node through, so it is the one that resolves through a published tag set too
  * (it is that row's node4, one of its idents, or the front of one of its
  * destinations, whichever the row was found by). */
 bool loraMonSenderOf(const uint8_t* f, size_t len, uint8_t type, uint8_t out[3]) {
     if (!f || type != LORA_PKT_OURS || len < 1) return false;
-    if (f[0] == SUPE_T_ANNOUNCE2) {
-        if (len < SUPE_ANN2_BASE + SUPE_ID_LEN) return false;
-        memcpy(out, f + SUPE_ANN2_BASE, SUPE_TAG_LEN);
+    if (f[0] == SUPE_T_ANNOUNCE) {
+        if (len < SUPE_ANN_BASE + SUPE_ID_LEN) return false;
+        memcpy(out, f + SUPE_ANN_BASE, SUPE_TAG_LEN);
         return true;
     }
-    if (f[0] != SUPE_T_PRIVSYNC || len < SUPE_PRIVSYNC_ID_LEN) return false;
-    memcpy(out, f + SUPE_PRIVSYNC_LEN, SUPE_TAG_LEN);
+    if (f[0] != SUPE_T_HAIL || len < SUPE_HAIL_ID_LEN) return false;
+    memcpy(out, f + SUPE_HAIL_LEN, SUPE_TAG_LEN);
     return true;
 }
 
@@ -537,6 +639,18 @@ void loraMonClassify(LoraRadio* r, uint8_t dir, const uint8_t* f, size_t len,
         ms->pend = false;
         return;
     }
+    /* A split frame with no head pending is a tail whose head did not arrive —
+     * inside a meeting the head is resent after the tail, in the repair round.
+     * A head is always the full frame, so a shorter one cannot be a head, and
+     * reading a packet header out of its payload bytes would name a random
+     * packet type and a random node. It waits for nothing: the head, when it
+     * comes, opens a pending of its own. */
+    if (split && len < 1 + RNODE_MAX_PAYLOAD) {
+        *desc  = LMD_RNS_SPLIT;
+        *whole = LMD_RNS_SPLIT;
+        tag[0] = tag[1] = tag[2] = 0;
+        return;
+    }
     *desc  = loraMonDescribe(f, len, type);
     *whole = *desc;
     loraMonTagOf(f, len, type, tag);
@@ -562,6 +676,16 @@ uint8_t loraMonCastOf(LoraRadio* r, const uint8_t tag[3]) {
         for (int k = 0; k < e->nIds; k++)
             if (memcmp(e->ids[k], tag, 3) == 0) return LMC_US;
     }
+    /* Addresses that mean us without naming us. A delivery proof is addressed
+     * to the truncated hash of the packet it proves (SUPE.md §5), and that
+     * hash names this node for as long as the receipt window lasts: the
+     * engine holds one per single-destination packet we sent or relayed, and
+     * the peer table one per proof we elicited from a direct neighbour. Asked
+     * apart from the rows above because a hash is not a row. */
+    if (peersPendPeek(r->nei, tag, 3)) return LMC_US;
+#if !defined(CONFIG_LORA_NO_SUPE)
+    if (r->supe && supeEngTagIsOurs(&r->supe->eng, tag)) return LMC_US;
+#endif
     /* A link we are an endpoint of carries our traffic even though its
      * identifier belongs to neither side's announced set. `ours` is the whole
      * test — we only ever track links we are one end of. Answered apart from
@@ -578,9 +702,9 @@ uint8_t loraMonDescribe(const uint8_t* f, size_t len, uint8_t type) {
     if (!f || len < 1) return LMD_NONE;
     if (type == LORA_PKT_OURS) {
         switch (f[0]) {
-            case SUPE_T_PRIVSYNC:  return LMD_PRIVSYNC;
-            case SUPE_T_ANNOUNCE2: return LMD_ANNOUNCE2;
-            case SUPE_T_HAVEDATA:  return LMD_HAVEDATA;
+            case SUPE_T_HAIL:  return LMD_HAIL;
+            case SUPE_T_ANNOUNCE: return LMD_ANNOUNCE;
+            case SUPE_T_HAVE:  return LMD_HAVE;
             case SUPE_T_GIMME:     return LMD_GIMME;
             case SUPE_T_THATSIT:   return LMD_THATSIT;
             case SUPE_T_BYE:       return LMD_BYE;
@@ -906,6 +1030,8 @@ static void loraIfTaskMain(void*) {
 #endif
     TickType_t lastBeat  = 0;
     TickType_t lastShift = 0;
+    TickType_t lastMeas  = 0;
+    uint64_t   measSig   = 0;   /* traffic signature at the last publication */
     uint64_t   statsSig   = 0;
     const TickType_t shiftTicks =
         pdMS_TO_TICKS(Rolling1h::kBucketMinutes * 60u * 1000u);
@@ -923,6 +1049,16 @@ static void loraIfTaskMain(void*) {
             bool active = s_monWatched || uiTelemetryWanted();
             TickType_t due = active ? lastBeat + pdMS_TO_TICKS(LORA_STATS_MIN_MS)
                                     : lastShift + shiftTicks;
+            /* The measurement publication has its own 15 s beat, UI or not —
+             * its readers are other firmware tasks (lxmf's Ping) as much as
+             * the browser — armed only while there is a neighbour to publish
+             * AND a frame has moved since the last publication. Traffic that
+             * arrives during a long idle block is picked up at this task's next
+             * wake, whatever brings it. */
+            if (lastMeas == 0) lastMeas = now;
+            bool       meas    = measWanted() && measTrafficSig() != measSig;
+            TickType_t measDue = lastMeas + pdMS_TO_TICKS(LORA_MEAS_MS);
+            if (meas && (int32_t)(measDue - due) < 0) due = measDue;
             int32_t    rem  = (int32_t)(due - now);
             TickType_t wait = rem > 0 ? (TickType_t)rem : 0;
 
@@ -993,6 +1129,14 @@ static void loraIfTaskMain(void*) {
             if (sig != statsSig) {
                 statsSig = sig;
                 for (int i = 0; i < kNumRadios; i++) publishStats(&s_radios[i]);
+            }
+
+            /* The per-peer measurements, on their own cadence, and only when
+             * frames have moved since the last publication. */
+            if (meas && (int32_t)(now - measDue) >= 0) {
+                lastMeas = now;
+                measSig  = measTrafficSig();
+                for (int i = 0; i < kNumRadios; i++) publishMeas(&s_radios[i]);
             }
 
             /* The pill rides this beat rather than the stats gate above: a

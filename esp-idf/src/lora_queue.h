@@ -41,6 +41,9 @@
 #define LORAQ_F_REPLAY    0x04   /* a buffered announce being replayed: goes out
                                   * verbatim and is never re-recorded */
 #define LORAQ_F_HAVE_TAG  0x08   /* `tag` holds the packet's first-address prefix */
+#define LORAQ_F_ANNOUNCE  0x10   /* a Reticulum announce, ours or replayed: rides
+                                  * an announce run back to back with the one
+                                  * before it (lora_bridge annTrainChain) */
 
 struct LoraPkt {
     uint8_t*  bytes;           /* heap block we own; free() when refs hits 0 */

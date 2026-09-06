@@ -7,6 +7,7 @@ set(LORA_SRCS
     "src/lora_observe.cpp"
     "src/lora_power.cpp"
     "src/lora_fem.cpp"
+    "src/lora_rfcal.cpp"
     "src/lora_mon.cpp"
     "src/lora_bridge.cpp"
     "src/lora_rnode.cpp"

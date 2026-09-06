@@ -97,5 +97,8 @@ void     supeAnnCancel(LoraRadio* r);
  * that announces six destinations, or a burst of relayed announces, costs one
  * ANNOUNCE2 and not six. */
 void     supeAnnSoon(LoraRadio* r);
+/* Fire the pending announcement now, back to back after an announce run's
+ * last packet, if its airtime fits `budgetMs`. True when it is on the air. */
+bool     supeAnnTrainFire(LoraRadio* r, uint32_t budgetMs);
 uint8_t  supeOwnFamily(const LoraRadio* r);
 SupeCaps supeOwnCaps(const LoraRadio* r);

@@ -163,6 +163,49 @@ config LORA0_FEM_GAIN_DB
         a front end whose TX input tops out at a few dBm from being handed the
         chip's full +22.
 
+config LORA0_TX_CAL
+    string "Radio 0 — TX calibration curves (empty = uncalibrated)"
+    default ""
+    depends on LORA_COUNT > 0
+    help
+        What this board actually radiates at the antenna connector for a given
+        radio register setting, measured rather than assumed. Neither half of
+        the error is a constant — the chip's own set-versus-actual output
+        drifts several dB at the extremes, an amplifier compresses, and a board
+        may sit a fixed pad between the two — so this is a curve, not a gain.
+
+        One entry per part the board can carry, since a board that ships two
+        front ends across revisions has a different curve for each and only
+        learns which at boot:
+
+            <part> <grade> <reg>:<ant>,<reg>:<ant>,... ; <part> <grade> ...
+
+        `part` is none, gc1109, kct8103l or declared. `grade` is measured or
+        datasheet, and travels with the numbers so provenance cannot drift away
+        from the data it describes; it is published as lora.<n>.cal. Register
+        values must ascend. The curve is straight lines between its points and
+        flat outside them, and it covers the sub-GHz port only — a dual-band
+        board's 2.4 GHz front end keeps the flat LORA0_FEM_GAIN_DB model.
+
+        A part with no entry here is uncalibrated and says so. That is the
+        honest default: it behaves exactly as the flat model always has.
+
+config LORA0_RSSI_CAL
+    int "Radio 0 — receive gain in front of the chip, dB (0 = the part's own)"
+    default 0
+    depends on LORA_COUNT > 0
+    help
+        How much gain sits between the antenna connector and the radio's
+        receiver, so a level read at the chip can be referred back to the
+        connector. A detected front end knows its own figure from its
+        datasheet (GC1109 17 dB, KCT8103L 20 dB) and 0 takes it; set this only
+        where the board puts something else in the receive path, such as an
+        amplifier the driver cannot identify or a lossy switch, in which case a
+        loss is negative.
+
+        SNR is a ratio and is never corrected: gain in front raises signal and
+        noise together.
+
 config LORA0_FEM_HF_PWR_PIN
     int "Radio 0 — 2.4 GHz front-end supply GPIO (-1 if none)"
     default -1
@@ -374,6 +417,20 @@ config LORA1_FEM_GAIN_DB
         a front end whose TX input tops out at a few dBm from being handed the
         chip's full +22.
 
+config LORA1_TX_CAL
+    string "Radio 1 — TX calibration curves (empty = uncalibrated)"
+    default ""
+    depends on LORA_COUNT > 1
+    help
+        LORA0_TX_CAL for radio 1.
+
+config LORA1_RSSI_CAL
+    int "Radio 1 — receive gain in front of the chip, dB (0 = the part's own)"
+    default 0
+    depends on LORA_COUNT > 1
+    help
+        LORA0_RSSI_CAL for radio 1.
+
 config LORA1_FEM_HF_PWR_PIN
     int "Radio 1 — 2.4 GHz front-end supply GPIO (-1 if none)"
     default -1
@@ -579,6 +636,20 @@ config LORA2_FEM_GAIN_DB
         a front end whose TX input tops out at a few dBm from being handed the
         chip's full +22.
 
+config LORA2_TX_CAL
+    string "Radio 2 — TX calibration curves (empty = uncalibrated)"
+    default ""
+    depends on LORA_COUNT > 2
+    help
+        LORA0_TX_CAL for radio 2.
+
+config LORA2_RSSI_CAL
+    int "Radio 2 — receive gain in front of the chip, dB (0 = the part's own)"
+    default 0
+    depends on LORA_COUNT > 2
+    help
+        LORA0_RSSI_CAL for radio 2.
+
 config LORA2_FEM_HF_PWR_PIN
     int "Radio 2 — 2.4 GHz front-end supply GPIO (-1 if none)"
     default -1
@@ -783,6 +854,20 @@ config LORA3_FEM_GAIN_DB
         asked for more than LORA_TX_POWER_MAX minus this — which is what keeps
         a front end whose TX input tops out at a few dBm from being handed the
         chip's full +22.
+
+config LORA3_TX_CAL
+    string "Radio 3 — TX calibration curves (empty = uncalibrated)"
+    default ""
+    depends on LORA_COUNT > 3
+    help
+        LORA0_TX_CAL for radio 3.
+
+config LORA3_RSSI_CAL
+    int "Radio 3 — receive gain in front of the chip, dB (0 = the part's own)"
+    default 0
+    depends on LORA_COUNT > 3
+    help
+        LORA0_RSSI_CAL for radio 3.
 
 config LORA3_FEM_HF_PWR_PIN
     int "Radio 3 — 2.4 GHz front-end supply GPIO (-1 if none)"

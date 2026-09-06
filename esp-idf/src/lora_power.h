@@ -144,15 +144,17 @@ struct SupeCfg;
 #define LORA_MAGIC_PWRREQ     0x04
 #define PWRREQ_LEN            4
 #define PWRREQ_NO_TXP         ((int8_t)0x7F)   /* "no suggestion" sentinel */
-/* The per-radio antenna-dBm ceiling is r->maxTxDbm (22 bare chip, 27 through
- * a FEM — set by femInit); asking a peer for it is what sending nothing
- * already means. */
+/* The per-radio connector-dBm range is r->minTxDbm .. r->maxTxDbm, both read
+ * off this board's own calibration by femInit; asking a peer for the ceiling
+ * is what sending nothing already means. */
 #define AP_MIN_SAMPLES        3      /* recent frames before we dial a peer down,
                                       * and clean exchanges per ratchet notch */
 
 #define AP_FLOOR_DECAY_MS (10u * 60u * 1000u)  /* the failure floor's decay */
-#define AP_FLOOR_DBM      (-9)   /* the low end adaptive power may ask for;
-                                  * chips clamp up from it */
+#define AP_FLOOR_DBM      (-9)   /* the low end a power REQUEST may name. Not this
+                                  * board's floor — the peer's, which we cannot
+                                  * know, so it is a generic bound and the peer
+                                  * clamps to its own minTxDbm on arrival */
 
 /* ─────────────── lora_power: adaptive transmit power ─────────────── */
 /* Is the controller running at all? It has no key of its own: it runs exactly

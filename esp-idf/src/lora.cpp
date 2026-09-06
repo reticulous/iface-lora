@@ -68,7 +68,8 @@ static const LoraSlot kSlots[] = {
       CONFIG_LORA0_TCXO_MV, LORA0_DIO2, CONFIG_LORA0_RFSW_RX_PIN, CONFIG_LORA0_RFSW_TX_PIN,
       CONFIG_LORA0_FEM_PWR_PIN, CONFIG_LORA0_FEM_EN_PIN,
       CONFIG_LORA0_FEM_TXSEL_A_PIN, CONFIG_LORA0_FEM_TXSEL_B_PIN,
-      CONFIG_LORA0_FEM_GAIN_DB, CONFIG_LORA0_FEM_HF_PWR_PIN,
+      CONFIG_LORA0_FEM_GAIN_DB, CONFIG_LORA0_TX_CAL, CONFIG_LORA0_RSSI_CAL,
+      CONFIG_LORA0_FEM_HF_PWR_PIN,
       CONFIG_LORA0_FEM_HF_GAIN_DB, CONFIG_LORA0_LR_IRQ_DIO,
       { CONFIG_LORA0_LR_RFSW_IDLE, CONFIG_LORA0_LR_RFSW_RX,
         CONFIG_LORA0_LR_RFSW_TX, CONFIG_LORA0_LR_RFSW_RX_HF,
@@ -79,7 +80,8 @@ static const LoraSlot kSlots[] = {
       CONFIG_LORA1_TCXO_MV, LORA1_DIO2, CONFIG_LORA1_RFSW_RX_PIN, CONFIG_LORA1_RFSW_TX_PIN,
       CONFIG_LORA1_FEM_PWR_PIN, CONFIG_LORA1_FEM_EN_PIN,
       CONFIG_LORA1_FEM_TXSEL_A_PIN, CONFIG_LORA1_FEM_TXSEL_B_PIN,
-      CONFIG_LORA1_FEM_GAIN_DB, CONFIG_LORA1_FEM_HF_PWR_PIN,
+      CONFIG_LORA1_FEM_GAIN_DB, CONFIG_LORA1_TX_CAL, CONFIG_LORA1_RSSI_CAL,
+      CONFIG_LORA1_FEM_HF_PWR_PIN,
       CONFIG_LORA1_FEM_HF_GAIN_DB, CONFIG_LORA1_LR_IRQ_DIO,
       { CONFIG_LORA1_LR_RFSW_IDLE, CONFIG_LORA1_LR_RFSW_RX,
         CONFIG_LORA1_LR_RFSW_TX, CONFIG_LORA1_LR_RFSW_RX_HF,
@@ -91,7 +93,8 @@ static const LoraSlot kSlots[] = {
       CONFIG_LORA2_TCXO_MV, LORA2_DIO2, CONFIG_LORA2_RFSW_RX_PIN, CONFIG_LORA2_RFSW_TX_PIN,
       CONFIG_LORA2_FEM_PWR_PIN, CONFIG_LORA2_FEM_EN_PIN,
       CONFIG_LORA2_FEM_TXSEL_A_PIN, CONFIG_LORA2_FEM_TXSEL_B_PIN,
-      CONFIG_LORA2_FEM_GAIN_DB, CONFIG_LORA2_FEM_HF_PWR_PIN,
+      CONFIG_LORA2_FEM_GAIN_DB, CONFIG_LORA2_TX_CAL, CONFIG_LORA2_RSSI_CAL,
+      CONFIG_LORA2_FEM_HF_PWR_PIN,
       CONFIG_LORA2_FEM_HF_GAIN_DB, CONFIG_LORA2_LR_IRQ_DIO,
       { CONFIG_LORA2_LR_RFSW_IDLE, CONFIG_LORA2_LR_RFSW_RX,
         CONFIG_LORA2_LR_RFSW_TX, CONFIG_LORA2_LR_RFSW_RX_HF,
@@ -103,7 +106,8 @@ static const LoraSlot kSlots[] = {
       CONFIG_LORA3_TCXO_MV, LORA3_DIO2, CONFIG_LORA3_RFSW_RX_PIN, CONFIG_LORA3_RFSW_TX_PIN,
       CONFIG_LORA3_FEM_PWR_PIN, CONFIG_LORA3_FEM_EN_PIN,
       CONFIG_LORA3_FEM_TXSEL_A_PIN, CONFIG_LORA3_FEM_TXSEL_B_PIN,
-      CONFIG_LORA3_FEM_GAIN_DB, CONFIG_LORA3_FEM_HF_PWR_PIN,
+      CONFIG_LORA3_FEM_GAIN_DB, CONFIG_LORA3_TX_CAL, CONFIG_LORA3_RSSI_CAL,
+      CONFIG_LORA3_FEM_HF_PWR_PIN,
       CONFIG_LORA3_FEM_HF_GAIN_DB, CONFIG_LORA3_LR_IRQ_DIO,
       { CONFIG_LORA3_LR_RFSW_IDLE, CONFIG_LORA3_LR_RFSW_RX,
         CONFIG_LORA3_LR_RFSW_TX, CONFIG_LORA3_LR_RFSW_RX_HF,
@@ -295,6 +299,12 @@ static bool radioStart(LoraRadio* r) {
     float bw_khz   = (float)bw_hz   / 1.0e3f;
     float tcxo_v   = (float)r->slot->tcxo_mv / 1000.0f;
 
+    /* The front end's receive LNA: in the path by default, switchable out on
+     * the one part that allows it (~8 mA less while listening, ~20 dB less in
+     * front of the chip). Read ahead of femBandSelect, whose calibration
+     * rebuild takes the receive-gain correction from it. */
+    femRxLna(r, storageGetInt(sk(kb, sizeof kb, r->idx, "fem_rx_lna"), 1) != 0);
+
     /* Point the front end at the band this carrier is on before anything is
      * measured against it: on a dual-band part the ceiling below, and the
      * conversion radioBegin does, are both the band's. radioBegin repeats this
@@ -303,8 +313,19 @@ static bool radioStart(LoraRadio* r) {
 
     /* LNA boosted RX gain: ~+3 dB sensitivity for ~0.4 mA more RX current. On by
      * default; radioBegin applies it. Read before begin so it takes effect in
-     * the same bring-up. */
-    r->rxBoostedGain = storageGetInt(sk(kb, sizeof kb, r->idx, "rx_boosted_gain"), 1) != 0;
+     * the same bring-up.
+     *
+     * Ignored, and the chip's amplifier left off, while an external amplifier
+     * is in the RX path (the calibration femBandSelect just rebuilt says so:
+     * a positive receive gain). Behind 17..20 dB of front-end gain the chip's
+     * own noise figure is divided by that gain before it reaches the system's,
+     * so the boost's 3 dB shrinks to a few tenths — not worth its current or
+     * the large-signal headroom it gives up. The setting keeps its value: the
+     * moment the front end's LNA is bypassed the chip is the front end again
+     * and the switch means what it says. */
+    bool extAmp = r->cal.rxGainDb > 0;
+    r->rxBoostedGain = !extAmp &&
+        storageGetInt(sk(kb, sizeof kb, r->idx, "rx_boosted_gain"), 1) != 0;
 
     int16_t st = radioBegin(r, freq_mhz, bw_khz, (uint8_t)sf, (uint8_t)cr,
                             (uint8_t)syncWord, (int8_t)txp, (uint16_t)preamble, tcxo_v);
@@ -402,17 +423,29 @@ static bool radioStart(LoraRadio* r) {
     r->airPreamble = preamble; r->airImplicit = false; r->airSf = (uint8_t)sf;
     r->airBwHz = bw_hz;
     r->chNow   = LORA_CH_HAIL;
-    /* The config slider ranges to whatever this board reaches at the antenna on
-     * the band in use — a front end's rating, or the bare chip's own maximum
-     * for the port. Clamp what the user asked for to it. */
+    /* The config slider ranges over what this board actually reaches at the
+     * antenna connector on the band in use, both ends of it. The floor is not
+     * a formality: a board whose amplifier cannot be driven below its own
+     * output has a quietest transmission, and asking for less than that is
+     * asking for something no setting produces. Clamp what the user asked for
+     * to the range and say so, rather than accepting a number the hardware
+     * will silently ignore. */
     if (txp > r->maxTxDbm) {
         warn("lora/%d tx_power %d dBm exceeds this board's %d dBm max — clamped",
              r->idx, txp, r->maxTxDbm);
         txp = r->maxTxDbm;
     }
+    if (txp < r->minTxDbm) {
+        warn("lora/%d tx_power %d dBm is under this board's %d dBm floor — clamped",
+             r->idx, txp, r->minTxDbm);
+        txp = r->minTxDbm;
+    }
     r->cfgTxp = (int8_t)txp;
     r->cfgSync = (uint8_t)syncWord;
-    r->txPwrNow = (int8_t)txp;
+    /* What the register will be on once radioBegin programs it — the setting's
+     * own output, not the request, so nothing announces a power before the
+     * first frame that a frame would then contradict. */
+    r->txPwrNow = rfAntennaDbm(r, rfChipDbm(r, (int8_t)txp));
 
 #if !defined(CONFIG_LORA_NO_SUPE)
     /* The regime in force. The key's value IS the regime number — SUPE's as
@@ -422,7 +455,7 @@ static bool radioStart(LoraRadio* r) {
      * safe reading of a value this firmware cannot understand. */
     r->afa = (uint8_t)storageGetInt(sk(kb, sizeof kb, r->idx, "SUPE.afa"), 0);
     /* One interval for everything this node says about itself on this radio:
-     * SUPE's ANNOUNCE2 here, and the Reticulum announces rnsd replays onto this
+     * SUPE's ANNOUNCE here, and the Reticulum announces rnsd replays onto this
      * interface on the same beat (rnsdAnnounceBeat, in the task loop). */
     r->annIntervalMin = (uint16_t)storageGetInt(
         sk(kb, sizeof kb, r->idx, "announce_interval"), ANN_INTERVAL_DEF);
@@ -592,8 +625,8 @@ static bool anyRadioOnAir(void) {
  * explanation for whatever the radio is doing — and a receive control on a
  * radio that is not receiving is exactly that.
  *
- * Whether the front end amplifies on receive is SENSED on the pin rather than
- * declared, so the note about it can only be gated once femInit has answered.
+ * Which front end sits on the board is SENSED on the pin rather than declared,
+ * so the row for its LNA switch can only be gated once femInit has answered.
  * It always has by the time this matters: femInit runs for every slot as the
  * radio task starts, ahead of the cfgArm that brings applyConfig — and
  * applyConfig is the only thing that can make a gate truthy. */
@@ -605,7 +638,10 @@ static void loraPublishRowGates(LoraRadio* r) {
                r->enabled && radioHasRxBoost(fam) ? "1" : "");
     storageSet(rk(cb, sizeof cb, r->idx, "row_agc_reset"),
                r->enabled && radioHasAgcReset(fam) ? "1" : "");
-    storageSet(rk(cb, sizeof cb, r->idx, "row_fem_note"),
+    /* The LNA switch is the KCT8103L's alone: on the GC1109 the LNA cannot
+     * leave the path, and a switch that changed nothing would read as the
+     * reason the radio hears what it hears. */
+    storageSet(rk(cb, sizeof cb, r->idx, "row_fem_lna"),
                r->enabled && r->femType == FEM_KCT8103L ? "1" : "");
     storageEnd();
 }
@@ -641,7 +677,7 @@ static volatile bool s_supeEnDirty = false;
 
 /* "Announce now" presses, one bit per radio. Set by the sentinel (which runs on
  * whichever task wrote the key) and consumed by the radio task, which is the
- * only context allowed to arm SUPE's ANNOUNCE2 beside it. */
+ * only context allowed to arm SUPE's ANNOUNCE beside it. */
 static volatile uint32_t s_annNowMask = 0;
 
 static void onCfgChange(const char* key, const char* /*val*/) {
@@ -661,7 +697,7 @@ static void onCfgChange(const char* key, const char* /*val*/) {
 
 /* "Announce now" button, one sentinel per radio. Flags the radio task rather
  * than acting here: the rnsd side would be safe from any task, but SUPE's
- * ANNOUNCE2 goes out beside it and only the radio task may arm that. */
+ * ANNOUNCE goes out beside it and only the radio task may arm that. */
 static void onAnnounceNow(const char* key, const char* val) {
     if (!val || atoi(val) == 0) return;   /* the edge write's leading 0 is not a press */
     storageUnset(key);
@@ -994,14 +1030,13 @@ static void loraTaskMain(void*) {
                 r->slot->rfsw_tx < 0 ? RADIOLIB_NC : (uint32_t)r->slot->rfsw_tx);
         }
         /* External FEM (PA/LNA/switch), if the board wires one: detect the
-         * part, install its RF-switch table (supersedes the two-pin form
-         * above — a board wires one or the other) and set the antenna-dBm
-         * ceiling. Before begin(), like setRfSwitchPins. */
-        /* External FEM: detect the part or take the board's declared word for
-         * it, and publish what this radio reaches at the antenna so a UI sizes
-         * its power control to the hardware rather than to a build-time
-         * constant. femBandSelect does the publishing, here and on every begin
-         * — the figure follows the carrier across the band boundary. */
+         * part or take the board's declared word for it, install its RF-switch
+         * table (which supersedes the two-pin form above — a board wires one or
+         * the other), and build the calibration everything downstream converts
+         * through. Before begin() and before any power is programmed, like
+         * setRfSwitchPins. femBandSelect publishes the range and its grade,
+         * here and on every begin, so the figures follow the carrier across the
+         * band boundary. */
         femInit(r);
         r->radio = radioNew(r->slot->chip, r->mod);
         probeRadio(r);
@@ -1083,7 +1118,7 @@ static void loraTaskMain(void*) {
             /* Say who we are on the air, on this radio's own schedule: rnsd
              * replays every hosted destination's announce onto lora/<i>,
              * pinned, and spends no other interface's airtime doing it. SUPE's
-             * ANNOUNCE2 rides the same interval from its own beat (lora_supe),
+             * ANNOUNCE rides the same interval from its own beat (lora_supe),
              * because it is the same question — which is why the key is read
              * here, live, and handed to both rather than re-applied through a
              * radio cycle. */
@@ -1301,7 +1336,7 @@ void LoraService::onInit() {
         storageDefault(sk(kb, sizeof kb, 0, "bandwidth"), 125000);         /* 125 kHz */
         /* How often this radio says who it is — not a SUPE key: it paces the
          * Reticulum announces rnsd replays onto this interface whether or not
-         * SUPE is compiled in, and ANNOUNCE2 when it is. Radio 0's copy comes
+         * SUPE is compiled in, and ANNOUNCE when it is. Radio 0's copy comes
          * from the pane row; radios 1.. are seeded here. */
         for (int i = 1; i < kNumRadios; i++)
             storageDefault(sk(kb, sizeof kb, i, "announce_interval"), ANN_INTERVAL_DEF);

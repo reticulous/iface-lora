@@ -36,6 +36,10 @@ struct LoraSlot {
     int      fem_txsel_a;          /* TX-select when a GC1109-style FEM is detected */
     int      fem_txsel_b;          /* TX-select when a KCT8103L-style FEM is detected */
     int      fem_gain_db;          /* declared-FEM TX gain, dB (0 = no declared FEM) */
+    const char* tx_cal;            /* TX calibration curves, one entry per part the board
+                                    * can carry — see lora_fem.h. "" = uncalibrated */
+    int      rssi_cal;             /* receive gain in front of the chip, dB (0 = take the
+                                    * detected part's own datasheet figure) */
     int      fem_hf_pwr;           /* 2.4 GHz front end's supply GPIO (-1 = single band) */
     int      fem_hf_gain_db;       /* declared-FEM TX gain on the 2.4 GHz path, dB */
     int      lr_irq_dio;           /* LR2021: which chip DIO carries the IRQ line (5..11) */
@@ -108,6 +112,8 @@ static inline uint8_t radioMinSf(LoraFamily f) { return f == FAM_SX127X ? 7 : 5;
 
 void    radioIrqCache(LoraRadio* r);
 int16_t radioStartRx(LoraRadio* r);
+int16_t radioRxResume(LoraRadio* r);   /* after readData: a no-op where the chip kept receiving */
+void    radioRxDiscard(LoraRadio* r);  /* a packet that will not be read: empty a FIFO part's */
 bool    radioRxInProgress(LoraRadio* r);
 bool    radioIrqLinePending(const LoraRadio* r);
 void    radioIrqClearAll(LoraRadio* r);

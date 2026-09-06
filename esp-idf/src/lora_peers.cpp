@@ -202,6 +202,18 @@ void peersPendAdd(NeiState* st, const uint8_t phash[16], const uint8_t dest[16],
 
 /* Match-and-free a pend entry by the hash a proof is addressed to. The freed
  * slot's fields stay readable until the next peersPendAdd (single task). */
+/* Look without taking: the entry stays for the observer to settle. Compares
+ * the first `n` bytes, so a viewer's three-byte tag can ask as well as the
+ * proof's full address. */
+const NeiPend* peersPendPeek(const NeiState* st, const uint8_t* phash, size_t n) {
+    if (!st || !phash) return nullptr;
+    for (int i = 0; i < NEI_PEND_MAX; i++) {
+        const NeiPend* pd = &st->pend[i];
+        if (pd->used && memcmp(pd->phash, phash, n) == 0) return pd;
+    }
+    return nullptr;
+}
+
 NeiPend* peersPendTake(NeiState* st, const uint8_t phash[16]) {
     for (int i = 0; i < NEI_PEND_MAX; i++) {
         NeiPend* pd = &st->pend[i];
@@ -475,7 +487,7 @@ Neighbor* peersFindBy4(NeiState* st, const uint8_t b4[4]) {
  *
  * SUPE announces identities rather than destinations precisely because a node
  * typically has more of the latter (plans/SUPE.md §7), so this is the lookup
- * that turns an ANNOUNCE2 into a row. */
+ * that turns an ANNOUNCE into a row. */
 Neighbor* peersFindByIdent4(NeiState* st, const uint8_t b4[4]) {
     if (!st) return nullptr;
     for (int i = 0; i < NEI_MAX; i++) {

@@ -1,7 +1,7 @@
 /**
  * lora_supe — the platform half of SUPE: the SupeHost implementation the pure
  * engine (supe_engine.{h,cpp}) runs against on this device, the boundary lock
- * that serialises every entry point, the train buffers, the ANNOUNCE2 beat and
+ * that serialises every entry point, the train buffers, the ANNOUNCE beat and
  * its peer-table ingest, and the adapters that file the engine's peer notes
  * into the peer table and the power controller.
  */
@@ -15,30 +15,25 @@
  * announce, so the first one is worth having promptly. */
 #define SUPE_ANN_FIRST_MS    15000
 
-/* How long a first-seen announce going on the air holds the ANNOUNCE2 behind
+/* How long a first-seen announce going on the air holds the ANNOUNCE behind
  * it (supeAnnSoon). Long enough that the announces a boot or a route change
  * produces arrive as one burst and are answered by one frame; short enough
  * that the answer still belongs to the event that caused it. */
 #define SUPE_ANN_SOON_MS     10000
 
-/* The absence ladder's verdict (SUPE.md §12): after three narrow schedules
- * expired unmet the peer is absent this long, and its traffic is dropped
- * rather than transmitted into the void. */
-/* Declaring a peer absent is a bet that trying again is not worth the airtime,
- * and a meeting now costs one short frame on the shared channel. So the bet is
- * a small one and it is made gradually: after a few unmet appointments the node
- * waits a second, and only a peer that keeps missing them earns a longer hold,
- * doubling to a ceiling of a minute. A flat minute from the first three misses
- * was a blackout long enough to outlive the session that provoked it, so the
- * next attempt failed inside it too and the fault looked permanent. */
-#define SUPE_ABSENT_STRIKES  3        /* unmet appointments before any hold */
-#define SUPE_ABSENT_BASE_MS  1000     /* the first hold, doubling per strike */
-#define SUPE_ABSENT_MAX_MS   60000    /* …to this ceiling and no further */
-/* How recently a peer must have been heard for a missed appointment to say
- * nothing about whether it is still there. Comfortably longer than the retry
- * ladder's own span, so a burst of missed schedules cannot outrun it, and far
- * shorter than the hold it prevents. */
-#define SUPE_PRESENT_MS      10000
+/* The hold (SUPE.md §12): three hails unanswered in one run make the peer
+ * unreachable, and no hail is sent to it for a while — its traffic is queued
+ * and waits out its own patience. Declaring that is a bet that trying again is
+ * not worth the airtime, and a meeting now costs one short frame, so the bet
+ * is made in stages: a second at first, doubling per further unanswered run,
+ * to a ceiling of a minute. A peer that is present — heard at all lately, by
+ * a hail to somebody else, an announce, a meeting overheard — but does not
+ * answer us is likelier a transient fault than a terminal one, so its ceiling
+ * is ten seconds instead. Presence never clears a hold; only an answer does. */
+#define SUPE_HOLD_BASE_MS         1000
+#define SUPE_HOLD_MAX_MS         60000
+#define SUPE_HOLD_PRESENT_MAX_MS 10000
+#define SUPE_PRESENT_MS          60000    /* heard within this: present */
 
 /* The boundary watchdog: a meeting that outlives every deadline inside it
  * holds the radio against the whole outbound queue. Generous — the longest
@@ -60,7 +55,7 @@ static Neighbor* tagNode(LoraRadio* r, const uint8_t tag[SUPE_TAG_LEN]) {
         for (int d = 0; d < e->nDests; d++)
             if (memcmp(e->dests[d].hash, tag, SUPE_TAG_LEN) == 0) return e;
         /* Identities, and not only the destinations derived from them: a
-         * PRIVSYNC's sender_ident names the seeking node by its identity, and
+         * HAIL's sender_ident names the seeking node by its identity, and
          * nothing is ever *addressed* to an identity, so it appears in none of
          * the lists above. */
         for (int k = 0; k < e->nIds; k++)
@@ -154,12 +149,13 @@ static void hTuneHome(void* ctx) {
     radioSetSf(r, (uint8_t)r->cfgSf);
     radioSyncWord(r, r->cfgSync);
     r->radio->setPreambleLength((size_t)r->cfgPreamble);
-    r->radio->setOutputPower(femChipDbm(r, r->cfgTxp));
+    const int8_t homeChip = rfChipDbm(r, r->cfgTxp);
+    r->radio->setOutputPower(homeChip);
     r->airSf       = (uint8_t)r->cfgSf;
     r->airBwHz     = r->cfgBwHz;
     r->airPreamble = r->cfgPreamble;
     r->airImplicit = false;
-    r->txPwrNow    = r->cfgTxp;
+    r->txPwrNow    = rfAntennaDbm(r, homeChip);
     /* The meeting's floor is not this channel's — but the hailing channel's
      * own, from before the meeting, is the best estimate in the system and the
      * one a node returning home has to contend against straight away. */
@@ -194,6 +190,7 @@ static bool hTxFrame(void* ctx, const uint8_t* f, uint16_t len, int8_t dbm) {
         verb("lora/%d supe: tx type 0x%02x %uB ch%u txp=%d",
              r->idx, f[0], (unsigned)len, (unsigned)r->chNow, (int)dbm);
     apApplyPower(r, dbm);
+    loraNoteAnswer(r);
     startTxFrame(r, 0);
     return r->txActive;
 }
@@ -253,9 +250,13 @@ static bool hTrainBuild(void* ctx, uint16_t peerId,
     if (maxFrames > SUPE_TRAIN_MAX) maxFrames = SUPE_TRAIN_MAX;
     for (uint8_t i = 0; i < loraqDepth(&r->q) && out->count < maxFrames; i++) {
         LoraPkt* p = loraqAt(&r->q, i);
+        /* Unicast only. A packet with no tag is a broadcast — an announce, a
+         * path request — and it still carries a peer id from the next-hop
+         * lookup, so matching on the id alone would sweep it into one node's
+         * train and it would reach that node and nobody else. */
+        if (!(p->flags & LORAQ_F_HAVE_TAG)) continue;
         bool match = false;
-        if (tag && (p->flags & LORAQ_F_HAVE_TAG) &&
-            memcmp(p->tag, tag, SUPE_TAG_LEN) == 0) match = true;
+        if (tag && memcmp(p->tag, tag, SUPE_TAG_LEN) == 0) match = true;
         if (peerId != LORAQ_PEER_NONE && p->peer_id == peerId) match = true;
         if (!match) continue;
         uint8_t need = (uint8_t)(p->len > RNODE_MAX_PAYLOAD ? 2 : 1);
@@ -310,6 +311,7 @@ static bool hTrainFire(void* ctx, uint8_t idx, int8_t dbm) {
     r->txWaitPend     = false;
     ss->engineTx = true;
     apApplyPower(r, dbm);
+    loraNoteAnswer(r);
     startTxFrame(r, 0);
     return r->txActive;
 }
@@ -385,9 +387,9 @@ static bool hPeerGet(void* ctx, const uint8_t tag[SUPE_TAG_LEN], SupePeerView* o
         out->topBudget = e->supeCaps.topStep;
         out->maxTxpDbm = e->supeCaps.maxPwrDbm;
         out->txpOpen = apOpenPower(r, e);
-        out->absentStrikes = e->silentCount;
-        out->absentUntilMs = e->absentUntilMs;
-        out->retryWaitUntilMs = e->retryWaitUntilMs;
+        out->unanswered = e->silentCount;
+        out->holdUntilMs = e->absentUntilMs;
+        out->intervalUntilMs = e->retryWaitUntilMs;
         out->detoured = e->detoured;
         return true;
     }
@@ -426,6 +428,15 @@ static void hPeerNote(void* ctx, const uint8_t tag[SUPE_TAG_LEN],
     uint32_t now = millis();
     switch (n->ev) {
         case SUPE_EV_ALIVE:
+            /* Presence: heard at all. It shortens a hold's ceiling and clears
+             * nothing — under an asymmetric link we hear a peer constantly
+             * that never hears us, and a rule that let presence stand in for
+             * reachability would hail such a peer for ever (§12). */
+            if (e) e->supeHeardMs = now;
+            break;
+        case SUPE_EV_ANSWERED:
+            /* Reachability: it answered us, or hailed us. The run ends, the
+             * hold lifts, the full run is restored. */
             if (e) {
                 e->silentCount = 0;
                 e->absentUntilMs = 0;
@@ -433,42 +444,26 @@ static void hPeerNote(void* ctx, const uint8_t tag[SUPE_TAG_LEN],
                 e->supeHeardMs = now;
             }
             break;
-        case SUPE_EV_STRIKE:
+        case SUPE_EV_UNANSWERED:
             if (e) {
-                /* From the seed, not from the strike: `agoMs` is what the
-                 * horizon already spent, and only the remainder is owed. */
-                e->retryWaitUntilMs = now + (n->backoffMs > n->agoMs
-                                             ? n->backoffMs - n->agoMs : 0);
-                /* A node whose frames are still arriving is not absent, whatever
-                 * went wrong with the appointment. The ladder exists to stop a
-                 * node hammering the shared channel for a peer that has gone —
-                 * that is a claim about reachability, and receiving from it is
-                 * the direct refutation. Counting these misses towards absence
-                 * blacklists a peer we are actively talking to, and because the
-                 * blackout outlives the session, the next attempt fails inside
-                 * it too: exactly the shape of a fault that will not clear on a
-                 * restart. Back off from the schedule, keep the peer. */
-                bool heard = e->supeHeardMs &&
-                             (uint32_t)(now - e->supeHeardMs) < SUPE_PRESENT_MS;
-                if (heard) {
-                    if (logIsDebug(TAG))
-                        dbg("lora/%d supe: %02x%02x%02x missed an appointment, "
-                            "heard %lums ago — not absent",
-                            r->idx, tag[0], tag[1], tag[2],
-                            (unsigned long)(now - e->supeHeardMs));
-                    break;
-                }
+                /* The interval in which the hailed party may hail back; the
+                 * next hail of the run waits it out. */
+                e->retryWaitUntilMs = now + n->backoffMs;
                 if (e->silentCount < 255) e->silentCount++;
-                if (e->silentCount >= SUPE_ABSENT_STRIKES) {
-                    uint32_t hold = SUPE_ABSENT_BASE_MS;
-                    uint8_t over = (uint8_t)(e->silentCount - SUPE_ABSENT_STRIKES);
+                if (e->silentCount >= SUPE_RUN_HAILS) {
+                    uint32_t hold = SUPE_HOLD_BASE_MS;
+                    uint8_t over = (uint8_t)(e->silentCount - SUPE_RUN_HAILS);
                     if (over > 6) over = 6;            /* 1 s → 64 s, then capped */
                     hold <<= over;
-                    if (hold > SUPE_ABSENT_MAX_MS) hold = SUPE_ABSENT_MAX_MS;
+                    bool present = e->supeHeardMs &&
+                                   (uint32_t)(now - e->supeHeardMs) < SUPE_PRESENT_MS;
+                    uint32_t cap = present ? SUPE_HOLD_PRESENT_MAX_MS : SUPE_HOLD_MAX_MS;
+                    if (hold > cap) hold = cap;
                     e->absentUntilMs = now + hold;
                     if (logIsDebug(TAG))
-                        dbg("lora/%d supe: %02x%02x%02x unheard, holding off %lums "
-                            "(%u missed)", r->idx, tag[0], tag[1], tag[2],
+                        dbg("lora/%d supe: %02x%02x%02x unreachable%s, holding off %lums "
+                            "(%u unanswered)", r->idx, tag[0], tag[1], tag[2],
+                            present ? " but present" : "",
                             (unsigned long)hold, (unsigned)e->silentCount);
                 }
             }
@@ -713,11 +708,11 @@ static bool supeTryLock(LoraRadio* r) {
     return xSemaphoreTakeRecursive(r->supe->lock, 0) == pdTRUE;
 }
 
-/* ─────────────── ANNOUNCE2 (SUPE.md §9) ─────────────── */
+/* ─────────────── ANNOUNCE (SUPE.md §9) ─────────────── */
 
 static void annIngest(LoraRadio* r, const uint8_t* f, size_t len, int16_t rssi) {
-    SupeAnn2 a;
-    if (!supeDecAnn2(f, len, &a)) return;
+    SupeAnn a;
+    if (!supeDecAnn(f, len, &a)) return;
     if (!r->nei) return;
     uint32_t now = millis();
     int matched = 0;
@@ -739,13 +734,13 @@ static void annIngest(LoraRadio* r, const uint8_t* f, size_t len, int16_t rssi) 
      * quietly, misses, and the ratchet raises the power until it does not. A
      * self-correcting error against a permanent one. */
     Neighbor* keep = nullptr;
-    uint8_t   orphan[SUPE_ANN2_MAX];      /* ids this table could not place */
+    uint8_t   orphan[SUPE_ANN_MAX];      /* ids this table could not place */
     uint8_t   nOrphan = 0;
     for (int i = 0; i < a.count; i++) {
         Neighbor* e = peersFindByIdent4(r->nei, a.ids[i]);
         if (!e) e = peersFindBy4(r->nei, a.ids[i]);
         if (!e) e = peersFindClaim4(r->nei, a.ids[i]);
-        if (!e && i > 0 && nOrphan < SUPE_ANN2_MAX) orphan[nOrphan++] = (uint8_t)i;
+        if (!e && i > 0 && nOrphan < SUPE_ANN_MAX) orphan[nOrphan++] = (uint8_t)i;
         /* Never met: this frame IS the introduction — it carries the identities
          * and the capabilities together — so keep it rather than wait out an
          * announce interval for the next one. Only four bytes of each identity
@@ -788,12 +783,10 @@ static void annIngest(LoraRadio* r, const uint8_t* f, size_t len, int16_t rssi) 
         bool first = !e->supeSeen;
         e->supeSeen    = true;
         e->supeCaps    = a.caps;
+        /* Presence, not reachability: an announcement says the node is there,
+         * not that it can hear us. It shortens a hold and clears none (§12). */
         e->supeHeardMs = now;
         e->ourProto    = true;
-        /* Evidence of life cancels absence outright (§12). */
-        e->silentCount = 0;
-        e->absentUntilMs = 0;
-        e->retryWaitUntilMs = 0;
         /* The power byte is what makes the frame worth hearing: the reading
          * and the stated power together are path loss, not a bare level. */
         supeFilePair(r, e, rssi, a.pwrDbm, 0);
@@ -828,7 +821,7 @@ static void annIngest(LoraRadio* r, const uint8_t* f, size_t len, int16_t rssi) 
 
 /* Give the engine a name to sign its seeds with: this node's first identity,
  * truncated to a tag. The same list the announcement is built from, so what a
- * PRIVSYNC claims is what the neighbourhood has already filed against us — and
+ * HAIL claims is what the neighbourhood has already filed against us — and
  * what `tagNode` can resolve it back through. Identities arrive after the radio
  * does (rnsd registers them as it comes up), so this is a poll rather than a
  * one-off, and it stops looking once it has one. */
@@ -873,30 +866,27 @@ static uint32_t supeAnnGap(const LoraRadio* r) {
  * transmitter. */
 static void supeAnnBeat(LoraRadio* r, uint32_t now);
 
-static void supeAnnSend(LoraRadio* r) {
-    SupeState* ss = r->supe;
-    ss->annPending = false;
-    /* Whatever opened a coalescing window is answered by this frame, however
-     * the frame came to be sent. */
-    ss->annSoonPend = false;
-    auto retrySoon = [&]() {
-        ss->annNextMs = millis() + SUPE_ANN_FIRST_MS;
-        if (logIsDebug(TAG))
-            dbg("lora/%d supe: no identity to announce yet — retrying shortly", r->idx);
-    };
-    if (!r->nei) { retrySoon(); return; }
-    uint8_t ids[SUPE_ANN2_MAX][SUPE_ID_LEN];
+/* Build this node's announcement: every identity it holds, in one frame.
+ * Returns the frame length, 0 when there is nothing to say yet. */
+static size_t supeAnnBuild(LoraRadio* r, uint8_t* f, size_t cap, uint8_t* countOut) {
+    if (!r->nei) return 0;
+    uint8_t ids[SUPE_ANN_MAX][SUPE_ID_LEN];
     uint8_t count = 0;
-    for (int i = 0; i < NEI_MAX && count < SUPE_ANN2_MAX; i++) {
+    for (int i = 0; i < NEI_MAX && count < SUPE_ANN_MAX; i++) {
         Neighbor* e = &r->nei->nei[i];
         if (!e->used || !peersIsLocal(e)) continue;
-        for (int k = 0; k < e->nIds && count < SUPE_ANN2_MAX; k++)
+        for (int k = 0; k < e->nIds && count < SUPE_ANN_MAX; k++)
             memcpy(ids[count++], e->ids[k], SUPE_ID_LEN);
     }
-    if (count == 0) { retrySoon(); return; }
-    uint8_t f[SUPE_MAX_FRAME];
-    size_t n = supeEngBuildAnn(&ss->eng, f, sizeof f, ids, count, r->cfgTxp, r->supeOn);
-    if (!n) { retrySoon(); return; }
+    if (countOut) *countOut = count;
+    if (count == 0) return 0;
+    return supeEngBuildAnn(&r->supe->eng, f, cap, ids, count, r->cfgTxp, r->supeOn);
+}
+
+static void supeAnnFire(LoraRadio* r, const uint8_t* f, size_t n, uint8_t count) {
+    SupeState* ss = r->supe;
+    ss->annPending = false;
+    ss->annSoonPend = false;
     ss->annNextMs = millis() + supeAnnGap(r);   /* only a sent frame paces the beat */
     /* Broadcast, at the configured power, through the ordinary frame path.
      * The engine is idle (the beat stands off on it), so engineTx marks it and
@@ -905,6 +895,42 @@ static void supeAnnSend(LoraRadio* r) {
     if (logIsVerbose(TAG))
         verb("lora/%d supe: announced %u identit%s (%uB)", r->idx,
             (unsigned)count, count == 1 ? "y" : "ies", (unsigned)n);
+}
+
+static void supeAnnSend(LoraRadio* r) {
+    SupeState* ss = r->supe;
+    ss->annPending = false;
+    /* Whatever opened a coalescing window is answered by this frame, however
+     * the frame came to be sent. */
+    ss->annSoonPend = false;
+    uint8_t f[SUPE_MAX_FRAME];
+    uint8_t count = 0;
+    size_t n = supeAnnBuild(r, f, sizeof f, &count);
+    if (!n) {
+        ss->annNextMs = millis() + SUPE_ANN_FIRST_MS;
+        if (logIsDebug(TAG))
+            dbg("lora/%d supe: no identity to announce yet — retrying shortly", r->idx);
+        return;
+    }
+    supeAnnFire(r, f, n, count);
+}
+
+/* The announcement that closes a replay run, fired from the last replayed
+ * announce's completion without a polite wait of its own (lora_bridge
+ * annTrainChain) — if it fits what is left of the run's air budget. */
+bool supeAnnTrainFire(LoraRadio* r, uint32_t budgetMs) {
+    if (!supeMounted(r) || !r->running) return false;
+    SupeState* ss = r->supe;
+    if (!ss->annPending || supeEngBusy(&ss->eng)) return false;
+    uint8_t f[SUPE_MAX_FRAME];
+    uint8_t count = 0;
+    size_t n = supeAnnBuild(r, f, sizeof f, &count);
+    if (!n) return false;                    /* the beat will retry on its own */
+    uint32_t toa = (uint32_t)lround(1000.0 * loraAirtimeSeconds(
+                       r->cfgSf, r->cfgBwHz, r->cfgCr, r->cfgPreamble, (int)n, false));
+    if (toa > budgetMs) return false;
+    supeAnnFire(r, f, n, count);
+    return r->txActive;
 }
 
 /* The announce beat, which runs whether or not this node speaks the protocol:
@@ -928,7 +954,7 @@ static void supeAnnBeat(LoraRadio* r, uint32_t now) {
     if (!ss->annPending) return;
     if (csmaClear(r)) {
         supeAnnSend(r);
-        r->txWaitMs = csmaGrantWaitMs(r);   /* same restatement as the seed's */
+        r->txWaitMs = csmaGrantWaitMs(r);   /* same restatement as the hail's */
     } else if (r->lbtTimeoutMs && now - ss->annTryMs > r->lbtTimeoutMs) {
         ss->annPending = false;
         ss->annNextMs  = now + supeAnnGap(r);
@@ -945,13 +971,28 @@ void supeOnFrame(LoraRadio* r, const uint8_t* f, size_t len,
     if (!supeMounted(r)) return;
     supeLock(r);
     s_hosts[r->idx].logLevel = supeLogLevel();
-    if (len >= 1 && f[0] == SUPE_T_ANNOUNCE2) {
+    if (len >= 1 && f[0] == SUPE_T_ANNOUNCE) {
         /* Always read: this is the world picture, not an invitation. */
         r->supe->eng.rxFrames++;
         annIngest(r, f, len, rssi);
     } else if (supeReady(r)) {
         /* Everything else IS an invitation, and answering one is speaking. */
+        uint32_t discards = r->supe->eng.rxDiscard;
         supeEngOnRx(&r->supe->eng, f, (uint16_t)len, rssi, snr10);
+        /* A frame that carries one of our type bytes and does not decode is
+         * either a corrupt frame that passed its CRC or bytes that were never
+         * on the air as read — a buffer read at the wrong place. Both are
+         * rare and both matter, so the evidence is kept: the bytes, and
+         * where the meeting was. */
+        if (r->supe->eng.rxDiscard != discards) {
+            char hex[3 * 8 + 1];
+            size_t n = len < 8 ? len : 8;
+            for (size_t i = 0; i < n; i++)
+                snprintf(hex + 3 * i, sizeof hex - 3 * i, "%02x ", f[i]);
+            warn("lora/%d supe: undecodable type 0x%02x %uB on ch%u phase %u: %s",
+                 r->idx, f[0], (unsigned)len, (unsigned)r->chNow,
+                 (unsigned)r->supe->eng.m.phase, hex);
+        }
     }
     supeUnlock(r);
 }
@@ -1034,7 +1075,7 @@ void supePoll(LoraRadio* r) {
 
     /* Hard watchdog: a meeting that outlives every deadline inside it holds
      * the radio against the whole outbound queue. */
-    if (e->m.phase >= SUPE_M_HD_TX &&
+    if (e->m.phase >= SUPE_M_HAVE_TX &&
         (uint32_t)(now - e->m.beganMs) > SUPE_MEET_WATCHDOG_MS) {
         warn("lora/%d supe: meeting stuck in phase %u — standing down",
              r->idx, (unsigned)e->m.phase);
@@ -1075,18 +1116,20 @@ void supePoll(LoraRadio* r) {
     if (loraCfgQuiet()) { supeUnlock(r); return; }
 
     /* The launch: the verdict armed a seed, the jitter has passed, and the
-     * PRIVSYNC contends for the shared medium like any other frame. */
+     * HAIL contends for the shared medium like any other frame. */
     if (supeEngLaunchDue(e)) {
         if (csmaClear(r)) {
             supeEngLaunch(e);
-            /* The PRIVSYNC won the medium for itself; hTxFrame zeroed the wait
+            /* The HAIL won the medium for itself; hTxFrame zeroed the wait
              * mark, so what channel access just cost is restated for the
              * record — otherwise the graph shows a seed that never waited. */
             r->txWaitMs = csmaGrantWaitMs(r);
-        } else if (r->lbtTimeoutMs && now - e->offerJitterUntilMs > r->lbtTimeoutMs) {
+        } else if (r->lbtTimeoutMs && e->offerArmed &&
+                   now - e->offerJitterUntilMs > r->lbtTimeoutMs) {
             /* A channel that never frees must not hold the queue behind a
-             * seed forever: give the schedule up, the packet takes the main
-             * channel on the ordinary path. */
+             * hail forever: give it up, the packet takes the main channel on
+             * the ordinary path. An owed hail that cannot win the channel is
+             * simply left to expire at patience. */
             e->offerArmed = false;
             e->plainOnce = true;
             csmaResetAccess(r);

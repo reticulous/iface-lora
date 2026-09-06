@@ -84,6 +84,11 @@
  * until frequency agility is switched on. Higher indices are the agile channels
  * of the regime in force. */
 #define LORA_CH_HAIL    0
+/* The most continuous air one run of back-to-back packets may take before it
+ * pays a polite wait again (lora_bridge annTrainChain): EN 300 220's ceiling
+ * on a single transmission, and what keeps an announce replay from holding a
+ * shared channel for as long as its buffer lasts. */
+#define LORA_TX_TRAIN_MAX_MS  1000
 #define LORA_CH_MAX     10          /* hailing channel + the largest regime's agile set */
 /* Channel-RSSI sampling cadence. One getRSSI(false) per beat: a single SPI
  * transaction against a radio that is already in RX, so it costs no measurable
@@ -145,6 +150,8 @@ enum : uint8_t { MTXP_OFF = 0, MTXP_LBT = 1, MTXP_TX = 2 };
 #define LORA_CFG_ONAIR_RETRY_MS 50
 
 #define LORA_STATS_MIN_MS 1000
+/* Cadence of the per-peer measurement publication (lora.<n>.meas.*). */
+#define LORA_MEAS_MS      15000
 
 #define LORA_FREQ_MIN_HZ  100000000    /* 100 MHz */
 #define LORA_FREQ_MAX_HZ  2000000000   /* 2 GHz — storage ints are int32, keep the cast safe */
@@ -193,6 +200,7 @@ static inline const char* rk(char* b, size_t n, int i, const char* leaf) {
 
 #include "lora_queue.h"
 #include "lora_radio.h"
+#include "lora_fem.h"
 #include "lora_csma.h"
 #include "lora_mon.h"
 
@@ -349,6 +357,11 @@ struct LoraRadio {
     bool            txWaitPend;
     uint16_t        txWaitMs;        /* of that wait, what the channel cost … */
     uint16_t        txOwnMs;         /* … and what we cost ourselves */
+    /* Air spent back to back since the last channel grant: a run of announces
+     * chains from transmit-done without a polite wait between them, and this
+     * is what says when the next one would carry the run past
+     * LORA_TX_TRAIN_MAX_MS of continuous transmission. */
+    uint16_t        txTrainMs;
 
     /* Stats — published to ephemeral storage once per task tick. */
     uint64_t        txBytes, rxBytes, txFrames, rxFrames, crcErr, splitTimeouts, txDropped;
@@ -356,14 +369,27 @@ struct LoraRadio {
 
     /* LoRaMon — each on-air frame becomes a storage node lora.<n>.packets.<ms>;
      * this FIFO of start-ms drives expiry (delete nodes > 1 h old). */
-    int8_t          cfgTxp;          /* configured TX power dBm (ANTENNA dBm — the
-                                      * FEM gain conversion happens only at the
-                                      * chip, in femChipDbm) */
+    int8_t          cfgTxp;          /* configured TX power dBm (CONNECTOR dBm — the
+                                      * conversion to a register setting happens
+                                      * only at the chip, in rfChipDbm) */
     uint8_t         cfgSync;         /* configured sync word (restored after a sweep) */
-    int8_t          txPwrNow;        /* power of the frame on-air, stamped into tx records */
+    int8_t          txPwrNow;        /* what the frame on air actually radiates, connector
+                                      * dBm: the setting's own output, not the request.
+                                      * Announced to peers and stamped into tx records */
     uint8_t         femType;         /* LoraFemType — external front-end module, set by femInit */
-    int8_t          maxTxDbm;        /* antenna-dBm ceiling for the band in use: the bare
-                                      * chip's own max, or the front end's rating */
+    bool            femRxLna;        /* the front end's receive LNA is in the RX path
+                                      * (s.lora.<i>.fem_rx_lna). Only a KCT8103L can take
+                                      * it out; everywhere else it stays true */
+    int8_t          maxTxDbm;        /* connector-dBm ceiling for the band in use: the
+                                      * conversion's own peak, capped by a front end's
+                                      * board rating */
+    int8_t          minTxDbm;        /* connector-dBm floor — the quietest transmission this
+                                      * board can make. Nowhere near the chip's own on an
+                                      * amplified board, which cannot be driven below its
+                                      * amplifier's output */
+    LoraRfCal       cal;             /* what this board puts on the connector for a given
+                                      * register setting, and what its front end adds on
+                                      * receive — rebuilt per port by femBandSelect */
     bool            highBand;        /* the carrier is on the chip's 2.4 GHz port, which
                                       * has its own amplifier, ceiling and drive range */
     uint8_t         txType[2];       /* per frame: LORA_PKT_*. A 0x04 power request
@@ -376,6 +402,19 @@ struct LoraRadio {
                                       * its queue is released when the last frame
                                       * of it leaves (see txRearmRx). */
     uint32_t        txFrameStartMs;  /* start (millis) of the on-air TX frame */
+    /* The flip, measured: from the computed end of our frame on the air to
+     * the receiver being armed again (retuned first, where the engine asked).
+     * What SUPE_FLIP_MS must cover at the far end; read in `lora` stats. */
+    uint16_t        flipMaxMs;
+    uint32_t        flipSumMs;
+    uint16_t        flipN;
+    /* The answer latency, measured: from the end of a received frame to the
+     * start of the engine's next frame, when that follows within an answer's
+     * reach. What SUPE_TURNAROUND_MS must cover at the far end. */
+    uint32_t        rxDoneAtMs;      /* 0 once an answer has been counted */
+    uint16_t        ansMaxMs;
+    uint32_t        ansSumMs;
+    uint16_t        ansN;
 
     /* Channel-RSSI sampling (radio task). One getRSSI(false) per beat while the
      * radio is idle; carrier sense outranks it, so a frame contending for the
@@ -395,7 +434,7 @@ struct LoraRadio {
     uint16_t        annIntervalMin;  /* s.lora.<i>.announce_interval, minutes; 0 =
                                       * manual only. The same key the Reticulum
                                       * announce beat reads — one question, one
-                                      * answer — read here for SUPE's ANNOUNCE2 */
+                                      * answer — read here for SUPE's ANNOUNCE */
 #endif
     /* The channel the radio is tuned to right now, so a record and its airtime
      * credit both land where the frame actually flew. Held here rather than

@@ -112,18 +112,27 @@ int8_t apTxPower(LoraRadio* r, const uint8_t* pkt, size_t len) {
 
 /* Put the chip on `txp`. This is the only place the tx path moves the power
  * register, and txPwrNow is what the radio is currently set to as well as what
- * the LoRaMon record is stamped with, so the two can't drift — a frame to a
- * quiet neighbour must not leave the next frame transmitting at its power while
- * being recorded at another. */
+ * the LoRaMon record is stamped with and what a transmission announces, so the
+ * three can't drift — a frame to a quiet neighbour must not leave the next
+ * frame transmitting at its power while being recorded at another.
+ *
+ * What gets recorded is the power the chosen setting ACTUALLY radiates, not
+ * the power that was asked for. The two part company wherever the range or the
+ * curve cannot honour a request — most visibly at the bottom, where a board
+ * that cannot be driven below its amplifier's output would otherwise announce
+ * a figure tens of dB under what it puts on the air, and every peer would
+ * compute its path loss to us wrong by the difference. */
 void apApplyPower(LoraRadio* r, int8_t txp) {
-    if (txp == r->txPwrNow) return;
-    int16_t st = r->radio->setOutputPower(femChipDbm(r, txp));
+    const int8_t chip = rfChipDbm(r, txp);
+    const int8_t got  = rfAntennaDbm(r, chip);
+    if (got == r->txPwrNow) return;
+    int16_t st = r->radio->setOutputPower(chip);
     if (st != RADIOLIB_ERR_NONE) {
         warn("lora/%d setOutputPower(%d): %s (%d)",
-             r->idx, (int)txp, rlErrName(st), (int)st);
+             r->idx, (int)chip, rlErrName(st), (int)st);
         return;
     }
-    r->txPwrNow = txp;
+    r->txPwrNow = got;
 }
 
 /* Should this outbound packet carry a power request, and what should it ask for?
@@ -196,16 +205,21 @@ bool apPwrReqFor(LoraRadio* r, const uint8_t* pkt, size_t len, int8_t* out) {
 /* ── adaptive TX power: deriving one node's opening power ──
  * (overview at AP_FRESH_MS, in lora_power.h) */
 
-/* Clamp a power to what this radio may transmit at: the chip's range, and
- * never above the configured tx_power. Every tier needs it: a derived need can
- * land below what the chip will emit, and a floor filed after a miss can land
- * above what the antenna is allowed. */
+/* Clamp a power to what this radio may transmit at: the range this board
+ * reaches at the connector, and never above the configured tx_power. Every
+ * tier needs it: a derived need can land below what the board will emit, and a
+ * floor filed after a miss can land above what the antenna is allowed.
+ *
+ * Both bounds are the board's, not the chip's. Asking the radio to validate
+ * the number would judge a connector-referenced power against a
+ * register-referenced range, which is wrong at both ends on an amplified
+ * board: it would cap the request below the ceiling the board actually
+ * reaches, and let it sit far under a floor the board cannot go beneath. What
+ * the chip will accept is rfChipDbm's business, one step further on. */
 static int8_t apClamp(LoraRadio* r, int want) {
     if (want > r->cfgTxp)    want = r->cfgTxp;
-    if (want < AP_FLOOR_DBM) want = AP_FLOOR_DBM;
-    int8_t clipped = (int8_t)want;
-    r->radio->checkOutputPower((int8_t)want, &clipped);
-    return clipped;
+    if (want < r->minTxDbm)  want = r->minTxDbm;
+    return (int8_t)want;
 }
 
 #if !defined(CONFIG_LORA_NO_SUPE)

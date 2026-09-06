@@ -157,6 +157,17 @@ static const int kNumBandwidths = (int)(sizeof kBandwidths / sizeof kBandwidths[
 /* Receiver noise figure. A middling figure for the parts this drives, and it
  * cancels out of every *difference* the ladder works in — it only sets where
  * the absolute floor sits. */
+/* Receiver noise figure, dB. Deliberately a bare radio's, not this board's:
+ * every caller asks this about the FAR end — what power must reach a peer for
+ * it to decode — and a peer's front end is not ours to assume. Crediting one
+ * with an amplifier it may not have would under-power the link, while assuming
+ * it has none only ever spends a dB or two too many, so the conservative
+ * reading is the one that stands.
+ *
+ * A node reasoning about its OWN reception has no use for this: nothing in the
+ * tree compares a level of ours against an absolute floor. Margin is an SNR
+ * question (peersHeadroom10) and carrier sense tracks its own floor from the
+ * channel, so both are already indifferent to what sits in front of us. */
 #define SUPE_NOISE_FIGURE_DB  6
 
 int16_t supeReqSnrDeci(uint8_t sf) { return reqSnrDeci((int)sf); }
@@ -199,27 +210,27 @@ static void decCaps(const uint8_t* p, SupeCaps* c) {
     c->maxPwrDbm = (int8_t)supeDecLevel(p[1]);
 }
 
-size_t supeEncAnn2(uint8_t* out, size_t cap, const SupeAnn2* a) {
-    if (a->count == 0 || a->count > SUPE_ANN2_MAX) return 0;
-    size_t n = SUPE_ANN2_BASE + (size_t)a->count * SUPE_ID_LEN;
+size_t supeEncAnn(uint8_t* out, size_t cap, const SupeAnn* a) {
+    if (a->count == 0 || a->count > SUPE_ANN_MAX) return 0;
+    size_t n = SUPE_ANN_BASE + (size_t)a->count * SUPE_ID_LEN;
     if (cap < n) return 0;
-    out[0] = SUPE_T_ANNOUNCE2;
+    out[0] = SUPE_T_ANNOUNCE;
     out[1] = packNibbles(a->regime, a->version);
     encCaps(out + 2, &a->caps);
     out[4] = supeEncLevel(a->pwrDbm);
     /* Hashes last, so the count needs no byte of its own. */
     for (int i = 0; i < a->count; i++)
-        memcpy(out + SUPE_ANN2_BASE + i * SUPE_ID_LEN, a->ids[i], SUPE_ID_LEN);
+        memcpy(out + SUPE_ANN_BASE + i * SUPE_ID_LEN, a->ids[i], SUPE_ID_LEN);
     return n;
 }
 
-static bool lenOkAnn2(size_t len);
+static bool lenOkAnn(size_t len);
 
-bool supeDecAnn2(const uint8_t* f, size_t len, SupeAnn2* out) {
-    if (len < 2 || f[0] != SUPE_T_ANNOUNCE2) return false;
+bool supeDecAnn(const uint8_t* f, size_t len, SupeAnn* out) {
+    if (len < 2 || f[0] != SUPE_T_ANNOUNCE) return false;
     uint8_t regime  = (uint8_t)(f[1] >> 4);
     uint8_t version = (uint8_t)(f[1] & 0x0F);
-    if (!lenOkAnn2(len)) return false;
+    if (!lenOkAnn(len)) return false;
     /* "I do not speak SUPE" is not a dialect, so it is not checked against one:
      * a node renouncing the protocol has no version to agree about, and the
      * identities the frame carries are worth reading either way. */
@@ -231,9 +242,9 @@ bool supeDecAnn2(const uint8_t* f, size_t len, SupeAnn2* out) {
     out->version = version;
     decCaps(f + 2, &out->caps);
     out->pwrDbm  = (int8_t)supeDecLevel(f[4]);
-    out->count   = (uint8_t)((len - SUPE_ANN2_BASE) / SUPE_ID_LEN);
+    out->count   = (uint8_t)((len - SUPE_ANN_BASE) / SUPE_ID_LEN);
     for (int i = 0; i < out->count; i++)
-        memcpy(out->ids[i], f + SUPE_ANN2_BASE + i * SUPE_ID_LEN, SUPE_ID_LEN);
+        memcpy(out->ids[i], f + SUPE_ANN_BASE + i * SUPE_ID_LEN, SUPE_ID_LEN);
     return true;
 }
 
@@ -439,13 +450,19 @@ void supeDeriveSchedule(const uint8_t d0[32], const uint8_t d1[32],
         if (k == 0) {
             t = wide ? 150u + (j % 40u) : (uint32_t)SUPE_NARROW_T0_MS;
         } else {
-            uint32_t base = wide ? (60u + 30u * k) : 40u;
+            uint32_t base = wide ? (60u + 30u * k) : 100u;
             if (wide && base > 350u) base = 350u;
             t += base + (j % (wide ? 40u : 24u));
         }
         if (t > horizon) break;
+        uint8_t chan = nChans ? (uint8_t)(1 + (c % nChans)) : SUPE_CH_HAIL;
+        /* A narrow schedule's second slot is never on the first's channel —
+         * that is what it is for: a busy channel is answered by a different
+         * one (§7). Redrawn one step along, so both ends land identically. */
+        if (!wide && n == 1 && nChans > 1 && chan == out->slot[0].chan)
+            chan = (uint8_t)(1 + ((c + 1) % nChans));
         out->slot[n].tMs   = (uint16_t)t;
-        out->slot[n].chan  = nChans ? (uint8_t)(1 + (c % nChans)) : SUPE_CH_HAIL;
+        out->slot[n].chan  = chan;
         out->slot[n].sByte = s;
         n++;
     }
@@ -454,127 +471,116 @@ void supeDeriveSchedule(const uint8_t d0[32], const uint8_t d1[32],
 
 /* ─────────────── codec, the meeting frames (§0.1) ─────────────── */
 
-static bool lenOkAnn2(size_t len) {
-    if (len < SUPE_ANN2_BASE + SUPE_ID_LEN) return false;
-    size_t idBytes = len - SUPE_ANN2_BASE;
+static bool lenOkAnn(size_t len) {
+    if (len < SUPE_ANN_BASE + SUPE_ID_LEN) return false;
+    size_t idBytes = len - SUPE_ANN_BASE;
     if (idBytes % SUPE_ID_LEN) return false;
-    return idBytes / SUPE_ID_LEN <= SUPE_ANN2_MAX;
+    return idBytes / SUPE_ID_LEN <= SUPE_ANN_MAX;
 }
 
-size_t supeEncPrivsync(uint8_t* out, size_t cap, const SupePrivsync* p) {
-    size_t n = p->haveIdent ? SUPE_PRIVSYNC_ID_LEN : SUPE_PRIVSYNC_LEN;
-    if (cap < n) return 0;
-    out[0] = SUPE_T_PRIVSYNC;
-    out[1] = packNibbles(p->regime, p->version);
-    memcpy(out + 2, p->tag, SUPE_TAG_LEN);
-    out[5] = supeEncLevel(p->pwrDbm);
-    out[6] = p->salt;
-    if (p->haveIdent) memcpy(out + 7, p->ident, SUPE_TAG_LEN);
+size_t supeEncHail(uint8_t* out, size_t cap, const SupeHail* h) {
+    size_t n = h->haveIdent ? SUPE_HAIL_ID_LEN : SUPE_HAIL_LEN;
+    if (cap < n || h->count > SUPE_TRAIN_MAX) return 0;
+    out[0] = SUPE_T_HAIL;
+    out[1] = packNibbles(h->regime, h->version);
+    memcpy(out + 2, h->tag, SUPE_TAG_LEN);
+    out[5] = supeEncLevel(h->pwrDbm);
+    out[6] = h->salt;
+    out[7] = h->budgetCeil;
+    out[8] = h->count;
+    out[9] = h->lenByte;
+    /* The identity last: presence is implicit in the frame length, and a
+     * hail-back tags the identity the hail it answers carried here. */
+    if (h->haveIdent) memcpy(out + SUPE_HAIL_LEN, h->ident, SUPE_TAG_LEN);
     return n;
 }
 
-bool supeDecPrivsync(const uint8_t* f, size_t len, SupePrivsync* out) {
-    if (len < 2 || f[0] != SUPE_T_PRIVSYNC) return false;
-    if (len != SUPE_PRIVSYNC_LEN && len != SUPE_PRIVSYNC_ID_LEN) return false;
+bool supeDecHail(const uint8_t* f, size_t len, SupeHail* out) {
+    if (len < 2 || f[0] != SUPE_T_HAIL) return false;
+    if (len != SUPE_HAIL_LEN && len != SUPE_HAIL_ID_LEN) return false;
     uint8_t regime  = (uint8_t)(f[1] >> 4);
     uint8_t version = (uint8_t)(f[1] & 0x0F);
     const SupeRegime* g = supeRegime(regime);
     if (!g || g->version != version) return false;
+    if (f[8] > SUPE_TRAIN_MAX) return false;
     out->regime  = regime;
     out->version = version;
     memcpy(out->tag, f + 2, SUPE_TAG_LEN);
-    out->pwrDbm  = (int8_t)supeDecLevel(f[5]);
-    out->salt    = f[6];
+    out->pwrDbm     = (int8_t)supeDecLevel(f[5]);
+    out->salt       = f[6];
+    out->budgetCeil = f[7];
+    out->count      = f[8];
+    out->lenByte    = f[9];
     /* Presence of the sender's identity is implicit in the frame length; a
      * node with `sender_ident` off still parses and honours the long form. */
-    out->haveIdent = (len == SUPE_PRIVSYNC_ID_LEN);
-    if (out->haveIdent) memcpy(out->ident, f + 7, SUPE_TAG_LEN);
+    out->haveIdent = (len == SUPE_HAIL_ID_LEN);
+    if (out->haveIdent) memcpy(out->ident, f + SUPE_HAIL_LEN, SUPE_TAG_LEN);
     else                memset(out->ident, 0, SUPE_TAG_LEN);
     return true;
 }
 
-size_t supeEncHaveData(uint8_t* out, size_t cap, const SupeHaveData* h) {
-    size_t n = h->answering ? (size_t)SUPE_HAVEDATA_ANS_BASE + h->maskLen
-                            : (size_t)SUPE_HAVEDATA_LEN;
-    if (cap < n || h->count > SUPE_TRAIN_MAX) return 0;
-    if (h->answering && h->maskLen > SUPE_MASK_MAX) return 0;
-    out[0] = SUPE_T_HAVEDATA;
-    memcpy(out + 1, h->hash, SUPE_HASH_LEN);
-    out[4] = supeEncLevel(h->pwrDbm);
-    out[5] = h->budget;
-    out[6] = h->count;
-    out[7] = h->lenByte;
-    if (h->answering) {
-        out[8] = supeEncLevel(h->trainRssi);
-        out[9] = (uint8_t)h->trainSnrQ;
-        memcpy(out + 10, h->mask, h->maskLen);
-    }
-    return n;
-}
-
-bool supeDecHaveData(const uint8_t* f, size_t len, uint8_t peerCount,
-                     SupeHaveData* out) {
-    if (len < 1 || f[0] != SUPE_T_HAVEDATA) return false;
-    size_t ansLen = (size_t)SUPE_HAVEDATA_ANS_BASE + supeMaskLen(peerCount);
-    bool answering;
-    if (len == SUPE_HAVEDATA_LEN) answering = false;
-    else if (peerCount > 0 && len == ansLen) answering = true;
-    else return false;
-    memcpy(out->hash, f + 1, SUPE_HASH_LEN);
-    out->pwrDbm  = (int8_t)supeDecLevel(f[4]);
-    out->budget  = f[5];
-    out->count   = f[6];
-    out->lenByte = f[7];
-    if (out->count > SUPE_TRAIN_MAX) return false;
-    out->answering = answering;
-    memset(out->mask, 0, sizeof out->mask);
-    if (answering) {
-        out->trainRssi = supeDecLevel(f[8]);
-        out->trainSnrQ = (int8_t)f[9];
-        out->maskLen   = supeMaskLen(peerCount);
-        memcpy(out->mask, f + 10, out->maskLen);
-    } else {
-        out->trainRssi = 0;
-        out->trainSnrQ = 0;
-        out->maskLen   = 0;
-    }
-    return true;
-}
-
-size_t supeEncGimme(uint8_t* out, size_t cap, const SupeGimme* g) {
-    size_t n = g->havePsHeard ? SUPE_GIMME_LEN : SUPE_GIMME_WIDE_LEN;
-    if (cap < n) return 0;
-    out[0] = SUPE_T_GIMME;
+/* GIMME's nine bytes are HAVE's first nine: one layout, written once. */
+static void encGimmeBody(uint8_t* out, uint8_t type, const SupeGimme* g) {
+    out[0] = type;
     memcpy(out + 1, g->hash, SUPE_HASH_LEN);
     out[4] = supeEncLevel(g->pwrDbm);
     out[5] = g->budget;
-    size_t o = 6;
-    if (g->havePsHeard) {
-        out[o++] = supeEncLevel(g->psRssi);
-        out[o++] = (uint8_t)g->psSnrQ;
-    }
-    out[o++] = supeEncLevel(g->hdRssi);
-    out[o++] = (uint8_t)g->hdSnrQ;
-    return n;
+    out[6] = g->countCeil;
+    out[7] = supeEncLevel(g->heardRssi);
+    out[8] = (uint8_t)g->heardSnrQ;
+}
+
+static void decGimmeBody(const uint8_t* f, SupeGimme* g) {
+    memcpy(g->hash, f + 1, SUPE_HASH_LEN);
+    g->pwrDbm    = (int8_t)supeDecLevel(f[4]);
+    g->budget    = f[5];
+    g->countCeil = f[6];
+    g->heardRssi = supeDecLevel(f[7]);
+    g->heardSnrQ = (int8_t)f[8];
+}
+
+size_t supeEncGimme(uint8_t* out, size_t cap, const SupeGimme* g) {
+    if (cap < SUPE_GIMME_LEN) return 0;
+    encGimmeBody(out, SUPE_T_GIMME, g);
+    return SUPE_GIMME_LEN;
 }
 
 bool supeDecGimme(const uint8_t* f, size_t len, SupeGimme* out) {
-    if (len < 1 || f[0] != SUPE_T_GIMME) return false;
-    if (len != SUPE_GIMME_LEN && len != SUPE_GIMME_WIDE_LEN) return false;
-    memcpy(out->hash, f + 1, SUPE_HASH_LEN);
-    out->pwrDbm = (int8_t)supeDecLevel(f[4]);
-    out->budget = f[5];
-    out->havePsHeard = (len == SUPE_GIMME_LEN);
-    size_t o = 6;
-    if (out->havePsHeard) {
-        out->psRssi = supeDecLevel(f[o]); o++;
-        out->psSnrQ = (int8_t)f[o];       o++;
-    } else {
-        out->psRssi = 0;
-        out->psSnrQ = 0;
+    if (len != SUPE_GIMME_LEN || f[0] != SUPE_T_GIMME) return false;
+    decGimmeBody(f, out);
+    return true;
+}
+
+size_t supeEncHave(uint8_t* out, size_t cap, const SupeHave* h) {
+    size_t n = h->answering ? (size_t)SUPE_HAVE_ANS_BASE + h->maskLen
+                            : (size_t)SUPE_HAVE_LEN;
+    if (cap < n || h->count > SUPE_TRAIN_MAX) return 0;
+    if (h->answering && (h->maskLen == 0 || h->maskLen > SUPE_MASK_MAX)) return 0;
+    encGimmeBody(out, SUPE_T_HAVE, &h->g);
+    out[9]  = h->count;
+    out[10] = h->lenByte;
+    if (h->answering) memcpy(out + SUPE_HAVE_ANS_BASE, h->mask, h->maskLen);
+    return n;
+}
+
+bool supeDecHave(const uint8_t* f, size_t len, uint8_t peerCount, SupeHave* out) {
+    if (len < 1 || f[0] != SUPE_T_HAVE) return false;
+    size_t ansLen = (size_t)SUPE_HAVE_ANS_BASE + supeMaskLen(peerCount);
+    bool answering;
+    if (len == SUPE_HAVE_LEN) answering = false;
+    else if (peerCount > 0 && len == ansLen) answering = true;
+    else return false;
+    if (f[9] > SUPE_TRAIN_MAX) return false;
+    decGimmeBody(f, &out->g);
+    out->count     = f[9];
+    out->lenByte   = f[10];
+    out->answering = answering;
+    memset(out->mask, 0, sizeof out->mask);
+    out->maskLen = 0;
+    if (answering) {
+        out->maskLen = supeMaskLen(peerCount);
+        memcpy(out->mask, f + SUPE_HAVE_ANS_BASE, out->maskLen);
     }
-    out->hdRssi = supeDecLevel(f[o]); o++;
-    out->hdSnrQ = (int8_t)f[o];
     return true;
 }
 

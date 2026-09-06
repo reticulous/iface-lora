@@ -16,7 +16,12 @@ struct LoraRadio;
 #define CSMA_CW_MIN          2       /* initial CW exponent → up to 2^2 = 4 slots */
 #define CSMA_CW_MAX          6       /* CW ceiling → up to 2^6 = 64 slots */
 #define CSMA_RSSI_MARGIN_DB  6.0f    /* dB above noise floor that reads as busy */
-#define CSMA_NOISE_FLOOR_DBM (-105.0f)  /* initial noise-floor estimate */
+#define CSMA_NOISE_FLOOR_DBM (-105.0f)  /* initial noise-floor estimate, dBm at the
+                                         * antenna connector. The only absolute
+                                         * level in carrier sense: every decision
+                                         * after the first samples is against a
+                                         * floor tracked from the channel itself,
+                                         * so a receive-gain offset cancels there */
 
 /* The slot sense's threshold is ABSOLUTE, not floor-relative, and that is the
  * whole point (SUPE.md §14.2, EN 300 220-1 table 45): −81 dBm in 125 kHz,

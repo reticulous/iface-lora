@@ -60,12 +60,12 @@ struct LoraMonState {
  * carries a byte. Values are wire — a viewer decodes them — so they are
  * appended to, never renumbered.
  *
- *   0 unknown   1 PRIVSYNC  2 ANNOUNCE2  3 HAVEDATA  4 GIMME
+ *   0 unknown   1 HAIL  2 ANNOUNCE  3 HAVE  4 GIMME
  *   5 THATSIT   6 BYE       7 RESEND     8 data      9 announce
  *  10 link req 11 proof    12 split     13 RNode */
 enum : uint8_t {
     LMD_NONE = 0,
-    LMD_PRIVSYNC, LMD_ANNOUNCE2, LMD_HAVEDATA, LMD_GIMME,
+    LMD_HAIL, LMD_ANNOUNCE, LMD_HAVE, LMD_GIMME,
     LMD_THATSIT, LMD_BYE, LMD_RESEND,
     LMD_RNS_DATA, LMD_RNS_ANNOUNCE, LMD_RNS_LINKREQ, LMD_RNS_PROOF,
     LMD_RNS_SPLIT, LMD_RNODE,
@@ -102,10 +102,10 @@ void loraMonClassify(LoraRadio* r, uint8_t dir, const uint8_t* f, size_t len,
                      uint8_t* desc, uint8_t* whole, uint8_t tag[3]);
 
 /* Who SENT a frame, where the frame says so, and false where it does not. Two
- * SUPE frames do. PRIVSYNC carries the sender's identity prefix precisely
+ * SUPE frames do. HAIL carries the sender's identity prefix precisely
  * because the node it names in its address field is the node being hailed, not
  * the one hailing: a received hail concerns the sender, since the address on it
- * is us. ANNOUNCE2 has no address field at all and its payload IS the sender's
+ * is us. ANNOUNCE has no address field at all and its payload IS the sender's
  * identities, so without this an announcement — the frame that introduces a
  * node — is the one frame on the graph attributed to nobody. */
 bool loraMonSenderOf(const uint8_t* f, size_t len, uint8_t type, uint8_t out[3]);

@@ -47,3 +47,4 @@ esp-idf/build/
 # it is committed and its diff is how a deliberate wire change gets reviewed.
 esp-idf/test/supe_core_test
 esp-idf/test/supe_engine_test
+esp-idf/test/rfcal_test

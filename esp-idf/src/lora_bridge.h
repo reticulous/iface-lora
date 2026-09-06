@@ -42,7 +42,9 @@ struct AnnBuf { AnnRec e[ANN_MAX_ENTRIES]; };
 uint8_t modeFromString(const char* s);
 bool registerWithRnsd(LoraRadio* r);
 void deregisterFromRnsd(LoraRadio* r);
-void rearmRx(LoraRadio* r);
+void rearmRx(LoraRadio* r);      /* after a transmit or a retune: the chip is in standby */
+void loraNoteAnswer(LoraRadio* r); /* an engine frame is leaving: score it against the last rx */
+void rxContinue(LoraRadio* r);   /* after a frame was read out: the chip kept receiving */
 void startTxFrame(LoraRadio* r, int idx);
 /* The frame-level tail of the receive path — split reassembly and delivery —
  * shared by the live path and the meeting buffer's replay at close, so a

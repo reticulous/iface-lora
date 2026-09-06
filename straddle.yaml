@@ -95,10 +95,10 @@ settings:
           label: "Maximum TX power"
           unit: "dBm"
           key: "s.lora.0.tx_power"
-          min: -9
+          min: { key: "lora.0.tx_power_min", default: -9 }
           max: { key: "lora.0.tx_power_max", default: 22 }
         when_key: "s.lora.0.enable"
-      - caption: "The most this radio will ever transmit at, measured at the antenna. Frames to a peer whose signal we have measured go out at whatever reaches it, which is often well below this."
+      - caption: "The most this radio will ever transmit at, measured at the antenna connector. Frames to a peer whose signal we have measured go out at whatever reaches it, which is often well below this. The bottom of the range is the board's own: an amplified one cannot transmit quietly, because its amplifier's output is its quietest frame."
         when_key: "s.lora.0.enable"
       - integer: { label: "Preamble", key: "s.lora.0.preamble", min: 6, max: 32, default: 12 }
         when_key: "s.lora.0.enable"
@@ -113,14 +113,23 @@ settings:
       # doing — and a radio that is off is the plainest case of that.
       - switch: { label: "RX boosted gain", key: "s.lora.0.rx_boosted_gain", default: 1 }
         when_key: "lora.0.row_rx_boost"
-      - caption: "About 3 dB more sensitivity for a fraction of a milliamp more while listening. For optimal gain, this might need to be turned off if your hardware uses a pre-amplifier."
+      # Behind an external receive amplifier the chip's boost buys a few tenths
+      # of a dB (its noise figure is divided by the front end's gain before it
+      # reaches the system's), so the firmware leaves the chip's amplifier off
+      # for as long as one is in the path, whatever this says. The switch keeps
+      # its value for when the front end's LNA is bypassed — then the chip is
+      # the front end again and the user may still want both off.
+      - caption: "About 3 dB more sensitivity for a fraction of a milliamp more while listening. Note: if your board has an external amplifier switched on, this setting will be ignored and the built-in amplifier turned off."
         when_key: "lora.0.row_rx_boost"
-      # Shown only where the detected front end amplifies on receive (femInit
-      # senses it on the pin): with an LNA already in front, the chip's own
-      # boost may buy nothing and costs some large-signal headroom, so the
-      # honest advice is to try both. Nobody has measured it on this tree.
-      - caption: "This board's front end has a receive amplifier of its own, so you may (or may not) actually receive slightly more with this turned off. Try it out."
-        when_key: "lora.0.row_fem_note"
+      # The front end's own receive LNA, on the one detected part that can
+      # switch it out (KCT8103L): the board's standing receive cost. Gated on
+      # `lora.0.row_fem_lna`, truthy only when that part was sensed AND the
+      # radio is on — a GC1109 board never sees the row, since there the
+      # setting would change nothing.
+      - switch: { label: "Front-end receive amplifier", key: "s.lora.0.fem_rx_lna", default: 1 }
+        when_key: "lora.0.row_fem_lna"
+      - caption: "The board's external receive amplifier costs about 8 mA for as long as the radio listens, more than the radio itself. It buys range: turning it off loses about 20 dB of gain in front of the chip. When operating a solar node you might want to turn it off."
+        when_key: "lora.0.row_fem_lna"
       # Analog front-end recalibration. An SX126x that has heard a strong signal
       # can leave its gain control latched and go deaf, and only powering the
       # front end down resets it — so this beat is the one periodic wake the

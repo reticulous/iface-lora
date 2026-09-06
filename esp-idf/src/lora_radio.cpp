@@ -275,7 +275,7 @@ int16_t radioBegin(LoraRadio* r, float freq, float bw, uint8_t sf, uint8_t cr,
      * ceiling and the conversion below — so this has to come first, and it has
      * to come on every begin, because the frequency is the thing that changed. */
     femBandSelect(r, loraFreqIsHighBand(freq));
-    power = femChipDbm(r, power);   /* antenna dBm → chip drive for the port in use */
+    power = rfChipDbm(r, power);   /* connector dBm → register setting for the port in use */
     int16_t st = radioBeginOnce(r, freq, bw, sf, cr, sync, power, preamble, tcxoV);
     if (tcxoV > 0.0f &&
         (st == RADIOLIB_ERR_SPI_CMD_TIMEOUT || st == RADIOLIB_ERR_SPI_CMD_INVALID ||
@@ -386,8 +386,27 @@ void radioIrqCache(LoraRadio* r) {
  * radio still holds no wake; radioRxInProgress reads the record when it wants it.
  * Families whose timeout constant differs take their own arm; SX127x has no
  * preamble-detect IRQ to latch, so it keeps the plain call. */
+/* Drop whatever the chip holds of a packet that will not be read. On the
+ * families that address a packet by its offset in a buffer this is nothing:
+ * the next packet is found by its own offset. The LR2021 reads its packets
+ * out of a FIFO in order, and starting receive does not empty it, so a packet
+ * left unread there is what the NEXT read returns — under the new packet's
+ * length, with the new packet flushed behind it: a phantom frame delivered
+ * in place of a real one. So the FIFO is emptied wherever a packet is not
+ * read: a discarded RX-done, and every start of receive. */
+void radioRxDiscard(LoraRadio* r) {
+    if (chipFamily(r->slot->chip) != FAM_LR2021) return;
+    /* RadioLib keeps the chip's ClearRxFifo private; the command is one
+     * data-less write, issued the way its own wrapper issues one. */
+    int16_t st = r->mod->SPIwriteStream((uint16_t)RADIOLIB_LR2021_CMD_CLEAR_RX_FIFO,
+                                        nullptr, 0, true, true);
+    if (st != RADIOLIB_ERR_NONE)
+        warn("lora/%d LR2021 rx fifo clear refused: %s (%d)", r->idx, rlErrName(st), (int)st);
+}
+
 int16_t radioStartRx(LoraRadio* r) {
     PhysicalLayer* p = r->radio;
+    radioRxDiscard(r);
     switch (chipFamily(r->slot->chip)) {
         case FAM_SX126X:
             return p->startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF, LORA_RX_IRQ_FLAGS,
@@ -405,6 +424,19 @@ int16_t radioStartRx(LoraRadio* r) {
             break;
     }
     return p->startReceive();
+}
+
+/* The receiver after a frame has been read out of the chip. Every family is
+ * armed in continuous receive, and on all but one the chip is still receiving
+ * once readData has emptied its buffer — in a train the next preamble is being
+ * demodulated while the task is still reading this frame. Nothing is done to
+ * it: a startReceive begins with standby, and standby throws that reception
+ * away, which at the fastest budgets is every second frame of a train. The
+ * SX128x is the exception — RadioLib's readData takes it to standby first — so
+ * it alone is started again. */
+int16_t radioRxResume(LoraRadio* r) {
+    if (chipFamily(r->slot->chip) != FAM_SX128X) return RADIOLIB_ERR_NONE;
+    return radioStartRx(r);
 }
 
 /* Is a reception under way *right now*, as the modem sees it?
@@ -624,25 +656,32 @@ uint32_t computeBitrate(int sf, int bw_hz, int cr_denom, int preamble) {
     return (uint32_t)((double)(RNS_MTU * 8) / secs);
 }
 
-/* Instantaneous channel RSSI (dBm), read without leaving continuous RX.
- * getRSSI(false) is the "current channel" overload (vs the base getRSSI() which
- * returns last-packet RSSI); it lives on the concrete chip class, not on
- * PhysicalLayer, so dispatch per chip like radioBegin does. */
+/* Instantaneous channel RSSI (dBm at the antenna connector), read without
+ * leaving continuous RX. getRSSI(false) is the "current channel" overload (vs
+ * the base getRSSI() which returns last-packet RSSI); it lives on the concrete
+ * chip class, not on PhysicalLayer, so dispatch per chip like radioBegin does.
+ *
+ * The conversion happens here rather than at the callers because this is the
+ * only way a channel level enters the driver, and carrier sense, the noise
+ * floor and the spectrum record must all be reading the same quantity. Carrier
+ * sense compares against a floor tracked from these same samples, so a
+ * constant offset cancels out of the busy test and only the initial estimate
+ * is an absolute number. */
 float channelRssi(LoraRadio* r) {
     PhysicalLayer* p = r->radio;
     switch (r->slot->chip) {
         case CHIP_SX1261: case CHIP_SX1262: case CHIP_SX1268: case CHIP_LLCC68:
-            return static_cast<SX126x*>(p)->getRSSI(false);
+            return rfRssiDbm(r, static_cast<SX126x*>(p)->getRSSI(false));
         case CHIP_SX1272:
-            return static_cast<SX1272*>(p)->getRSSI(false);
+            return rfRssiDbm(r, static_cast<SX1272*>(p)->getRSSI(false));
         case CHIP_SX1276: case CHIP_SX1277: case CHIP_SX1278:
-            return static_cast<SX1278*>(p)->getRSSI(false);
+            return rfRssiDbm(r, static_cast<SX1278*>(p)->getRSSI(false));
         case CHIP_SX1280: case CHIP_SX1281: case CHIP_SX1282:
-            return static_cast<SX128x*>(p)->getRSSI(false);
+            return rfRssiDbm(r, static_cast<SX128x*>(p)->getRSSI(false));
         case CHIP_LR1110: case CHIP_LR1120: case CHIP_LR1121:
-            return static_cast<LR11x0*>(p)->getRSSI(false);
+            return rfRssiDbm(r, static_cast<LR11x0*>(p)->getRSSI(false));
         case CHIP_LR2021:
-            return static_cast<LR2021*>(p)->getRSSI(false);
+            return rfRssiDbm(r, static_cast<LR2021*>(p)->getRSSI(false));
     }
     return -200.0f;   /* unhandled chip → read as free (fail open to blind TX) */
 }

@@ -64,12 +64,6 @@ bool registerWithRnsd(LoraRadio* r) {
      * A radio cannot name the sender of a packet it merely overheard; those
      * carry an all-zero key, which is rnsd's "unknown". */
     reg.rx_origin = 1;
-    /* Configured antenna power, for the rx-report proof to quote back to a peer
-     * so it can read the path loss off our signal. The configured figure, not the
-     * adaptive per-peer one: this is a readout, and re-registration on the config
-     * cycle is what keeps it current. */
-    reg.tx_power_known = 1;
-    reg.tx_power_dbm   = r->cfgTxp;
     reg.community_radius = r->curCommunityRadius;
     safeStrncpy(reg.ifac_netname, r->curIfacNetname, sizeof(reg.ifac_netname));
     safeStrncpy(reg.ifac_netkey,  r->curIfacNetkey,  sizeof(reg.ifac_netkey));
@@ -175,7 +169,17 @@ static void deliverInbound(LoraRadio* r, const uint8_t* data, size_t len,
  * disables it on each fire; a completed readData()/finishTransmit() has cleared
  * the chip IRQ so the line has dropped low and the next edge fires again).
  * Shared by the RX drain and the post-TX return to listening. */
-void rearmRx(LoraRadio* r) {
+/* Back to listening. Two entries, one difference: whether the chip is told to
+ * receive. After a transmit, a retune or an IRQ repair it sits in standby and
+ * must be started (rearmRx). After a frame has been read out it is still
+ * receiving — every family is armed in continuous receive, and in a train the
+ * next preamble is already being demodulated by the time the task has read this
+ * frame — and a startReceive there begins with standby and throws that reception
+ * away: at the fastest budgets, every second frame of a train. So the RX-done
+ * paths take rxContinue, which resets only the driver's own state and leaves
+ * the modem alone (radioRxResume covers the one family whose readData does
+ * leave receive). */
+static void backToRx(LoraRadio* r, bool start) {
     /* A transmit fired meanwhile (the radio-check slot timer runs off-task) — a
      * startReceive now would abort it. TxDone re-arms RX when it completes. */
     if (r->txActive) {
@@ -191,13 +195,17 @@ void rearmRx(LoraRadio* r) {
 #else
     radioHoldOsc(r, false);
 #endif
-    radioStartRx(r);
-    /* A fresh receiver has no reception in progress; the evidence radioRxInProgress
-     * tracks was cleared with the chip's flags. */
+    if (start) radioStartRx(r);
+    else       radioRxResume(r);
+    /* No reception in progress as far as the driver knows: a fresh receiver has
+     * none, and readData cleared the flags radioRxInProgress reads. */
     r->rxActiveStart = 0;
     r->rxHeaderSeen  = false;
     gpio_intr_enable((gpio_num_t)r->slot->dio1);
 }
+
+void rearmRx(LoraRadio* r)    { backToRx(r, true); }
+void rxContinue(LoraRadio* r) { backToRx(r, false); }
 
 /* Drain a completed reception. serviceRadio has already confirmed RX_DONE from
  * the chip's IRQ flags, so go straight to reading the packet. */
@@ -208,7 +216,13 @@ static void handleRxDone(LoraRadio* r) {
     uint32_t rxEndMs = millis();
     size_t pktLen = r->radio->getPacketLength();
     if (pktLen == 0 || pktLen > 1 + RNODE_MAX_PAYLOAD) {
-        rearmRx(r);
+        /* Nothing is read out, so the flags readData would have cleared are
+         * cleared here — a latched RX_DONE is a permanent wake source — and
+         * the packet itself is discarded from the chip, since on a FIFO part
+         * a packet left unread is what the next read returns. */
+        radioIrqClearAll(r);
+        radioRxDiscard(r);
+        rxContinue(r);
         return;
     }
     /* Time on air of what just landed, from the framing it actually flew with.
@@ -228,30 +242,38 @@ static void handleRxDone(LoraRadio* r) {
              * the graph must show the hole in a train where it died. */
             /* Nothing to describe: the bytes did not survive their CRC, so
               * reading a type out of them would be reading noise. */
+            const float badRssi = rfRssiDbm(r, r->radio->getRSSI());
             loraMonPush(r, 0 /*rx*/, (airMs <= rxEndMs ? rxEndMs - airMs : rxEndMs),
                         (uint16_t)airMs, (uint16_t)pktLen,
-                        (int16_t)lround(r->radio->getRSSI()),
+                        (int16_t)lround(badRssi),
                         (int16_t)lround(r->radio->getSNR() * 10.0), 0,
                         LORA_PKT_BAD, 0, 0, LMD_NONE, nullptr, LMC_BCAST);
             if (logIsVerbose(TAG))        /* a frame, so it belongs at verbose */
                 verb("lora/%d rx CRC-FAIL %uB rssi=%.0f snr=%.1f",
                      r->idx, (unsigned)pktLen,
-                     (double)r->radio->getRSSI(), (double)r->radio->getSNR());
+                     (double)badRssi, (double)r->radio->getSNR());
         }
-        rearmRx(r);
+        rxContinue(r);
         return;
     }
     csmaMediumHeld(r, airMs);
     r->rxFrames++;
-    r->rssiLast = r->radio->getRSSI();
+    r->rxDoneAtMs = rxEndMs ? rxEndMs : 1;   /* what the engine's next frame answers */
+    /* Referred to the antenna connector here, once, because this is where a
+     * received level enters the driver: the neighbour tap, the path losses
+     * built on it, the bucket ring, the records and the RNode endpoint all read
+     * rssiLast and must all read the same quantity. SNR is a ratio — gain in
+     * front raises signal and noise together — so it is passed through. */
+    r->rssiLast = rfRssiDbm(r, r->radio->getRSSI());
     r->snrLast  = r->radio->getSNR();
 
-    /* The frame is out of the chip — put the receiver back on the air before
-     * any of the processing below. In a train the next preamble can start
-     * under a millisecond after this RX_DONE at the fastest budget, and the
-     * dispatch, records, fan-out and inject below all fit inside its flight.
-     * Anything downstream that transmits or retunes overrides this arm. */
-    rearmRx(r);
+    /* The frame is out of the chip, and the chip is still listening: in a train
+     * the next preamble is already on its way in, which is exactly why the modem
+     * is not restarted here. Only the driver's side is reset, before any of the
+     * processing below — the dispatch, records, fan-out and inject all fit
+     * inside the next frame's flight. Anything downstream that transmits or
+     * retunes re-arms for real. */
+    rxContinue(r);
 
     uint8_t  header     = frame[0];
     size_t   payloadLen = pktLen - 1;
@@ -346,7 +368,7 @@ static void handleRxDone(LoraRadio* r) {
          * meeting frame is with the peer and for us, so answering the first
          * from the second would call the bulk of our own traffic somebody
          * else's. */
-        uint8_t rxCast = (rxWhole == LMD_RNS_ANNOUNCE || rxWhole == LMD_ANNOUNCE2)
+        uint8_t rxCast = (rxWhole == LMD_RNS_ANNOUNCE || rxWhole == LMD_ANNOUNCE)
                              ? (uint8_t)LMC_BCAST
                              : inMeeting ? (uint8_t)LMC_US /* a meeting has two parties
                                                             * and we are one of them */
@@ -360,6 +382,20 @@ static void handleRxDone(LoraRadio* r) {
          * at. */
         if (!inMeeting && !loraMonSenderOf(frame, pktLen, rxType, rxTag))
             memcpy(rxTag, addrTag, 3);
+        /* A delivery proof is addressed to the hash of the packet it proves,
+         * which names nobody. When it answers one of our own elicitors the
+         * pending entry knows the destination the packet went to, and that
+         * node is who this is with. The address sits past the transport
+         * identifier on a relayed frame. */
+        if (!inMeeting && rxWhole == LMD_RNS_PROOF && rxType == LORA_PKT_RNS) {
+            size_t at = 1 + 2 + ((frame[1] & 0x40) ? 16 : 0);
+            const NeiPend* pd = pktLen >= at + 16
+                                    ? peersPendPeek(r->nei, frame + at, 16) : nullptr;
+            if (pd) {
+                Neighbor* e = r->nei ? peersFindByDest(r->nei, pd->dest) : nullptr;
+                memcpy(rxTag, e && e->haveNode4 ? e->node4 : pd->dest, 3);
+            }
+        }
         uint32_t now = rxEndMs;
         uint32_t dur = airMs;
         uint8_t  chLive = r->chNow;
@@ -459,6 +495,37 @@ void bridgeFrameDeliver(LoraRadio* r, const uint8_t* frame, size_t pktLen) {
  * never started. If the packet came from the RNode client, this is where its
  * frame is finished with the radio, so its queue is released here: CMD_READY is
  * harmless with flow control off and mandatory with it on. */
+/* The flip as made: from the formula's end of our frame on the air to the
+ * receiver armed again. The far end's answer waits SUPE_FLIP_MS for exactly
+ * this, so the number is kept where `lora` stats can show it. */
+static void noteFlip(LoraRadio* r, uint32_t endMs) {
+    uint32_t now = millis();
+    uint32_t f = (int32_t)(now - endMs) > 0 ? now - endMs : 0;
+    if (f > 0xFFFF) f = 0xFFFF;
+    if (r->flipN == 0xFFFF) { r->flipN = 0; r->flipSumMs = 0; }
+    if (f > r->flipMaxMs) r->flipMaxMs = (uint16_t)f;
+    r->flipSumMs += f;
+    r->flipN++;
+}
+
+/* The answer latency as made: the end of the last frame received to the
+ * start of the engine's frame now leaving, counted once per received frame
+ * and only when the frame follows within an answer's reach — a frame the
+ * engine sends a second later is a slot or a hail, not an answer. The far
+ * end's deadline covers SUPE_TURNAROUND_MS of this, so it is kept where
+ * `lora` stats can show it. */
+#define LORA_ANSWER_REACH_MS 200
+void loraNoteAnswer(LoraRadio* r) {
+    if (!r->rxDoneAtMs) return;
+    uint32_t a = millis() - r->rxDoneAtMs;
+    r->rxDoneAtMs = 0;
+    if (a > LORA_ANSWER_REACH_MS) return;
+    if (r->ansN == 0xFFFF) { r->ansN = 0; r->ansSumMs = 0; }
+    if (a > r->ansMaxMs) r->ansMaxMs = (uint16_t)a;
+    r->ansSumMs += a;
+    r->ansN++;
+}
+
 static void txRearmRx(LoraRadio* r) {
     r->txActive = false;
     if (r->txFromRnode) { r->txFromRnode = false; rnodeSendReady(); }
@@ -733,7 +800,7 @@ bool fireStagedTx(LoraRadio* r) {
  * detour sends states the power it went out at (plans/SUPE.md §7). What is
  * left is the on-demand replay `lora [<n>] a[nnounce]` asks for — every
  * announce this node has originated, one at a time through the queue and
- * ordinary channel access, followed by SUPE's own ANNOUNCE2.
+ * ordinary channel access, followed by SUPE's own ANNOUNCE.
  *
  * Announces are no longer bunched and no longer swallowed. They go out when
  * rnsd hands them over, which is what SUPE.md §9 requires and what the buffer
@@ -788,7 +855,7 @@ static void annReplayFill(LoraRadio* r) {
     if (!b) { r->annReplay = false; return; }
     memcpy(b, e->data, e->len);
     if (!loraqPush(&r->q, b, e->len, millis(), LORAQ_PEER_NONE, nullptr, 1,
-                   LORAQ_ORIG_RNSD | LORAQ_F_REPLAY)) {
+                   LORAQ_ORIG_RNSD | LORAQ_F_REPLAY | LORAQ_F_ANNOUNCE)) {
         free(b);
         r->annIdx--;              /* no room this pass; try again next */
     }
@@ -857,8 +924,9 @@ void queueFill(LoraRadio* r) {
         const uint8_t* tag3 = nullptr;
         RnsHdr h;
         if (rnsParse(b, len, &h)) {
-            if (h.ptype != NEI_PT_ANNOUNCE &&
-                (h.dtype == NEI_DT_SINGLE || h.dtype == NEI_DT_LINK))
+            if (h.ptype == NEI_PT_ANNOUNCE)
+                flags |= LORAQ_F_ANNOUNCE;
+            else if (h.dtype == NEI_DT_SINGLE || h.dtype == NEI_DT_LINK)
                 tag3 = h.hdr2 ? h.transportId : h.dest;
         }
         if (!loraqPush(&r->q, b, len, millis(), peer, tag3, /*refs=*/1, flags)) {
@@ -1020,7 +1088,63 @@ void drainOneOutbound(LoraRadio* r) {
         r->txOwnMs    = (uint16_t)((total - cont) > 0xFFFF ? 0xFFFF : (total - cont));
         r->txWaitPend = false;
     }
+    r->txTrainMs = 0;                  /* a channel grant starts a fresh run */
     queueSendHead(r);
+}
+
+/* ─────────────── the announce run ───────────────
+ *
+ * Announces go out as a train: a run of them chains from transmit-done with
+ * nothing but the receiver's flip gap between packets — the spacing the two
+ * halves of a split already fly at — and the polite wait is paid once, for
+ * the run. It is paid again only where the next announce would carry the run
+ * past LORA_TX_TRAIN_MAX_MS of continuous air, which at SF7/125 kHz is about
+ * three announces. This node's own SUPE announcement closes a replay run the
+ * same way. Everything else still contends per packet. */
+static uint32_t pktAirMs(const LoraRadio* r, uint16_t len) {
+    size_t first  = len > RNODE_MAX_PAYLOAD ? RNODE_MAX_PAYLOAD : len;
+    uint32_t ms = (uint32_t)lround(1000.0 * loraAirtimeSeconds(
+                      r->airSf, r->airBwHz, r->cfgCr, r->airPreamble,
+                      (int)first + 1, r->airImplicit));
+    if (len > RNODE_MAX_PAYLOAD)
+        ms += (uint32_t)lround(1000.0 * loraAirtimeSeconds(
+                  r->airSf, r->airBwHz, r->cfgCr, r->airPreamble,
+                  (int)(len - first) + 1, r->airImplicit));
+    return ms;
+}
+
+/* At an announce's completion: fire the next announce, or the SUPE
+ * announcement that closes a replay, without returning to the drain. True
+ * when something is on the air; false leaves the completion path to re-arm
+ * receive as usual. Radio task, under the SUPE lock (serviceRadio). */
+static bool annTrainChain(LoraRadio* r) {
+    if (!r->running || r->mtxPhase != MTXP_OFF || loraCfgQuiet()) return false;
+    if (r->chNow != LORA_CH_HAIL) return false;
+    uint32_t left = r->txTrainMs < LORA_TX_TRAIN_MAX_MS
+                        ? LORA_TX_TRAIN_MAX_MS - r->txTrainMs : 0;
+    /* The replay feeds one entry per pass; at a completion the next one may
+     * not be queued yet, and at the run's end this is what arms the SUPE
+     * announcement that closes it. */
+    if (loraqDepth(&r->q) == 0) annReplayFill(r);
+    LoraPkt* p = loraqAt(&r->q, 0);
+    if (p && (p->flags & LORAQ_F_ANNOUNCE)) {
+        if (pktAirMs(r, p->len) > left) return false;
+        r->txActive = false;
+        if (r->txFromRnode) { r->txFromRnode = false; rnodeSendReady(); }
+        r->txWaitMs = 0;
+        r->txOwnMs = 0;
+        r->txWaitPend = false;
+        queueSendHead(r);
+        return r->txActive;
+    }
+#if !defined(CONFIG_LORA_NO_SUPE)
+    if (!p) {
+        r->txActive = false;
+        if (r->txFromRnode) { r->txFromRnode = false; rnodeSendReady(); }
+        return supeAnnTrainFire(r, left);
+    }
+#endif
+    return false;
 }
 
 /* Ask the chip what just completed and act on it — the IRQ flags are ground
@@ -1032,9 +1156,10 @@ static void serviceRadioLocked(LoraRadio* r);
 /* **Serialised against SUPE's timer steps.** A transaction advances from the
  * esp_timer task — retune, sense, transmit — while this runs on the radio task,
  * and both drive the same chip. Without the lock a radio task delayed (a
- * storage stall is enough) can resume inside `handleRxDone` and re-arm receive
- * across a `startTransmit` the timer has just issued: the frame never leaves,
- * no TxDone ever arrives, and the watchdog abandons it a second later.
+ * storage stall is enough) can resume inside `handleRxDone` and drive the chip
+ * — read it, clear its flags, on an SX128x restart receive — across a
+ * `startTransmit` the timer has just issued: the frame never leaves, no TxDone
+ * ever arrives, and the watchdog abandons it a second later.
  *
  * Holding it here is cheap now that no transmit blocks — the timer's steps are
  * register writes and a return — which is exactly why this was not affordable
@@ -1055,12 +1180,48 @@ static void serviceRadioLocked(LoraRadio* r) {
     if (flags & r->irqTxDone) {
         r->radio->finishTransmit();          /* clear IRQ, chip → standby */
         r->txFrames++;
-        /* Record the frame that just went out (one per split half). */
+        uint32_t doneAtMs = millis();
         uint8_t  doneIdx  = r->txFrameSent;
         uint8_t  doneType = r->txType[doneIdx];
+        uint16_t doneLen  = r->txFrameLen[doneIdx];
         uint32_t dur = (uint32_t)lround(1000.0 * loraAirtimeSeconds(
                            r->airSf, r->airBwHz, r->cfgCr, r->airPreamble,
-                           (int)r->txFrameLen[doneIdx], r->airImplicit));
+                           (int)doneLen, r->airImplicit));
+        uint32_t endMs = r->txFrameStartMs + dur;   /* end of air, by the formula */
+
+        /* THE RECEIVER COMES FIRST. The far end answers a frame of ours after
+         * the flip (SUPE_FLIP_MS), and at the fastest budgets its preamble is
+         * two milliseconds: every millisecond spent here before the chip is
+         * receiving again — retuned to the budget, where the engine asks — is
+         * a millisecond in which that answer starts unheard. So the frame's
+         * record and its accounting are done AFTER the radio is dealt with,
+         * from a snapshot taken now, because dealing with the radio may
+         * restage txFrame[0] with the next train frame, retune, and move
+         * chNow — and close the meeting whose peer the record is tagged with. */
+        uint8_t  frame[1 + RNODE_MAX_PAYLOAD];
+        memcpy(frame, r->txFrame[doneIdx], doneLen);
+        uint8_t  doneCh    = r->chNow;
+        int8_t   donePwr   = r->txPwrNow;
+        uint32_t doneStart = r->txFrameStartMs;
+        uint16_t doneWait  = doneIdx == 0 ? r->txWaitMs : 0;
+        uint16_t doneOwn   = doneIdx == 0 ? r->txOwnMs  : 0;
+        uint8_t  meetTag[3] = {0, 0, 0};
+        bool     inMeeting = false;
+        bool     engineFrame = false;
+#if !defined(CONFIG_LORA_NO_SUPE)
+        inMeeting = supeMeetingTag(r, meetTag);
+        engineFrame = r->supe && r->supe->engineTx;
+#endif
+        r->txTrainMs = (uint16_t)((uint32_t)r->txTrainMs + dur > 0xFFFF
+                                  ? 0xFFFF : r->txTrainMs + dur);
+        bool lastFrame = ++r->txFrameSent >= r->txFrameCount;
+        if (!lastFrame) {
+            startTxFrame(r, r->txFrameSent);   /* split: the second half, back to back */
+        } else if (engineFrame) {
+            txRearmRx(r);                      /* the engine: retune and receive, or its next frame */
+            if (!r->txActive) noteFlip(r, endMs);
+        }
+
         /* The chip's own account of the frame it just flew, against the
          * formula's: start-of-air to this TxDone, minus the computed time on
          * air, should be IRQ+task latency and nothing else. A steady excess
@@ -1068,11 +1229,11 @@ static void serviceRadioLocked(LoraRadio* r) {
          * (preamble length is the classic), and every deadline and record
          * derived from the formula is off by that much. */
         if (logIsVerbose(TAG)) {
-            uint32_t measured = millis() - r->txFrameStartMs;
+            uint32_t measured = doneAtMs - doneStart;
             if (measured > dur + 5 || measured + 5 < dur)
                 verb("lora/%d tx toa measured %lums computed %lums (%uB)",
                      r->idx, (unsigned long)measured, (unsigned long)dur,
-                     (unsigned)r->txFrameLen[doneIdx]);
+                     (unsigned)doneLen);
         }
         /* What it is and the address it was aimed at. The frame index cannot say
          * which half of a split this is — a train stages every frame as
@@ -1080,36 +1241,38 @@ static void serviceRadioLocked(LoraRadio* r) {
          * a tail takes its head's answers. */
         uint8_t txDesc, txWhole;
         uint8_t addrTag[3] = {0, 0, 0};
-        loraMonClassify(r, 1 /*tx*/, r->txFrame[doneIdx], r->txFrameLen[doneIdx],
-                        doneType, r->txFrameStartMs, &txDesc, &txWhole, addrTag);
+        loraMonClassify(r, 1 /*tx*/, frame, doneLen, doneType, doneStart,
+                        &txDesc, &txWhole, addrTag);
         /* Our own transmit: it went to everyone or to one node, and "for us"
          * cannot arise — so OTHER is what the graph reads as "unicast" here.
          * Being aimed at everyone is what the description says, not what an
          * address lookup says, so nothing is looked up — and it is the PACKET's
          * description that says it, so a split announce is a broadcast in both
          * its halves. */
-        uint8_t txCast = (txWhole == LMD_RNS_ANNOUNCE || txWhole == LMD_ANNOUNCE2)
+        uint8_t txCast = (txWhole == LMD_RNS_ANNOUNCE || txWhole == LMD_ANNOUNCE)
                              ? LMC_BCAST : LMC_OTHER;
         /* Who it is with. Our own broadcast is with nobody: the address on it is
          * ours, and naming ourselves above a bar that is already ours by its
          * colour says nothing. */
         uint8_t txTag[3] = {0, 0, 0};
         if (txCast != LMC_BCAST) {
-#if !defined(CONFIG_LORA_NO_SUPE)
-            if (!supeMeetingTag(r, txTag))
-#endif
-                memcpy(txTag, addrTag, 3);
+            if (inMeeting) memcpy(txTag, meetTag, 3);
+            else           memcpy(txTag, addrTag, 3);
         }
         /* Everything but our own air protocol carries the 1-byte seq/split
          * header on air; the record reports payload bytes, so strip it.
-         * RNode-origin packets go out through that same framing as rnsd's. */
-        loraMonPush(r, 1 /*tx*/, r->txFrameStartMs, (uint16_t)dur,
-                    (uint16_t)(r->txFrameLen[doneIdx] -
-                               (doneType == LORA_PKT_OURS ? 0 : 1)),
-                    0, 0, r->txPwrNow, doneType,
-                    doneIdx == 0 ? r->txWaitMs : 0,
-                    doneIdx == 0 ? r->txOwnMs  : 0,
-                    txDesc, txTag, txCast);
+         * RNode-origin packets go out through that same framing as rnsd's.
+         * On the record the frame belongs to the channel it flew on, which
+         * the engine may already have left. */
+        {
+            uint8_t chLive = r->chNow;
+            r->chNow = doneCh;
+            loraMonPush(r, 1 /*tx*/, doneStart, (uint16_t)dur,
+                        (uint16_t)(doneLen - (doneType == LORA_PKT_OURS ? 0 : 1)),
+                        0, 0, donePwr, doneType, doneWait, doneOwn,
+                        txDesc, txTag, txCast);
+            r->chNow = chLive;
+        }
         /* Every frame we put on air is charged somewhere, and *which* somewhere
          * is the whole point. Hailing-channel frames feed the APPC band, which
          * is chosen from this radio's own recent airtime. A detour's frames —
@@ -1119,17 +1282,19 @@ static void serviceRadioLocked(LoraRadio* r) {
          * it deliberately did not, and would leave the ring defending a budget
          * it never saw most of. */
 #if !defined(CONFIG_LORA_NO_SUPE)
-        if (r->chNow == LORA_CH_HAIL) appcAddAirtime(r, dur);
-        else                          airtimeRecord(r, r->chNow, dur);
+        if (doneCh == LORA_CH_HAIL) appcAddAirtime(r, dur);
+        else                        airtimeRecord(r, doneCh, dur);
 #else
         appcAddAirtime(r, dur);   /* one channel, so every frame feeds the band */
 #endif
-        if (++r->txFrameSent < r->txFrameCount) {   /* split: send the second half */
-            startTxFrame(r, r->txFrameSent);
-            return;
-        }
+        if (!lastFrame) return;
         r->txBytes += r->txPayloadBytes;
+        if (engineFrame) return;             /* the radio was dealt with above */
+        /* An announce is followed by the next announce of its run, back to
+         * back, while the run stays inside its budget (annTrainChain). */
+        if (txWhole == LMD_RNS_ANNOUNCE && annTrainChain(r)) return;
         txRearmRx(r);                        /* whole packet sent → back to listening */
+        if (!r->txActive) noteFlip(r, endMs);
         return;
     }
 

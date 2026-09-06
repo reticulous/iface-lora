@@ -4,11 +4,12 @@
  * names a radio, a task or a timer, so this file supplies all three as plain
  * data and a loop.
  *
- * What it steps: a PRIVSYNC seeding a schedule and the meeting a slot opens,
- * the return leg riding the answering HAVEDATA, a repair round recovering a
- * dropped frame, in-sequence delivery around a hole, the absence ladder on
- * narrow-schedule expiry, the no-evidence rules, contact consuming a schedule,
- * and the seed-hash gate.
+ * What it steps: regime 0's dialogue in both shapes (hail, answer, frames at
+ * the hailing rate; the full meeting at a lowered one), the hailed party
+ * opening with HAVE, the hail-back a busy hailed party owes, the run and the
+ * hold, patience; and under a channel plan the two-slot schedule, the return
+ * leg, a repair round, a hole, the wide schedule's ride, crossed hails, the
+ * seed-hash gate, and the no-stale-deadline rule.
  *
  *   make -C iface-lora/esp-idf/test engine
  */
@@ -33,8 +34,6 @@ static void eqi(long got, long want, const char* what) {
     if (got != want) { g_fail++; printf("FAIL  %s: got %ld want %ld\n", what, got, want); }
 }
 
-/* Bounds-safe peek into a delivered-frames list: -1 where a test's expectation
- * ran past what actually arrived, so a shortfall reads as a FAIL, not a crash. */
 static int dByte(const std::vector<std::vector<uint8_t>>& v, size_t i, size_t j) {
     if (i >= v.size() || j >= v[i].size()) return -1;
     return v[i][j];
@@ -44,30 +43,33 @@ static int dByte(const std::vector<std::vector<uint8_t>>& v, size_t i, size_t j)
 
 static uint32_t g_now = 1000;
 static uint32_t g_rand = 12345;
+/* The SNR every frame lands with. 60 (6 dB) affords one budget step from
+ * SF7; 0 affords none, which is what a hailing-rate dialogue needs. */
+static int16_t g_airSnr10 = 60;
 
 struct AirItem {
-    bool     isTrain;                  /* fired through train_fire */
+    bool     isTrain;
     std::vector<uint8_t> bytes;
     int8_t   dbm;
 };
 
 /* The peer record a real host keeps in its peer table; the note handler below
- * mirrors what lora_supe.cpp's does, because that contract is exactly what is
- * under test. */
+ * mirrors what lora_supe.cpp's does, because that contract is under test. */
 struct StubPeer {
     bool     known = false;
     uint16_t peerId = LORAQ_PEER_NONE;
     uint8_t  fam = SUPE_FAM_SX126X, topBudget = 8;
     int8_t   maxTxpDbm = 14;
     int8_t   txpOpen = 14, txpMax = 14;
-    uint8_t  strikes = 0;
-    uint32_t absentUntilMs = 0, retryWaitUntilMs = 0;
+    uint8_t  unanswered = 0;
+    uint32_t holdUntilMs = 0, intervalUntilMs = 0;
     bool     detoured = false;
+    uint32_t heardMs = 0;
 };
 
 struct TxFrameCopy {
     std::vector<uint8_t> bytes;
-    uint8_t* fromPkt;                  /* the queue heap block it was cut from */
+    uint8_t* fromPkt;
 };
 
 struct Node {
@@ -75,34 +77,32 @@ struct Node {
     SupeEngine eng;
     LoraQueue  q;
     SupeHost   host;
-    /* radio */
     bool     home = true;
     uint8_t  chan = 0;
     SupeCfg  cfg = {};
     uint8_t  sync = 0x42;
     uint32_t tunes = 0, homes = 0;
     bool     ccaClear = true;
-    /* one-shot timer */
     bool     schedArmed = false;
     uint32_t schedAt = 0;
-    /* what went on the air, awaiting tx-done + delivery */
     std::vector<AirItem> txq;
-    /* the outgoing train, held to the close */
     std::vector<TxFrameCopy> train;
     bool     trainHeld = false;
     uint32_t trainsDelivered = 0, trainsDropped = 0;
-    /* the inbound buffer, arrival order; flushed on train_deliver */
     std::vector<std::vector<uint8_t>> rxBuf;
     std::vector<std::vector<uint8_t>> delivered;
-    /* the host's peer table, one tag */
+    uint32_t plainRx = 0;             /* train frames handed up as they landed */
     uint8_t  peerTag[3] = {};
+    uint8_t  peerTag2[3] = {};        /* a second name for the same node — its
+                                       * identity beside its destination, as the
+                                       * real peer table resolves both */
     StubPeer peer;
     std::vector<SupePeerNote> notes;
     SupeChanView chans = {};
 };
 
 static uint32_t chanKey(const Node* n) {
-    if (n->home) return 0x42u;                     /* hailing: chan 0, 0x42 */
+    if (n->home) return 0x42u;
     return 1000u + n->chan * 1000u + n->cfg.sf * 100u + n->sync;
 }
 
@@ -114,8 +114,6 @@ static void hSched(void* c, uint32_t at) {
     n->schedAt = at;
 }
 static void hSha(void*, const uint8_t* d, uint16_t n, uint8_t out[32]) {
-    /* Not SHA-256 — both ends run the same function, which is all the hash is
-     * for here (the schedule derivation and its wire id). FNV-1a folded. */
     uint32_t h = 2166136261u;
     for (uint16_t i = 0; i < n; i++) { h ^= d[i]; h *= 16777619u; }
     for (int i = 0; i < 32; i++) { out[i] = (uint8_t)(h >> ((i % 4) * 8)); h = h * 31 + 7; }
@@ -141,15 +139,10 @@ static bool hTxFrame(void* c, const uint8_t* f, uint16_t len, int8_t dbm) {
     return true;
 }
 static void hRx(void*) {}
-/* A reception under way, as the modem would report it: set for as long as a
- * test wants the radio held. */
 static bool g_rxBusy = false;
 static bool hRxBusy(void*) { return g_rxBusy; }
 static bool hCca(void* c) { return ((Node*)c)->ccaClear; }
 
-/* The stub's train pipeline: frames are copies cut from the queue — one frame
- * per packet up to 200 bytes, two above — held until train_done, consumed only
- * on a delivered close. */
 static bool hTrainBuild(void* c, uint16_t peerId, const uint8_t tag[3],
                         uint8_t maxFrames, SupeTrainInfo* out) {
     Node* n = (Node*)c;
@@ -157,9 +150,9 @@ static bool hTrainBuild(void* c, uint16_t peerId, const uint8_t tag[3],
     memset(out, 0, sizeof *out);
     for (uint8_t i = 0; i < loraqDepth(&n->q) && out->count < maxFrames; i++) {
         LoraPkt* p = loraqAt(&n->q, i);
+        if (!(p->flags & LORAQ_F_HAVE_TAG)) continue;   /* unicast only, as the host */
         bool match = false;
-        if (tag && (p->flags & LORAQ_F_HAVE_TAG) && memcmp(p->tag, tag, 3) == 0)
-            match = true;
+        if (tag && memcmp(p->tag, tag, 3) == 0) match = true;
         if (peerId != LORAQ_PEER_NONE && p->peer_id == peerId) match = true;
         if (!match) continue;
         uint16_t first = p->len > 200 ? 200 : p->len;
@@ -190,7 +183,6 @@ static void hTrainDone(void* c, bool delivered) {
     Node* n = (Node*)c;
     if (delivered) {
         n->trainsDelivered++;
-        /* Consume the queue entries the frames were cut from, by heap block. */
         for (auto& fc : n->train) {
             for (uint8_t i = 0; i < loraqDepth(&n->q); i++) {
                 if (loraqAt(&n->q, i)->bytes == fc.fromPkt) { loraqConsume(&n->q, i); break; }
@@ -210,13 +202,18 @@ static void hTrainDeliver(void* c, const uint8_t* order, uint8_t cnt) {
     n->rxBuf.clear();
 }
 
+static bool peerNamed(const Node* n, const uint8_t tag[3]) {
+    return n->peer.known && (memcmp(tag, n->peerTag, 3) == 0 ||
+                             memcmp(tag, n->peerTag2, 3) == 0);
+}
+
 static bool hPeerGet(void* c, const uint8_t tag[3], SupePeerView* out) {
     Node* n = (Node*)c;
     memset(out, 0, sizeof *out);
     out->peerId = LORAQ_PEER_NONE;
     out->txpMax = 14;
     out->txpOpen = 14;
-    if (!n->peer.known || memcmp(tag, n->peerTag, 3) != 0) return false;
+    if (!peerNamed(n, tag)) return false;
     out->known = true;
     out->peerId = n->peer.peerId;
     out->fam = n->peer.fam;
@@ -224,34 +221,38 @@ static bool hPeerGet(void* c, const uint8_t tag[3], SupePeerView* out) {
     out->maxTxpDbm = n->peer.maxTxpDbm;
     out->txpOpen = n->peer.txpOpen;
     out->txpMax = n->peer.txpMax;
-    out->absentStrikes = n->peer.strikes;
-    out->absentUntilMs = n->peer.absentUntilMs;
-    out->retryWaitUntilMs = n->peer.retryWaitUntilMs;
+    out->unanswered = n->peer.unanswered;
+    out->holdUntilMs = n->peer.holdUntilMs;
+    out->intervalUntilMs = n->peer.intervalUntilMs;
     out->detoured = n->peer.detoured;
     return true;
 }
 static int8_t hTxpOpen(void* c, const uint8_t tag[3], const SupeCfg*) {
     Node* n = (Node*)c;
-    if (!n->peer.known || memcmp(tag, n->peerTag, 3) != 0) return 14;
+    if (!peerNamed(n, tag)) return 14;
     return n->peer.txpOpen;
 }
+/* The run and the hold, as lora_supe.cpp keeps them: presence never clears a
+ * hold, an answer does; three unanswered hails and the peer is held. */
 static void hPeerNote(void* c, const uint8_t tag[3], const SupePeerNote* nt) {
     Node* n = (Node*)c;
     n->notes.push_back(*nt);
-    if (memcmp(tag, n->peerTag, 3) != 0) return;
+    if (!peerNamed(n, tag)) return;
     switch (nt->ev) {
         case SUPE_EV_ALIVE:
+            n->peer.heardMs = g_now;
+            break;
+        case SUPE_EV_ANSWERED:
         case SUPE_EV_MET:
-            n->peer.strikes = 0;
-            n->peer.absentUntilMs = 0;
-            n->peer.retryWaitUntilMs = 0;
+            n->peer.unanswered = 0;
+            n->peer.holdUntilMs = 0;
+            n->peer.intervalUntilMs = 0;
             if (nt->ev == SUPE_EV_MET) n->peer.detoured = true;
             break;
-        case SUPE_EV_STRIKE:
-            n->peer.strikes++;
-            n->peer.retryWaitUntilMs = g_now
-                + (nt->backoffMs > nt->agoMs ? nt->backoffMs - nt->agoMs : 0);
-            if (n->peer.strikes >= 3) n->peer.absentUntilMs = g_now + 60000;
+        case SUPE_EV_UNANSWERED:
+            n->peer.unanswered++;
+            n->peer.intervalUntilMs = g_now + nt->backoffMs;
+            if (n->peer.unanswered >= 3) n->peer.holdUntilMs = g_now + 60000;
             break;
         default:
             break;
@@ -259,17 +260,12 @@ static void hPeerNote(void* c, const uint8_t tag[3], const SupePeerNote* nt) {
 }
 static void hChanGet(void* c, SupeChanView* out) { *out = ((Node*)c)->chans; }
 static void hLog(void* c, bool verbose, const char* msg) {
-    /* VERBOSE=1 shows the meeting lines, VERBOSE=2 the steps behind them —
-     * the same split the firmware makes. */
     const char* v = getenv("VERBOSE");
     if (!v) return;
     if (verbose && atoi(v) < 2) return;
     printf("  [%s %6u]%s %s\n", ((Node*)c)->name, g_now, verbose ? " ." : "", msg);
 }
 
-/* Each node's own identity, which its PRIVSYNCs carry. The listening side has
- * nothing else to name a seeker by: the tag a PRIVSYNC asks about is one of
- * the LISTENER'S addresses. */
 static const uint8_t IDENT_A[3] = { 0xa1, 0xa2, 0xa3 };
 static const uint8_t IDENT_B[3] = { 0xb1, 0xb2, 0xb3 };
 static const uint8_t TAG[3]     = { 0xd1, 0x0d, 0x51 };
@@ -320,17 +316,26 @@ static void pushPkt(Node* n, const uint8_t tag[3], uint16_t peerId, uint16_t len
 
 /* ─────────────── the air ─────────────── */
 
-/* Drop filter for the loss tests: drop the Nth train frame seen (1-based),
- * once; 0 = drop nothing. dropRepairs also drops every LATER transmission of
- * a frame already dropped — the repair round's resend of the same bytes. */
 static int  g_dropNthTrain = 0;
-static uint8_t g_dropType = 0;   /* drop the first SUPE frame of this type */
-static uint8_t g_dropNthType = 0; /* …or the g_dropNth'th of this type */
-static int     g_dropNth = 0;
-static int     g_typeSeen = 0;
+static uint8_t g_dropType = 0;
 static bool g_dropRepairs = false;
 static int  g_trainSeen = 0;
 static std::vector<uint8_t> g_droppedCsums;
+static int  g_typeCount[256];
+
+static void deliverTo(Node* dst, const AirItem& it) {
+    if (it.isTrain) {
+        uint8_t csum = supeCrc8(it.bytes.data(), it.bytes.size());
+        if (supeEngOnTrainFrame(&dst->eng, csum, (int16_t)(it.dbm - 80), g_airSnr10))
+            dst->rxBuf.push_back(it.bytes);
+        else if (dst->eng.m.phase == SUPE_M_TRAIN_RX || dst->eng.m.phase == SUPE_M_TRAIN_WAIT ||
+                 dst->eng.m.phase == SUPE_M_IDLE)
+            dst->plainRx++;
+    } else {
+        supeEngOnRx(&dst->eng, it.bytes.data(), (uint16_t)it.bytes.size(),
+                    (int16_t)(it.dbm - 80), g_airSnr10);
+    }
+}
 
 static bool airPump(std::vector<Node*>& nodes) {
     bool moved = false;
@@ -351,37 +356,35 @@ static bool airPump(std::vector<Node*>& nodes) {
             } else if (g_dropRepairs) {
                 for (uint8_t c : g_droppedCsums) if (c == csum) drop = true;
             }
-        }
-        if (!it.isTrain && g_dropType && !it.bytes.empty() &&
-            it.bytes[0] == g_dropType) {
-            g_dropType = 0;
-    g_dropNthType = 0; g_dropNth = 0; g_typeSeen = 0;                       /* one frame, once */
-            continue;
-        }
-        if (!it.isTrain && g_dropNthType && !it.bytes.empty() &&
-            it.bytes[0] == g_dropNthType && ++g_typeSeen == g_dropNth) {
-            continue;
+        } else if (!it.bytes.empty()) {
+            g_typeCount[it.bytes[0]]++;
+            if (g_dropType && it.bytes[0] == g_dropType) { g_dropType = 0; continue; }
         }
         if (drop) continue;
         for (Node* dst : nodes) {
             if (dst == src || chanKey(dst) != key) continue;
-            if (it.isTrain) {
-                uint8_t csum = supeCrc8(it.bytes.data(), it.bytes.size());
-                if (supeEngOnTrainFrame(&dst->eng, csum, (int16_t)(it.dbm - 80), 60))
-                    dst->rxBuf.push_back(it.bytes);
-            } else {
-                supeEngOnRx(&dst->eng, it.bytes.data(), (uint16_t)it.bytes.size(),
-                            (int16_t)(it.dbm - 80), 60);
-            }
+            deliverTo(dst, it);
         }
     }
     return moved;
 }
 
-/* Wake latency, in ms: what a real task pays between a timer firing and the
- * work running — the timer task, the notify, the scheduler, the retune. Zero
- * here would model a machine this code never runs on, and a slot window sized
- * for zero is exactly the bug the bench found. */
+static bool pumpOne(std::vector<Node*>& nodes) {
+    for (Node* src : nodes) {
+        if (src->txq.empty()) continue;
+        AirItem it = src->txq.front();
+        src->txq.erase(src->txq.begin());
+        uint32_t key = chanKey(src);
+        supeEngOnTxDone(&src->eng, true);
+        for (Node* dst : nodes) {
+            if (dst == src || chanKey(dst) != key) continue;
+            deliverTo(dst, it);
+        }
+        return true;
+    }
+    return false;
+}
+
 static uint32_t g_wakeLateMs = 0;
 
 static void fireTimers(std::vector<Node*>& nodes) {
@@ -393,21 +396,24 @@ static void fireTimers(std::vector<Node*>& nodes) {
     }
 }
 
-/* Run the air and the clocks until everything is idle or `maxMs` passes. */
+/* The glue's launch service, as supePoll does it: a hail contends for the
+ * hailing channel when the engine says it wants it. */
+static void launchService(std::vector<Node*>& nodes) {
+    for (Node* n : nodes)
+        if (supeEngLaunchDue(&n->eng)) supeEngLaunch(&n->eng);
+}
+
 static uint32_t drive(std::vector<Node*> nodes, uint32_t maxMs) {
     uint32_t began = g_now, end = g_now + maxMs;
     while ((int32_t)(end - g_now) > 0) {
         bool moved = airPump(nodes);
         fireTimers(nodes);
+        launchService(nodes);
         if (moved) continue;
-        /* A timer armed at-or-before now during this very pass must fire
-         * before the clock may jump. */
         bool due = false;
         for (Node* n : nodes)
             if (n->schedArmed && (int32_t)(g_now - (n->schedAt + g_wakeLateMs)) >= 0) due = true;
         if (due) continue;
-        /* Jump the clock to the next armed timer's effective firing; +1 when
-         * none is. */
         uint32_t next = end;
         for (Node* n : nodes) {
             uint32_t at = n->schedAt + g_wakeLateMs;
@@ -423,17 +429,14 @@ static uint32_t drive(std::vector<Node*> nodes, uint32_t maxMs) {
     return g_now - began;
 }
 
-/* Drive until `watch` has closed `wantDone` meetings and every engine is
- * quiet — schedules may still be live, which is the point: the checks run at
- * the goodbye, not after the reseeded schedule has expired. */
 static void driveUntilDone(std::vector<Node*> nodes, Node* watch,
                            uint32_t wantDone, uint32_t maxMs) {
     uint32_t end = g_now + maxMs;
     while ((int32_t)(end - g_now) > 0) {
         bool moved = airPump(nodes);
         fireTimers(nodes);
+        launchService(nodes);
         if (moved) continue;
-        /* Never jump the clock over a frame still in flight. */
         bool inFlight = false;
         for (Node* n : nodes)
             if (!n->txq.empty()) inFlight = true;
@@ -444,7 +447,7 @@ static void driveUntilDone(std::vector<Node*> nodes, Node* watch,
         if (due) continue;
         bool anyBusy = false;
         for (Node* n : nodes)
-            if (n->eng.m.phase >= SUPE_M_HD_TX) anyBusy = true;
+            if (n->eng.m.phase != SUPE_M_IDLE) anyBusy = true;
         if (!anyBusy && watch->eng.meetingsDone >= wantDone) return;
         uint32_t next = end;
         for (Node* n : nodes) {
@@ -465,15 +468,19 @@ static void launchFrom(Node* a) {
 }
 
 /* Wire A→B: A holds traffic for tag TAG (B's address, peer id 5); B knows A
- * by A's identity (peer id 9). */
+ * by A's identity (peer id 9), and B's identity is one of A's addresses so a
+ * hail-back from B resolves at A. */
 static void wire(Node* A, Node* B) {
     memcpy(A->peerTag, TAG, 3);
+    memcpy(A->peerTag2, IDENT_B, 3);
     A->peer.known = true;
     A->peer.peerId = 5;
     memcpy(B->peerTag, IDENT_A, 3);
     B->peer.known = true;
     B->peer.peerId = 9;
     supeEngTagAdd(&B->eng, TAG, true, 0);
+    supeEngTagAdd(&A->eng, IDENT_A, true, 0);
+    supeEngTagAdd(&B->eng, IDENT_B, true, 0);
 }
 
 static void resetAir(void) {
@@ -481,22 +488,226 @@ static void resetAir(void) {
     g_wakeLateMs = 0;
     g_dropNthTrain = 0;
     g_dropType = 0;
-    g_dropNthType = 0; g_dropNth = 0; g_typeSeen = 0;
     g_dropRepairs = false;
     g_trainSeen = 0;
     g_droppedCsums.clear();
+    g_airSnr10 = 60;
+    memset(g_typeCount, 0, sizeof g_typeCount);
 }
 
-/* ─────────────── the tests ─────────────── */
+static bool holdsWide(const Node* n) {
+    for (int i = 0; i < SUPE_SCHED_MAX; i++)
+        if (n->eng.sched[i].used && n->eng.sched[i].wide) return true;
+    return false;
+}
 
-static void testMeeting(void) {
+/* ─────────────── regime 0: the dialogue ─────────────── */
+
+/* Hail, GIMME, frames — and nothing else. The frames reach the daemon as they
+ * land, the queue is consumed on transmit, and no goodbye seeds anything. */
+static void testDialogueLite(void) {
+    resetAir();
+    g_airSnr10 = 0;                            /* no headroom: budget 0 */
+    Node A = {}, B = {};
+    nodeInit(&A, "A", SUPE_REGIME_SINGLE);
+    nodeInit(&B, "B", SUPE_REGIME_SINGLE);
+    std::vector<Node*> air = { &A, &B };
+    wire(&A, &B);
+    pushPkt(&A, TAG, 5, 300, 0x11);
+    pushPkt(&A, TAG, 5, 120, 0x22);
+
+    launchFrom(&A);
+    driveUntilDone(air, &A, 1, 5000);
+
+    eqi(A.eng.m.phase, SUPE_M_IDLE, "A is home");
+    eqi(B.eng.m.phase, SUPE_M_IDLE, "B is home");
+    eqi(A.eng.hailsOut, 1, "one hail on the shared channel");
+    eqi(g_typeCount[SUPE_T_GIMME], 1, "one GIMME answered it");
+    eqi(g_typeCount[SUPE_T_HAVE], 0, "no HAVE: the hailed party held nothing");
+    eqi(g_typeCount[SUPE_T_THATSIT], 0, "no THATSIT at the hailing rate");
+    eqi(g_typeCount[SUPE_T_BYE], 0, "…and no BYE");
+    eqi(A.eng.framesOut, 3, "a 300 B packet split: three frames out");
+    eqi(B.eng.framesIn, 3, "…three frames counted in");
+    eqi((long)B.plainRx, 3, "…each handed up as it landed");
+    eqi((long)B.delivered.size(), 0, "…none buffered for the close");
+    eqi(A.eng.meetingsDone, 1, "A counts one meeting");
+    eqi(B.eng.meetingsDone, 1, "B counts one meeting");
+    eqi(loraqDepth(&A.q), 0, "A's queue was consumed: the frames flew");
+    eqi(A.trainsDelivered, 1, "A's train copies were released as done with");
+    ok(!holdsWide(&A) && !holdsWide(&B), "regime 0 seeds no schedule");
+    eqi((long)A.tunes, 0, "A never retuned");
+    eqi((long)B.tunes, 0, "…nor did B");
+}
+
+/* Hail, GIMME at budget 1, the train at SF6, THATSIT, BYE. */
+static void testDialogueFull(void) {
+    resetAir();
+    Node A = {}, B = {};
+    nodeInit(&A, "A", SUPE_REGIME_SINGLE);
+    nodeInit(&B, "B", SUPE_REGIME_SINGLE);
+    std::vector<Node*> air = { &A, &B };
+    wire(&A, &B);
+    pushPkt(&A, TAG, 5, 300, 0x11);
+
+    launchFrom(&A);
+    driveUntilDone(air, &A, 1, 5000);
+
+    eqi(A.eng.meetingsDone, 1, "A counts one meeting");
+    eqi(B.eng.meetingsDone, 1, "B counts one meeting");
+    eqi(g_typeCount[SUPE_T_THATSIT], 1, "the train was closed by a THATSIT");
+    eqi(g_typeCount[SUPE_T_BYE], 1, "…and answered by a BYE");
+    eqi((long)B.delivered.size(), 2, "B delivered the whole train at the close");
+    ok(dByte(B.delivered, 0, 0) == 0x02 && dByte(B.delivered, 1, 0) == 0x12,
+       "…in sequence");
+    eqi(B.cfg.sf, 6, "B retuned to SF6 for the train");
+    eqi((long)B.chan, 0, "…on the hailing frequency");
+    eqi((long)B.sync, 0x42, "…under the interface's own word");
+    ok(A.homes >= 1 && B.homes >= 1, "both radios came home");
+    ok(!holdsWide(&A) && !holdsWide(&B), "regime 0 seeds no schedule");
+    eqi(loraqDepth(&A.q), 0, "A's queue was consumed on the proven close");
+    bool aReport = false, aOk = false, aAnswered = false;
+    for (auto& nt : A.notes) {
+        if (nt.ev == SUPE_EV_REPORT) aReport = true;
+        if (nt.ev == SUPE_EV_TRAIN_OK) aOk = true;
+        if (nt.ev == SUPE_EV_ANSWERED) aAnswered = true;
+    }
+    ok(aReport, "A got the GIMME's report of its hail");
+    ok(aOk, "A's power controller heard its train confirmed");
+    ok(aAnswered, "A's peer record shows B answered");
+}
+
+/* The hailed party holds traffic too: it answers with HAVE, its train goes
+ * first, and the hailer's rides the answering turn. */
+static void testDialogueHaveFirst(void) {
+    resetAir();
+    Node A = {}, B = {};
+    nodeInit(&A, "A", SUPE_REGIME_SINGLE);
+    nodeInit(&B, "B", SUPE_REGIME_SINGLE);
+    std::vector<Node*> air = { &A, &B };
+    wire(&A, &B);
+    pushPkt(&A, TAG, 5, 150, 0x11);
+    pushPkt(&B, IDENT_A, 9, 100, 0x33);
+    pushPkt(&B, IDENT_A, 9, 80, 0x44);
+
+    launchFrom(&A);
+    driveUntilDone(air, &A, 1, 5000);
+
+    eqi(g_typeCount[SUPE_T_HAVE], 2, "an opening HAVE and an answering one");
+    eqi(g_typeCount[SUPE_T_GIMME], 1, "one GIMME confirmed the terms for both");
+    eqi(A.eng.meetingsDone, 1, "one meeting carried both directions");
+    eqi(B.eng.meetingsDone, 1, "…on B's count too");
+    eqi(B.eng.framesOut, 2, "B's train went first");
+    eqi((long)A.delivered.size(), 2, "A delivered B's frames");
+    eqi((long)B.delivered.size(), 1, "B delivered A's frame");
+    eqi(loraqDepth(&B.q), 0, "B's queue was consumed on the proven close");
+    eqi(loraqDepth(&A.q), 0, "…and A's");
+    eqi(A.eng.hailsOut, 1, "the return leg cost the shared channel nothing");
+}
+
+/* The same, at the hailing rate: HAVE, GIMME, B's frames, A's frames, done. */
+static void testDialogueHaveFirstLite(void) {
+    resetAir();
+    g_airSnr10 = 0;
+    Node A = {}, B = {};
+    nodeInit(&A, "A", SUPE_REGIME_SINGLE);
+    nodeInit(&B, "B", SUPE_REGIME_SINGLE);
+    std::vector<Node*> air = { &A, &B };
+    wire(&A, &B);
+    pushPkt(&A, TAG, 5, 150, 0x11);
+    pushPkt(&B, IDENT_A, 9, 100, 0x33);
+
+    launchFrom(&A);
+    driveUntilDone(air, &A, 1, 5000);
+
+    eqi(g_typeCount[SUPE_T_HAVE], 1, "one opening HAVE");
+    eqi(g_typeCount[SUPE_T_GIMME], 1, "one GIMME");
+    eqi(g_typeCount[SUPE_T_THATSIT], 0, "no THATSIT at the hailing rate");
+    eqi(B.eng.framesOut, 1, "B's frame went first");
+    eqi(A.eng.framesOut, 1, "…then A's");
+    eqi((long)A.plainRx, 1, "A handed B's frame up as it landed");
+    eqi((long)B.plainRx, 1, "B handed A's frame up as it landed");
+    eqi(A.eng.meetingsDone, 1, "A counts one meeting");
+    eqi(B.eng.meetingsDone, 1, "B counts one meeting");
+    eqi(loraqDepth(&A.q), 0, "A's queue was consumed");
+    eqi(loraqDepth(&B.q), 0, "…and B's");
+}
+
+/* A hailed party that cannot answer owes a hail: it hails back with a count
+ * of zero, the hailer answers with HAVE, and the traffic flows. */
+static void testHailBackRegime0(void) {
+    resetAir();
+    Node A = {}, B = {};
+    nodeInit(&A, "A", SUPE_REGIME_SINGLE);
+    nodeInit(&B, "B", SUPE_REGIME_SINGLE);
+    std::vector<Node*> air = { &A, &B };
+    wire(&A, &B);
+    pushPkt(&A, TAG, 5, 150, 0x11);
+
+    /* B's radio is spoken for when the hail lands. */
+    B.eng.m.phase = SUPE_M_AWAIT_GIMME;
+    B.eng.m.deadlineMs = g_now + 100000;
+    launchFrom(&A);
+    airPump(air);                              /* the hail crosses */
+    ok(B.eng.owed[0].used, "B owes A a hail");
+    supeEngAbort(&B.eng, "test");              /* B comes free */
+    driveUntilDone(air, &A, 1, 5000);
+
+    eqi(B.eng.hailBacksOut, 1, "B hailed back");
+    eqi(A.eng.hailsOut + A.eng.hailBacksOut, 1, "A hailed once");
+    eqi(A.eng.meetingsDone, 1, "A's traffic met");
+    eqi(g_typeCount[SUPE_T_HAVE], 1, "A answered the hail-back with HAVE");
+    eqi((long)B.delivered.size(), 1, "B delivered A's frame");
+    eqi(loraqDepth(&A.q), 0, "A's queue was consumed");
+    ok(!B.eng.owed[0].used, "the debt is discharged");
+}
+
+/* Nobody answers: three hails at rising power, an interval after each, then
+ * the hold; the packet leaves at its own patience. */
+static void testRunAndHold(void) {
+    resetAir();
+    Node A = {};
+    nodeInit(&A, "A", SUPE_REGIME_SINGLE);
+    memcpy(A.peerTag, TAG, 3);
+    A.peer.known = true;
+    A.peer.peerId = 5;
+    A.peer.txpOpen = 2;
+    std::vector<Node*> air = { &A };
+    pushPkt(&A, TAG, 5, 100, 0x11);
+    uint32_t queuedAt = g_now;
+
+    std::vector<int8_t> powers;
+    uint32_t end = g_now + 1900;
+    while ((int32_t)(end - g_now) > 0) {
+        uint8_t v = supeEngVerdict(&A.eng);
+        if (v == SUPE_V_OFFER && supeEngLaunchDue(&A.eng)) {
+            supeEngLaunch(&A.eng);
+            powers.push_back(A.txq.back().dbm);
+        }
+        airPump(air);
+        fireTimers(air);
+        g_now++;
+    }
+    eqi(A.eng.hailsOut, 3, "three hails in the run");
+    ok(powers.size() == 3 && powers[0] == 2 && powers[1] == 8 && powers[2] == 14,
+       "…at the opening power, halfway, then maximum");
+    eqi(A.peer.unanswered, 3, "three unanswered");
+    ok(A.peer.holdUntilMs && (int32_t)(A.peer.holdUntilMs - g_now) > 0, "the peer is held");
+    eqi(supeEngVerdict(&A.eng), SUPE_V_WAIT, "held: the packet waits, not dropped");
+    g_now = queuedAt + SUPE_PATIENCE_MS;
+    eqi(supeEngVerdict(&A.eng), SUPE_V_DROP, "…until its own patience runs out");
+    eqi(A.eng.dropsPatience, 1, "counted as a patience drop");
+    eqi(A.trainsDropped, 3, "each hail's train was released unflown");
+}
+
+/* ─────────────── a channel plan ─────────────── */
+
+static void testMeetingPlan(void) {
     resetAir();
     Node A = {}, B = {};
     nodeInit(&A, "A", SUPE_REGIME_EU863);
     nodeInit(&B, "B", SUPE_REGIME_EU863);
     std::vector<Node*> air = { &A, &B };
     wire(&A, &B);
-
     pushPkt(&A, TAG, 5, 300, 0x11);
     pushPkt(&A, TAG, 5, 120, 0x22);
 
@@ -505,65 +716,50 @@ static void testMeeting(void) {
 
     eqi(A.eng.m.phase, SUPE_M_IDLE, "A is home");
     eqi(B.eng.m.phase, SUPE_M_IDLE, "B is home");
-    eqi(A.eng.seedsOut, 1, "one PRIVSYNC on the shared channel — and only one");
+    eqi(A.eng.hailsOut, 1, "one hail on the shared channel — and only one");
+    eqi(B.eng.slotsSpoken, 1, "B spoke at the first slot");
+    eqi(A.eng.slotsListened, 1, "A listened at it");
     eqi(A.eng.meetingsDone, 1, "A counts one meeting");
     eqi(B.eng.meetingsDone, 1, "B counts one meeting");
-    eqi(A.eng.framesOut, 3, "a 300 B packet split: three frames out");
+    eqi(A.eng.framesOut, 3, "three frames out");
     eqi(B.eng.framesIn, 3, "…three frames in");
     eqi((long)B.delivered.size(), 3, "B delivered the whole train upward");
     ok(dByte(B.delivered, 0, 0) == 0x02 && dByte(B.delivered, 1, 0) == 0x12,
        "…in sequence: the split's halves are adjacent");
+    ok(B.chan >= 1 && B.chan <= 9, "the meeting was on an agile channel");
     eqi(loraqDepth(&A.q), 0, "A's queue was consumed on the proven close");
-    eqi(A.trainsDelivered, 1, "A's train copies were released as delivered");
     ok(A.peer.detoured, "A's peer record remembers the meeting");
-    ok(A.homes >= 1 && B.homes >= 1, "both radios came home");
-
-    /* Every goodbye keys the next schedule: both ends hold a wide one now. */
-    bool aWide = false, bWide = false;
-    for (int i = 0; i < SUPE_SCHED_MAX; i++) {
-        if (A.eng.sched[i].used && A.eng.sched[i].wide) aWide = true;
-        if (B.eng.sched[i].used && B.eng.sched[i].wide) bWide = true;
-    }
-    ok(aWide && bWide, "the final THATSIT seeded a wide schedule at both ends");
-    /* The receiver of the final train transmits first on it. */
+    ok(holdsWide(&A) && holdsWide(&B), "the final THATSIT seeded a wide schedule at both ends");
     for (int i = 0; i < SUPE_SCHED_MAX; i++) {
         if (A.eng.sched[i].used && A.eng.sched[i].wide)
             ok(!A.eng.sched[i].weTx0, "A sent the final train, so B speaks first");
         if (B.eng.sched[i].used && B.eng.sched[i].wide)
             ok(B.eng.sched[i].weTx0, "…and B holds the mirror of that");
     }
-    bool aReport = false, aPair = false, aOk = false;
-    for (auto& nt : A.notes) {
-        if (nt.ev == SUPE_EV_REPORT) aReport = true;
-        if (nt.ev == SUPE_EV_PAIR) aPair = true;
-        if (nt.ev == SUPE_EV_TRAIN_OK) aOk = true;
-    }
-    ok(aReport, "A got the GIMME's report of its own transmission");
-    ok(aPair, "A filed a path-loss pair");
-    ok(aOk, "A's power controller heard its train confirmed");
 }
 
-static void testReturnLeg(void) {
+static void testHaveFirstPlan(void) {
     resetAir();
     Node A = {}, B = {};
     nodeInit(&A, "A", SUPE_REGIME_EU863);
     nodeInit(&B, "B", SUPE_REGIME_EU863);
     std::vector<Node*> air = { &A, &B };
     wire(&A, &B);
-
     pushPkt(&A, TAG, 5, 150, 0x11);
-    pushPkt(&B, nullptr, 9, 100, 0x33);       /* B's reply, already queued */
-    pushPkt(&B, nullptr, 9, 80, 0x44);
+    pushPkt(&B, IDENT_A, 9, 100, 0x33);
+    pushPkt(&B, IDENT_A, 9, 80, 0x44);
 
     launchFrom(&A);
     driveUntilDone(air, &A, 1, 20000);
 
     eqi(A.eng.meetingsDone, 1, "one meeting carried both directions");
     eqi(B.eng.meetingsDone, 1, "…on B's count too");
-    eqi(B.eng.framesOut, 2, "B's return train rode the answering HAVEDATA");
-    eqi((long)A.delivered.size(), 2, "A delivered B's return frames");
-    eqi(loraqDepth(&B.q), 0, "B's queue was consumed on the proven close");
-    eqi(A.eng.seedsOut, 1, "the return leg cost the shared channel nothing");
+    eqi(B.eng.framesOut, 2, "B's train went first, opening with HAVE");
+    eqi((long)A.delivered.size(), 2, "A delivered B's frames");
+    eqi((long)B.delivered.size(), 1, "B delivered A's frame from the answering turn");
+    eqi(loraqDepth(&B.q), 0, "B's queue was consumed");
+    eqi(loraqDepth(&A.q), 0, "…and A's");
+    eqi(A.eng.hailsOut, 1, "the return leg cost the shared channel nothing");
 }
 
 static void testRepair(void) {
@@ -573,11 +769,10 @@ static void testRepair(void) {
     nodeInit(&B, "B", SUPE_REGIME_EU863);
     std::vector<Node*> air = { &A, &B };
     wire(&A, &B);
-
     pushPkt(&A, TAG, 5, 150, 0x11);
     pushPkt(&A, TAG, 5, 150, 0x22);
     pushPkt(&A, TAG, 5, 150, 0x33);
-    g_dropNthTrain = 2;                        /* the middle frame is lost */
+    g_dropNthTrain = 2;
 
     launchFrom(&A);
     driveUntilDone(air, &A, 1, 20000);
@@ -599,12 +794,11 @@ static void testHole(void) {
     nodeInit(&B, "B", SUPE_REGIME_EU863);
     std::vector<Node*> air = { &A, &B };
     wire(&A, &B);
-
     pushPkt(&A, TAG, 5, 150, 0x11);
     pushPkt(&A, TAG, 5, 150, 0x22);
     pushPkt(&A, TAG, 5, 150, 0x33);
     g_dropNthTrain = 2;
-    g_dropRepairs = true;                      /* the repair round is lost too */
+    g_dropRepairs = true;
 
     launchFrom(&A);
     driveUntilDone(air, &A, 1, 30000);
@@ -614,103 +808,7 @@ static void testHole(void) {
        "…the hole stays a hole and the order stays the order");
 }
 
-static void testAbsenceLadder(void) {
-    resetAir();
-    Node A = {};
-    nodeInit(&A, "A", SUPE_REGIME_EU863);
-    std::vector<Node*> air = { &A };           /* nobody is listening */
-    memcpy(A.peerTag, TAG, 3);
-    A.peer.known = true;
-    A.peer.peerId = 5;
-    A.peer.txpOpen = 2;                        /* what the evidence says B needs */
-    pushPkt(&A, TAG, 5, 200, 0x11);
-
-    int8_t seedTxp[3] = {};
-    for (int attempt = 0; attempt < 3; attempt++) {
-        /* Between seeds the ladder's randomised wait runs, and the expiring
-         * schedule needs its timers fired to score the strike. */
-        while (supeEngVerdict(&A.eng) == SUPE_V_WAIT) drive(air, 50);
-        launchFrom(&A);
-        /* The PRIVSYNC is the first air item. */
-        seedTxp[attempt] = A.txq.front().dbm;
-        drive(air, 800);                       /* the narrow horizon passes in silence */
-    }
-    eqi(A.eng.strikes, 3, "three narrow schedules expired unmet — three strikes");
-    eqi(seedTxp[0], 2, "the first seed at what the evidence said");
-    eqi(seedTxp[1], 8, "the second halfway to maximum (§12: more power)");
-    eqi(seedTxp[2], 14, "the third at maximum");
-    ok(A.peer.absentUntilMs > g_now, "the peer is absent for a minute");
-    eqi(supeEngVerdict(&A.eng), SUPE_V_DROP,
-        "its traffic drops rather than transmitting into the void");
-    /* Any evidence of life cancels the record outright. */
-    SupePeerNote alive = {};
-    alive.ev = SUPE_EV_ALIVE;
-    hPeerNote(&A, TAG, &alive);
-    ok(A.peer.absentUntilMs == 0 && A.peer.strikes == 0,
-       "evidence of life cancels absence and restores the full ladder");
-}
-
-static void testWideExpiryScoresNothing(void) {
-    resetAir();
-    Node A = {}, B = {};
-    nodeInit(&A, "A", SUPE_REGIME_EU863);
-    nodeInit(&B, "B", SUPE_REGIME_EU863);
-    std::vector<Node*> air = { &A, &B };
-    wire(&A, &B);
-    pushPkt(&A, TAG, 5, 150, 0x11);
-    launchFrom(&A);
-    driveUntilDone(air, &A, 1, 20000);
-    eqi(A.eng.meetingsDone, 1, "the meeting completed");
-    size_t notesBefore = A.notes.size();
-    uint32_t strikesBefore = A.eng.strikes;
-    drive(air, 5000);                          /* the wide schedules expire unmet */
-    bool anyWide = false;
-    for (int i = 0; i < SUPE_SCHED_MAX; i++)
-        if (A.eng.sched[i].used) anyWide = true;
-    ok(!anyWide, "the wide schedule expired at its horizon");
-    eqi(A.eng.strikes, (long)strikesBefore,
-        "a wide schedule expiring unmet scores nothing");
-    bool struck = false;
-    for (size_t i = notesBefore; i < A.notes.size(); i++)
-        if (A.notes[i].ev == SUPE_EV_STRIKE) struck = true;
-    ok(!struck, "…not even a note");
-}
-
-/* The wide schedule is the reply's ride (§7): a reply born a few hundred ms
- * after the goodbye meets its peer at a wide slot — no PRIVSYNC, nothing on
- * the shared channel. */
 static void testWideRide(void) {
-    resetAir();
-    Node A = {}, B = {};
-    nodeInit(&A, "A", SUPE_REGIME_EU863);
-    nodeInit(&B, "B", SUPE_REGIME_EU863);
-    std::vector<Node*> air = { &A, &B };
-    wire(&A, &B);
-    pushPkt(&A, TAG, 5, 200, 0x11);
-    launchFrom(&A);
-    driveUntilDone(air, &A, 1, 20000);
-    eqi(A.eng.meetingsDone, 1, "the first meeting completed");
-    eqi(A.eng.seedsOut, 1, "…for one seed");
-
-    /* The reply, born 200 ms after the goodbye. */
-    g_now += 200;
-    pushPkt(&B, nullptr, 9, 120, 0x33);
-    driveUntilDone(air, &B, 2, 20000);
-    eqi(B.eng.meetingsDone, 2, "the reply's meeting completed");
-    eqi(B.eng.seedsOut, 0, "…at a wide slot: B never touched the shared channel");
-    eqi((long)A.delivered.size(), 1, "A holds the reply");
-    eqi((long)B.delivered.size(), 1, "B holds the first train");
-}
-
-/* The bench's own failure: a slot is reached from an idle task, so it opens
- * late — 16-20 ms of timer, notify, scheduler and retune. The window that has
- * to cover that cannot borrow its cover from the preamble, which shrinks with
- * the budget the wide schedule flies at. At zero wake latency every schedule
- * works and this passes vacuously; at the measured latency only a window sized
- * to the software's slop does. */
-static void testWideRideWhenWokenLate(void) {
-    /* The measured figure, not the constant under test: a test whose
-     * coverage shrinks when the constant is weakened tests nothing. */
     for (uint32_t late = 0; late <= 20; late += 10) {
         resetAir();
         Node A = {}, B = {};
@@ -721,321 +819,75 @@ static void testWideRideWhenWokenLate(void) {
         pushPkt(&A, TAG, 5, 200, 0x11);
         launchFrom(&A);
         driveUntilDone(air, &A, 1, 20000);
-        eqi(A.eng.meetingsDone, 1, "the seeded meeting completed");
+        eqi(A.eng.meetingsDone, 1, "the first meeting completed");
 
-        /* Everything from here is reached from an idle task. */
         g_wakeLateMs = late;
         g_now += 200;
-        pushPkt(&B, nullptr, 9, 120, 0x33);
+        pushPkt(&B, IDENT_A, 9, 120, 0x33);
         driveUntilDone(air, &B, 2, 20000);
-        eqi(B.eng.meetingsDone, 2, "the reply met at a wide slot despite the late wake");
-        eqi(B.eng.seedsOut, 0, "…without touching the shared channel");
-        eqi((long)A.delivered.size(), 1, "and A holds the reply");
+        eqi(B.eng.meetingsDone, 2, "the reply's meeting completed at a wide slot");
+        eqi(B.eng.hailsOut, 0, "…B never touched the shared channel");
+        eqi((long)A.delivered.size(), 1, "A holds the reply");
+        eqi((long)B.delivered.size(), 1, "B holds the first train");
     }
     g_wakeLateMs = 0;
 }
 
-/* Two meetings that close the same way — same one-frame train, same power —
- * must not seed the same schedule. Without a salt a THATSIT is a type, a power
- * that rarely moves and one checksum, so ordinary sessions collide; and a
- * collision is worse than it sounds, because each end derives its role from
- * ITS OWN view of who sent the final THATSIT. Two ends holding the same-named
- * schedule from different meetings take opposite roles and both fall silent. */
-static void testGoodbyesAreUnique(void) {
+/* The hailed party cannot take either slot (both channels read busy): it owes
+ * a hail, sends it when the schedule has expired, and the hailer answers with
+ * HAVE. */
+static void testOwedHailPlan(void) {
     resetAir();
     Node A = {}, B = {};
     nodeInit(&A, "A", SUPE_REGIME_EU863);
     nodeInit(&B, "B", SUPE_REGIME_EU863);
     std::vector<Node*> air = { &A, &B };
     wire(&A, &B);
+    pushPkt(&A, TAG, 5, 150, 0x11);
+    B.ccaClear = false;
 
-    uint8_t seen[2][SUPE_HASH_LEN];
-    for (int round = 0; round < 2; round++) {
-        pushPkt(&A, TAG, 5, 90, (uint8_t)0x11);     /* the same train each time */
-        launchFrom(&A);
-        driveUntilDone(air, &A, (uint32_t)(round + 1), 20000);
-        bool got = false;
-        for (int i = 0; i < SUPE_SCHED_MAX; i++) {
-            if (!A.eng.sched[i].used || !A.eng.sched[i].wide) continue;
-            memcpy(seen[round], A.eng.sched[i].d.hash3, SUPE_HASH_LEN);
-            got = true;
-        }
-        ok(got, "the goodbye seeded a wide schedule");
-        drive(air, 4000);                            /* let it expire, then again */
-    }
-    ok(memcmp(seen[0], seen[1], SUPE_HASH_LEN) != 0,
-       "two identical meetings seeded two different schedules");
-}
-
-/* A lost THATSIT must not leave the two ends disagreeing about whether a
- * schedule exists. The sender holds the frame and the receiver does not, so a
- * sender that seeds from it derives a schedule its peer has never heard of —
- * and then spends the whole horizon speaking into a node that is not
- * attending. On the bench that turned one lost frame into a dead session: six
- * slots unanswered, the shared channel, the absence ladder, absent for 60 s. */
-static void testLostThatsitLeavesNoOrphanSchedule(void) {
-    resetAir();
-    Node A = {}, B = {};
-    nodeInit(&A, "A", SUPE_REGIME_EU863);
-    nodeInit(&B, "B", SUPE_REGIME_EU863);
-    std::vector<Node*> air = { &A, &B };
-    wire(&A, &B);
-    pushPkt(&A, TAG, 5, 120, 0x11);
-    g_dropType = SUPE_T_THATSIT;               /* A's goodbye never lands */
     launchFrom(&A);
-    /* Long enough for the meeting to give up, short enough that an orphan
-     * schedule would still be inside its horizon — checking after it expired
-     * would pass no matter what the code did. */
-    drive(air, 1500);
-
-    int aWide = 0, bWide = 0;
-    for (int i = 0; i < SUPE_SCHED_MAX; i++) {
-        if (A.eng.sched[i].used && A.eng.sched[i].wide) aWide++;
-        if (B.eng.sched[i].used && B.eng.sched[i].wide) bWide++;
-    }
-    eqi(aWide, 0, "the sender of a THATSIT nobody answered seeds nothing");
-    eqi(bWide, 0, "…and the peer that never received it seeds nothing either");
-    eqi((long)B.delivered.size(), 1, "the train that did arrive is still delivered");
-    /* Both ends agreeing on no schedule is what lets the traffic seed one on
-     * the shared channel straight away, rather than after a wasted horizon:
-     * the unconfirmed train stays queued, and the verdict offers rather than
-     * waiting on a schedule the peer has never heard of. */
-    eqi(supeEngVerdict(&A.eng), SUPE_V_OFFER, "A seeds afresh rather than waiting");
+    drive(air, 300);                           /* both slots read busy */
+    eqi(A.eng.meetingsDone, 0, "nothing met at the slots");
+    eqi(B.eng.slotsSkipped, 2, "B skipped both slots as busy");
+    B.ccaClear = true;
+    driveUntilDone(air, &A, 1, 20000);
+    eqi(B.eng.hailBacksOut, 1, "B owed a hail and hailed back");
+    eqi(A.eng.meetingsDone, 1, "A's traffic met at B's schedule");
+    eqi((long)B.delivered.size(), 1, "B delivered A's frame");
+    eqi(A.eng.hailsOut, 1, "A hailed once — the hail-back came inside the interval");
 }
 
-/* A bidirectional meeting whose RETURN THATSIT is lost. The opener holds only
- * its own THATSIT — superseded the moment the answering HAVEDATA promised a
- * return train — while the listener holds the later one it sent and never had
- * answered. Neither may seed: on the bench the opener did, derived a schedule
- * the listener had never heard of, and then sat listening on agile channels
- * through three of the listener's PRIVSYNC retries before declaring it absent. */
-static void testSupersededGoodbyeSeedsNothing(void) {
+/* Crossed hails: A hails while B is deaf to it, then B hails A. A holds both
+ * schedules and speaks at B's; one meeting carries both directions, and A's
+ * own schedule is consumed by it rather than scoring. */
+static void testCrossedHails(void) {
     resetAir();
     Node A = {}, B = {};
     nodeInit(&A, "A", SUPE_REGIME_EU863);
     nodeInit(&B, "B", SUPE_REGIME_EU863);
     std::vector<Node*> air = { &A, &B };
+    std::vector<Node*> aAlone = { &A };
     wire(&A, &B);
-    pushPkt(&A, TAG, 5, 120, 0x11);
-    pushPkt(&B, nullptr, 9, 90, 0x33);          /* B answers: a return leg runs */
+    pushPkt(&A, TAG, 5, 150, 0x11);
+    pushPkt(&B, IDENT_A, 9, 100, 0x33);
+    loraqAt(&B.q, 0)->flags |= LORAQ_F_HAVE_TAG;
+    memcpy(loraqAt(&B.q, 0)->tag, IDENT_A, 3);
+
     launchFrom(&A);
-    /* Two THATSITs fly; the second — B's, closing the return train — is lost. */
-    g_dropNth = 2; g_dropNthType = SUPE_T_THATSIT;
-    drive(air, 1500);
+    pumpOne(aAlone);                           /* A's hail: B never hears it */
+    launchFrom(&B);                            /* B hails A */
+    pumpOne(air);                              /* …and A hears that */
+    driveUntilDone(air, &B, 1, 20000);
 
-    int aWide = 0, bWide = 0;
-    for (int i = 0; i < SUPE_SCHED_MAX; i++) {
-        if (A.eng.sched[i].used && A.eng.sched[i].wide) aWide++;
-        if (B.eng.sched[i].used && B.eng.sched[i].wide) bWide++;
-    }
-    eqi(aWide, 0, "the opener does not seed from a THATSIT already superseded");
-    eqi(bWide, 0, "…nor the listener from one nothing answered");
-}
-
-/* Put one hail from A on B's receiver, seeded by `salt` so each call derives a
- * different schedule — the salt is what makes every retry of a hail a fresh
- * seed on the air. */
-static void hailB(Node* B, uint8_t salt, const uint8_t* toTag = TAG,
-                  const uint8_t* fromIdent = IDENT_A) {
-    SupePrivsync ps = {};
-    ps.regime  = SUPE_REGIME_EU863;
-    ps.version = supeRegime(SUPE_REGIME_EU863)->version;
-    memcpy(ps.tag, toTag, SUPE_TAG_LEN);        /* the target's own address */
-    ps.pwrDbm  = 14;
-    ps.salt    = salt;
-    ps.haveIdent = true;
-    memcpy(ps.ident, fromIdent, SUPE_TAG_LEN);
-    uint8_t f[SUPE_PRIVSYNC_ID_LEN];
-    size_t n = supeEncPrivsync(f, sizeof f, &ps);
-    ok(n == SUPE_PRIVSYNC_ID_LEN, "the hail encodes");
-    supeEngOnRx(&B->eng, f, (uint16_t)n, -44, 80);
-}
-
-/* A busy receiver defers the two acts that touch the radio and nothing else.
- * Expiry and the walk past dead slots are bookkeeping, and the next-event time
- * is computed from both: leave them frozen and an overdue slot reports "now"
- * for as long as the reception lasts, so the deadline pins at zero, the main
- * loop spins on it, and the horizon never retires the schedule. On the bench
- * that read as 500 zero-deadline passes in 49 ms and a 400 ms schedule still
- * live 1.8 s later. */
-static void testBusyReceiverStillRetiresSchedules(void) {
-    resetAir();
-    Node B = {};
-    nodeInit(&B, "B", SUPE_REGIME_EU863);
-    memcpy(B.peerTag, IDENT_A, 3);
-    B.peer.known = true;
-    B.peer.peerId = 9;
-    supeEngTagAdd(&B.eng, TAG, true, 0);
-    hailB(&B, 0x77);                     /* one hail: B holds a narrow schedule */
-    int held = 0;
-    for (int i = 0; i < SUPE_SCHED_MAX; i++) if (B.eng.sched[i].used) held++;
-    eqi(held, 1, "B holds a schedule from the hail");
-
-    g_rxBusy = true;                     /* the modem is mid-frame from here on */
-    uint32_t stop = g_now + 3000;        /* well past the narrow horizon */
-    while ((int32_t)(stop - g_now) > 0) { supeEngOnTimer(&B.eng); g_now += 5; }
-
-    int live = 0;
-    for (int i = 0; i < SUPE_SCHED_MAX; i++)
-        if (B.eng.sched[i].used && !B.eng.sched[i].consumed) live++;
-    eqi(live, 0, "the horizon still retires a schedule while the receiver is busy");
-    uint32_t at = supeEngNextEventMs(&B.eng, g_now);
-    ok(at == UINT32_MAX || (int32_t)(at - g_now) > 0,
-       "…and the engine asks for no wake at-or-before now");
-}
-
-/* One narrow schedule per peer. A hail retried is a hail whose schedule went
- * unanswered, so that schedule is dead to both ends — held alongside the new
- * one its slots are appointments nobody keeps, and the two sets interleave
- * until each retune arrives late for the other. The salt makes every retry a
- * fresh seed, which is exactly why the identical-hash rule cannot catch it. */
-static void testHailRetryReplacesSchedule(void) {
-    resetAir();
-    Node B = {};
-    nodeInit(&B, "B", SUPE_REGIME_EU863);
-    memcpy(B.peerTag, IDENT_A, 3);
-    B.peer.known = true;
-    B.peer.peerId = 9;
-    supeEngTagAdd(&B.eng, TAG, true, 0);
-
-    for (int retry = 0; retry < 3; retry++) {
-        hailB(&B, (uint8_t)(0x10 + retry));     /* each retry a different seed */
-        g_now += 40;                            /* inside the narrow horizon */
-    }
-    int narrow = 0;
-    for (int i = 0; i < SUPE_SCHED_MAX; i++)
-        if (B.eng.sched[i].used && !B.eng.sched[i].wide) narrow++;
-    eqi(narrow, 1, "three hails from one peer leave one narrow schedule");
-}
-
-/* A train that went unconfirmed reports the configuration it failed at. The
- * far end weighs the loss the peer measured against what that regime needs and
- * raises the power only when the margin was thin; a note with no configuration
- * reads as a receiver needing 0 dBm, against which every real signal looks weak
- * and every unanswered close is scored as too little power. On the bench that
- * ratcheted a table-top pair from −9 dBm to 22 dBm over four minutes, each side
- * climbing because the other had. */
-static void testTrainLostCarriesItsConfig(void) {
-    resetAir();
-    Node A = {}, B = {};
-    nodeInit(&A, "A", SUPE_REGIME_EU863);
-    nodeInit(&B, "B", SUPE_REGIME_EU863);
-    std::vector<Node*> air = { &A, &B };
-    wire(&A, &B);
-    pushPkt(&A, TAG, 5, 120, 0x11);
-    g_dropType = SUPE_T_BYE;                  /* A's close is never answered */
-    launchFrom(&A);
-    drive(air, 4000);
-
-    const SupePeerNote* lost = nullptr;
-    for (const SupePeerNote& n : A.notes)
-        if (n.ev == SUPE_EV_TRAIN_LOST) lost = &n;
-    ok(lost != nullptr, "an unconfirmed train is reported lost");
-    if (lost) {
-        ok(lost->cfg.bwHz != 0, "…and the note names the bandwidth it flew at");
-        ok(lost->cfg.sf != 0, "…and the spreading factor");
-        /* The whole point of carrying it: a real sensitivity, not the 0 dBm a
-         * blank configuration collapses to. */
-        ok(supeSensitivityDeci(&lost->cfg) < -900,
-           "…so the regime's sensitivity is a real figure");
-    }
-}
-
-/* An orphaned wide schedule is abandoned for the shared channel rather than
- * spent. The last frame of any handshake cannot be acknowledged, so a lost
- * answer will always be able to leave one end holding a schedule the other
- * never derived — that is not designable-away, only make-it-cheap. Here the
- * peer simply never attends: the node must stop asking after a couple of
- * unanswered slots and offer a fresh seed, not speak into three seconds of
- * silence first. */
-/* A hail outranks a rendezvous. A node holding a wide schedule that is hailed
- * must attend the hail: that schedule was paid for on the shared channel by a
- * peer with traffic in hand and lasts a few hundred milliseconds, while the
- * rendezvous is a standing appointment that may be empty at both ends. Taken in
- * array order the rendezvous wins about half the time and its retunes land the
- * node late for every slot of the hail — which is what the bench showed, three
- * own slots late out of three, followed by the peer giving up. */
-static void testHailOutranksRendezvous(void) {
-    resetAir();
-    Node A = {}, B = {};
-    nodeInit(&A, "A", SUPE_REGIME_EU863);
-    nodeInit(&B, "B", SUPE_REGIME_EU863);
-    std::vector<Node*> air = { &A, &B };
-    wire(&A, &B);
-    pushPkt(&A, TAG, 5, 90, 0x11);
-    launchFrom(&A);
-    driveUntilDone(air, &A, 1, 20000);        /* both ends now hold a rendezvous */
-
-    int wideA = 0, narrowA = 0;
-    for (int i = 0; i < SUPE_SCHED_MAX; i++) {
-        if (!A.eng.sched[i].used) continue;
-        if (A.eng.sched[i].wide) wideA++; else narrowA++;
-    }
-    eqi(wideA, 1, "A holds the rendezvous the goodbye seeded");
-
-    /* A hail lands on top of it. Both are live; the narrow one must be served. */
-    supeEngTagAdd(&A.eng, IDENT_A, true, 0);   /* A's own address, so it is for A */
-    hailB(&A, 0x5a, IDENT_A, IDENT_B);
-    narrowA = 0;
-    for (int i = 0; i < SUPE_SCHED_MAX; i++)
-        if (A.eng.sched[i].used && !A.eng.sched[i].wide) narrowA++;
-    eqi(narrowA, 1, "…and the hail installs a narrow one beside it");
-
-    /* Line the two up so their first slots fall at the same instant — the
-     * contended case, which chance alone produces only now and then. The
-     * rendezvous sits earlier in the table, so array order would take it. */
-    SupeSched* narrow = nullptr; SupeSched* wideS = nullptr;
-    for (int i = 0; i < SUPE_SCHED_MAX; i++) {
-        SupeSched* s = &A.eng.sched[i];
-        if (!s->used) continue;
-        if (s->wide) { if (!wideS) wideS = s; } else if (!narrow) narrow = s;
-    }
-    ok(narrow && wideS, "both kinds are live");
-    ok(wideS && narrow && wideS < narrow, "…with the rendezvous found first");
-    if (!narrow || !wideS) return;
-    uint32_t both = narrow->epochMs + narrow->d.slot[0].tMs;
-    wideS->epochMs = both - wideS->d.slot[0].tMs;
-
-    g_now = both;
-    supeEngOnTimer(&A.eng);
-    eqi(narrow->nextSlot, 1, "the hail's slot is the one taken");
-    eqi(wideS->nextSlot, 0, "…and the rendezvous still has its slot to come");
-}
-
-static void testOrphanWideScheduleIsAbandoned(void) {
-    resetAir();
-    Node A = {}, B = {};
-    nodeInit(&A, "A", SUPE_REGIME_EU863);
-    nodeInit(&B, "B", SUPE_REGIME_EU863);
-    std::vector<Node*> air = { &A, &B };
-    wire(&A, &B);
-    pushPkt(&A, TAG, 5, 90, 0x11);
-    launchFrom(&A);
-    driveUntilDone(air, &A, 1, 20000);        /* a real meeting, a real goodbye */
-    int wide = 0;
-    for (int i = 0; i < SUPE_SCHED_MAX; i++)
-        if (A.eng.sched[i].used && A.eng.sched[i].wide) wide++;
-    eqi(wide, 1, "the goodbye seeded a wide schedule");
-
-    /* B stops attending — the shape a lost final answer leaves behind, without
-     * needing to lose one: A holds the schedule and nobody else derived it. */
-    std::vector<Node*> alone = { &A };
-    pushPkt(&A, TAG, 5, 90, 0x22);            /* traffic that wants the schedule */
-
-    uint32_t stop = g_now + SUPE_WIDE_HORIZON_MS;
-    while ((int32_t)(stop - g_now) > 0 && A.eng.schedsAbandoned == 0) {
-        airPump(alone);
-        fireTimers(alone);
-        g_now += 5;
-    }
-    eqi((long)A.eng.schedsAbandoned, 1, "the unanswered wide schedule is abandoned");
-    ok((int32_t)(stop - g_now) > 0, "…well inside the horizon it would have spent");
-    int live = 0;
-    for (int i = 0; i < SUPE_SCHED_MAX; i++)
-        if (A.eng.sched[i].used && !A.eng.sched[i].consumed) live++;
-    eqi(live, 0, "…and nothing is left holding the traffic back");
-    eqi(supeEngVerdict(&A.eng), SUPE_V_OFFER,
-        "…so the traffic seeds afresh on the shared channel");
+    eqi(A.eng.meetingsDone, 1, "one meeting at A");
+    eqi(B.eng.meetingsDone, 1, "…and at B");
+    eqi((long)A.delivered.size(), 1, "A holds B's frame");
+    eqi((long)B.delivered.size(), 1, "B holds A's frame");
+    eqi(loraqDepth(&A.q), 0, "A's queue was consumed");
+    eqi(loraqDepth(&B.q), 0, "…and B's");
+    drive(air, 400);                           /* A's own schedule runs out */
+    eqi(A.eng.unanswered, 0, "A's crossed schedule was consumed, not scored");
 }
 
 static void testSeedHashGate(void) {
@@ -1047,30 +899,25 @@ static void testSeedHashGate(void) {
     wire(&A, &B);
     pushPkt(&A, TAG, 5, 150, 0x11);
     launchFrom(&A);
-    /* Pump the PRIVSYNC across, then corrupt A's next frame's hash. */
     airPump(air);
-    /* B holds a listening schedule now. Drive to just before slot 0 and let
-     * A's HAVEDATA fly with a poisoned hash byte. */
     drive(air, 20);
-    fireTimers(air);
-    /* A is at HD_TX or beyond; intercept its HAVEDATA on the air. */
     bool poisoned = false;
     uint32_t end = g_now + 2000;
     while ((int32_t)(end - g_now) > 0) {
         for (Node* n : air)
-            if (n == &A && !n->txq.empty() && !poisoned &&
-                n->txq.front().bytes[0] == SUPE_T_HAVEDATA) {
+            if (n == &B && !n->txq.empty() && !poisoned &&
+                n->txq.front().bytes[0] == SUPE_T_GIMME) {
                 n->txq.front().bytes[1] ^= 0xFF;
                 poisoned = true;
             }
         bool moved = airPump(air);
         fireTimers(air);
         if (!moved) g_now++;
-        if (poisoned && B.eng.rxForeign) break;
+        if (poisoned && A.eng.rxForeign) break;
     }
-    ok(poisoned, "the HAVEDATA was poisoned on the air");
-    ok(B.eng.rxForeign >= 1, "a mismatched seed hash dies in one frame");
-    eqi(B.eng.meetingsDone, 0, "…and no meeting follows it");
+    ok(poisoned, "the GIMME was poisoned on the air");
+    ok(A.eng.rxForeign >= 1, "a mismatched seed hash dies in one frame");
+    eqi(A.eng.meetingsDone, 0, "…and no meeting follows it");
 }
 
 static void testVerdicts(void) {
@@ -1084,49 +931,15 @@ static void testVerdicts(void) {
     eqi(supeEngVerdict(&A.eng), SUPE_V_OFFER, "a known peer draws an offer");
     launchFrom(&A);
     std::vector<Node*> air = { &A };
-    airPump(air);                              /* the seed is out; a schedule lives */
-    eqi(supeEngVerdict(&A.eng), SUPE_V_WAIT,
-        "a live schedule holds the packet for its slot");
-    drive(air, 800);                           /* horizon passes */
-    /* Unknown peer: plain, exactly as with the feature off. */
+    airPump(air);
+    eqi(supeEngVerdict(&A.eng), SUPE_V_WAIT, "a live schedule holds the packet for its slots");
+    drive(air, 400);                           /* horizon and interval pass */
     Node C = {};
     nodeInit(&C, "C", SUPE_REGIME_EU863);
     pushPkt(&C, TAG, LORAQ_PEER_NONE, 100, 0x11);
     eqi(supeEngVerdict(&C.eng), SUPE_V_PLAIN, "an unknown peer flies plainly");
 }
 
-/* Deliver exactly one frame off the air — unlike airPump, which services every
- * node's queue in one pass and so completes a turnaround answer's tx in the
- * same call that provoked it. Mid-flight states are invisible to it, and the
- * stale-deadline storm below lives precisely there. */
-static bool pumpOne(std::vector<Node*>& nodes) {
-    for (Node* src : nodes) {
-        if (src->txq.empty()) continue;
-        AirItem it = src->txq.front();
-        src->txq.erase(src->txq.begin());
-        uint32_t key = chanKey(src);
-        supeEngOnTxDone(&src->eng, true);
-        for (Node* dst : nodes) {
-            if (dst == src || chanKey(dst) != key) continue;
-            if (it.isTrain) {
-                uint8_t csum = supeCrc8(it.bytes.data(), it.bytes.size());
-                if (supeEngOnTrainFrame(&dst->eng, csum, (int16_t)(it.dbm - 80), 60))
-                    dst->rxBuf.push_back(it.bytes);
-            } else {
-                supeEngOnRx(&dst->eng, it.bytes.data(), (uint16_t)it.bytes.size(),
-                            (int16_t)(it.dbm - 80), 60);
-            }
-        }
-        return true;
-    }
-    return false;
-}
-
-/* A frame in flight is the one state whose clock is the tx completion and
- * nothing else. A deadline left standing there — the listen window's, on the
- * side that just answered with GIMME — re-arms the host timer at zero delay on
- * every firing, and on the device that storm outranks the radio task that
- * would deliver the tx-done ending it. */
 static void testNoStaleDeadlineInTxPhase(void) {
     resetAir();
     Node A = {}, B = {};
@@ -1165,22 +978,19 @@ static void testNoStaleDeadlineInTxPhase(void) {
 }
 
 int main(void) {
-    testMeeting();
-    testReturnLeg();
+    testDialogueLite();
+    testDialogueFull();
+    testDialogueHaveFirst();
+    testDialogueHaveFirstLite();
+    testHailBackRegime0();
+    testRunAndHold();
+    testMeetingPlan();
+    testHaveFirstPlan();
     testRepair();
     testHole();
-    testAbsenceLadder();
-    testWideExpiryScoresNothing();
     testWideRide();
-    testWideRideWhenWokenLate();
-    testGoodbyesAreUnique();
-    testLostThatsitLeavesNoOrphanSchedule();
-    testSupersededGoodbyeSeedsNothing();
-    testBusyReceiverStillRetiresSchedules();
-    testHailRetryReplacesSchedule();
-    testTrainLostCarriesItsConfig();
-    testHailOutranksRendezvous();
-    testOrphanWideScheduleIsAbandoned();
+    testOwedHailPlan();
+    testCrossedHails();
     testSeedHashGate();
     testVerdicts();
     testNoStaleDeadlineInTxPhase();

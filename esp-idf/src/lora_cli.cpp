@@ -4,7 +4,7 @@
  * transmit machinery (tx / tx_psa / tx_prot) it drives on the radio task.
  */
 #include "lora_priv.h"
-#include "lora_fem.h"   /* femName, for the front-end line in the slot dump */
+#include "lora_fem.h"   /* femName / rfCalName, for the front-end line in the slot dump */
 
 #if defined(CONFIG_LORA0_CS_PIN)
 
@@ -186,9 +186,14 @@ static void cliPrintSlot(int i) {
      * switches its own front end — the DIO map that does it. On a board with no
      * FEM there is nothing here to read, so the line is skipped. */
     if (r->femType != FEM_NONE)
-        cliPrintf("        fem=%s  band=%s  max=%d dBm at antenna\n",
+        cliPrintf("        fem=%s  band=%s  rx +%d dB\n",
                   femName((LoraFemType)r->femType),
-                  r->highBand ? "2.4GHz" : "sub-GHz", r->maxTxDbm);
+                  r->highBand ? "2.4GHz" : "sub-GHz", r->cal.rxGainDb);
+    /* The range this board reaches at the antenna connector, and how well that
+     * is known. An uncalibrated radio says so rather than presenting an
+     * identity conversion as a characterisation. */
+    cliPrintf("        antenna %d..%d dBm  cal=%s\n",
+              r->minTxDbm, r->maxTxDbm, rfCalName(r->cal.grade));
     if (chipFamily(s->chip) == FAM_LR2021)
         cliPrintf("        lr2021 irq=DIO%d  rfsw idle/rx/tx/rx_hf/tx_hf="
                   "%02x/%02x/%02x/%02x/%02x (bit 0 = DIO5)\n",
@@ -215,8 +220,9 @@ static void cliPrintSlot(int i) {
     if (radioHasRxBoost(fam)) {
         bool on = storageGetInt(sk(kb, sizeof kb, i, "rx_boosted_gain"), 1) != 0;
         cliPrintf("        rx_boosted_gain=%d%s", on,
-                  fam == FAM_LR2021 ? on ? " (gain level 7 of 7)" : " (gain level 0 of 7)"
-                                    : "");
+                  r->cal.rxGainDb > 0 ? " (ignored: external amplifier in the RX path, chip's off)"
+                  : fam == FAM_LR2021 ? on ? " (gain level 7 of 7)" : " (gain level 0 of 7)"
+                                      : "");
         if (fam == FAM_SX126X)
             cliPrintf("  ocp=%.0f mA", (double)radioOcpMilliamps(s->chip));
         if (radioHasAgcReset(fam)) {
@@ -225,6 +231,11 @@ static void cliPrintSlot(int i) {
             else         cliPrintf("  agc_reset=off");
         }
         cliPrintf("\n");
+    }
+    if (r->femType == FEM_KCT8103L) {
+        bool lna = storageGetInt(sk(kb, sizeof kb, i, "fem_rx_lna"), 1) != 0;
+        cliPrintf("        fem_rx_lna=%d (%s)\n", lna,
+                  lna ? "front-end LNA in the RX path, ~8 mA" : "bypassed, power saving");
     }
     if (!r->lbt) {
         cliPrintf("        lbt=off (blind tx)\n");
@@ -264,6 +275,20 @@ static void cliPrintSlot(int i) {
               (unsigned)r->txFrames, (unsigned)r->txBytes,
               (int)r->rssiLast, (int)r->snrLast,
               (unsigned)r->crcErr, (unsigned)r->splitTimeouts);
+    /* The transmit-to-receive turn as this board actually makes it: end of
+     * our frame on the air to the receiver armed again. The far end's answer
+     * must not start before it (SUPE_FLIP_MS). */
+    if (r->flipN)
+        cliPrintf("        flip tx->rx %u ms max, %u ms avg over %u frames\n",
+                  (unsigned)r->flipMaxMs, (unsigned)(r->flipSumMs / r->flipN),
+                  (unsigned)r->flipN);
+    /* And the other direction: end of a frame received to the start of the
+     * engine's answer to it. The far end's deadlines cover SUPE_TURNAROUND_MS
+     * of this. */
+    if (r->ansN)
+        cliPrintf("        answer rx->tx %u ms max, %u ms avg over %u answers\n",
+                  (unsigned)r->ansMaxMs, (unsigned)(r->ansSumMs / r->ansN),
+                  (unsigned)r->ansN);
     {
         cliPrintf("        announces %d buffered for `lora %d a`\n",
                   annCount(r), r->idx);
@@ -354,7 +379,7 @@ static void cliPrintNode(Neighbor* e, int num, void* ud) {
         /* Only what cannot already be read off the block above: a destination's
          * tag IS the first six characters of the hash printed there, and a link
          * gets a line of its own. What is left is the identities, which appear
-         * nowhere else and are what a PRIVSYNC names its SENDER by.
+         * nowhere else and are what a HAIL names its SENDER by.
          *
          * Labelled `ident` rather than `tags` because it is not one. A TAG is an
          * address prefix — a destination hash or a link id — since that is what
@@ -444,6 +469,28 @@ static void cliPrintNode(Neighbor* e, int num, void* ud) {
             add(t);
         }
         if (o) cliPrintf(RNSD_PEER_ROW_PAD "( %s )\n", f);
+
+        /* Path loss, both directions, each with the age of its reading — the
+         * one number that describes the link whatever either end transmits at
+         * (§15.1). us->them is the peer's own report of how our frame landed;
+         * them->us is a frame heard here against the power the peer stated for
+         * it. `?` is unmeasured: only a SUPE peer states a power, and a
+         * direction nobody has reported yet has no loss to print. */
+        int      lossFrom = 0;
+        uint32_t fromMs   = 0;
+        bool     haveFrom = peersLossFrom(e, &lossFrom, &fromMs);
+        if (haveFrom || e->haveApRpt) {
+            char to[32] = "?", from[32] = "?";
+            if (e->haveApRpt) {
+                cliAgo(ago, sizeof ago, c->now, e->apRptMs);
+                snprintf(to, sizeof to, "%d dB (%s)", (int)e->apRptTxp - (int)e->apRptRssi, ago);
+            }
+            if (haveFrom) {
+                cliAgo(ago, sizeof ago, c->now, fromMs);
+                snprintf(from, sizeof from, "%d dB (%s)", lossFrom, ago);
+            }
+            cliPrintf(RNSD_PEER_ROW_PAD "path loss  us->them %s  them->us %s\n", to, from);
+        }
     }
 
     if (c->verbose) {
@@ -689,11 +736,12 @@ static void cliSupe(int idx, const char* sub, const char* arg) {
     for (int i = 0; i < SUPE_SCHED_MAX; i++) {
         SupeSched* s = &e->sched[i];
         if (!s->used) continue;
-        cliPrintf("  schedule    %02x%02x%02x %s, %u slots, next %u, we tx %s%s\n",
+        cliPrintf("  schedule    %02x%02x%02x %s, %u slots, next %u, we %s\n",
                   s->d.hash3[0], s->d.hash3[1], s->d.hash3[2],
                   s->wide ? "wide" : "narrow", (unsigned)s->d.nSlots,
-                  (unsigned)s->nextSlot, s->weTx0 ? "even" : "odd",
-                  s->weSeeded ? " (our seed)" : "");
+                  (unsigned)s->nextSlot,
+                  s->wide ? (s->weTx0 ? "tx even" : "tx odd")
+                          : (s->weHailed ? "listen (our hail)" : "speak"));
     }
     cliPrintf("  rx          %u frames, %u discarded, %u for other meetings\n",
               (unsigned)e->rxFrames, (unsigned)e->rxDiscard, (unsigned)e->rxForeign);
@@ -718,11 +766,12 @@ static void cliSupe(int idx, const char* sub, const char* arg) {
                           (unsigned)((now - en->supeHeardMs) / 1000),
                           en->havePair ? "" : ", no path-loss pair yet",
                           (en->absentUntilMs &&
-                           (int32_t)(en->absentUntilMs - now) > 0) ? ", ABSENT" : "");
+                           (int32_t)(en->absentUntilMs - now) > 0) ? ", HELD" : "");
             }
     }
-    cliPrintf("  seeds       %u out; %u schedules taken; %u strikes\n",
-              (unsigned)e->seedsOut, (unsigned)e->schedsIn, (unsigned)e->strikes);
+    cliPrintf("  hails       %u out, %u hail-backs; %u unanswered; %u schedules taken\n",
+              (unsigned)e->hailsOut, (unsigned)e->hailBacksOut,
+              (unsigned)e->unanswered, (unsigned)e->schedsIn);
     cliPrintf("  slots       %u listened, %u spoken, %u skipped busy\n",
               (unsigned)e->slotsListened, (unsigned)e->slotsSpoken,
               (unsigned)e->slotsSkipped);
@@ -730,8 +779,8 @@ static void cliSupe(int idx, const char* sub, const char* arg) {
               (unsigned)e->meetingsDone, (unsigned)e->framesOut,
               (unsigned)e->framesIn, (unsigned)e->repairsOut,
               (unsigned)e->repairsIn);
-    cliPrintf("  verdicts    %u packets dropped as absent\n",
-              (unsigned)e->dropsAbsent);
+    cliPrintf("  verdicts    %u waits on a held peer; %u packets dropped at patience\n",
+              (unsigned)e->dropsHold, (unsigned)e->dropsPatience);
     {
         /* The last meeting ends, oldest first — the engine's own record, good
          * even when the debug log dropped the lines. */
@@ -886,7 +935,7 @@ void cliLora(const char* args) {
 #endif
         cliPrintf("%-*s freq MHz / bw kHz / sf / cr /\n",   CLI_HELP_COL, "lora <n> <param> <val>");
         cliPrintf("%-*s   txp dBm / preamble / sync / mode / lbt 0|1 / appc 0|1 /\n", CLI_HELP_COL, "");
-        cliPrintf("%-*s   rx_boosted_gain 0|1\n", CLI_HELP_COL, "");
+        cliPrintf("%-*s   rx_boosted_gain 0|1 / fem_rx_lna 0|1\n", CLI_HELP_COL, "");
         cliPrintf("%-*s blind-transmit a payload (0x<hex> = raw bytes)\n", CLI_HELP_COL, "lora <n> tx <string>");
         cliPrintf("%-*s carrier-sense (as normal tx), then transmit\n", CLI_HELP_COL, "lora <n> tx_psa <string>");
         cliPrintf("%-*s emit a header committing receivers for <ms> (4/8)\n", CLI_HELP_COL, "lora <n> tx_prot <ms>");
@@ -948,7 +997,7 @@ void cliLora(const char* args) {
 
     /* The hex comes off the original line rather than the token array: the
      * tokeniser holds four and truncates at 80 characters, and a bundled
-     * ANNOUNCE2 vector is longer than that. */
+     * ANNOUNCE vector is longer than that. */
 #if !defined(CONFIG_LORA_NO_SUPE)
     if (cliVerbIs(cmd, "supe", 1)) {
         cliSupe((int)idx, nt > 2 ? tok[2] : nullptr, cliRest(args, 3));
@@ -956,7 +1005,7 @@ void cliLora(const char* args) {
     }
 #endif  /* CONFIG_LORA_NO_SUPE */
 
-    if (nt < 3) { cliPrintf("usage: lora %ld <freq|bw|sf|cr|txp|preamble|sync|mode|lbt|appc|rx_boosted_gain|agc_reset> <value>\n", idx); return; }
+    if (nt < 3) { cliPrintf("usage: lora %ld <freq|bw|sf|cr|txp|preamble|sync|mode|lbt|appc|rx_boosted_gain|fem_rx_lna|agc_reset> <value>\n", idx); return; }
     const char* val = tok[2];
 
     /* Human units in: frequency MHz, bandwidth kHz. Storage stays in Hz. */
@@ -1007,9 +1056,21 @@ void cliLora(const char* args) {
         if (!radioHasRxBoost(fam))
             cliPrintf("        note: %s has no such control — the setting is inert here\n",
                       chipName(s_radios[idx].slot->chip));
+        else if (s_radios[idx].cal.rxGainDb > 0)
+            cliPrintf("        note: ignored while the board's external amplifier is in the "
+                      "RX path — the chip's stays off; applies once that LNA is bypassed\n");
         else if (fam == FAM_LR2021)
             cliPrintf("        note: on this part it is a gain LEVEL — %s\n",
                       on ? "7 of 7, the most sensitive" : "0, power-saving");
+    } else if (strcmp(cmd, "fem_rx_lna") == 0) {
+        int on = atoi(val) != 0;
+        storageSet(sk(kb, sizeof kb, idx, "fem_rx_lna"), on);
+        cliPrintf("lora/%ld fem_rx_lna = %s\n", idx,
+                  on ? "on (front-end LNA in the RX path, ~8 mA while listening)"
+                     : "off (bypassed — ~8 mA less, ~20 dB less in front of the chip)");
+        if (s_radios[idx].femType != FEM_KCT8103L)
+            cliPrintf("        note: only a KCT8103L front end can switch its LNA out — "
+                      "the setting is inert here\n");
     } else if (strcmp(cmd, "agc_reset") == 0) {
         int secs = atoi(val);
         if (secs < 0) secs = 0;
@@ -1021,7 +1082,7 @@ void cliLora(const char* args) {
                       "SX126x's — %s ignores the beat\n",
                       chipName(s_radios[idx].slot->chip));
     } else {
-        cliPrintf("unknown: lora %ld %s (try freq|bw|sf|cr|txp|preamble|sync|mode|lbt|appc|rx_boosted_gain|agc_reset)\n", idx, cmd);
+        cliPrintf("unknown: lora %ld %s (try freq|bw|sf|cr|txp|preamble|sync|mode|lbt|appc|rx_boosted_gain|fem_rx_lna|agc_reset)\n", idx, cmd);
     }
 }
 

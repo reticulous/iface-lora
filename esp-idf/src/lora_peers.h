@@ -129,8 +129,9 @@ struct Neighbor {
      * there is no detection to do and no fallback to arrange. */
     bool     supeSeen;
     SupeCaps supeCaps;
-    uint32_t supeHeardMs;           /* last ANNOUNCE2 or answered offer — the
-                                     * five-minute staleness gate reads this */
+    uint32_t supeHeardMs;           /* presence: last frame of any kind heard
+                                     * from it — its ANNOUNCE, a hail, a meeting.
+                                     * Shortens a hold's ceiling; clears nothing */
 #endif
     /* Path loss, never a bare level (SUPE.md §10). Every reading is a pair: a
      * level measured here, and the transmit power the other side states for it
@@ -160,13 +161,11 @@ struct Neighbor {
     int16_t  apRptRssi;
     int8_t   apRptTxp;
     uint32_t apRptMs;
-    /* Absence is a provisional verdict, not a finding: it expires, and it is
-     * suppressed outright while an overheard START says the node is merely
-     * busy. The counter decays so a silent peer is retried occasionally rather
-     * than never. */
-    uint32_t absentUntilMs;
-    uint8_t  silentCount;           /* the ladder's strikes since evidence of life */
-    uint32_t retryWaitUntilMs;      /* the randomised wait between requests */
+    /* Reachability (SUPE.md §12): the run and the hold. Cleared only by an
+     * answer — the peer answering our hail, hailing us, or meeting us. */
+    uint32_t absentUntilMs;         /* the hold: while in the future, no hail */
+    uint8_t  silentCount;           /* hails unanswered since it last answered */
+    uint32_t retryWaitUntilMs;      /* the interval for a hail-back after one */
     uint32_t backoffUntilMs;        /* a refusal said how long not to ask */
     bool     detoured;              /* a detour to it has been answered at least
                                      * once — what lifts the first-offer cap */
@@ -295,6 +294,21 @@ struct NeiState {
 
 typedef void (*PeersVisitFn)(Neighbor* e, int num, void* ud);
 
+/* The them→us path loss, in dB, and the millis() of the reading it came from:
+ * the fresher of the hailing pair and the step pair, since either pair answers
+ * for the loss (SUPE.md §10) and the newer one describes the link as it is now.
+ * False when neither exists — only a SUPE peer states a power, and without one
+ * a level is not a loss. The us→them direction is `haveApRpt` alone. */
+static inline bool peersLossFrom(const Neighbor* e, int* loss, uint32_t* ms) {
+    if (e->havePair && (!e->haveStepPair || (int32_t)(e->pairMs - e->stepPairMs) >= 0)) {
+        *loss = (int)e->pairTxp - (int)e->pairRssi; *ms = e->pairMs; return true;
+    }
+    if (e->haveStepPair) {
+        *loss = (int)e->stepTxp - (int)e->stepRssi; *ms = e->stepPairMs; return true;
+    }
+    return false;
+}
+
 /* A row that is one of this device's own two local endpoints — us, or the
  * attached RNode client — rather than a node out on the air. Every RF-layer
  * guard that means "this traffic terminates at our transmitter" tests this. */
@@ -345,6 +359,7 @@ NeiLink*  peersLinkEnsure(NeiState* st, const uint8_t linkId[16], uint32_t now);
 void      peersPendAdd(NeiState* st, const uint8_t phash[16], const uint8_t dest[16],
                      bool isLR, bool counted, uint32_t now);
 NeiPend*  peersPendTake(NeiState* st, const uint8_t phash[16]);
+const NeiPend* peersPendPeek(const NeiState* st, const uint8_t* phash, size_t n);
 void      peersAddId(Neighbor* e, const uint8_t id[16]);
 /* File a link identifier on a row: an address that resolves to this node for as
  * long as the entry survives, which is what lets traffic on the link detour. */
