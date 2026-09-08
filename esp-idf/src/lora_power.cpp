@@ -123,9 +123,22 @@ int8_t apTxPower(LoraRadio* r, const uint8_t* pkt, size_t len) {
  * a figure tens of dB under what it puts on the air, and every peer would
  * compute its path loss to us wrong by the difference. */
 void apApplyPower(LoraRadio* r, int8_t txp) {
+    /* Which side of the front end this frame goes out through, decided from the
+     * power itself and nothing else. An amplified board cannot speak quietly
+     * through its own amplifier — its faintest frame is the amplifier's output
+     * — so a power below that reaches the air only round it. Nothing above here
+     * knows or should: the whole point of deriving a power per peer is to speak
+     * microwatts across a room and watts across a valley, and which path
+     * carries that is the board's business, not the protocol's. */
+    const bool wasPa = r->femTxPa;
+    femTxPa(r, femWantPa(r, txp));
+
     const int8_t chip = rfChipDbm(r, txp);
     const int8_t got  = rfAntennaDbm(r, chip);
-    if (got == r->txPwrNow) return;
+    /* A register setting means a different power on each side of the front end,
+     * so a state change has to reach the register even when the power it buys
+     * is the one already recorded. */
+    if (got == r->txPwrNow && wasPa == r->femTxPa) return;
     int16_t st = r->radio->setOutputPower(chip);
     if (st != RADIOLIB_ERR_NONE) {
         warn("lora/%d setOutputPower(%d): %s (%d)",

@@ -47,6 +47,10 @@ struct LoraSlot {
                                     * chip numbers them — idle, rx, tx, rx_hf, tx_hf; bit 0
                                     * = DIO5 … bit 6 = DIO11. All zero = no radio-driven
                                     * front end (see lora_radio.cpp's lr2021ApplyDio) */
+    uint8_t  lr_rfsw_tx_bypass;    /* LR2021: the sub-GHz TX row again, with the transmit
+                                    * amplifier's select line dropped so the chip drives
+                                    * the antenna directly. 0 = this board has no bypass
+                                    * path, and its floor is the amplifier's output */
     LoraChip chip;
 };
 
@@ -121,6 +125,12 @@ bool    radioAgcReset(LoraRadio* r);
 void    agcResetPoll(LoraRadio* r);
 void    radioHoldOsc(LoraRadio* r, bool hold);
 float   channelRssi(LoraRadio* r);
+
+/* Re-program the LR2021's DIO RF-switch map from the board's masks and the
+ * front end's current transmit state. Runs inside every begin(), which resets
+ * the map, and again whenever femTxPa moves the amplifier in or out of the
+ * path. A no-op on every other family. */
+void    lr2021ApplyDio(LoraRadio* r);
 int16_t radioHeaderMode(LoraRadio* r, bool implicit, size_t len);
 int16_t radioSetCodingRate(LoraRadio* r, uint8_t crDenom);
 int16_t radioSyncWord(LoraRadio* r, uint8_t sync);

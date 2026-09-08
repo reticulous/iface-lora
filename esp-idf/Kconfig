@@ -278,6 +278,27 @@ config LORA0_LR_RFSW_TX_HF
     hex "Radio 0 — LR2021 DIOs driven high in 2.4 GHz transmit"
     default 0
     depends on LORA_COUNT > 0
+config LORA0_LR_RFSW_TX_BYPASS
+    hex "Radio 0 — LR2021 sub-GHz transmit DIOs with the PA bypassed (0 = no bypass)"
+    default 0
+    depends on LORA_COUNT > 0
+    help
+        LORA0_LR_RFSW_TX again, with the front end's PA-select line dropped so
+        the chip drives the antenna through the part's transmit-bypass path
+        instead of through its amplifier. That is what lets an amplified board
+        transmit quietly: the floor stops being the PA's output and becomes the
+        chip's own, less the bypass path's insertion loss.
+
+        Leave at 0 unless the board really has that path AND you know which bit
+        selects it. Dropping the wrong bit does not merely mis-set the power —
+        clearing the transmit-direction line instead of the PA select points the
+        chip's full output at the front end's receive input, which these parts
+        are not rated to survive.
+
+        A board that sets this must also give the bypass state its own
+        LORA0_TX_CAL entry, named `<part>-bypass`; without one there is no
+        conversion for the state and it stays unavailable.
+
 choice
     prompt "Radio 0 — chip"
     default LORA0_RADIO_SX1262
@@ -503,6 +524,12 @@ config LORA1_LR_RFSW_TX_HF
     hex "Radio 1 — LR2021 DIOs driven high in 2.4 GHz transmit"
     default 0
     depends on LORA_COUNT > 1
+config LORA1_LR_RFSW_TX_BYPASS
+    hex "Radio 1 — LR2021 sub-GHz transmit DIOs with the PA bypassed (0 = no bypass)"
+    default 0
+    depends on LORA_COUNT > 1
+    help
+        LORA0_LR_RFSW_TX_BYPASS for radio 1.
 choice
     prompt "Radio 1 — chip"
     default LORA1_RADIO_SX1262
@@ -722,6 +749,12 @@ config LORA2_LR_RFSW_TX_HF
     hex "Radio 2 — LR2021 DIOs driven high in 2.4 GHz transmit"
     default 0
     depends on LORA_COUNT > 2
+config LORA2_LR_RFSW_TX_BYPASS
+    hex "Radio 2 — LR2021 sub-GHz transmit DIOs with the PA bypassed (0 = no bypass)"
+    default 0
+    depends on LORA_COUNT > 2
+    help
+        LORA0_LR_RFSW_TX_BYPASS for radio 2.
 choice
     prompt "Radio 2 — chip"
     default LORA2_RADIO_SX1262
@@ -941,6 +974,12 @@ config LORA3_LR_RFSW_TX_HF
     hex "Radio 3 — LR2021 DIOs driven high in 2.4 GHz transmit"
     default 0
     depends on LORA_COUNT > 3
+config LORA3_LR_RFSW_TX_BYPASS
+    hex "Radio 3 — LR2021 sub-GHz transmit DIOs with the PA bypassed (0 = no bypass)"
+    default 0
+    depends on LORA_COUNT > 3
+    help
+        LORA0_LR_RFSW_TX_BYPASS for radio 3.
 choice
     prompt "Radio 3 — chip"
     default LORA3_RADIO_SX1262

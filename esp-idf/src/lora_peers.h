@@ -20,7 +20,7 @@ struct LoraRadio;
 #define NEI_DESTS_MAX        8       /* dest hashes clustered per node */
 #define NEI_IDS_MAX          8       /* identities clustered per node — one
                                       * device legitimately runs several (its
-                                      * transport, rnsh, lxmf, rlpg and nomad
+                                      * transport, rnsh, lxmf, lxmproxy and nomad
                                       * identities are all distinct), and an
                                       * announcement naming them together is
                                       * what folds them into one row.

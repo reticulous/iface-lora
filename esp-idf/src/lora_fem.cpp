@@ -128,21 +128,31 @@ void femBandSelect(LoraRadio* r, bool highBand)
     }
 
     /* The two ports have different register ranges, different front ends and
-     * different curves, so the calibration is rebuilt rather than adjusted. */
+     * different curves, so the calibration is rebuilt rather than adjusted.
+     * The amplifier goes back in the path first: calBuild reads that state, and
+     * the begin() this runs inside resets the chip's DIO map to match. */
+    r->femTxPa = true;
     calBuild(r);
 
     /* Both ends of the range come out of that calibration, so they describe
      * what this board can actually put on the connector rather than what the
-     * chip would do on its own. A front end's board rating caps the ceiling —
-     * that is a rating, not a measurement, and it is allowed to be the tighter
-     * of the two. */
-    int mx = rfCalMaxDbm(&r->cal);
+     * chip would do on its own. A board that can transmit round its amplifier
+     * spans BOTH states — the quiet end is the bypass path's, the loud end the
+     * amplifier's — because nothing outside here has to know which one a given
+     * power will use. A front end's board rating caps the ceiling; that is a
+     * rating, not a measurement, and it is allowed to be the tighter. */
+    int mx = rfCalMaxDbm(&r->cal), mn = rfCalMinDbm(&r->cal);
+    if (femCanBypassPa(r)) {
+        const int byMx = rfCalMaxDbm(&r->calBypass), byMn = rfCalMinDbm(&r->calBypass);
+        if (byMx > mx) mx = byMx;
+        if (byMn < mn) mn = byMn;
+    }
     if (r->femType != FEM_NONE) {
         const int cap = highBand ? CONFIG_LORA_TX_POWER_MAX_HF : CONFIG_LORA_TX_POWER_MAX;
         if (mx > cap) mx = cap;
     }
     r->maxTxDbm = (int8_t)mx;
-    r->minTxDbm = rfCalMinDbm(&r->cal);
+    r->minTxDbm = (int8_t)mn;
 
     /* What this radio can actually reach at the antenna, republished on every
      * begin so a UI sizing its power control from the key follows the carrier
@@ -168,6 +178,8 @@ void femInit(LoraRadio* r)
 {
     const LoraSlot* s = r->slot;
     r->femType   = FEM_NONE;
+    r->femTxPa   = true;   /* the amplifier is in the path until a board that can
+                            * take it out is told to; femTxPa enforces that */
     r->femRxLna  = true;   /* every wiring but the KCT8103L's receives through
                             * whatever LNA it has; the flag is only ever cleared
                             * by femRxLna on that part */
@@ -270,6 +282,50 @@ void femRxLna(LoraRadio* r, bool on)
     info("lora/%d FEM: receive LNA %s", r->idx, on ? "in the RX path" : "bypassed");
 }
 
+bool femCanBypassPa(const LoraRadio* r)
+{
+    return r->slot->lr_rfsw_tx_bypass != 0 && r->haveBypassCal && !r->highBand;
+}
+
+/* Move the front end's transmit amplifier in or out of the path, and swap the
+ * calibration with it — the two are one act, because the board is a different
+ * transmitter in each state and a register setting means a different power.
+ *
+ * Called from apApplyPower, which every transmit path runs immediately before
+ * staging its frame, so the chip is on its way to standby and TX anyway. The
+ * DIO map is what carries the state; the chip reads it when it enters a mode,
+ * so rewriting it before the transmit starts is what makes the frame come out
+ * of the path we just costed it against. */
+void femTxPa(LoraRadio* r, bool on)
+{
+    if (!femCanBypassPa(r)) { r->femTxPa = true; return; }
+    if (r->femTxPa == on) return;
+    r->femTxPa = on;
+
+    LoraRfCal swap = r->cal;
+    r->cal = r->calBypass;
+    r->calBypass = swap;
+
+    lr2021ApplyDio(r);
+    if (logIsDebug(TAG))
+        dbg("lora/%d FEM: transmit amplifier %s (%d..%d dBm)", r->idx,
+            on ? "in the TX path" : "bypassed",
+            rfCalMinDbm(&r->cal), rfCalMaxDbm(&r->cal));
+}
+
+/* The state a wanted power should go out through: the bypass path whenever it
+ * can reach the power at all, the amplifier only when it cannot. Quiet is the
+ * common case on a dense mesh and the bypass path is both quieter and cheaper,
+ * so it wins ties. The two ranges do not overlap on any board seen so far — the
+ * amplifier's floor sits above the bypass path's ceiling — which makes this a
+ * single threshold with nothing to oscillate around. */
+bool femWantPa(const LoraRadio* r, int8_t antennaDbm)
+{
+    if (!femCanBypassPa(r)) return true;
+    const LoraRfCal* by = r->femTxPa ? &r->calBypass : &r->cal;
+    return antennaDbm > rfCalMaxDbm(by);
+}
+
 /* ─────────────── the conversion, both directions ───────────────
  *
  * The arithmetic is lora_rfcal's; this is where it meets the hardware. The
@@ -313,10 +369,33 @@ static void calBuild(LoraRadio* r)
 
     if (r->highBand) return;   /* the 2.4 GHz port keeps the flat model */
 
+    const char* name = femName((LoraFemType)r->femType);
     char why[80];
-    if (!rfCalParse(&r->cal, s->tx_cal, femName((LoraFemType)r->femType),
-                    why, sizeof why) && why[0])
+    if (!rfCalParse(&r->cal, s->tx_cal, name, why, sizeof why) && why[0])
         err("lora/%d TX_CAL %s — uncalibrated", r->idx, why);
+
+    /* With the transmit amplifier out of the path the board is a different
+     * transmitter, so it carries a second curve — named `<part>-bypass`, and
+     * required before the state can be entered at all: a state with no
+     * conversion for it is a state that cannot say what it radiates, which is
+     * the one thing this must never do. It starts from the same flat model and
+     * receive gain, since only the transmit path moved. */
+    r->calBypass = r->cal;
+    r->calBypass.n = 0;
+    r->calBypass.grade = CAL_NONE;
+    r->haveBypassCal = false;
+    if (!s->lr_rfsw_tx_bypass) return;
+
+    char part[32];
+    snprintf(part, sizeof part, "%s-bypass", name);
+    if (rfCalParse(&r->calBypass, s->tx_cal, part, why, sizeof why)) {
+        r->haveBypassCal = true;
+    } else if (why[0]) {
+        err("lora/%d TX_CAL %s — bypass unavailable", r->idx, why);
+    } else {
+        err("lora/%d names a transmit-bypass mask but TX_CAL has no %s entry — "
+            "bypass unavailable", r->idx, part);
+    }
 }
 
 #endif  /* CONFIG_LORA0_CS_PIN */

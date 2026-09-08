@@ -74,6 +74,7 @@ static const LoraSlot kSlots[] = {
       { CONFIG_LORA0_LR_RFSW_IDLE, CONFIG_LORA0_LR_RFSW_RX,
         CONFIG_LORA0_LR_RFSW_TX, CONFIG_LORA0_LR_RFSW_RX_HF,
         CONFIG_LORA0_LR_RFSW_TX_HF },
+      CONFIG_LORA0_LR_RFSW_TX_BYPASS,
       (LoraChip)CONFIG_LORA0_CHIP_ID },
 #if defined(CONFIG_LORA1_CS_PIN)
     { CONFIG_LORA1_CS_PIN, CONFIG_LORA1_DIO1_PIN, CONFIG_LORA1_BUSY_PIN, CONFIG_LORA1_RST_PIN,
@@ -86,6 +87,7 @@ static const LoraSlot kSlots[] = {
       { CONFIG_LORA1_LR_RFSW_IDLE, CONFIG_LORA1_LR_RFSW_RX,
         CONFIG_LORA1_LR_RFSW_TX, CONFIG_LORA1_LR_RFSW_RX_HF,
         CONFIG_LORA1_LR_RFSW_TX_HF },
+      CONFIG_LORA1_LR_RFSW_TX_BYPASS,
       (LoraChip)CONFIG_LORA1_CHIP_ID },
 #endif
 #if defined(CONFIG_LORA2_CS_PIN)
@@ -99,6 +101,7 @@ static const LoraSlot kSlots[] = {
       { CONFIG_LORA2_LR_RFSW_IDLE, CONFIG_LORA2_LR_RFSW_RX,
         CONFIG_LORA2_LR_RFSW_TX, CONFIG_LORA2_LR_RFSW_RX_HF,
         CONFIG_LORA2_LR_RFSW_TX_HF },
+      CONFIG_LORA2_LR_RFSW_TX_BYPASS,
       (LoraChip)CONFIG_LORA2_CHIP_ID },
 #endif
 #if defined(CONFIG_LORA3_CS_PIN)
@@ -112,6 +115,7 @@ static const LoraSlot kSlots[] = {
       { CONFIG_LORA3_LR_RFSW_IDLE, CONFIG_LORA3_LR_RFSW_RX,
         CONFIG_LORA3_LR_RFSW_TX, CONFIG_LORA3_LR_RFSW_RX_HF,
         CONFIG_LORA3_LR_RFSW_TX_HF },
+      CONFIG_LORA3_LR_RFSW_TX_BYPASS,
       (LoraChip)CONFIG_LORA3_CHIP_ID },
 #endif
 };
@@ -304,6 +308,7 @@ static bool radioStart(LoraRadio* r) {
      * front of the chip). Read ahead of femBandSelect, whose calibration
      * rebuild takes the receive-gain correction from it. */
     femRxLna(r, storageGetInt(sk(kb, sizeof kb, r->idx, "fem_rx_lna"), 1) != 0);
+
 
     /* Point the front end at the band this carrier is on before anything is
      * measured against it: on a dual-band part the ceiling below, and the

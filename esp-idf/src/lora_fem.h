@@ -87,6 +87,28 @@ void femInit(LoraRadio* r);
  * call this before radioBegin, as applyConfig does. */
 void femRxLna(LoraRadio* r, bool on);
 
+/* Whether this radio can transmit round its amplifier at all: the board has to
+ * name the bypass mask AND give the bypass state its own calibration, and the
+ * path is the sub-GHz port's. */
+bool femCanBypassPa(const LoraRadio* r);
+
+/* Which side of the front end a wanted power has to go out through — the
+ * amplifier only when the bypass path cannot reach the power at all. */
+bool femWantPa(const LoraRadio* r, int8_t antennaDbm);
+
+/* Put the front end in that state, swapping the calibration with it. This is
+ * what gives an amplified board a low power at all: with the amplifier in
+ * circuit its quietest frame is the amplifier's own output — +21 dBm on the
+ * Meshnology W12 — and round it the floor is the chip's, less the bypass path's
+ * insertion loss, so the board spans both ranges rather than one.
+ *
+ * Driven per frame from apApplyPower, not configured: deriving a power per peer
+ * exists so a node can speak microwatts across a room and watts across a
+ * valley, and a board whose floor sat above the quiet end could not do the
+ * first. Nothing above the driver needs to know which path carried a frame —
+ * what a frame announces is what it radiated either way. */
+void femTxPa(LoraRadio* r, bool on);
+
 /* Point the front end at the band this carrier is on: raise that port's supply
  * gate and drop the other's, record the band, and set/publish the antenna
  * ceiling it brings. Called from radioBegin with the frequency it is about to

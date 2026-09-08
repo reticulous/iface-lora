@@ -126,17 +126,33 @@ static uint8_t lr2021DioPull(int dio)
                     : RADIOLIB_LR2021_DIO_SLEEP_PULL_AUTO;
 }
 
-static void lr2021ApplyDio(LoraRadio* r)
+void lr2021ApplyDio(LoraRadio* r)
 {
     const LoraSlot* s = r->slot;
+    /* The sub-GHz transmit row is the one the front end's PA select sits in, so
+     * a radio transmitting round its amplifier takes the board's bypass mask in
+     * that slot and nothing else changes. femTxPa holds which state the front
+     * end is in; it can only be false where the board named a mask. */
+    uint8_t rfsw[5];
+    for (int i = 0; i < 5; i++) rfsw[i] = s->lr_rfsw[i];
+    if (!r->femTxPa && s->lr_rfsw_tx_bypass) rfsw[2] = s->lr_rfsw_tx_bypass;
+
+    /* Every DIO this board uses in ANY row, so a line that drops out of the
+     * transmit row gets written back as "no modes" rather than keeping the
+     * configuration it had. Re-running this is how the front end changes state,
+     * and a stale row would leave the amplifier in circuit while the
+     * calibration said otherwise. */
+    uint8_t used = s->lr_rfsw_tx_bypass;
+    for (int i = 0; i < 5; i++) used |= s->lr_rfsw[i];
+
     for (int dio = 5; dio <= 11; dio++) {
         uint8_t bit = (uint8_t)(1u << (dio - 5));
         uint8_t cfg = 0;
         /* The chip's own mode numbering, which is also RadioLib's: bit 0 is
          * standby, then rx, tx, rx_hf, tx_hf — the order lr_rfsw is written in. */
         for (int mode = 0; mode < 5; mode++)
-            if (s->lr_rfsw[mode] & bit) cfg |= (uint8_t)(1u << mode);
-        if (!cfg) continue;
+            if (rfsw[mode] & bit) cfg |= (uint8_t)(1u << mode);
+        if (!(used & bit)) continue;
         if (dio == s->lr_irq_dio) {
             warn("lora/%d LR2021 DIO%d carries the IRQ line and cannot also drive "
                  "the RF switch — check CONFIG_LORA%d_LR_RFSW_*", r->idx, dio, r->idx);

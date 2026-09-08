@@ -455,11 +455,48 @@ Two consequences are worth stating because they are easy to get backwards:
   below its own amplifier's output has a quietest transmission, around +7 dBm
   on that board against the chip's −9, and +21 dBm on the Meshnology W12.
   `minTxDbm` is what the adaptive controller clamps to and what a node
-  announces, so nothing claims a power no setting produces. Where a front end
-  has a transmit-bypass path the floor is a driving choice rather than a limit,
-  but reaching it costs a front-end mode change on the transmit path and a
-  second curve with a discontinuity between them — scoped, unbuilt, in
-  [hw-meshnology-w12's INTERNALS](../hw-meshnology-w12/INTERNALS.md).
+  announces, so nothing claims a power no setting produces. Where the board
+  wired a way round the amplifier, that floor is a choice — see below.
+
+**Bypassing the transmit amplifier.** Deriving a power per peer exists so a node
+can speak microwatts to the neighbour across the room and watts to the one
+across the valley. An amplified board cannot do the first through its own
+amplifier: its faintest possible frame is that amplifier's output, +21 dBm on
+the Meshnology W12. Where the front end has a transmit-bypass path and the board
+wired it reachably, the quiet end of the range is reached round the amplifier
+instead, and the board spans **both** — the W12 runs −10 … +20 bypassed and
++21 … +30 amplified, published as one range of −10 … +30.
+
+**The choice is per frame and belongs to nobody above the driver.** There is no
+setting. `apApplyPower` asks `femWantPa` which side of the front end the power
+it was handed can come out of, and `femTxPa` puts it there — bypass whenever it
+can reach the power at all, since it is both the quiet path and the cheap one.
+Every transmit path calls `apApplyPower` immediately before staging its frame,
+so the chip is on its way to standby and TX anyway; `lr2021ApplyDio` rewrites
+the DIO map there, and the chip reads that map when it enters a mode. The two
+ranges do not overlap on any board in the tree — the amplifier's floor sits
+above the bypass path's ceiling — so this is a single threshold with nothing to
+oscillate around.
+
+Two consequences fall out of the states being different transmitters:
+
+- **Each carries its own curve.** The bypass state takes a `<part>-bypass` entry
+  in `LORAn_TX_CAL`, and a board without one cannot enter the state at all: a
+  transmitter that cannot say what it radiates is the one thing this must never
+  produce. `femTxPa` swaps the calibration and the DIO map together, because a
+  register setting means a different power on each side.
+- **A state change must reach the register even when the power does not.**
+  `apApplyPower`'s early-out compares the front-end state as well as the power,
+  or a frame would go out through a newly-selected path at the other path's
+  setting.
+
+`lr2021ApplyDio` writes every DIO named in *any* row, including one that drops
+out of the transmit row, so a line that should go quiet is written back as "no
+modes" rather than keeping what it had. Only a board that names
+`LORAn_LR_RFSW_TX_BYPASS` has the path at all — the mask is the transmit row
+with the amplifier's select line dropped, and getting the *wrong* bit would
+point the chip's full output at the front end's receive input, so it is stated
+per board rather than derived.
 
 **What is transmitted is what is announced.** `apApplyPower` records
 `rfAntennaDbm` of the setting it programmed, never the request, and `txPwrNow`
@@ -2563,7 +2600,7 @@ statics, globals or long-lived structs, never on a stack or in anything freed.
 
 | Key | Value |
 |---|---|
-| `lora.<n>.chans` | `"<freqHz>,<bwHz>\|…"`, index = channel, 0 = hailing. One key, not a subtree: a handful of numbers that the viewers want all of at once to label their graphs. A list of **one** entry means no agile lanes, so a viewer tells the two cases apart by the entry count and needs no separate flag. **Two conditions put a lane in the list**: the regime names the channel, *and* `SUPE.enable` is on — a regime says which channels may be used, not that anything will use them, and only a detour ever leaves the hailing channel. So it is republished on the runtime enable toggle as well as at config apply, those being the two things that can change the answer. |
+| `lora.<n>.chans` | `"<freqHz>,<bwHz>\|…"`, index = channel, 0 = hailing. One key, not a subtree: a handful of numbers that the viewers want all of at once to label their graphs. A list of **one** entry means no agile lanes, so a viewer tells the two cases apart by the entry count and needs no separate flag. **Two conditions put a lane in the list**: the regime names the channel, *and* SUPE is running — a regime says which channels may be used, not that anything will use them, and only a detour ever leaves the hailing channel. So it is republished on the runtime enable toggle as well as at config apply, those being the two things that can change the answer. The second condition is `r->supeOn`, the **verdict**, not `s.lora.<n>.SUPE.enable`, the wish: an access code (`ifac_size`), an expired dialect or a failed `supeInit` each leave the switch on in the settings pane and SUPE off on the radio, and then this key holds the hailing channel alone. A monitor drawing one graph where the operator set a nine-channel regime is that state, seen from the far end — `lora supe` names which of the three it is. |
 | `lora.<n>.rssi` | `"<ms>\|<ch0 dBm>\|<ch1 dBm>\|…"`, the newest sample set only. The device timestamp is in the **value**, not the key, so a viewer can tell a fresh reading from a repeated one and place it on the same clock the packet nodes use. A skipped beat republishes nothing, so the key is unchanged, no point is appended, and the gap reads as a gap. One key rather than a node per sample: the series is live-only, so there is no backlog to mirror and nothing to expire. |
 
 One field, the hailing channel's: this radio samples nothing else (§18.5), and

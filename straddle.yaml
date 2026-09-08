@@ -205,11 +205,14 @@ settings:
       #
       # The regime is the statement of what is permissible on which channels —
       # the channel raster, the airtime allowance, the length ceilings and the
-      # power limit. It also selects which channels the per-second RSSI beat
-      # measures and draws, which is all it does with SUPE off.
+      # power limit. With SUPE not running it does nothing at all: the published
+      # channel list stays at the hailing channel alone, so a monitor shows one
+      # graph and not ten.
       #
       # Inert on an interface with an access code: IFAC masks the frame end to
-      # end, so the modem cannot read an address to match.
+      # end, so the modem cannot read an address to match. The switch above
+      # still moves — it is the wish, not the verdict — and `lora supe` is what
+      # states which of the two a radio is running under.
       #
       # Every row here is gated on CONFIG_LORA_NO_SUPE: a build without SUPE has
       # no engine to configure, so it gets no rows, no pane section and no keys

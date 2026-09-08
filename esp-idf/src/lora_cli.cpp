@@ -237,6 +237,13 @@ static void cliPrintSlot(int i) {
         cliPrintf("        fem_rx_lna=%d (%s)\n", lna,
                   lna ? "front-end LNA in the RX path, ~8 mA" : "bypassed, power saving");
     }
+    /* Not a setting — where the front end happens to be right now, which the
+     * last power asked for decided. Worth showing because it is the difference
+     * between the two halves of the published range. */
+    if (femCanBypassPa(r))
+        cliPrintf("        tx path: %s\n",
+                  r->femTxPa ? "through the front-end PA"
+                             : "round it — the chip drives the antenna");
     if (!r->lbt) {
         cliPrintf("        lbt=off (blind tx)\n");
     } else if (!r->appc) {
@@ -330,6 +337,12 @@ static void cliPrintNode(Neighbor* e, int num, void* ud) {
     for (int pass = 0; pass < 2; pass++) {
         for (int d = 0; d < e->nDests; d++) {
             NeiDest* nd = &e->dests[d];
+            /* The local rows are built from announces we were heard sending and
+             * are never retired, so this table remembers an address long after
+             * it stops being ours — an LXMF account handed to a proxy server is
+             * the case in point. The heading says "us", so ask what is actually
+             * hosted rather than what was once transmitted. */
+            if (c->local && e->isUs && !rnsdHostsDest(nd->hash)) continue;
             const char* asp = nd->haveName ? rnsNameLabel(nd->nameHash) : nullptr;
             bool isTransport = asp && strcmp(asp, "rnstransport.probe") == 0;
             if ((pass == 0) != isTransport) continue;
@@ -670,10 +683,22 @@ static void cliSupe(int idx, const char* sub, const char* arg) {
     uint32_t nowUnix = (uint32_t)time(nullptr);
     uint32_t exp = supeExpiryUnix();
     char kb[48];
-    cliPrintf("lora/%d SUPE: %s\n", idx,
-              r->supeOn ? "on"
-                        : (storageGetInt(sk(kb, sizeof kb, idx, "SUPE.enable"), 0)
-                               ? "off (an access code is configured)" : "off"));
+    /* The switch is the wish; `supeOn` is the verdict. Naming the reason they
+     * differ is the whole value of this line — a node whose pane says "enabled"
+     * and whose monitor draws one graph is asking exactly this question — so
+     * each gate is tested for rather than the first one being assumed. */
+    const char* supeState = "off";
+    if (r->supeOn)
+        supeState = "on";
+    else if (storageGetInt(sk(kb, sizeof kb, idx, "SUPE.enable"), 0)) {
+        if (storageGetInt(sk(kb, sizeof kb, idx, "ifac_size"), 0))
+            supeState = "off (an access code is configured)";
+        else if (supeExpired(nowUnix))
+            supeState = "off (the dialect this build speaks has expired)";
+        else
+            supeState = "off (enabled, but it did not come up — see the boot log)";
+    }
+    cliPrintf("lora/%d SUPE: %s\n", idx, supeState);
     const SupeRegime* g = supeRegime(r->afa);
     cliPrintf("  regime      %u (%s), version %u\n", (unsigned)r->afa,
               g ? g->name : "unrecognised — no agile channels", SUPE_VERSION);

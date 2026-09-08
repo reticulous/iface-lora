@@ -380,6 +380,13 @@ struct LoraRadio {
     bool            femRxLna;        /* the front end's receive LNA is in the RX path
                                       * (s.lora.<i>.fem_rx_lna). Only a KCT8103L can take
                                       * it out; everywhere else it stays true */
+    bool            femTxPa;         /* the front end's transmit amplifier is in the TX path
+                                      * right now. Chosen per frame from the power being
+                                      * asked for, not configured: an amplified board
+                                      * cannot speak quietly through its own PA, so the
+                                      * quiet end of the range is the bypass path's. Only a
+                                      * board declaring LORAn_LR_RFSW_TX_BYPASS and a
+                                      * `<part>-bypass` curve ever moves it */
     int8_t          maxTxDbm;        /* connector-dBm ceiling for the band in use: the
                                       * conversion's own peak, capped by a front end's
                                       * board rating */
@@ -389,7 +396,14 @@ struct LoraRadio {
                                       * amplifier's output */
     LoraRfCal       cal;             /* what this board puts on the connector for a given
                                       * register setting, and what its front end adds on
-                                      * receive — rebuilt per port by femBandSelect */
+                                      * receive — the ACTIVE one, so everything that
+                                      * converts reads it without knowing about states.
+                                      * Rebuilt per port by femBandSelect */
+    LoraRfCal       calBypass;       /* the same for the amplifier-bypassed state, where the
+                                      * board has one. femTxPa swaps it with `cal`; the two
+                                      * together are the range this radio really spans */
+    bool            haveBypassCal;   /* that second curve exists and was parsed, which is
+                                      * what makes the bypass state enterable at all */
     bool            highBand;        /* the carrier is on the chip's 2.4 GHz port, which
                                       * has its own amplifier, ceiling and drive range */
     uint8_t         txType[2];       /* per frame: LORA_PKT_*. A 0x04 power request
