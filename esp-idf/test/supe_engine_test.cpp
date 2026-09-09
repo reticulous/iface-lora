@@ -6,7 +6,7 @@
  *
  * What it steps: regime 0's dialogue in both shapes (hail, answer, frames at
  * the hailing rate; the full meeting at a lowered one), the hailed party
- * opening with HAVE, the hail-back a busy hailed party owes, the run and the
+ * opening with GOT, the hail-back a busy hailed party owes, the run and the
  * hold, patience; and under a channel plan the two-slot schedule, the return
  * leg, a repair round, a hole, the wide schedule's ride, crossed hails, the
  * seed-hash gate, and the no-stale-deadline rule.
@@ -503,7 +503,7 @@ static bool holdsWide(const Node* n) {
 
 /* ─────────────── regime 0: the dialogue ─────────────── */
 
-/* Hail, GIMME, frames — and nothing else. The frames reach the daemon as they
+/* Hail, READY, frames — and nothing else. The frames reach the daemon as they
  * land, the queue is consumed on transmit, and no goodbye seeds anything. */
 static void testDialogueLite(void) {
     resetAir();
@@ -522,9 +522,9 @@ static void testDialogueLite(void) {
     eqi(A.eng.m.phase, SUPE_M_IDLE, "A is home");
     eqi(B.eng.m.phase, SUPE_M_IDLE, "B is home");
     eqi(A.eng.hailsOut, 1, "one hail on the shared channel");
-    eqi(g_typeCount[SUPE_T_GIMME], 1, "one GIMME answered it");
-    eqi(g_typeCount[SUPE_T_HAVE], 0, "no HAVE: the hailed party held nothing");
-    eqi(g_typeCount[SUPE_T_THATSIT], 0, "no THATSIT at the hailing rate");
+    eqi(g_typeCount[SUPE_T_READY], 1, "one READY answered it");
+    eqi(g_typeCount[SUPE_T_GOT], 0, "no GOT: the hailed party held nothing");
+    eqi(g_typeCount[SUPE_T_END], 0, "no END at the hailing rate");
     eqi(g_typeCount[SUPE_T_BYE], 0, "…and no BYE");
     eqi(A.eng.framesOut, 3, "a 300 B packet split: three frames out");
     eqi(B.eng.framesIn, 3, "…three frames counted in");
@@ -539,7 +539,7 @@ static void testDialogueLite(void) {
     eqi((long)B.tunes, 0, "…nor did B");
 }
 
-/* Hail, GIMME at budget 1, the train at SF6, THATSIT, BYE. */
+/* Hail, READY at budget 1, the train at SF6, END, BYE. */
 static void testDialogueFull(void) {
     resetAir();
     Node A = {}, B = {};
@@ -554,7 +554,7 @@ static void testDialogueFull(void) {
 
     eqi(A.eng.meetingsDone, 1, "A counts one meeting");
     eqi(B.eng.meetingsDone, 1, "B counts one meeting");
-    eqi(g_typeCount[SUPE_T_THATSIT], 1, "the train was closed by a THATSIT");
+    eqi(g_typeCount[SUPE_T_END], 1, "the train was closed by a END");
     eqi(g_typeCount[SUPE_T_BYE], 1, "…and answered by a BYE");
     eqi((long)B.delivered.size(), 2, "B delivered the whole train at the close");
     ok(dByte(B.delivered, 0, 0) == 0x02 && dByte(B.delivered, 1, 0) == 0x12,
@@ -571,14 +571,14 @@ static void testDialogueFull(void) {
         if (nt.ev == SUPE_EV_TRAIN_OK) aOk = true;
         if (nt.ev == SUPE_EV_ANSWERED) aAnswered = true;
     }
-    ok(aReport, "A got the GIMME's report of its hail");
+    ok(aReport, "A got the READY's report of its hail");
     ok(aOk, "A's power controller heard its train confirmed");
     ok(aAnswered, "A's peer record shows B answered");
 }
 
-/* The hailed party holds traffic too: it answers with HAVE, its train goes
+/* The hailed party holds traffic too: it answers with GOT, its train goes
  * first, and the hailer's rides the answering turn. */
-static void testDialogueHaveFirst(void) {
+static void testDialogueGotFirst(void) {
     resetAir();
     Node A = {}, B = {};
     nodeInit(&A, "A", SUPE_REGIME_SINGLE);
@@ -592,8 +592,8 @@ static void testDialogueHaveFirst(void) {
     launchFrom(&A);
     driveUntilDone(air, &A, 1, 5000);
 
-    eqi(g_typeCount[SUPE_T_HAVE], 2, "an opening HAVE and an answering one");
-    eqi(g_typeCount[SUPE_T_GIMME], 1, "one GIMME confirmed the terms for both");
+    eqi(g_typeCount[SUPE_T_GOT], 2, "an opening GOT and an answering one");
+    eqi(g_typeCount[SUPE_T_READY], 1, "one READY confirmed the terms for both");
     eqi(A.eng.meetingsDone, 1, "one meeting carried both directions");
     eqi(B.eng.meetingsDone, 1, "…on B's count too");
     eqi(B.eng.framesOut, 2, "B's train went first");
@@ -604,8 +604,8 @@ static void testDialogueHaveFirst(void) {
     eqi(A.eng.hailsOut, 1, "the return leg cost the shared channel nothing");
 }
 
-/* The same, at the hailing rate: HAVE, GIMME, B's frames, A's frames, done. */
-static void testDialogueHaveFirstLite(void) {
+/* The same, at the hailing rate: GOT, READY, B's frames, A's frames, done. */
+static void testDialogueGotFirstLite(void) {
     resetAir();
     g_airSnr10 = 0;
     Node A = {}, B = {};
@@ -619,9 +619,9 @@ static void testDialogueHaveFirstLite(void) {
     launchFrom(&A);
     driveUntilDone(air, &A, 1, 5000);
 
-    eqi(g_typeCount[SUPE_T_HAVE], 1, "one opening HAVE");
-    eqi(g_typeCount[SUPE_T_GIMME], 1, "one GIMME");
-    eqi(g_typeCount[SUPE_T_THATSIT], 0, "no THATSIT at the hailing rate");
+    eqi(g_typeCount[SUPE_T_GOT], 1, "one opening GOT");
+    eqi(g_typeCount[SUPE_T_READY], 1, "one READY");
+    eqi(g_typeCount[SUPE_T_END], 0, "no END at the hailing rate");
     eqi(B.eng.framesOut, 1, "B's frame went first");
     eqi(A.eng.framesOut, 1, "…then A's");
     eqi((long)A.plainRx, 1, "A handed B's frame up as it landed");
@@ -633,7 +633,7 @@ static void testDialogueHaveFirstLite(void) {
 }
 
 /* A hailed party that cannot answer owes a hail: it hails back with a count
- * of zero, the hailer answers with HAVE, and the traffic flows. */
+ * of zero, the hailer answers with GOT, and the traffic flows. */
 static void testHailBackRegime0(void) {
     resetAir();
     Node A = {}, B = {};
@@ -644,7 +644,7 @@ static void testHailBackRegime0(void) {
     pushPkt(&A, TAG, 5, 150, 0x11);
 
     /* B's radio is spoken for when the hail lands. */
-    B.eng.m.phase = SUPE_M_AWAIT_GIMME;
+    B.eng.m.phase = SUPE_M_AWAIT_READY;
     B.eng.m.deadlineMs = g_now + 100000;
     launchFrom(&A);
     airPump(air);                              /* the hail crosses */
@@ -655,7 +655,7 @@ static void testHailBackRegime0(void) {
     eqi(B.eng.hailBacksOut, 1, "B hailed back");
     eqi(A.eng.hailsOut + A.eng.hailBacksOut, 1, "A hailed once");
     eqi(A.eng.meetingsDone, 1, "A's traffic met");
-    eqi(g_typeCount[SUPE_T_HAVE], 1, "A answered the hail-back with HAVE");
+    eqi(g_typeCount[SUPE_T_GOT], 1, "A answered the hail-back with GOT");
     eqi((long)B.delivered.size(), 1, "B delivered A's frame");
     eqi(loraqDepth(&A.q), 0, "A's queue was consumed");
     ok(!B.eng.owed[0].used, "the debt is discharged");
@@ -729,7 +729,7 @@ static void testMeetingPlan(void) {
     ok(B.chan >= 1 && B.chan <= 9, "the meeting was on an agile channel");
     eqi(loraqDepth(&A.q), 0, "A's queue was consumed on the proven close");
     ok(A.peer.detoured, "A's peer record remembers the meeting");
-    ok(holdsWide(&A) && holdsWide(&B), "the final THATSIT seeded a wide schedule at both ends");
+    ok(holdsWide(&A) && holdsWide(&B), "the final END seeded a wide schedule at both ends");
     for (int i = 0; i < SUPE_SCHED_MAX; i++) {
         if (A.eng.sched[i].used && A.eng.sched[i].wide)
             ok(!A.eng.sched[i].weTx0, "A sent the final train, so B speaks first");
@@ -738,7 +738,7 @@ static void testMeetingPlan(void) {
     }
 }
 
-static void testHaveFirstPlan(void) {
+static void testGotFirstPlan(void) {
     resetAir();
     Node A = {}, B = {};
     nodeInit(&A, "A", SUPE_REGIME_EU863);
@@ -754,7 +754,7 @@ static void testHaveFirstPlan(void) {
 
     eqi(A.eng.meetingsDone, 1, "one meeting carried both directions");
     eqi(B.eng.meetingsDone, 1, "…on B's count too");
-    eqi(B.eng.framesOut, 2, "B's train went first, opening with HAVE");
+    eqi(B.eng.framesOut, 2, "B's train went first, opening with GOT");
     eqi((long)A.delivered.size(), 2, "A delivered B's frames");
     eqi((long)B.delivered.size(), 1, "B delivered A's frame from the answering turn");
     eqi(loraqDepth(&B.q), 0, "B's queue was consumed");
@@ -835,7 +835,7 @@ static void testWideRide(void) {
 
 /* The hailed party cannot take either slot (both channels read busy): it owes
  * a hail, sends it when the schedule has expired, and the hailer answers with
- * HAVE. */
+ * GOT. */
 static void testOwedHailPlan(void) {
     resetAir();
     Node A = {}, B = {};
@@ -906,7 +906,7 @@ static void testSeedHashGate(void) {
     while ((int32_t)(end - g_now) > 0) {
         for (Node* n : air)
             if (n == &B && !n->txq.empty() && !poisoned &&
-                n->txq.front().bytes[0] == SUPE_T_GIMME) {
+                n->txq.front().bytes[0] == SUPE_T_READY) {
                 n->txq.front().bytes[1] ^= 0xFF;
                 poisoned = true;
             }
@@ -915,7 +915,7 @@ static void testSeedHashGate(void) {
         if (!moved) g_now++;
         if (poisoned && A.eng.rxForeign) break;
     }
-    ok(poisoned, "the GIMME was poisoned on the air");
+    ok(poisoned, "the READY was poisoned on the air");
     ok(A.eng.rxForeign >= 1, "a mismatched seed hash dies in one frame");
     eqi(A.eng.meetingsDone, 0, "…and no meeting follows it");
 }
@@ -951,7 +951,7 @@ static void testNoStaleDeadlineInTxPhase(void) {
     launchFrom(&A);
 
     uint32_t guard = g_now + 20000;
-    while (B.eng.m.phase != SUPE_M_GIMME_TX && (int32_t)(guard - g_now) > 0) {
+    while (B.eng.m.phase != SUPE_M_READY_TX && (int32_t)(guard - g_now) > 0) {
         if (pumpOne(air)) continue;
         bool due = false;
         for (Node* n : air)
@@ -963,13 +963,13 @@ static void testNoStaleDeadlineInTxPhase(void) {
                 (int32_t)(next - n->schedAt) > 0) next = n->schedAt;
         g_now = next > g_now ? next : g_now + 1;
     }
-    eqi(B.eng.m.phase, SUPE_M_GIMME_TX, "B's GIMME is on the air");
+    eqi(B.eng.m.phase, SUPE_M_READY_TX, "B's READY is on the air");
     eqi((long)B.eng.m.deadlineMs, 0, "no deadline stands while a tx is in flight");
     uint32_t at = supeEngNextEventMs(&B.eng, g_now);
     ok(at == UINT32_MAX || (int32_t)(at - g_now) > 0,
        "the engine asks for no wake at-or-before now");
     for (int i = 0; i < 5; i++) supeEngOnTimer(&B.eng);
-    eqi(B.eng.m.phase, SUPE_M_GIMME_TX, "hammering the timer changes nothing");
+    eqi(B.eng.m.phase, SUPE_M_READY_TX, "hammering the timer changes nothing");
     ok(!B.schedArmed || (int32_t)(B.schedAt - g_now) > 0,
        "…and never re-arms it at or before now");
 
@@ -980,12 +980,12 @@ static void testNoStaleDeadlineInTxPhase(void) {
 int main(void) {
     testDialogueLite();
     testDialogueFull();
-    testDialogueHaveFirst();
-    testDialogueHaveFirstLite();
+    testDialogueGotFirst();
+    testDialogueGotFirstLite();
     testHailBackRegime0();
     testRunAndHold();
     testMeetingPlan();
-    testHaveFirstPlan();
+    testGotFirstPlan();
     testRepair();
     testHole();
     testWideRide();

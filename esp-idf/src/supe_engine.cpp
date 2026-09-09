@@ -118,10 +118,10 @@ static uint32_t trainWorstMs(const SupeEngine* e, uint8_t count, const SupeCfg* 
 }
 
 /* The answer deadline is sized to the largest of the three frames that may
- * answer a THATSIT, since which arrives is the answer itself. */
+ * answer a END, since which arrives is the answer itself. */
 static uint32_t answerDeadlineMs(const SupeEngine* e, const SupeCfg* c) {
     return SUPE_TURNAROUND_MS
-           + toaFrameMs(e, c, SUPE_HAVE_ANS_BASE + SUPE_MASK_MAX, false)
+           + toaFrameMs(e, c, SUPE_GOT_ANS_BASE + SUPE_MASK_MAX, false)
            + SUPE_GUARD_MS;
 }
 
@@ -390,11 +390,11 @@ bool supeEngBusy(const SupeEngine* e) {
 }
 
 bool supeEngXactLive(const SupeEngine* e) {
-    return e->m.phase >= SUPE_M_HAVE_TX;
+    return e->m.phase >= SUPE_M_GOT_TX;
 }
 
 uint16_t supeEngCargoPeer(const SupeEngine* e) {
-    return e->m.phase >= SUPE_M_HAVE_TX ? e->m.peerId : (uint16_t)LORAQ_PEER_NONE;
+    return e->m.phase >= SUPE_M_GOT_TX ? e->m.peerId : (uint16_t)LORAQ_PEER_NONE;
 }
 
 void supeEngSetIdent(SupeEngine* e, const uint8_t id[SUPE_TAG_LEN]) {
@@ -492,7 +492,7 @@ static SupeSched* schedInstall(SupeEngine* e, const uint8_t* seed, uint16_t seed
                                const uint8_t* tag, uint16_t peerId,
                                const SupeCfg* slotCfg, uint32_t epochMs) {
     uint8_t d0[32], d1[32];
-    uint8_t buf[SUPE_THATSIT_BASE + SUPE_TRAIN_MAX + 1];
+    uint8_t buf[SUPE_END_BASE + SUPE_TRAIN_MAX + 1];
     if ((size_t)seedLen + 1 > sizeof buf) return nullptr;
     e->host->sha256(e->host->ctx, seed, seedLen, d0);
     memcpy(buf, seed, seedLen);
@@ -604,7 +604,7 @@ static void deliverInbound(SupeEngine* e) {
     uint8_t order[SUPE_TRAIN_MAX];
     uint8_t n = 0;
     if (!m->rxAligned) {
-        /* No THATSIT ever came: the frames arrived in transmitted order, which
+        /* No END ever came: the frames arrived in transmitted order, which
          * IS sequence order with the holes unknowable. Deliver as they came. */
         for (uint8_t i = 0; i < m->rxN; i++) order[n++] = i;
     } else {
@@ -687,13 +687,13 @@ static void finishMeeting(SupeEngine* e, bool ok, const char* why) {
 
     /* Every goodbye keys the next schedule, and the seed must be a frame both
      * ends can PROVE the other holds (§7) — received, or answered. And it must
-     * be the meeting's LAST THATSIT. Only a channel plan derives one. */
+     * be the meeting's LAST END. Only a channel plan derives one. */
     bool goodbyeShared = (m->weReceivedFinal || m->ourTrainConfirmed)
-                         && !m->laterThatsit;
-    if (e->plan && !m->lite && m->lastThatsitLen && was >= SUPE_M_TRAIN_RX &&
+                         && !m->laterEnd;
+    if (e->plan && !m->lite && m->lastEndLen && was >= SUPE_M_TRAIN_RX &&
         goodbyeShared) {
         SupeCfg cfg = m->cfg;
-        SupeSched* s = schedInstall(e, m->lastThatsit, m->lastThatsitLen, /*wide=*/true,
+        SupeSched* s = schedInstall(e, m->lastEnd, m->lastEndLen, /*wide=*/true,
                                     /*weHailed=*/false, /*weTx0=*/m->weReceivedFinal,
                                     m->haveTag ? m->tag : nullptr, m->peerId, &cfg, eNow(e));
         if (s) { s->lastRssi = m->lastRssi; s->lastSnrQ = m->lastSnrQ; }
@@ -713,7 +713,7 @@ static void finishMeeting(SupeEngine* e, bool ok, const char* why) {
                         (m->peerId != LORAQ_PEER_NONE && s->peerId == m->peerId);
             if (same) s->consumed = true;
         }
-    } else if (!m->weHailed && m->fromHail && !m->anyRx && was >= SUPE_M_GIMME_TX &&
+    } else if (!m->weHailed && m->fromHail && !m->anyRx && was >= SUPE_M_READY_TX &&
                m->haveTag) {
         /* We answered a hail and nothing came of it — the hailer may have been
          * caught by a frame on the hailing channel. It is still owed a hail. */
@@ -729,7 +729,7 @@ static void finishMeeting(SupeEngine* e, bool ok, const char* why) {
     er->sent = m->txNext;   er->got = got;
     er->expect = m->exCount;
 
-    if (was >= SUPE_M_HAVE_TX) meetingLine(e, got, ok, why);
+    if (was >= SUPE_M_GOT_TX) meetingLine(e, got, ok, why);
 
     memset(m, 0, sizeof *m);
     m->phase = SUPE_M_IDLE;
@@ -974,7 +974,7 @@ void supeEngLaunch(SupeEngine* e) {
     } else {
         /* The hail-back: a hail with a count of zero, tagged with the identity
          * the hail it answers carried. The hailed party — the node whose
-         * traffic prompted it — answers with HAVE (§8). */
+         * traffic prompted it — answers with GOT (§8). */
         memcpy(tag, owed->ident, SUPE_TAG_LEN);
         peerId = owed->peerId;
         owed->used = false;
@@ -1096,8 +1096,8 @@ static bool tuneToBudget(SupeEngine* e) {
     return true;
 }
 
-/* The hailed party's answer, from a slot or a turnaround after the hail: HAVE
- * where it holds traffic for the hailer, GIMME otherwise (§8). The meeting
+/* The hailed party's answer, from a slot or a turnaround after the hail: GOT
+ * where it holds traffic for the hailer, READY otherwise (§8). The meeting
  * record already names the hail — hash, tag, what it declared, how it was
  * heard — and the radio is on the answer's configuration. */
 static void openAsHailed(SupeEngine* e, SupeSched* s) {
@@ -1135,7 +1135,7 @@ static void openAsHailed(SupeEngine* e, SupeSched* s) {
         }
     }
 
-    SupeGimme g = {};
+    SupeReady g = {};
     memcpy(g.hash, m->hash3, SUPE_HASH_LEN);
     g.pwrDbm = m->ourTxp;
     g.countCeil = SUPE_TRAIN_MAX;
@@ -1143,9 +1143,9 @@ static void openAsHailed(SupeEngine* e, SupeSched* s) {
     g.heardSnrQ = m->hailSnrQ;
 
     if (haveTrain) {
-        /* HAVE: our train goes first, the hailer's rides the answering turn.
+        /* GOT: our train goes first, the hailer's rides the answering turn.
          * The budget byte is our proposal for the meeting — as far up this
-         * channel's ladder as both ceilings allow; the hailer's GIMME confirms
+         * channel's ladder as both ceilings allow; the hailer's READY confirms
          * one at or below it, and below its own hail's ceiling. */
         SupeCfg propCfg;
         uint8_t top = proposalTop(e, m->tag, m->haveTag, chanMaxBwOf(e, m->chan), &propCfg);
@@ -1154,24 +1154,24 @@ static void openAsHailed(SupeEngine* e, SupeSched* s) {
         m->budget = top;
         m->cfg = m->slotCfg;
         m->peerCeil = SUPE_TRAIN_MAX;
-        SupeHave hv = {};
+        SupeGot hv = {};
         hv.g = g;
         hv.g.budget = top;
         hv.count = m->tx.count;
         hv.lenByte = supeEncLen(trainLenMs(e, &m->tx, m->tx.count, &propCfg));
-        uint8_t f[SUPE_HAVE_LEN];
-        size_t n = supeEncHave(f, sizeof f, &hv);
+        uint8_t f[SUPE_GOT_LEN];
+        size_t n = supeEncGot(f, sizeof f, &hv);
         if (!n || !e->host->tx_frame(e->host->ctx, f, (uint16_t)n, m->ourTxp)) {
-            finishMeeting(e, false, "HAVE would not transmit");
+            finishMeeting(e, false, "GOT would not transmit");
             return;
         }
-        enterTxPhase(m, SUPE_M_HAVE_TX);
-        eLog(e, true, "supe: HAVE ch%u %u frames, propose budget %u, txp=%d",
+        enterTxPhase(m, SUPE_M_GOT_TX);
+        eLog(e, true, "supe: GOT ch%u %u frames, propose budget %u, txp=%d",
              (unsigned)m->chan, (unsigned)hv.count, (unsigned)top, (int)m->ourTxp);
         return;
     }
 
-    /* GIMME: the receiver's terms. The budget is chosen from how the hail was
+    /* READY: the receiver's terms. The budget is chosen from how the hail was
      * heard, never above the hail's ceiling. In regime 0 it selects the
      * dialogue's shape: 0 is hail, answer, frames and nothing else. */
     SupeCfg cfg;
@@ -1183,23 +1183,23 @@ static void openAsHailed(SupeEngine* e, SupeSched* s) {
     m->cfg = cfg;
     m->lite = !e->plan && budget == 0;
     m->exCount = m->hailCount < SUPE_TRAIN_MAX ? m->hailCount : SUPE_TRAIN_MAX;
-    m->peerTrainTxp = m->hailTxp;          /* until their THATSIT states the train's */
+    m->peerTrainTxp = m->hailTxp;          /* until their END states the train's */
     m->havePeerTxp = true;
     g.budget = budget;
-    uint8_t f[SUPE_GIMME_LEN];
-    size_t n = supeEncGimme(f, sizeof f, &g);
+    uint8_t f[SUPE_READY_LEN];
+    size_t n = supeEncReady(f, sizeof f, &g);
     if (!n || !e->host->tx_frame(e->host->ctx, f, (uint16_t)n, m->ourTxp)) {
-        finishMeeting(e, false, "GIMME would not transmit");
+        finishMeeting(e, false, "READY would not transmit");
         return;
     }
-    enterTxPhase(m, SUPE_M_GIMME_TX);
-    eLog(e, true, "supe: GIMME budget %u txp=%d for %u frames%s",
+    enterTxPhase(m, SUPE_M_READY_TX);
+    eLog(e, true, "supe: READY budget %u txp=%d for %u frames%s",
          (unsigned)budget, (int)m->ourTxp, (unsigned)m->exCount,
          m->lite ? " (lite)" : "");
 }
 
 /* The wide schedule's speaker: a holder of traffic, in its own slot, opening
- * with HAVE. Nobody asked anything at a goodbye, so this frame is the one
+ * with GOT. Nobody asked anything at a goodbye, so this frame is the one
  * that flies blind — sensed first, on a private channel, bounded (§7). */
 static void slotSpeakWide(SupeEngine* e, SupeSched* s, uint8_t k) {
     SupeMeet* m = &e->m;
@@ -1256,7 +1256,7 @@ static void slotSpeakWide(SupeEngine* e, SupeSched* s, uint8_t k) {
     m->worstRssi = 127;
     m->beganMs = eNow(e);
 
-    SupeHave hv = {};
+    SupeGot hv = {};
     memcpy(hv.g.hash, m->hash3, SUPE_HASH_LEN);
     hv.g.pwrDbm  = m->ourTxp;
     hv.g.budget  = top;
@@ -1265,17 +1265,17 @@ static void slotSpeakWide(SupeEngine* e, SupeSched* s, uint8_t k) {
     hv.g.heardSnrQ = s->lastSnrQ;
     hv.count   = m->tx.count;
     hv.lenByte = supeEncLen(trainLenMs(e, &m->tx, m->tx.count, &propCfg));
-    uint8_t f[SUPE_HAVE_LEN];
-    size_t n = supeEncHave(f, sizeof f, &hv);
+    uint8_t f[SUPE_GOT_LEN];
+    size_t n = supeEncGot(f, sizeof f, &hv);
     if (!n || !e->host->tx_frame(e->host->ctx, f, (uint16_t)n, m->ourTxp)) {
-        finishMeeting(e, false, "HAVE would not transmit");
+        finishMeeting(e, false, "GOT would not transmit");
         return;
     }
     e->slotsSpoken++;
     if (s->nSpoke < 255) s->nSpoke++;
-    enterTxPhase(m, SUPE_M_HAVE_TX);
+    enterTxPhase(m, SUPE_M_GOT_TX);
     s->nextSlot = (uint8_t)(k + 1);
-    eLog(e, true, "supe: HAVE ch%u %u frames, propose budget %u, txp=%d (rndv)",
+    eLog(e, true, "supe: GOT ch%u %u frames, propose budget %u, txp=%d (rndv)",
          (unsigned)sl->chan, (unsigned)hv.count, (unsigned)top, (int)m->ourTxp);
 }
 
@@ -1454,35 +1454,35 @@ static void enterTrainWait(SupeEngine* e, uint32_t gapMs) {
     e->host->schedule(e->host->ctx, m->deadlineMs);
 }
 
-static void sendThatsit(SupeEngine* e);
+static void sendEnd(SupeEngine* e);
 static void sendClose(SupeEngine* e);
-static void answerThatsit(SupeEngine* e);
+static void answerEnd(SupeEngine* e);
 static void answerHail(SupeEngine* e);
 
 /* What a TRAIN_WAIT expiry fires when it is not the next train frame. */
 enum : uint8_t {
     SUPE_PEND_NONE = 0,
-    SUPE_PEND_THATSIT,
+    SUPE_PEND_END,
     SUPE_PEND_ANSWER,
     SUPE_PEND_CLOSE,
-    SUPE_PEND_HAIL_ANSWER,   /* regime 0: GIMME or HAVE, one gap after the hail */
+    SUPE_PEND_HAIL_ANSWER,   /* regime 0: READY or GOT, one gap after the hail */
     SUPE_PEND_TRAIN,         /* the second train of a hailing-rate dialogue */
-    SUPE_PEND_GIMME,         /* the GIMME answering a HAVE at a slot */
+    SUPE_PEND_READY,         /* the READY answering a GOT at a slot */
 };
 
 /* Park a send. An ANSWER to the peer's frame waits the flip (SUPE_FLIP_MS):
  * the peer is only now turning from transmit back to receive, and a send
  * fired before that turn is done is never heard. A send that follows our own
- * frame — the THATSIT after our train — waits only the train gap: the peer's
+ * frame — the END after our train — waits only the train gap: the peer's
  * receiver has been open throughout. */
 static void deferSend(SupeEngine* e, uint8_t what, uint32_t gapMs) {
     e->m.pendSend = what;
     enterTrainWait(e, gapMs);
 }
-static void sendGimme(SupeEngine* e);
+static void sendReady(SupeEngine* e);
 
 /* The end of a hailing-rate train: nothing follows it (§8). Where the hailer's
- * train is still owed — we opened with HAVE and the hail declared frames — it
+ * train is still owed — we opened with GOT and the hail declared frames — it
  * comes next, a turnaround after ours; otherwise the dialogue is over. */
 static void liteTrainSent(SupeEngine* e) {
     SupeMeet* m = &e->m;
@@ -1535,7 +1535,7 @@ static void fireNext(SupeEngine* e) {
             e->host->schedule(e->host->ctx, m->deadlineMs);
             return;
         }
-        deferSend(e, SUPE_PEND_THATSIT, SUPE_TRAIN_GAP_MS);
+        deferSend(e, SUPE_PEND_END, SUPE_TRAIN_GAP_MS);
         return;
     }
     if (!e->host->train_fire(e->host->ctx, idx, m->trainTxp)) {
@@ -1549,25 +1549,25 @@ static void fireNext(SupeEngine* e) {
     else              e->framesOut++;
 }
 
-static void sendThatsit(SupeEngine* e) {
+static void sendEnd(SupeEngine* e) {
     SupeMeet* m = &e->m;
-    SupeThatsit t = {};
+    SupeEnd t = {};
     t.pwrDbm = m->trainTxp;
     t.salt   = (uint8_t)e->host->rand32(e->host->ctx);
     t.count  = m->tx.count;
     memcpy(t.csum, m->tx.csum, m->tx.count);
-    size_t n = supeEncThatsit(m->txThatsit, sizeof m->txThatsit, &t);
-    if (!n || !e->host->tx_frame(e->host->ctx, m->txThatsit, (uint16_t)n,
+    size_t n = supeEncEnd(m->txEnd, sizeof m->txEnd, &t);
+    if (!n || !e->host->tx_frame(e->host->ctx, m->txEnd, (uint16_t)n,
                                  m->trainTxp)) {
-        finishMeeting(e, false, "THATSIT would not transmit");
+        finishMeeting(e, false, "END would not transmit");
         return;
     }
-    m->txThatsitLen = (uint8_t)n;
-    memcpy(m->lastThatsit, m->txThatsit, n);
-    m->lastThatsitLen = (uint8_t)n;
+    m->txEndLen = (uint8_t)n;
+    memcpy(m->lastEnd, m->txEnd, n);
+    m->lastEndLen = (uint8_t)n;
     m->weReceivedFinal = false;
-    enterTxPhase(m, SUPE_M_THATSIT_TX);
-    eLog(e, true, "supe: THATSIT %u frames txp=%d", (unsigned)t.count,
+    enterTxPhase(m, SUPE_M_END_TX);
+    eLog(e, true, "supe: END %u frames txp=%d", (unsigned)t.count,
          (int)m->trainTxp);
 }
 
@@ -1575,9 +1575,9 @@ static void sendThatsit(SupeEngine* e) {
  * At the hailing rate the power is the one already stated, since nothing
  * will restate it afterwards (§0.3). */
 /* `leadMs` is what the first frame waits: the flip where the train answers
- * the peer's GIMME — the peer is turning from that transmit to receive, and
+ * the peer's READY — the peer is turning from that transmit to receive, and
  * retuning to the budget on the way — and only the train lead where it
- * follows our own answering HAVE, with the peer's receiver open throughout. */
+ * follows our own answering GOT, with the peer's receiver open throughout. */
 static void startTrain(SupeEngine* e, uint32_t leadMs) {
     SupeMeet* m = &e->m;
     if (m->tx.count > m->peerCeil) m->tx.count = m->peerCeil;
@@ -1613,10 +1613,10 @@ static void sendClose(SupeEngine* e) {
     enterTxPhase(m, SUPE_M_CLOSE_TX);
 }
 
-/* Align the buffered arrivals against a THATSIT's checksum list: a greedy
+/* Align the buffered arrivals against a END's checksum list: a greedy
  * leftmost ordered-subsequence match. Conservative on collisions — when in
  * doubt, ask for more (§8). */
-static void alignTrain(SupeEngine* e, const SupeThatsit* t) {
+static void alignTrain(SupeEngine* e, const SupeEnd* t) {
     SupeMeet* m = &e->m;
     m->peerCount = t->count;
     uint8_t assigned[SUPE_TRAIN_MAX] = { 0 };
@@ -1777,7 +1777,7 @@ static void answerHail(SupeEngine* e) {
 }
 
 /* Our hail's answer arrived, or a rendezvous opened toward us: the peer's
- * terms, with a train behind them (HAVE) or not (GIMME). */
+ * terms, with a train behind them (GOT) or not (READY). */
 static bool answerIsOurs(SupeEngine* e, const uint8_t hash[SUPE_HASH_LEN]) {
     SupeMeet* m = &e->m;
     if (m->phase != SUPE_M_SLOT_LISTEN && m->phase != SUPE_M_AWAIT_HAIL_ANSWER) return false;
@@ -1787,7 +1787,7 @@ static bool answerIsOurs(SupeEngine* e, const uint8_t hash[SUPE_HASH_LEN]) {
 /* Our hail was answered, or a rendezvous was kept: the schedule is consumed,
  * the run ends, and the hail's reading — the one measurement of the direction
  * we transmit in at the hailing configuration — is filed. */
-static void hailAnswered(SupeEngine* e, const SupeGimme* g, int16_t rssi) {
+static void hailAnswered(SupeEngine* e, const SupeReady* g, int16_t rssi) {
     SupeMeet* m = &e->m;
     /* The train the hail described. Held since the hail where nothing else
      * needed the host's buffer; rebuilt here where something did — a slot
@@ -1832,36 +1832,36 @@ static void hailAnswered(SupeEngine* e, const SupeGimme* g, int16_t rssi) {
     if (!m->beganMs) m->beganMs = eNow(e);
 }
 
-/* The GIMME answering a HAVE, from what onHave settled: the budget it
- * confirmed and the reading of the HAVE it confirmed it from. */
-static void sendGimme(SupeEngine* e) {
+/* The READY answering a GOT, from what onGot settled: the budget it
+ * confirmed and the reading of the GOT it confirmed it from. */
+static void sendReady(SupeEngine* e) {
     SupeMeet* m = &e->m;
-    SupeGimme g = {};
+    SupeReady g = {};
     memcpy(g.hash, m->hash3, SUPE_HASH_LEN);
     g.pwrDbm = m->ourTxp;
     g.budget = m->budget;
     g.countCeil = SUPE_TRAIN_MAX;
     g.heardRssi = m->lastRssi;
     g.heardSnrQ = m->lastSnrQ;
-    uint8_t out[SUPE_GIMME_LEN];
-    size_t n = supeEncGimme(out, sizeof out, &g);
+    uint8_t out[SUPE_READY_LEN];
+    size_t n = supeEncReady(out, sizeof out, &g);
     if (!n || !e->host->tx_frame(e->host->ctx, out, (uint16_t)n, m->ourTxp)) {
-        finishMeeting(e, false, "GIMME would not transmit");
+        finishMeeting(e, false, "READY would not transmit");
         return;
     }
-    enterTxPhase(m, SUPE_M_GIMME_TX);
-    eLog(e, true, "supe: GIMME budget %u txp=%d for %u frames%s",
+    enterTxPhase(m, SUPE_M_READY_TX);
+    eLog(e, true, "supe: READY budget %u txp=%d for %u frames%s",
          (unsigned)m->budget, (int)m->ourTxp, (unsigned)m->exCount,
          m->lite ? " (lite)" : "");
 }
 
-static void onHave(SupeEngine* e, const uint8_t* f, uint16_t len,
+static void onGot(SupeEngine* e, const uint8_t* f, uint16_t len,
                    int16_t rssi, int16_t snr10) {
     SupeMeet* m = &e->m;
 
     if (m->phase == SUPE_M_SLOT_LISTEN || m->phase == SUPE_M_AWAIT_HAIL_ANSWER) {
-        SupeHave hv;
-        if (!supeDecHave(f, len, 0, &hv) || hv.answering) { e->rxDiscard++; return; }
+        SupeGot hv;
+        if (!supeDecGot(f, len, 0, &hv) || hv.answering) { e->rxDiscard++; return; }
         if (!answerIsOurs(e, hv.g.hash)) { e->rxForeign++; return; }
         noteLast(m, rssi, snr10);
         hailAnswered(e, &hv.g, rssi);
@@ -1884,24 +1884,24 @@ static void onHave(SupeEngine* e, const uint8_t* f, uint16_t len,
         m->cfg = cfg;
         m->lite = !e->plan && budget == 0;
         m->leg = 0;
-        /* The answer waits the flip: the peer has just transmitted the HAVE
+        /* The answer waits the flip: the peer has just transmitted the GOT
          * and is turning back to receive. */
-        deferSend(e, SUPE_PEND_GIMME, SUPE_FLIP_MS);
+        deferSend(e, SUPE_PEND_READY, SUPE_FLIP_MS);
         return;
     }
 
     if (m->phase == SUPE_M_AWAIT_ANSWER && m->leg == 0 && !m->listener) {
-        /* The return leg: the answering HAVE carries the train's reading and
+        /* The return leg: the answering GOT carries the train's reading and
          * any repair request; the return train follows (§8). It also PROMISES
-         * a later THATSIT, which supersedes ours as the goodbye. */
-        SupeHave hv;
-        if (!supeDecHave(f, len, m->tx.count, &hv) || !hv.answering || hv.count == 0) {
+         * a later END, which supersedes ours as the goodbye. */
+        SupeGot hv;
+        if (!supeDecGot(f, len, m->tx.count, &hv) || !hv.answering || hv.count == 0) {
             e->rxDiscard++;
             return;
         }
         if (memcmp(hv.g.hash, m->hash3, SUPE_HASH_LEN) != 0) { e->rxForeign++; return; }
         noteLast(m, rssi, snr10);
-        m->laterThatsit = true;
+        m->laterEnd = true;
         m->ourTrainConfirmed = true;
         notePair(e, m->tag, &m->cfg, rssi, hv.g.pwrDbm);
         noteReport(e, m->tag, &m->cfg, hv.g.heardRssi, m->trainTxp);
@@ -1933,16 +1933,16 @@ static void onHave(SupeEngine* e, const uint8_t* f, uint16_t len,
     e->rxForeign++;
 }
 
-static void onGimme(SupeEngine* e, const uint8_t* f, uint16_t len,
+static void onReady(SupeEngine* e, const uint8_t* f, uint16_t len,
                     int16_t rssi, int16_t snr10) {
     SupeMeet* m = &e->m;
-    SupeGimme g;
-    if (!supeDecGimme(f, len, &g)) { e->rxDiscard++; return; }
+    SupeReady g;
+    if (!supeDecReady(f, len, &g)) { e->rxDiscard++; return; }
 
     bool answerToHail = answerIsOurs(e, g.hash);
-    bool confirmsOurHave = m->phase == SUPE_M_AWAIT_GIMME &&
+    bool confirmsOurGot = m->phase == SUPE_M_AWAIT_READY &&
                            memcmp(g.hash, m->hash3, SUPE_HASH_LEN) == 0;
-    if (!answerToHail && !confirmsOurHave) { e->rxForeign++; return; }
+    if (!answerToHail && !confirmsOurGot) { e->rxForeign++; return; }
     noteLast(m, rssi, snr10);
 
     if (answerToHail) {
@@ -1950,7 +1950,7 @@ static void onGimme(SupeEngine* e, const uint8_t* f, uint16_t len,
         hailAnswered(e, &g, rssi);
         m->listener = false;
     } else {
-        /* Our HAVE is confirmed: attention, budget, ceiling. The schedule it
+        /* Our GOT is confirmed: attention, budget, ceiling. The schedule it
          * opened is consumed. */
         if (m->schedIdx >= 0) {
             SupeSched* s = &e->sched[m->schedIdx];
@@ -1965,7 +1965,7 @@ static void onGimme(SupeEngine* e, const uint8_t* f, uint16_t len,
             noteReport(e, m->tag, &m->slotCfg, g.heardRssi, m->ourTxp);
         }
     }
-    /* Stands in for the train's own reading until an answering HAVE carries
+    /* Stands in for the train's own reading until an answering GOT carries
      * one: same peer, same tuning, one frame earlier. */
     if (!m->haveOurRead) {
         m->ourTrainRssi = g.heardRssi;
@@ -1994,39 +1994,39 @@ static void onGimme(SupeEngine* e, const uint8_t* f, uint16_t len,
     startTrain(e, SUPE_FLIP_MS);
 }
 
-static void onThatsit(SupeEngine* e, const uint8_t* f, uint16_t len,
+static void onEnd(SupeEngine* e, const uint8_t* f, uint16_t len,
                       int16_t rssi, int16_t snr10) {
     SupeMeet* m = &e->m;
-    SupeThatsit t;
-    if (!supeDecThatsit(f, len, &t)) { e->rxDiscard++; return; }
-    if (m->phase != SUPE_M_AWAIT_THATSIT && m->phase != SUPE_M_TRAIN_RX) {
+    SupeEnd t;
+    if (!supeDecEnd(f, len, &t)) { e->rxDiscard++; return; }
+    if (m->phase != SUPE_M_AWAIT_END && m->phase != SUPE_M_TRAIN_RX) {
         e->rxForeign++;
         return;
     }
     noteLast(m, rssi, snr10);
     if (t.count != m->exCount)
-        eLog(e, true, "supe: THATSIT count %u against declared %u",
+        eLog(e, true, "supe: END count %u against declared %u",
              (unsigned)t.count, (unsigned)m->exCount);
     if (m->haveTag && m->anyRx)
         notePair(e, m->tag, &m->cfg, m->worstRssi, t.pwrDbm);
     m->peerTrainTxp = t.pwrDbm;
     m->havePeerTxp = true;
-    if (len <= sizeof m->lastThatsit) {
-        memcpy(m->lastThatsit, f, len);
-        m->lastThatsitLen = (uint8_t)len;
+    if (len <= sizeof m->lastEnd) {
+        memcpy(m->lastEnd, f, len);
+        m->lastEndLen = (uint8_t)len;
         m->weReceivedFinal = true;
-        m->laterThatsit = false;
+        m->laterEnd = false;
     }
     alignTrain(e, &t);
     deferSend(e, SUPE_PEND_ANSWER, SUPE_FLIP_MS);
 }
 
-/* The answer a THATSIT calls for, one train gap after it arrived. */
-static void answerThatsit(SupeEngine* e) {
+/* The answer a END calls for, one train gap after it arrived. */
+static void answerEnd(SupeEngine* e) {
     SupeMeet* m = &e->m;
     if (m->listener && m->leg == 0) {
         /* Our turn. Return traffic rides now — the hailer's held train, or one
-         * built fresh — in the answering HAVE, with the reading and the repair
+         * built fresh — in the answering GOT, with the reading and the repair
          * request (§8). */
         bool haveReturn = m->txBuilt && m->tx.count > 0;
         if (!haveReturn && (m->peerId != LORAQ_PEER_NONE || m->haveTag)) {
@@ -2043,7 +2043,7 @@ static void answerThatsit(SupeEngine* e) {
             if (m->tx.count > m->peerCeil) m->tx.count = m->peerCeil;
             trimToCeiling(e, &m->tx, &m->cfg);
             m->leg = 1;
-            SupeHave hv = {};
+            SupeGot hv = {};
             memcpy(hv.g.hash, m->hash3, SUPE_HASH_LEN);
             hv.g.pwrDbm  = m->ourTxp;
             hv.g.budget  = m->budget;
@@ -2055,14 +2055,14 @@ static void answerThatsit(SupeEngine* e) {
             hv.answering = true;
             hv.maskLen = supeMaskLen(m->peerCount);
             memcpy(hv.mask, m->missMask, hv.maskLen);
-            uint8_t out[SUPE_HAVE_ANS_BASE + SUPE_MASK_MAX];
-            size_t n = supeEncHave(out, sizeof out, &hv);
+            uint8_t out[SUPE_GOT_ANS_BASE + SUPE_MASK_MAX];
+            size_t n = supeEncGot(out, sizeof out, &hv);
             if (!n || !e->host->tx_frame(e->host->ctx, out, (uint16_t)n, m->ourTxp)) {
-                finishMeeting(e, false, "answering HAVE would not transmit");
+                finishMeeting(e, false, "answering GOT would not transmit");
                 return;
             }
             m->repairExpect = m->missCount;     /* their repairs ride their close */
-            enterTxPhase(m, SUPE_M_HAVE_TX);
+            enterTxPhase(m, SUPE_M_GOT_TX);
             return;
         }
         m->pendClose = m->missCount ? 2 : 1;
@@ -2127,9 +2127,9 @@ void supeEngOnRx(SupeEngine* e, const uint8_t* f, uint16_t len,
     if (e->expired) { e->rxDiscard++; return; }
     switch (f[0]) {
         case SUPE_T_HAIL:     onHail(e, f, len, rssi, snr10);    break;
-        case SUPE_T_HAVE:     onHave(e, f, len, rssi, snr10);    break;
-        case SUPE_T_GIMME:    onGimme(e, f, len, rssi, snr10);   break;
-        case SUPE_T_THATSIT:  onThatsit(e, f, len, rssi, snr10); break;
+        case SUPE_T_GOT:     onGot(e, f, len, rssi, snr10);    break;
+        case SUPE_T_READY:    onReady(e, f, len, rssi, snr10);   break;
+        case SUPE_T_END:  onEnd(e, f, len, rssi, snr10); break;
         case SUPE_T_BYE:
             if (len == SUPE_BYE_LEN) onBye(e);
             else e->rxDiscard++;
@@ -2155,12 +2155,12 @@ bool supeEngOnTrainFrame(SupeEngine* e, uint8_t csum, int16_t rssi, int16_t snr1
             return false;
         }
         m->rxCsum[m->rxN] = csum;
-        m->rxPos[m->rxN] = m->rxN;     /* provisional until the THATSIT aligns */
+        m->rxPos[m->rxN] = m->rxN;     /* provisional until the END aligns */
         m->rxN++;
         if (m->rxN >= m->exCount) {
-            m->phase = SUPE_M_AWAIT_THATSIT;
+            m->phase = SUPE_M_AWAIT_END;
             m->deadlineMs = eNow(e) + SUPE_TURNAROUND_MS
-                + toaFrameMs(e, &m->cfg, SUPE_THATSIT_BASE + m->exCount, false)
+                + toaFrameMs(e, &m->cfg, SUPE_END_BASE + m->exCount, false)
                 + SUPE_GUARD_MS;
             e->host->schedule(e->host->ctx, m->deadlineMs);
         }
@@ -2211,7 +2211,7 @@ void supeEngOnTxDone(SupeEngine* e, bool ok) {
                 m->cfg = hail;
                 m->chan = SUPE_CH_HAIL;
                 m->deadlineMs = eNow(e) + SUPE_TRAIN_GAP_MS + SUPE_TURNAROUND_MS
-                                + toaFrameMs(e, &hail, SUPE_HAVE_LEN, false) + SUPE_GUARD_MS;
+                                + toaFrameMs(e, &hail, SUPE_GOT_LEN, false) + SUPE_GUARD_MS;
                 e->host->rx(e->host->ctx);
                 e->host->schedule(e->host->ctx, m->deadlineMs);
                 return;
@@ -2235,19 +2235,19 @@ void supeEngOnTxDone(SupeEngine* e, bool ok) {
             armTimer(e);
             return;
         }
-        case SUPE_M_HAVE_TX:
+        case SUPE_M_GOT_TX:
             if (m->listener && m->leg == 1) {
-                /* The answering HAVE is out; the return train follows. */
+                /* The answering GOT is out; the return train follows. */
                 startTrain(e, SUPE_TRAIN_LEAD_MS);
                 return;
             }
-            m->phase = SUPE_M_AWAIT_GIMME;
+            m->phase = SUPE_M_AWAIT_READY;
             m->deadlineMs = eNow(e) + SUPE_TURNAROUND_MS
-                + toaFrameMs(e, &m->slotCfg, SUPE_GIMME_LEN, false) + SUPE_GUARD_MS;
+                + toaFrameMs(e, &m->slotCfg, SUPE_READY_LEN, false) + SUPE_GUARD_MS;
             e->host->rx(e->host->ctx);
             e->host->schedule(e->host->ctx, m->deadlineMs);
             return;
-        case SUPE_M_GIMME_TX: {
+        case SUPE_M_READY_TX: {
             if (m->exCount == 0) {
                 /* Nothing to receive: a hail-back met with nothing waiting,
                  * or traffic that expired. Two short frames, and home. */
@@ -2271,7 +2271,7 @@ void supeEngOnTxDone(SupeEngine* e, bool ok) {
              * deadline: the flip interval is paid, not parked (§14.7). */
             fireNext(e);
             return;
-        case SUPE_M_THATSIT_TX:
+        case SUPE_M_END_TX:
             m->phase = SUPE_M_AWAIT_ANSWER;
             m->deadlineMs = eNow(e) + answerDeadlineMs(e, &m->cfg);
             e->host->rx(e->host->ctx);
@@ -2305,7 +2305,7 @@ void supeEngOnTimer(SupeEngine* e) {
                 m->txNext < SUPE_WINDOW_EXTENDS_MAX) {
                 m->txNext++;
                 m->deadlineMs = now
-                    + toaFrameMs(e, &m->slotCfg, SUPE_HAVE_LEN, false)
+                    + toaFrameMs(e, &m->slotCfg, SUPE_GOT_LEN, false)
                     + SUPE_GUARD_MS;
                 e->host->schedule(e->host->ctx, m->deadlineMs);
                 return;
@@ -2333,17 +2333,17 @@ void supeEngOnTimer(SupeEngine* e) {
         case SUPE_M_TRAIN_WAIT:
             if ((int32_t)(now - m->deadlineMs) < 0) { armTimer(e); return; }
             switch (m->pendSend) {
-                case SUPE_PEND_THATSIT:     m->pendSend = 0; sendThatsit(e);   return;
-                case SUPE_PEND_ANSWER:      m->pendSend = 0; answerThatsit(e); return;
+                case SUPE_PEND_END:     m->pendSend = 0; sendEnd(e);   return;
+                case SUPE_PEND_ANSWER:      m->pendSend = 0; answerEnd(e); return;
                 case SUPE_PEND_CLOSE:       m->pendSend = 0; sendClose(e);     return;
                 case SUPE_PEND_HAIL_ANSWER: m->pendSend = 0; answerHail(e);    return;
                 case SUPE_PEND_TRAIN:       m->pendSend = 0; fireNext(e);      return;
-                case SUPE_PEND_GIMME:       m->pendSend = 0; sendGimme(e);     return;
+                case SUPE_PEND_READY:       m->pendSend = 0; sendReady(e);     return;
                 default:                    fireNext(e);                       return;
             }
-        case SUPE_M_AWAIT_GIMME:
+        case SUPE_M_AWAIT_READY:
             if ((int32_t)(now - m->deadlineMs) < 0) { armTimer(e); return; }
-            finishMeeting(e, false, "no GIMME");
+            finishMeeting(e, false, "no READY");
             return;
         case SUPE_M_TRAIN_RX:
             if ((int32_t)(now - m->deadlineMs) < 0) { armTimer(e); return; }
@@ -2353,15 +2353,15 @@ void supeEngOnTimer(SupeEngine* e) {
                 else          finishMeeting(e, false, "no train");
                 return;
             }
-            m->phase = SUPE_M_AWAIT_THATSIT;
+            m->phase = SUPE_M_AWAIT_END;
             m->deadlineMs = now + SUPE_TURNAROUND_MS
-                + toaFrameMs(e, &m->cfg, SUPE_THATSIT_BASE + m->exCount, false)
+                + toaFrameMs(e, &m->cfg, SUPE_END_BASE + m->exCount, false)
                 + SUPE_GUARD_MS;
             e->host->schedule(e->host->ctx, m->deadlineMs);
             return;
-        case SUPE_M_AWAIT_THATSIT:
+        case SUPE_M_AWAIT_END:
             if ((int32_t)(now - m->deadlineMs) < 0) { armTimer(e); return; }
-            finishMeeting(e, false, "no THATSIT");
+            finishMeeting(e, false, "no END");
             return;
         case SUPE_M_AWAIT_ANSWER: {
             if ((int32_t)(now - m->deadlineMs) < 0) { armTimer(e); return; }

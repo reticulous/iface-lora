@@ -26,7 +26,7 @@ rfcal_test: rfcal_test.cpp ../src/lora_rfcal.cpp ../src/lora_rfcal.h
 	$(CXX) $(CXXFLAGS) -o $@ rfcal_test.cpp ../src/lora_rfcal.cpp
 
 run: supe_core_test
-	./supe_core_test golden.txt supe-ladder-vectors.txt
+	./supe_core_test golden.txt supe-rate-table-vectors.txt
 
 engine: supe_engine_test
 	./supe_engine_test

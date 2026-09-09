@@ -704,9 +704,9 @@ uint8_t loraMonDescribe(const uint8_t* f, size_t len, uint8_t type) {
         switch (f[0]) {
             case SUPE_T_HAIL:  return LMD_HAIL;
             case SUPE_T_ANNOUNCE: return LMD_ANNOUNCE;
-            case SUPE_T_HAVE:  return LMD_HAVE;
-            case SUPE_T_GIMME:     return LMD_GIMME;
-            case SUPE_T_THATSIT:   return LMD_THATSIT;
+            case SUPE_T_GOT:  return LMD_GOT;
+            case SUPE_T_READY:     return LMD_READY;
+            case SUPE_T_END:   return LMD_END;
             case SUPE_T_BYE:       return LMD_BYE;
             case SUPE_T_RESEND:    return LMD_RESEND;
             default: return LMD_NONE;

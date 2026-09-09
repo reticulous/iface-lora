@@ -405,7 +405,7 @@ static void handleRxDone(LoraRadio* r) {
          * none. Subtracting it from a SUPE frame anyway put every one of them in
          * the record a byte short of what flew — which is not cosmetic, because
          * the wire lengths are how a reader gets at fields the record does not
-         * carry: a THATSIT is SUPE_THATSIT_BASE + one checksum per train frame,
+         * carry: a END is SUPE_END_BASE + one checksum per train frame,
          * so a byte off is a frame off, and a repair round reads as a resend of
          * something already received. */
         uint16_t rxBytes = (uint16_t)(rxType == LORA_PKT_OURS ? pktLen : payloadLen);

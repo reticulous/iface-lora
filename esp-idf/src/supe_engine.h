@@ -2,10 +2,10 @@
  * supe_engine — the SUPE state machine (plans/SUPE.md). A HAIL asks; the
  * party it names answers — a turnaround later on the hailing channel in
  * regime 0, at derived slots on a private channel under a channel plan — with
- * GIMME (its terms) or HAVE (its terms and a train of its own). Trains of LoRa
- * frames flow at the confirmed budget; at a lowered rate THATSIT's checksum
+ * READY (its terms) or GOT (its terms and a train of its own). Trains of LoRa
+ * frames flow at the confirmed budget; at a lowered rate END's checksum
  * list names the sequence after the fact, one RESEND round repairs, and the
- * meeting's final THATSIT seeds the next schedule under a plan. A hailed party
+ * meeting's final END seeds the next schedule under a plan. A hailed party
  * that cannot answer owes a hail, and sends one when it is free. One machine,
  * both roles, and the one decider in the system — everything else answers
  * questions.
@@ -91,7 +91,7 @@ struct SupeChanView {
 /* ─────────────── the outgoing train ───────────────
  *
  * Built by the host from the queue when a hail is sent or a slot is opened
- * with HAVE, and held until the meeting closes — the frames are what a repair
+ * with GOT, and held until the meeting closes — the frames are what a repair
  * round resends, so they outlive the queue entries they were built from
  * (consumed at build; a meeting that dies loses them to the layers above,
  * exactly as the air would have). */
@@ -239,7 +239,7 @@ struct SupeSched {
     int8_t    lastSnrQ;
     /* Why a schedule carried nothing, counted as it happens. */
     uint8_t   nOwnDue;        /* own slots whose moment arrived */
-    uint8_t   nSpoke;         /* …opened with GIMME or HAVE */
+    uint8_t   nSpoke;         /* …opened with READY or GOT */
     uint8_t   nNoTraffic;     /* …nothing queued for this peer at that instant (wide) */
     uint8_t   nBusy;          /* …the channel was not clear */
     uint8_t   nLate;          /* …reached past the lateness tolerance */
@@ -251,18 +251,18 @@ struct SupeSched {
 enum SupeMPhase : uint8_t {
     SUPE_M_IDLE = 0,
     SUPE_M_HAIL_TX,        /* our HAIL on the air; its end is the epoch */
-    SUPE_M_AWAIT_HAIL_ANSWER, /* regime 0: the hail is out, GIMME or HAVE is owed */
+    SUPE_M_AWAIT_HAIL_ANSWER, /* regime 0: the hail is out, READY or GOT is owed */
     SUPE_M_SLOT_LISTEN,    /* a slot window is open (the hailer, or the wide listener) */
-    SUPE_M_HAVE_TX,        /* our HAVE (opening or answering) on the air */
-    SUPE_M_AWAIT_GIMME,
-    SUPE_M_GIMME_TX,
+    SUPE_M_GOT_TX,        /* our GOT (opening or answering) on the air */
+    SUPE_M_AWAIT_READY,
+    SUPE_M_READY_TX,
     SUPE_M_TRAIN_WAIT,     /* the flip gap / retune lead before our next frame */
     SUPE_M_TRAIN_TX,       /* one of our train frames on the air */
-    SUPE_M_THATSIT_TX,
+    SUPE_M_END_TX,
     SUPE_M_TRAIN_RX,       /* counting the peer's frames */
-    SUPE_M_AWAIT_THATSIT,
-    SUPE_M_AWAIT_ANSWER,   /* our THATSIT is out; BYE / RESEND / answering
-                            * HAVE decides what follows */
+    SUPE_M_AWAIT_END,
+    SUPE_M_AWAIT_ANSWER,   /* our END is out; BYE / RESEND / answering
+                            * GOT decides what follows */
     SUPE_M_REPAIR_TX,      /* resending the frames the peer named */
     SUPE_M_REPAIR_RX,      /* the peer is resending the frames we named */
     SUPE_M_CLOSE_TX,       /* our BYE or RESEND on the air */
@@ -286,8 +286,8 @@ struct SupeMeet {
     uint8_t  budget;
     bool     retuned;              /* off the hailing configuration */
     bool     atTrainCfg;           /* the confirmed budget is on the radio */
-    int8_t   ourTxp;               /* our meeting power (GIMME/HAVE stated) */
-    int8_t   trainTxp;             /* our train's power — THATSIT states it */
+    int8_t   ourTxp;               /* our meeting power (READY/GOT stated) */
+    int8_t   trainTxp;             /* our train's power — END states it */
     uint8_t  leg;                  /* 0: the first train; 1: the return leg */
     uint8_t  peerCeil;             /* the peer's count ceiling for our train */
     /* what the hail said, when we were hailed (regime 0 answer; slot answer) */
@@ -298,11 +298,11 @@ struct SupeMeet {
     uint8_t  txNext;               /* next frame index to fire */
     uint8_t  txMask[SUPE_MASK_MAX];/* a repair: which frames to refire */
     bool     txMaskAny;
-    uint8_t  txThatsit[SUPE_THATSIT_BASE + SUPE_TRAIN_MAX];
-    uint8_t  txThatsitLen;
-    bool     ourTrainConfirmed;    /* anything of theirs answered our THATSIT */
-    bool     laterThatsit;         /* an answering HAVE promised a return train,
-                                    * so a THATSIT later than ours will close the
+    uint8_t  txEnd[SUPE_END_BASE + SUPE_TRAIN_MAX];
+    uint8_t  txEndLen;
+    bool     ourTrainConfirmed;    /* anything of theirs answered our END */
+    bool     laterEnd;         /* an answering GOT promised a return train,
+                                    * so a END later than ours will close the
                                     * meeting: the one we hold is not the goodbye
                                     * until that one arrives */
     /* incoming */
@@ -311,7 +311,7 @@ struct SupeMeet {
     uint8_t  rxCsum[SUPE_TRAIN_MAX];
     uint8_t  rxPos[SUPE_TRAIN_MAX];   /* arrival → sequence position (after align) */
     bool     rxAligned;
-    uint8_t  peerCount;            /* the peer train's THATSIT count */
+    uint8_t  peerCount;            /* the peer train's END count */
     uint8_t  missMask[SUPE_MASK_MAX];
     uint8_t  missCount;
     uint8_t  repairPos[SUPE_TRAIN_MAX];  /* positions the peer will resend, in order */
@@ -329,15 +329,15 @@ struct SupeMeet {
     int16_t  ourTrainRssi;         /* THEIR reading of OUR train */
     int8_t   ourTrainSnrQ;
     bool     haveOurRead;
-    int8_t   peerTrainTxp;         /* what their train flew at (their THATSIT) */
+    int8_t   peerTrainTxp;         /* what their train flew at (their END) */
     bool     havePeerTxp;
     uint8_t  txFired;              /* frames of ours actually put on air, repairs
                                     * included — so it may exceed tx.count */
     bool     fromHail;             /* reached through a hail rather than a
                                     * goodbye's rendezvous */
     /* the goodbye */
-    uint8_t  lastThatsit[SUPE_THATSIT_BASE + SUPE_TRAIN_MAX];
-    uint8_t  lastThatsitLen;
+    uint8_t  lastEnd[SUPE_END_BASE + SUPE_TRAIN_MAX];
+    uint8_t  lastEndLen;
     bool     weReceivedFinal;      /* the final train was theirs → we transmit
                                     * first on the reseeded schedule */
     bool     closeIsFinal;         /* the CLOSE_TX on the air ends the meeting */

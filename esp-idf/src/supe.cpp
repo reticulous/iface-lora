@@ -255,7 +255,7 @@ bool supeDecAnn(const uint8_t* f, size_t len, SupeAnn* out) {
  * §14.3 admits no floating-point arithmetic anywhere: two implementations that
  * resolve a budget differently do not fail loudly — they set different
  * spreading factors and the link simply dies. Everything below is integers,
- * and test/supe-ladder-vectors.txt is the conformance authority. */
+ * and test/supe-rate-table-vectors.txt is the conformance authority. */
 
 /* §14.6: which spreading factors a family reaches. */
 static bool famReachesSf(uint8_t fam, int sf) {
@@ -519,8 +519,8 @@ bool supeDecHail(const uint8_t* f, size_t len, SupeHail* out) {
     return true;
 }
 
-/* GIMME's nine bytes are HAVE's first nine: one layout, written once. */
-static void encGimmeBody(uint8_t* out, uint8_t type, const SupeGimme* g) {
+/* READY's nine bytes are GOT's first nine: one layout, written once. */
+static void encReadyBody(uint8_t* out, uint8_t type, const SupeReady* g) {
     out[0] = type;
     memcpy(out + 1, g->hash, SUPE_HASH_LEN);
     out[4] = supeEncLevel(g->pwrDbm);
@@ -530,7 +530,7 @@ static void encGimmeBody(uint8_t* out, uint8_t type, const SupeGimme* g) {
     out[8] = (uint8_t)g->heardSnrQ;
 }
 
-static void decGimmeBody(const uint8_t* f, SupeGimme* g) {
+static void decReadyBody(const uint8_t* f, SupeReady* g) {
     memcpy(g->hash, f + 1, SUPE_HASH_LEN);
     g->pwrDbm    = (int8_t)supeDecLevel(f[4]);
     g->budget    = f[5];
@@ -539,39 +539,39 @@ static void decGimmeBody(const uint8_t* f, SupeGimme* g) {
     g->heardSnrQ = (int8_t)f[8];
 }
 
-size_t supeEncGimme(uint8_t* out, size_t cap, const SupeGimme* g) {
-    if (cap < SUPE_GIMME_LEN) return 0;
-    encGimmeBody(out, SUPE_T_GIMME, g);
-    return SUPE_GIMME_LEN;
+size_t supeEncReady(uint8_t* out, size_t cap, const SupeReady* g) {
+    if (cap < SUPE_READY_LEN) return 0;
+    encReadyBody(out, SUPE_T_READY, g);
+    return SUPE_READY_LEN;
 }
 
-bool supeDecGimme(const uint8_t* f, size_t len, SupeGimme* out) {
-    if (len != SUPE_GIMME_LEN || f[0] != SUPE_T_GIMME) return false;
-    decGimmeBody(f, out);
+bool supeDecReady(const uint8_t* f, size_t len, SupeReady* out) {
+    if (len != SUPE_READY_LEN || f[0] != SUPE_T_READY) return false;
+    decReadyBody(f, out);
     return true;
 }
 
-size_t supeEncHave(uint8_t* out, size_t cap, const SupeHave* h) {
-    size_t n = h->answering ? (size_t)SUPE_HAVE_ANS_BASE + h->maskLen
-                            : (size_t)SUPE_HAVE_LEN;
+size_t supeEncGot(uint8_t* out, size_t cap, const SupeGot* h) {
+    size_t n = h->answering ? (size_t)SUPE_GOT_ANS_BASE + h->maskLen
+                            : (size_t)SUPE_GOT_LEN;
     if (cap < n || h->count > SUPE_TRAIN_MAX) return 0;
     if (h->answering && (h->maskLen == 0 || h->maskLen > SUPE_MASK_MAX)) return 0;
-    encGimmeBody(out, SUPE_T_HAVE, &h->g);
+    encReadyBody(out, SUPE_T_GOT, &h->g);
     out[9]  = h->count;
     out[10] = h->lenByte;
-    if (h->answering) memcpy(out + SUPE_HAVE_ANS_BASE, h->mask, h->maskLen);
+    if (h->answering) memcpy(out + SUPE_GOT_ANS_BASE, h->mask, h->maskLen);
     return n;
 }
 
-bool supeDecHave(const uint8_t* f, size_t len, uint8_t peerCount, SupeHave* out) {
-    if (len < 1 || f[0] != SUPE_T_HAVE) return false;
-    size_t ansLen = (size_t)SUPE_HAVE_ANS_BASE + supeMaskLen(peerCount);
+bool supeDecGot(const uint8_t* f, size_t len, uint8_t peerCount, SupeGot* out) {
+    if (len < 1 || f[0] != SUPE_T_GOT) return false;
+    size_t ansLen = (size_t)SUPE_GOT_ANS_BASE + supeMaskLen(peerCount);
     bool answering;
-    if (len == SUPE_HAVE_LEN) answering = false;
+    if (len == SUPE_GOT_LEN) answering = false;
     else if (peerCount > 0 && len == ansLen) answering = true;
     else return false;
     if (f[9] > SUPE_TRAIN_MAX) return false;
-    decGimmeBody(f, &out->g);
+    decReadyBody(f, &out->g);
     out->count     = f[9];
     out->lenByte   = f[10];
     out->answering = answering;
@@ -579,25 +579,25 @@ bool supeDecHave(const uint8_t* f, size_t len, uint8_t peerCount, SupeHave* out)
     out->maskLen = 0;
     if (answering) {
         out->maskLen = supeMaskLen(peerCount);
-        memcpy(out->mask, f + SUPE_HAVE_ANS_BASE, out->maskLen);
+        memcpy(out->mask, f + SUPE_GOT_ANS_BASE, out->maskLen);
     }
     return true;
 }
 
-size_t supeEncThatsit(uint8_t* out, size_t cap, const SupeThatsit* t) {
+size_t supeEncEnd(uint8_t* out, size_t cap, const SupeEnd* t) {
     if (t->count == 0 || t->count > SUPE_TRAIN_MAX) return 0;
-    size_t n = (size_t)SUPE_THATSIT_BASE + t->count;
+    size_t n = (size_t)SUPE_END_BASE + t->count;
     if (cap < n) return 0;
-    out[0] = SUPE_T_THATSIT;
+    out[0] = SUPE_T_END;
     out[1] = supeEncLevel(t->pwrDbm);
     out[2] = t->salt;
     memcpy(out + 3, t->csum, t->count);
     return n;
 }
 
-bool supeDecThatsit(const uint8_t* f, size_t len, SupeThatsit* out) {
-    if (len < SUPE_THATSIT_BASE + 1 || f[0] != SUPE_T_THATSIT) return false;
-    size_t count = len - SUPE_THATSIT_BASE;
+bool supeDecEnd(const uint8_t* f, size_t len, SupeEnd* out) {
+    if (len < SUPE_END_BASE + 1 || f[0] != SUPE_T_END) return false;
+    size_t count = len - SUPE_END_BASE;
     if (count > SUPE_TRAIN_MAX) return false;
     out->pwrDbm = (int8_t)supeDecLevel(f[1]);
     out->salt   = f[2];

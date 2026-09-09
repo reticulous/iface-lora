@@ -20,7 +20,7 @@
  * The five things it answers:
  *
  *   - **What a budget resolves to.** The family-filtered, channel-bound
- *     ladder of SUPE.md §14.3, integer-only, with supe-ladder-vectors.txt in
+ *     ladder of SUPE.md §14.3, integer-only, with supe-rate-table-vectors.txt in
  *     test/ as the conformance authority.
  *   - **What a frame looks like.** Encode and decode for every frame, with the
  *     permitted lengths driven by the same tables, so a length outside the
@@ -59,9 +59,9 @@
 #define SUPE_TYPE_MAX      0xDF
 #define SUPE_T_HAIL        0xC2   /* main channel: traffic waiting, this train, answer me */
 #define SUPE_T_ANNOUNCE    0xC3   /* main channel: identities + capabilities */
-#define SUPE_T_HAVE        0xC4   /* GIMME with a train behind it */
-#define SUPE_T_GIMME       0xC5   /* the receiver's terms: budget, ceiling, reading */
-#define SUPE_T_THATSIT     0xC6   /* the train's power + checksums */
+#define SUPE_T_GOT        0xC4   /* READY with a train behind it */
+#define SUPE_T_READY       0xC5   /* the receiver's terms: budget, ceiling, reading */
+#define SUPE_T_END     0xC6   /* the train's power + checksums */
 #define SUPE_T_BYE         0xC7   /* everything accounted for */
 #define SUPE_T_RESEND      0xC8   /* one repair round's bitmask */
 
@@ -287,11 +287,11 @@ double supeAirtimeSeconds(int sf, int bw_hz, int cr_denom, int preamble,
 /* The least a node leaves between the end of a frame it answers and the start
  * of its answer (SUPE.md §14.7). The node that just transmitted is turning
  * from transmit to receive — tx-done serviced, the chip out of standby, the
- * receiver started, and after a GIMME retuned to the budget first — and a
+ * receiver started, and after a READY retuned to the budget first — and a
  * preamble that starts before it has finished is never heard. At the hailing
  * configuration a preamble is long enough to hide the turn; at the fastest
  * budgets it is two milliseconds, and hides nothing. Every answer waits this:
- * GIMME after HAVE, the train after GIMME, RESEND or BYE after THATSIT, the
+ * READY after GOT, the train after READY, RESEND or BYE after END, the
  * answer to a hail in regime 0. */
 #define SUPE_FLIP_MS         10
 #define SUPE_RETUNE_GAP_MS    1  /* the synthesizer, not the software */
@@ -300,7 +300,7 @@ double supeAirtimeSeconds(int sf, int bw_hz, int cr_denom, int preamble,
  * next one lands in the same buffer. The receiver itself stays open throughout
  * — it is never restarted between frames, since a fresh startReceive begins
  * with standby and would abort the preamble already being demodulated. It is
- * what a send that follows our OWN frame is parked for (a THATSIT after the
+ * what a send that follows our OWN frame is parked for (a END after the
  * train) and the per-frame pad in a train's budgeted length. Between two
  * frames of one train it is not parked but PAID — the frame is fired from
  * tx-done, and servicing that costs the peer's rx side the same interval to
@@ -360,7 +360,7 @@ static inline uint32_t supeDecLen(uint8_t b) { return (uint32_t)b * SUPE_LEN_STE
 
 /* ─────────────── the frame checksum (SUPE.md §8) ───────────────
  *
- * One byte per train frame, listed by THATSIT after the fact: the checksum
+ * One byte per train frame, listed by END after the fact: the checksum
  * list IS the sequence, so the frames themselves carry no numbering. CRC-8,
  * polynomial 0x07, init 0, MSB first, over the frame's on-air bytes.
  * Provisional per SUPE.md §16 — it cannot change inside a version. */
@@ -394,7 +394,7 @@ uint8_t supeSyncWordAt(uint8_t sf, uint8_t ifaceSync, uint8_t sByte);
  * D1 = SHA-256(seed ‖ 0x01) — because hashing is a host capability;
  * everything after that is integer arithmetic:
  *
- *   hash   = D0[0..2]                     the 3 bytes GIMME and HAVE quote
+ *   hash   = D0[0..2]                     the 3 bytes READY and GOT quote
  *   stream = D0[3..31] ‖ D1[0..31]        slot k consumes stream[3k..3k+2]
  *                                         as j_k, c_k, s_k
  *   t_0    = seed_gap                                      (narrow)
@@ -450,8 +450,8 @@ void supeDeriveSchedule(const uint8_t d0[32], const uint8_t d1[32],
 /* ─────────────── frames (SUPE.md §0.3) ───────────────
  *
  * Every frame has a length the receiver can enumerate from its type and from
- * state both sides already hold: one value for most, two for HAIL and HAVE,
- * count-derived for ANNOUNCE, THATSIT, RESEND and the answering HAVE. Nothing
+ * state both sides already hold: one value for most, two for HAIL and GOT,
+ * count-derived for ANNOUNCE, END, RESEND and the answering GOT. Nothing
  * is signalled by a flags byte and nothing is negotiated, so anything outside
  * the enumerated set is discarded. */
 
@@ -466,8 +466,8 @@ void supeDeriveSchedule(const uint8_t d0[32], const uint8_t d1[32],
 
 /* One train's frame cap. A train is a RAM commitment on the receiving side
  * (SUPE.md §8): delivery is whole and in sequence at the close, so this bounds
- * the buffer as well as the THATSIT and the bitmask. It is also the count
- * ceiling this node states in every GIMME and HAVE. */
+ * the buffer as well as the END and the bitmask. It is also the count
+ * ceiling this node states in every READY and GOT. */
 #define SUPE_TRAIN_MAX   12
 #define SUPE_MASK_MAX    ((SUPE_TRAIN_MAX + 7) / 8)
 
@@ -511,23 +511,23 @@ struct SupeHail {
     uint8_t ident[SUPE_TAG_LEN];        /* one of the sender's announced identities */
 };
 
-/* GIMME — the receiver's terms: "heard you; fly at this budget, no more than
+/* READY — the receiver's terms: "heard you; fly at this budget, no more than
  * this many frames; here is how the frame I am answering reached me."
- * Always nine bytes. HAVE is GIMME with a train behind it — the same fields,
- * then a count and a length of its sender's own; answering a THATSIT it adds
+ * Always nine bytes. GOT is READY with a train behind it — the same fields,
+ * then a count and a length of its sender's own; answering a END it adds
  * the repair bitmask over the peer's train. */
-struct SupeGimme {
+struct SupeReady {
     uint8_t hash[SUPE_HASH_LEN];        /* which hail this answers */
     int8_t  pwrDbm;                     /* this side's power until it states another */
-    uint8_t budget;                     /* confirmed (GIMME); proposed (opening HAVE) */
+    uint8_t budget;                     /* confirmed (READY); proposed (opening GOT) */
     uint8_t countCeil;                  /* the most frames this side will hold */
     int16_t heardRssi;                  /* the frame this answers: the hail, an
-                                         * opening HAVE, the train's worst frame */
+                                         * opening GOT, the train's worst frame */
     int8_t  heardSnrQ;
 };
 
-struct SupeHave {
-    SupeGimme g;
+struct SupeGot {
+    SupeReady g;
     uint8_t count;                      /* LoRa frames in this side's own train */
     uint8_t lenByte;                    /* its airtime + flip gaps at g.budget */
     bool    answering;                  /* implicit in the frame length */
@@ -535,7 +535,7 @@ struct SupeHave {
     uint8_t mask[SUPE_MASK_MAX];        /* bit i set: frame i is missing */
 };
 
-struct SupeThatsit {
+struct SupeEnd {
     int8_t  pwrDbm;                     /* what the train it closes went out at */
     uint8_t salt;                       /* random — this goodbye's freshness (§7) */
     uint8_t count;                      /* implicit in the frame length */
@@ -549,10 +549,10 @@ struct SupeResendF {
 
 #define SUPE_HAIL_LEN         10
 #define SUPE_HAIL_ID_LEN      13
-#define SUPE_GIMME_LEN         9
-#define SUPE_HAVE_LEN         11
-#define SUPE_HAVE_ANS_BASE    11        /* + maskLen */
-#define SUPE_THATSIT_BASE      3        /* + count */
+#define SUPE_READY_LEN         9
+#define SUPE_GOT_LEN         11
+#define SUPE_GOT_ANS_BASE    11        /* + maskLen */
+#define SUPE_END_BASE      3        /* + count */
 #define SUPE_BYE_LEN           1
 #define SUPE_RESEND_BASE       1        /* + maskLen */
 
@@ -560,17 +560,17 @@ struct SupeResendF {
  * (a count past a cap, a buffer too small). Decoders return false on any
  * length, range or type mismatch and leave `out` untouched. Where a frame's
  * length depends on state both sides hold — the peer train's count for the
- * answering HAVE and for RESEND — the decoder takes it as an argument. */
+ * answering GOT and for RESEND — the decoder takes it as an argument. */
 size_t supeEncAnn(uint8_t* out, size_t cap, const SupeAnn* a);
 bool   supeDecAnn(const uint8_t* f, size_t len, SupeAnn* out);
 size_t supeEncHail(uint8_t* out, size_t cap, const SupeHail* h);
 bool   supeDecHail(const uint8_t* f, size_t len, SupeHail* out);
-size_t supeEncGimme(uint8_t* out, size_t cap, const SupeGimme* g);
-bool   supeDecGimme(const uint8_t* f, size_t len, SupeGimme* out);
-size_t supeEncHave(uint8_t* out, size_t cap, const SupeHave* h);
-bool   supeDecHave(const uint8_t* f, size_t len, uint8_t peerCount, SupeHave* out);
-size_t supeEncThatsit(uint8_t* out, size_t cap, const SupeThatsit* t);
-bool   supeDecThatsit(const uint8_t* f, size_t len, SupeThatsit* out);
+size_t supeEncReady(uint8_t* out, size_t cap, const SupeReady* g);
+bool   supeDecReady(const uint8_t* f, size_t len, SupeReady* out);
+size_t supeEncGot(uint8_t* out, size_t cap, const SupeGot* h);
+bool   supeDecGot(const uint8_t* f, size_t len, uint8_t peerCount, SupeGot* out);
+size_t supeEncEnd(uint8_t* out, size_t cap, const SupeEnd* t);
+bool   supeDecEnd(const uint8_t* f, size_t len, SupeEnd* out);
 size_t supeEncResend(uint8_t* out, size_t cap, const SupeResendF* m);
 bool   supeDecResend(const uint8_t* f, size_t len, uint8_t peerCount,
                      SupeResendF* out);
@@ -583,7 +583,7 @@ bool   supeDecResend(const uint8_t* f, size_t len, uint8_t peerCount,
  * ascending, ties toward the narrower bandwidth then the higher spreading
  * factor. Index 0 is always the hailing configuration.
  *
- * Conformance is `supe-ladder-vectors.txt` (test/), generated over the full
+ * Conformance is `supe-rate-table-vectors.txt` (test/), generated over the full
  * §14.3.4 cross-product; the file is the authority where it and a reading of
  * the prose disagree. */
 

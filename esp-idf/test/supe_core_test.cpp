@@ -87,8 +87,8 @@ static void testTypeBytes(void) {
     ok(supeIsFramingByte(0xD0) && supeIsFramingByte(0xD1), "0xD0/0xD1 are framing bytes");
     ok(!supeIsTypeByte(0xC0) && !supeIsTypeByte(0xD1), "framing bytes are not type bytes");
     ok(supeIsTypeByte(SUPE_T_HAIL) && supeIsTypeByte(SUPE_T_ANNOUNCE) &&
-       supeIsTypeByte(SUPE_T_HAVE) && supeIsTypeByte(SUPE_T_GIMME) &&
-       supeIsTypeByte(SUPE_T_THATSIT) && supeIsTypeByte(SUPE_T_BYE) &&
+       supeIsTypeByte(SUPE_T_GOT) && supeIsTypeByte(SUPE_T_READY) &&
+       supeIsTypeByte(SUPE_T_END) && supeIsTypeByte(SUPE_T_BYE) &&
        supeIsTypeByte(SUPE_T_RESEND),
        "every assigned type is a type byte");
     ok(!supeIsTypeByte(0xBF) && !supeIsTypeByte(0xE0), "the range is 0xC0–0xDF");
@@ -201,8 +201,8 @@ static void testHailCodec(void) {
     ok(supeEncHail(f, sizeof f, &h) == 0, "a count past the train cap refuses");
 }
 
-static void testGimmeCodec(void) {
-    SupeGimme g = {};
+static void testReadyCodec(void) {
+    SupeReady g = {};
     uint8_t hash[3] = { 0xde, 0xad, 0x01 };
     memcpy(g.hash, hash, 3);
     g.pwrDbm = 0;
@@ -210,21 +210,21 @@ static void testGimmeCodec(void) {
     g.countCeil = 12;
     g.heardRssi = -95;
     g.heardSnrQ = supeEncSnrQ(60);
-    uint8_t f[SUPE_GIMME_LEN];
-    size_t n = supeEncGimme(f, sizeof f, &g);
-    eqi((long)n, SUPE_GIMME_LEN, "GIMME is nine bytes, always");
+    uint8_t f[SUPE_READY_LEN];
+    size_t n = supeEncReady(f, sizeof f, &g);
+    eqi((long)n, SUPE_READY_LEN, "READY is nine bytes, always");
     golden("gimme.budget6", f, n);
-    SupeGimme d = {};
-    ok(supeDecGimme(f, n, &d), "it decodes");
+    SupeReady d = {};
+    ok(supeDecReady(f, n, &d), "it decodes");
     eqi(d.heardRssi, -95, "the reading of the frame it answers rides");
     eqi(d.budget, 6, "the confirmed budget rides");
     eqi(d.countCeil, 12, "the count ceiling rides — a RAM promise");
-    ok(!supeDecGimme(f, 8, &d), "a length outside the enumerated set is discarded");
-    ok(!supeDecGimme(f, 10, &d), "…either way");
+    ok(!supeDecReady(f, 8, &d), "a length outside the enumerated set is discarded");
+    ok(!supeDecReady(f, 10, &d), "…either way");
 }
 
-static void testHaveCodec(void) {
-    SupeHave h = {};
+static void testGotCodec(void) {
+    SupeGot h = {};
     uint8_t hash[3] = { 0xde, 0xad, 0x01 };
     memcpy(h.g.hash, hash, 3);
     h.g.pwrDbm = 2;
@@ -234,17 +234,17 @@ static void testHaveCodec(void) {
     h.g.heardSnrQ = supeEncSnrQ(90);
     h.count = 5;
     h.lenByte = supeEncLen(200);
-    uint8_t f[SUPE_HAVE_ANS_BASE + SUPE_MASK_MAX];
-    size_t n = supeEncHave(f, sizeof f, &h);
-    eqi((long)n, SUPE_HAVE_LEN, "the opening form is eleven bytes — GIMME with a train behind it");
+    uint8_t f[SUPE_GOT_ANS_BASE + SUPE_MASK_MAX];
+    size_t n = supeEncGot(f, sizeof f, &h);
+    eqi((long)n, SUPE_GOT_LEN, "the opening form is eleven bytes — READY with a train behind it");
     golden("have.open.5frames", f, n);
-    SupeHave d = {};
-    ok(supeDecHave(f, n, 0, &d), "it decodes with no peer train in hand");
+    SupeGot d = {};
+    ok(supeDecGot(f, n, 0, &d), "it decodes with no peer train in hand");
     ok(!d.answering, "…as the opening form");
     eqi(d.g.budget, 8, "the proposed ceiling rides");
     eqi(d.count, 5, "the count rides");
     eqi(d.g.pwrDbm, 2, "the meeting power rides");
-    eqi(d.g.heardRssi, -70, "the reading rides — GIMME's fields are HAVE's first nine");
+    eqi(d.g.heardRssi, -70, "the reading rides — READY's fields are GOT's first nine");
 
     /* The answering form: its length is enumerable only from the peer train's
      * count, which both sides hold. */
@@ -253,34 +253,34 @@ static void testHaveCodec(void) {
     h.g.heardSnrQ = supeEncSnrQ(45);
     h.maskLen = supeMaskLen(7);
     h.mask[0] = 0x22;                  /* frames 1 and 5 of theirs are missing */
-    n = supeEncHave(f, sizeof f, &h);
-    eqi((long)n, SUPE_HAVE_ANS_BASE + 1, "answering: 11 bytes + one mask byte");
+    n = supeEncGot(f, sizeof f, &h);
+    eqi((long)n, SUPE_GOT_ANS_BASE + 1, "answering: 11 bytes + one mask byte");
     golden("have.answer.mask22", f, n);
-    ok(supeDecHave(f, n, 7, &d) && d.answering, "it decodes against count 7");
+    ok(supeDecGot(f, n, 7, &d) && d.answering, "it decodes against count 7");
     eqi(d.g.heardRssi, -88, "the train's worst reading rides");
     eqi(d.mask[0], 0x22, "the repair request rides");
-    ok(!supeDecHave(f, n, 0, &d),
+    ok(!supeDecGot(f, n, 0, &d),
        "the answering form is not decodable without the peer count");
-    ok(!supeDecHave(f, n, 12, &d), "…or against the wrong one");
+    ok(!supeDecGot(f, n, 12, &d), "…or against the wrong one");
 }
 
-static void testThatsitCodec(void) {
-    SupeThatsit t = {};
+static void testEndCodec(void) {
+    SupeEnd t = {};
     t.pwrDbm = 5;
     t.count = 4;
     t.csum[0] = 0x11; t.csum[1] = 0x22; t.csum[2] = 0x22; t.csum[3] = 0x44;
-    uint8_t f[SUPE_THATSIT_BASE + SUPE_TRAIN_MAX];
-    size_t n = supeEncThatsit(f, sizeof f, &t);
-    eqi((long)n, SUPE_THATSIT_BASE + 4, "no count byte: the length says n");
+    uint8_t f[SUPE_END_BASE + SUPE_TRAIN_MAX];
+    size_t n = supeEncEnd(f, sizeof f, &t);
+    eqi((long)n, SUPE_END_BASE + 4, "no count byte: the length says n");
     golden("thatsit.4frames", f, n);
-    SupeThatsit d = {};
-    ok(supeDecThatsit(f, n, &d), "it decodes");
+    SupeEnd d = {};
+    ok(supeDecEnd(f, n, &d), "it decodes");
     eqi(d.count, 4, "the count comes from the frame's own length");
     eqi(d.pwrDbm, 5,
         "the train's power rides — stated after the fact, chosen on the report");
     ok(memcmp(d.csum, t.csum, 4) == 0, "the checksum list IS the sequence");
     t.count = SUPE_TRAIN_MAX + 1;
-    ok(supeEncThatsit(f, sizeof f, &t) == 0, "a count past the train cap refuses");
+    ok(supeEncEnd(f, sizeof f, &t) == 0, "a count past the train cap refuses");
 }
 
 static void testByeResendCodec(void) {
@@ -447,7 +447,7 @@ static void testAirtime(void) {
     };
     eqi(ms(3), 26, "three bytes fill the first symbol group");
     eqi(ms(7), 31, "seven bytes fill the second");
-    eqi(ms(10), 36, "ten bytes fill the third — GIMME's narrow form sits on it");
+    eqi(ms(10), 36, "ten bytes fill the third — READY's narrow form sits on it");
     ok(ms(4) == ms(7), "every length inside a group costs the same");
     ok(ms(7) == ms(4), "PRIVSYNC's seven bytes fill the second group exactly");
     ok(ms(8) > ms(7), "the byte that crosses costs the whole group");
@@ -574,7 +574,7 @@ static void testLadder2(void) {
 static void writeLadderVectors(const char* path) {
     static const uint32_t kBw[] = { 125000, 250000, 500000 };
     FILE* fp = fopen(path, "w");
-    if (!fp) { ok(false, "supe-ladder-vectors.txt is writable"); return; }
+    if (!fp) { ok(false, "supe-rate-table-vectors.txt is writable"); return; }
     fprintf(fp,
         "# SUPE ladder conformance vectors (SUPE.md §14.3.4), regenerated by\n"
         "# supe_core_test. An implementation is conformant iff it reproduces this\n"
@@ -657,9 +657,9 @@ int main(int argc, char** argv) {
     testTypeBytes();
     testAnnCodec();
     testHailCodec();
-    testGimmeCodec();
-    testHaveCodec();
-    testThatsitCodec();
+    testReadyCodec();
+    testGotCodec();
+    testEndCodec();
     testByeResendCodec();
     testCrc8();
     testSyncWords();
@@ -669,7 +669,7 @@ int main(int argc, char** argv) {
     testSensitivity();
     testLadder2();
 
-    writeLadderVectors((argc > 2) ? argv[2] : "supe-ladder-vectors.txt");
+    writeLadderVectors((argc > 2) ? argv[2] : "supe-rate-table-vectors.txt");
     writeScheduleVectors("supe-schedule-vectors.txt");
 
     const char* out = (argc > 1) ? argv[1] : "golden.txt";
