@@ -36,12 +36,17 @@ static int8_t partRxGainDb(uint8_t femType)
 #define LORA_CHIP_MAX_DBM_HF   12
 #define LORA_CHIP_MIN_DBM_HF   (-19)
 
-/* One dB under the sub-GHz ceiling is the long-standing margin against a part
- * that refuses its own stated maximum; the 2.4 GHz numbers are the chip's
- * exactly, because that range is narrow enough that giving one away is giving
- * away a tenth of it. */
+/* Both ports get the part's own stated maximum, and nothing is held back from
+ * either. A margin here is invisible in the place it matters: a board with no
+ * TX_CAL entry has no curve, so its ceiling IS this number, and subtracting from
+ * it silently refuses a power the part is rated for and the driver is set up to
+ * deliver — radioOcpMilliamps() raises the over-current trip to 140 mA
+ * specifically for the parts that reach +22. A part that will not take its own
+ * maximum is a fault to find in that part, not a dBm to withhold from every
+ * board. A calibrated board is unaffected either way: its ceiling comes from the
+ * curve's own last point, which rfCalAntenna clamps to. */
 static inline int chipHi(const LoraRadio* r) {
-    return r->highBand ? LORA_CHIP_MAX_DBM_HF : LORA_CHIP_MAX_DBM_LF - 1;
+    return r->highBand ? LORA_CHIP_MAX_DBM_HF : LORA_CHIP_MAX_DBM_LF;
 }
 static inline int chipLo(const LoraRadio* r) {
     return r->highBand ? LORA_CHIP_MIN_DBM_HF : LORA_CHIP_MIN_DBM_LF;

@@ -436,8 +436,15 @@ static bool radioStart(LoraRadio* r) {
      * to the range and say so, rather than accepting a number the hardware
      * will silently ignore. */
     if (txp > r->maxTxDbm) {
-        warn("lora/%d tx_power %d dBm exceeds this board's %d dBm max — clamped",
-             r->idx, txp, r->maxTxDbm);
+        /* Name where the ceiling came from. On a board with no TX_CAL entry it
+         * is not a fact about this board at all — it is the part's register
+         * ceiling less the margin chipHi() holds back — and reading it as a
+         * measurement sends somebody looking for a hardware limit that was
+         * never characterised. */
+        warn("lora/%d tx_power %d dBm exceeds the %d dBm ceiling (%s) — clamped",
+             r->idx, txp, r->maxTxDbm,
+             r->cal.grade == CAL_NONE ? "uncalibrated: the part's range, not this board's"
+                                      : rfCalName(r->cal.grade));
         txp = r->maxTxDbm;
     }
     if (txp < r->minTxDbm) {
