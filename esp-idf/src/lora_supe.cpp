@@ -1075,7 +1075,7 @@ void supePoll(LoraRadio* r) {
 
     /* Hard watchdog: a meeting that outlives every deadline inside it holds
      * the radio against the whole outbound queue. */
-    if (e->m.phase >= SUPE_M_HAVE_TX &&
+    if (e->m.phase >= SUPE_M_GOT_TX &&
         (uint32_t)(now - e->m.beganMs) > SUPE_MEET_WATCHDOG_MS) {
         warn("lora/%d supe: meeting stuck in phase %u — standing down",
              r->idx, (unsigned)e->m.phase);
