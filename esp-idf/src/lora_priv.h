@@ -520,6 +520,17 @@ struct LoraRadio {
     volatile uint32_t mtxResGen;     /* bumped when a request completes */
     bool              mtxResOk;      /* last request's success */
     char              mtxResMsg[72]; /* human-readable outcome for the CLI echo */
+
+    /* `lora [<n>] forget <num>|all` (CLI → task), on the same handshake as the
+     * manual transmit above: the console fills the request and waits on
+     * fgtResGen, peersForgetPoll services it on the task loop. It goes through
+     * the task rather than straight at the table because the table is the
+     * task's — freeing a row under the walk that is reading it is a dangling
+     * row, and the console is a different task entirely. */
+    volatile bool     fgtReq;        /* CLI → task: a request is pending */
+    int               fgtNum;        /* the node number `lora n` printed; < 0 = all */
+    volatile uint32_t fgtResGen;     /* bumped when the request completes */
+    int               fgtResN;       /* rows forgotten, or -1 for no such node */
 };
 
 /* ─────────────── service-owned globals (lora.cpp) ─────────────── */

@@ -351,8 +351,9 @@ static void handleRxDone(LoraRadio* r) {
          * and speaks for both. */
         uint8_t rxDesc, rxWhole;
         uint8_t addrTag[3] = {0, 0, 0};
+        LoraMonExt rxExt;
         loraMonClassify(r, 0 /*rx*/, frame, pktLen, rxType, rxEndMs,
-                        &rxDesc, &rxWhole, addrTag);
+                        &rxDesc, &rxWhole, addrTag, &rxExt);
 
         uint8_t rxTag[3] = {0, 0, 0};
 #if !defined(CONFIG_LORA_NO_SUPE)
@@ -368,7 +369,7 @@ static void handleRxDone(LoraRadio* r) {
          * meeting frame is with the peer and for us, so answering the first
          * from the second would call the bulk of our own traffic somebody
          * else's. */
-        uint8_t rxCast = (rxWhole == LMD_RNS_ANNOUNCE || rxWhole == LMD_ANNOUNCE)
+        uint8_t rxCast = loraMonIsBroadcast(rxWhole)
                              ? (uint8_t)LMC_BCAST
                              : inMeeting ? (uint8_t)LMC_US /* a meeting has two parties
                                                             * and we are one of them */
@@ -387,7 +388,7 @@ static void handleRxDone(LoraRadio* r) {
          * pending entry knows the destination the packet went to, and that
          * node is who this is with. The address sits past the transport
          * identifier on a relayed frame. */
-        if (!inMeeting && rxWhole == LMD_RNS_PROOF && rxType == LORA_PKT_RNS) {
+        if (!inMeeting && loraMonIsProof(rxWhole) && rxType == LORA_PKT_RNS) {
             size_t at = 1 + 2 + ((frame[1] & 0x40) ? 16 : 0);
             const NeiPend* pd = pktLen >= at + 16
                                     ? peersPendPeek(r->nei, frame + at, 16) : nullptr;
@@ -413,7 +414,7 @@ static void handleRxDone(LoraRadio* r) {
                     rxBytes, (int16_t)lround(r->rssiLast),
                     (int16_t)lround(r->snrLast * 10.0), 0,
                     rxType, 0, 0 /*rx never waits*/,
-                    rxDesc, rxTag, rxCast);
+                    rxDesc, rxTag, rxCast, &rxExt);
         r->chNow = chLive;
     }
 
@@ -1241,16 +1242,16 @@ static void serviceRadioLocked(LoraRadio* r) {
          * a tail takes its head's answers. */
         uint8_t txDesc, txWhole;
         uint8_t addrTag[3] = {0, 0, 0};
+        LoraMonExt txExt;
         loraMonClassify(r, 1 /*tx*/, frame, doneLen, doneType, doneStart,
-                        &txDesc, &txWhole, addrTag);
+                        &txDesc, &txWhole, addrTag, &txExt);
         /* Our own transmit: it went to everyone or to one node, and "for us"
          * cannot arise — so OTHER is what the graph reads as "unicast" here.
          * Being aimed at everyone is what the description says, not what an
          * address lookup says, so nothing is looked up — and it is the PACKET's
          * description that says it, so a split announce is a broadcast in both
          * its halves. */
-        uint8_t txCast = (txWhole == LMD_RNS_ANNOUNCE || txWhole == LMD_ANNOUNCE)
-                             ? LMC_BCAST : LMC_OTHER;
+        uint8_t txCast = loraMonIsBroadcast(txWhole) ? LMC_BCAST : LMC_OTHER;
         /* Who it is with. Our own broadcast is with nobody: the address on it is
          * ours, and naming ourselves above a bar that is already ours by its
          * colour says nothing. */
@@ -1270,7 +1271,7 @@ static void serviceRadioLocked(LoraRadio* r) {
             loraMonPush(r, 1 /*tx*/, doneStart, (uint16_t)dur,
                         (uint16_t)(doneLen - (doneType == LORA_PKT_OURS ? 0 : 1)),
                         0, 0, donePwr, doneType, doneWait, doneOwn,
-                        txDesc, txTag, txCast);
+                        txDesc, txTag, txCast, &txExt);
             r->chNow = chLive;
         }
         /* Every frame we put on air is charged somewhere, and *which* somewhere
@@ -1291,8 +1292,12 @@ static void serviceRadioLocked(LoraRadio* r) {
         r->txBytes += r->txPayloadBytes;
         if (engineFrame) return;             /* the radio was dealt with above */
         /* An announce is followed by the next announce of its run, back to
-         * back, while the run stays inside its budget (annTrainChain). */
-        if (txWhole == LMD_RNS_ANNOUNCE && annTrainChain(r)) return;
+         * back, while the run stays inside its budget (annTrainChain). A path
+         * response is an announce on the wire and counts here too — it is one
+         * packet type with two names, and only the graph cares about the
+         * difference. */
+        if ((txWhole == LMD_RNS_ANNOUNCE || txWhole == LMD_RNS_PATHRESP) &&
+            annTrainChain(r)) return;
         txRearmRx(r);                        /* whole packet sent → back to listening */
         if (!r->txActive) noteFlip(r, endMs);
         return;

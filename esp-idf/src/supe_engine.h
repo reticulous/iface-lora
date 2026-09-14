@@ -75,6 +75,11 @@ struct SupePeerNote {
     /* PAIR / REPORT / TRAIN_OK: the measurement */
     SupeCfg  cfg;            /* the configuration the level was read at */
     int16_t  rssiDbm;
+    int16_t  snr10;          /* the same frame's signal-to-noise, deci-dB: PAIR
+                              * as this radio measured it, REPORT/TRAIN_OK as
+                              * the peer reported it. It rides with the level
+                              * because it answers what the level cannot —
+                              * whether a link is weak or merely quiet */
     int8_t   txpDbm;         /* PAIR: the power the other side stated;
                               * REPORT/TRAIN_OK: the power WE transmitted at */
     bool     haveLevel;      /* TRAIN_OK: rssiDbm carries the peer's reading */
@@ -321,6 +326,16 @@ struct SupeMeet {
     bool     anyRx;
     int16_t  lastRssi;             /* our reading of their last frame, any kind */
     int8_t   lastSnrQ;
+    bool     haveLast;
+    /* What WE last put on the air here, and what it flew at. An END states how
+     * the peer's last frame reached the sender, and the sender cannot say which
+     * of ours that was — so the receiver resolves it against its own last
+     * transmission, which is the frame the peer must have heard to answer at
+     * all. A level without the power behind it is not a path loss (§15.1), and
+     * the power is ours to remember. */
+    int8_t   lastTxp;
+    SupeCfg  lastTxCfg;
+    bool     haveLastTx;
     /* The meeting's one line, gathered as it happens. */
     int8_t   hailTxp;              /* the hail's power — whoever hailed */
     int16_t  hailRssi;             /* and how the other end read it */
@@ -471,6 +486,14 @@ void supeEngTagExpire(SupeEngine* e, uint32_t now);
 bool supeEngTagIsOurs(const SupeEngine* e, const uint8_t* addr);
 void supeEngProofRetFile(SupeEngine* e, const uint8_t phash[16], const uint8_t node4[4]);
 const uint8_t* supeEngProofRetLookup(SupeEngine* e, const uint8_t* addr);
+
+/* Drop everything the engine holds about one node, named by a tag it answers
+ * to: a hail owed to it, any schedule with it, any proof return filed against
+ * it. A meeting already running is left alone — it is a conversation the far
+ * end is timing against rather than a memory, and what it files on its way out
+ * is fresh measurement. Called once per tag the node answers to, since a node
+ * is plural and the engine files against whichever of its addresses it saw. */
+void supeEngForget(SupeEngine* e, const uint8_t tag[SUPE_TAG_LEN]);
 
 /* build our own announcement (the glue paces and transmits it) */
 size_t supeEngBuildAnn(SupeEngine* e, uint8_t* out, size_t cap,

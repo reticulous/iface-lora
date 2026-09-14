@@ -179,8 +179,8 @@ bool rnsParse(const uint8_t* p, size_t len, RnsHdr* h) {
  * [flags & 0x0F] + raw[2:] (HEADER_1) / raw[18:] (HEADER_2, transport_id
  * excluded); for an LR the link_id additionally drops any data beyond the
  * 64-byte ephemeral keys (MTU signalling). Static buffer: lora task only. */
-static void rnsPacketHash(const RnsHdr* h, const uint8_t* p, size_t len,
-                          bool isLr, uint8_t out[16]) {
+void rnsPacketHash(const RnsHdr* h, const uint8_t* p, size_t len,
+                   bool isLr, uint8_t out[16]) {
     static uint8_t buf[1 + RNS_MTU + 16];
     size_t skip = h->hdr2 ? 18 : 2;
     size_t n = len - skip;
@@ -455,15 +455,27 @@ void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
             /* Our own rebroadcast stamps OUR transport identity as the
              * transport_id — the exact frame neighbours identify us by, so
              * learn "who we are" from it symmetrically. This is the only way
-             * the transport identity surfaces here unless rnsd also hosts an
-             * announcing destination on it (rnstransport.probe usually does,
-             * in which case this merges into that us row and tags it). */
+             * the transport identity surfaces here at all: it hangs off no
+             * destination rnsd announces, so no announce of ours ever names
+             * it. It belongs on the local row as one more name this device
+             * answers to, not on a row of its own. */
             Neighbor* e = peersFindByIdentity(st, h.transportId);
             if (!e) {
-                e = peersAlloc(st, now);
-                if (e) {
-                    peersAddId(e, h.transportId);
+                /* It is not a second node: the transport identity is another
+                 * name for the endpoint this frame came from. File it on that
+                 * endpoint's row. Minting one instead would list a second `us`
+                 * holding nothing but an identity nobody has announced — a row
+                 * with no hash to print — until our next own announce folded it
+                 * away. Only if the endpoint has no row yet does one get made:
+                 * we can relay before we have ever announced, and the fold in
+                 * observeAnnounce joins the two when we do. */
+                bool rnode = (txOrigin == LORA_ORIG_RNODE);
+                for (int i = 0; i < NEI_MAX; i++) {
+                    Neighbor* o = &st->nei[i];
+                    if (o->used && (rnode ? o->isRnode : o->isUs)) { e = o; break; }
                 }
+                if (!e) e = peersAlloc(st, now);
+                if (e) peersAddId(e, h.transportId);
             }
             if (e) {
                 if (txOrigin == LORA_ORIG_RNODE) e->isRnode = true;

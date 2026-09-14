@@ -52,6 +52,83 @@ Neighbor* peersFindClaim4(NeiState* st, const uint8_t b4[4]) {
     return nullptr;
 }
 
+/* Retire a row: the node it held is no longer one this table has. rnsd's copy
+ * goes, and so does every hash the shared store filed against the slot — the
+ * slot is about to mean a different device, and a stub left behind would
+ * silently attribute the old node's traffic to the new one. */
+void peersRetire(NeiState* st, Neighbor* e) {
+    if (!st || !e) return;
+    if (e->used && e->rnsdDecl) peersRnsdWithdraw(st, e);
+    uint8_t node = (uint8_t)(e - st->nei);
+    for (int i = 0; i < NEI_HASHES_MAX; i++)
+        if (st->hashes[i].used && st->hashes[i].node == node) st->hashes[i].used = false;
+    memset(e, 0, sizeof(*e));
+}
+
+/* Forget one node outright: everything this radio holds about it goes, and
+ * nothing about it is believed afterwards — not its addresses, not its
+ * measurements, not that it speaks our air protocol. The next frame from it
+ * builds a fresh row from what that frame proves, which is the point: a node
+ * that has moved, been reflashed or been reconfigured is described by a table
+ * that learned it before any of that happened, and there is no way to correct a
+ * belief except to drop it.
+ *
+ * Order matters. The link rows go first, while the hashes that name them still
+ * resolve to this row; then the protocol's own state for the node, then what
+ * was published about the slot, then the row itself.
+ *
+ * A transaction already on the air is NOT torn down: it is a conversation
+ * rather than a memory, the far end is timing against it, and what it files on
+ * the way out is fresh measurement. */
+static void peersForgetRow(LoraRadio* r, Neighbor* e) {
+    NeiState* st = r->nei;
+    for (int l = 0; ; l++) {
+        uint8_t h4[4];
+        if (!peersHashAt(st, e, l, h4)) break;
+        for (int i = 0; i < NEI_LINKS_MAX; i++)
+            if (st->links[i].used && memcmp(st->links[i].linkId, h4, 4) == 0)
+                memset(&st->links[i], 0, sizeof st->links[i]);
+    }
+    /* Proof expectations against this node's destinations: an outstanding one
+     * is a question asked of a node this radio no longer holds, and its answer
+     * would score against a row rebuilt from a single frame. */
+    for (int i = 0; i < NEI_PEND_MAX; i++) {
+        NeiPend* pd = &st->pend[i];
+        if (!pd->used) continue;
+        for (int d = 0; d < e->nDests; d++)
+            if (memcmp(pd->dest, e->dests[d].hash, 16) == 0) { pd->used = false; break; }
+    }
+#if !defined(CONFIG_LORA_NO_SUPE)
+    supeForgetPeer(r, e);
+#endif
+    loraPeerPubForget(r, (int)(e - st->nei));
+    peersRetire(st, e);
+}
+
+/* `lora [<n>] forget <num>|all`. `num` is the number `lora n` printed, and
+ * `num` < 0 is every node out there — never this device's own rows, which are
+ * not neighbours and which nothing would rebuild. Returns how many rows went,
+ * or -1 when the number names nobody. Task-side: the table is the radio task's
+ * and a row freed under a walk is a dangling row. */
+int peersForget(LoraRadio* r, int num) {
+    NeiState* st = r ? r->nei : nullptr;
+    if (!st) return 0;
+    if (num >= 0) {
+        Neighbor* e = peersWalk(st, num, nullptr, nullptr);
+        if (!e) return -1;
+        peersForgetRow(r, e);
+        return 1;
+    }
+    int n = 0;
+    for (int i = 0; i < NEI_MAX; i++) {
+        Neighbor* e = &st->nei[i];
+        if (!e->used || peersIsLocal(e)) continue;
+        peersForgetRow(r, e);
+        n++;
+    }
+    return n;
+}
+
 /* Allocate an entry, evicting the longest-unheard non-us one when full. */
 Neighbor* peersAlloc(NeiState* st, uint32_t now) {
     Neighbor* victim = nullptr;
@@ -59,13 +136,10 @@ Neighbor* peersAlloc(NeiState* st, uint32_t now) {
         Neighbor* e = &st->nei[i];
         if (!e->used) { victim = e; break; }
         if (peersIsLocal(e)) continue;
-        if (!victim || (int32_t)(victim->lastHeardMs - e->lastHeardMs) > 0) victim = e;
+        if (!victim || (int32_t)(peersLastHeard(victim) - peersLastHeard(e)) > 0) victim = e;
     }
     if (!victim) return nullptr;
-    /* A reused slot is a different node under the same rnsd key, so the one
-     * rnsd holds has to go before this row becomes somebody else. */
-    if (victim->used && victim->rnsdDecl) peersRnsdWithdraw(st, victim);
-    memset(victim, 0, sizeof(*victim));
+    peersRetire(st, victim);     /* leaves the slot cleared */
     victim->used = true;
     victim->lastHeardMs = now;
     return victim;
@@ -113,6 +187,8 @@ void peersSample(Neighbor* e, int16_t rssi, int16_t snr10, uint32_t now) {
     if (!e->haveSig || rssi > e->rssiMax)   e->rssiMax  = rssi;
     if (!e->haveSig || snr10 < e->snrMin10) e->snrMin10 = snr10;
     if (!e->haveSig || snr10 > e->snrMax10) e->snrMax10 = snr10;
+    e->rssiLast  = rssi;
+    e->snrLast10 = snr10;
     e->haveSig = true;
     e->lastHeardMs = now;
     e->frames++;
@@ -351,6 +427,13 @@ void peersMergeInto(NeiState* st, Neighbor* dst, Neighbor* src) {
         if (!dst->haveSig || src->rssiMax > dst->rssiMax)   dst->rssiMax  = src->rssiMax;
         if (!dst->haveSig || src->snrMin10 < dst->snrMin10) dst->snrMin10 = src->snrMin10;
         if (!dst->haveSig || src->snrMax10 > dst->snrMax10) dst->snrMax10 = src->snrMax10;
+        /* The envelope folds either way; the newest reading is one of the two,
+         * and which one is settled by the same clock the listing prints its age
+         * from (folded below, so this still sees both rows' own). */
+        if (!dst->haveSig || (int32_t)(src->lastHeardMs - dst->lastHeardMs) > 0) {
+            dst->rssiLast  = src->rssiLast;
+            dst->snrLast10 = src->snrLast10;
+        }
         dst->haveSig = true;
     }
     dst->frames  += src->frames;
@@ -367,22 +450,25 @@ void peersMergeInto(NeiState* st, Neighbor* dst, Neighbor* src) {
      * where a frame went missing and neither has been disproved. */
     if (src->haveApRpt && (!dst->haveApRpt ||
                            (int32_t)(src->apRptMs - dst->apRptMs) > 0)) {
-        dst->haveApRpt = true;
-        dst->apRptRssi = src->apRptRssi;
-        dst->apRptTxp  = src->apRptTxp;
-        dst->apRptMs   = src->apRptMs;
+        dst->haveApRpt  = true;
+        dst->apRptRssi  = src->apRptRssi;
+        dst->apRptSnr10 = src->apRptSnr10;
+        dst->apRptTxp   = src->apRptTxp;
+        dst->apRptMs    = src->apRptMs;
     }
     if (src->havePair && (!dst->havePair ||
                           (int32_t)(src->pairMs - dst->pairMs) > 0)) {
-        dst->havePair = true;
-        dst->pairRssi = src->pairRssi;
-        dst->pairTxp  = src->pairTxp;
-        dst->pairMs   = src->pairMs;
+        dst->havePair  = true;
+        dst->pairRssi  = src->pairRssi;
+        dst->pairSnr10 = src->pairSnr10;
+        dst->pairTxp   = src->pairTxp;
+        dst->pairMs    = src->pairMs;
     }
     if (src->haveStepPair && (!dst->haveStepPair ||
                               (int32_t)(src->stepPairMs - dst->stepPairMs) > 0)) {
         dst->haveStepPair = true;
         dst->stepRssi     = src->stepRssi;
+        dst->stepSnr10    = src->stepSnr10;
         dst->stepTxp      = src->stepTxp;
         dst->stepPairStep = src->stepPairStep;
         dst->stepPairMs   = src->stepPairMs;
@@ -443,6 +529,16 @@ void peersExpire(LoraRadio* r, uint32_t now) {
      * row itself stays: a frame recorded an hour ago still has to resolve
      * through it, and LoRaMon reads back exactly that far. */
     peersHashAge(st, now);
+    /* A node nothing has been heard from for NEI_GONE_MS is not a neighbour any
+     * more, and a listing that keeps it is describing a neighbourhood that no
+     * longer exists. Silence is the only evidence either way — nothing says
+     * goodbye — so the row goes and the next frame from that node builds a
+     * fresh one. Our own rows stay whatever the air does. */
+    for (int i = 0; i < NEI_MAX; i++) {
+        Neighbor* e = &st->nei[i];
+        if (!e->used || peersIsLocal(e)) continue;
+        if ((uint32_t)(now - peersLastHeard(e)) > NEI_GONE_MS) peersRetire(st, e);
+    }
 }
 
 int peersOtherCount(const NeiState* st) {

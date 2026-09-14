@@ -574,6 +574,16 @@ static void testDialogueFull(void) {
     ok(aReport, "A got the READY's report of its hail");
     ok(aOk, "A's power controller heard its train confirmed");
     ok(aAnswered, "A's peer record shows B answered");
+    /* The answering side measures the direction it transmits in too. B never
+     * opened a leg, so no READY or GOT ever quoted a level back to it; A's END
+     * is what carries B's READY as A read it, and without that B would learn
+     * only the direction it receives in, for ever (§15.2). */
+    bool bReport = false;
+    int16_t bRssi = 0;
+    for (auto& nt : B.notes)
+        if (nt.ev == SUPE_EV_REPORT) { bReport = true; bRssi = nt.rssiDbm; }
+    ok(bReport, "B got the END's report of its READY — the answerer learns us->them");
+    ok(bRssi < 0, "…as a level, not an empty note");
 }
 
 /* The hailed party holds traffic too: it answers with GOT, its train goes
@@ -736,6 +746,17 @@ static void testMeetingPlan(void) {
         if (B.eng.sched[i].used && B.eng.sched[i].wide)
             ok(B.eng.sched[i].weTx0, "…and B holds the mirror of that");
     }
+
+    /* `lora forget` reaching the engine: the appointment held with a peer is
+     * state about that peer, so it goes with the rest of what was known. It is
+     * filed under the address the meeting was made on — here the packet tag A
+     * hailed, not B's announced identity — which is why the caller offers every
+     * address the peer table's row answers to rather than picking one. */
+    supeEngForget(&A.eng, IDENT_B);
+    ok(holdsWide(&A), "an address this schedule was not filed under leaves it");
+    supeEngForget(&A.eng, TAG);
+    ok(!holdsWide(&A), "the one it was filed under drops it");
+    ok(holdsWide(&B), "…and touches nobody else's");
 }
 
 static void testGotFirstPlan(void) {

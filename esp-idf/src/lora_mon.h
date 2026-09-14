@@ -60,16 +60,109 @@ struct LoraMonState {
  * carries a byte. Values are wire — a viewer decodes them — so they are
  * appended to, never renumbered.
  *
- *   0 unknown   1 HAIL  2 ANNOUNCE  3 GOT  4 READY
- *   5 END   6 BYE       7 RESEND     8 data      9 announce
- *  10 link req 11 proof    12 split     13 RNode */
+ * A code's NAME is the one the protocol that defined it uses — RNS's own
+ * all-caps constants verbatim, our own protocol's frames under a SUPE_ prefix —
+ * so the graph, a Reticulum log and the source all say the same word. `split`
+ * and `RNode` are neither protocol's: they are facts about this interface's own
+ * framing, and read lower case to say so.
+ *
+ *   0 unknown        1 SUPE_HAIL   2 SUPE_ANNOUNCE  3 SUPE_GOT  4 SUPE_READY
+ *   5 SUPE_END       6 SUPE_BYE    7 SUPE_RESEND    8 DATA      9 ANNOUNCE
+ *  10 LINKREQUEST   11 PROOF      12 split         13 RNode
+ *
+ * 8 through 11 are Reticulum's four packet-type bits and nothing more, which
+ * is all this record used to say about a packet that was not ours. The header
+ * carries a destination type and a context byte beside them, both in the clear
+ * and both naming what the packet is *for*, so a path request read as `data`
+ * and a path response — an announce answering one — as a broadcast announce.
+ * Everything from 14 is that header read out: the context byte first, then the
+ * destination type, with 8 through 11 left holding the cases none of the rest
+ * claims. A name here is a fact off the wire, never a guess: what a packet
+ * carries is encrypted and stays unsaid. */
 enum : uint8_t {
     LMD_NONE = 0,
     LMD_HAIL, LMD_ANNOUNCE, LMD_GOT, LMD_READY,
     LMD_END, LMD_BYE, LMD_RESEND,
     LMD_RNS_DATA, LMD_RNS_ANNOUNCE, LMD_RNS_LINKREQ, LMD_RNS_PROOF,
     LMD_RNS_SPLIT, LMD_RNODE,
+    /* 14 */ LMD_RNS_PATHREQ,      /* PLAIN, to rnstransport.path.request */
+    /* 15 */ LMD_RNS_PATHRESP,     /* an announce answering one (ctx PATH_RESPONSE) */
+    /* 16 */ LMD_RNS_TUNNEL,       /* PLAIN, to rnstransport.tunnel.synthesize */
+    /* 17 */ LMD_RNS_PLAIN,        /* PLAIN to anything else — unencrypted by definition */
+    /* 18 */ LMD_RNS_LRPROOF,      /* the proof that establishes a link */
+    /* 19 */ LMD_RNS_LINKPROOF,    /* a packet proof inside an established link */
+    /* 20 */ LMD_RNS_RESPROOF,
+    /* 21 */ LMD_RNS_GROUP,
+    /* 22 */ LMD_RNS_LINKDATA,     /* LINK dest, no context — the payload stream */
+    /* 23 */ LMD_RNS_RESPART,
+    /* 24 */ LMD_RNS_RESADV,
+    /* 25 */ LMD_RNS_RESREQ,
+    /* 26 */ LMD_RNS_RESHMU,
+    /* 27 */ LMD_RNS_RESCANCEL,    /* initiator cancelled */
+    /* 28 */ LMD_RNS_RESCANCEL_RX, /* receiver cancelled */
+    /* 29 */ LMD_RNS_CACHEREQ,
+    /* 30 */ LMD_RNS_REQUEST,
+    /* 31 */ LMD_RNS_RESPONSE,
+    /* 32 */ LMD_RNS_COMMAND,
+    /* 33 */ LMD_RNS_CMDSTATUS,
+    /* 34 */ LMD_RNS_CHANNEL,
+    /* 35 */ LMD_RNS_KEEPALIVE,
+    /* 36 */ LMD_RNS_LINKIDENT,
+    /* 37 */ LMD_RNS_LINKCLOSE,
+    /* 38 */ LMD_RNS_LINKRTT,
 };
+
+/* The detail fields, filled only while a viewer asks for them (§ the
+ * `detailed` toggle). Each is a short string whose MEANING is given by the
+ * record's `desc`: the viewer holds the table that says how to read them, the
+ * same division of labour the desc codes themselves use.
+ *
+ *   `to`   — the packet's DESTINATION, which is not the address the record's
+ *            `tag` carries. `tag` names the node this hop was addressed to (the
+ *            relay, on a packet in transport), which is the neighbour a person
+ *            watching the air is interacting with and what the peer pills want.
+ *            `to` is where the packet is ultimately going, plus the hop count
+ *            it has travelled: "3f2a11 h2". Empty where a frame names no
+ *            destination at all.
+ *   `subj` — what this packet is ABOUT, per desc: the hash a path request asks
+ *            for, the packet hash a proof proves, the link id a link request
+ *            creates, the aspect an announce serves, the far end of a link.
+ *            Empty where the kind has nothing of its own to say.
+ *   `hash` — this packet's own hash, six hex characters of it, which is the
+ *            name a PROOF for it will carry. Its own field rather than a case
+ *            of `subj` because a viewer needs it on the packets that have
+ *            something else to say as well: a proof answers a link's data
+ *            packet, and that packet's subject is already the far end it is
+ *            with. With both, the two can be joined on screen.
+ *
+ * 24 characters each: enough for a six-hex address and a short qualifier, or an
+ * aspect label like `nomadnetwork.node`. */
+#define LORA_MON_EXT_MAX 25              /* 24 characters + NUL */
+#define LORA_MON_HASH_MAX 7              /* six hex characters + NUL */
+struct LoraMonExt {
+    char to[LORA_MON_EXT_MAX];
+    char subj[LORA_MON_EXT_MAX];
+    char hash[LORA_MON_HASH_MAX];
+};
+
+/* Aimed at everyone, by what the frame IS. Being a broadcast is a property of
+ * the packet's kind, not of an address lookup — a path request goes to a
+ * well-known control address that names no node, and an announce's address is
+ * the destination it announces — so this is what decides the audience, and the
+ * colour that follows from it, on both directions.
+ *
+ * A list rather than a single code because Reticulum broadcasts in more than
+ * one shape: an announce, the path request that asks for one, the path response
+ * that answers it, and a tunnel synthesis. Missing one leaves that kind reading
+ * as somebody else's unicast. */
+bool loraMonIsBroadcast(uint8_t desc);
+
+/* A proof of something, in any of the shapes Reticulum proves in: a packet, a
+ * link request, a packet inside a link, a resource. They were one code until
+ * the context byte was read, and everything that asks "is this a proof" wants
+ * all four — a proof is addressed to the hash of what it proves rather than to
+ * a node, which is the property the callers turn on. */
+bool loraMonIsProof(uint8_t desc);
 
 /* Classify one on-air frame. `type` is the LORA_PKT_* class the caller already
  * knows; `f` is the frame as it flew, framing byte included.
@@ -96,10 +189,16 @@ void loraMonTagOf(const uint8_t* f, size_t len, uint8_t type, uint8_t out[3]);
  * only at close) as well as for plain traffic.
  *
  * `desc` is what this FRAME is — a tail is a `split`. `whole` is what the PACKET
- * is, which a tail inherits from its head; cast keys off that one. RADIO TASK. */
+ * is, which a tail inherits from its head; cast keys off that one. RADIO TASK.
+ *
+ * `ext`, where given, is filled with the two detail fields — but only while a
+ * viewer has asked for them; it comes back empty otherwise, and a split's tail
+ * always comes back empty (it carries no header, and its head's answers belong
+ * to the head's own record). */
 void loraMonClassify(LoraRadio* r, uint8_t dir, const uint8_t* f, size_t len,
                      uint8_t type, uint32_t now,
-                     uint8_t* desc, uint8_t* whole, uint8_t tag[3]);
+                     uint8_t* desc, uint8_t* whole, uint8_t tag[3],
+                     LoraMonExt* ext = nullptr);
 
 /* Who SENT a frame, where the frame says so, and false where it does not. Two
  * SUPE frames do. HAIL carries the sender's identity prefix precisely
@@ -136,7 +235,8 @@ uint8_t loraMonCastOf(LoraRadio* r, const uint8_t tag[3]);
 void loraMonPush(LoraRadio* r, uint8_t dir, uint32_t t_ms, uint16_t dur_ms,
                  uint16_t bytes, int16_t rssi, int16_t snr10, int8_t txp,
                  uint8_t type, uint16_t wait_ms, uint16_t own_ms,
-                 uint8_t desc, const uint8_t tag[3], uint8_t cast);
+                 uint8_t desc, const uint8_t tag[3], uint8_t cast,
+                 const LoraMonExt* ext = nullptr);
 /* One listening span closed off: where the radio was and for how long. Called
  * on every retune and on the maintenance beat — see the note at the record. */
 void loraMonDwell(LoraRadio* r, uint32_t now);
@@ -147,7 +247,20 @@ void publishPill(void);
 void publishChannels(LoraRadio* r);
 void publishState(LoraRadio* r, const char* state);
 void rssiSamplePoll(LoraRadio* r);
+/* Drop everything published about one peer-table slot — the neighbourhood
+ * record and the measurements. Both publishers delete an empty slot on their
+ * own beat, but neither beat is guaranteed to come: the neighbourhood one runs
+ * only while a LoRaMon viewer is open, and the measurement one only when a
+ * frame has moved. A node that was just forgotten must not go on being
+ * described to every reader outside this binary until something happens to
+ * arrive. */
+void loraPeerPubForget(LoraRadio* r, int slot);
 bool loraMonOpen(void);          /* a LoRaMon viewer (web or LCD) is open */
+/* A viewer has the `detailed` toggle on, so records carry their two extra
+ * fields. Separate from loraMonOpen because it is a separate appetite and a
+ * separate cost: filling the fields reads further into every frame, and the
+ * strings ride in every record node for as long as the ring holds it. */
+bool loraMonDetail(void);
 void loraMonStart(void);
 bool loraMonParked(void);
 #if CONFIG_STRADDLE_LORAMON

@@ -219,9 +219,9 @@ SF/BW/CR/preamble are set; `lora.<n>.state` reads `unconfigured` until then.
 | `lora.<n>.bitrate_eff` | Effective bitrate registered with `rnsd`, bits/s (airtime-derived). |
 | `lora.<n>.stats.{tx_bytes,rx_bytes,tx_frames,rx_frames,crc_err,split_rx_timeout,tx_dropped,rssi_last,snr_last}` | Traffic counters (`tx_dropped` = frames shed by the LBT timeout) and last-RX RSSI/SNR. Published only when a UI can read them — see `uiTelemetryWanted()`. |
 | `lora.<n>.stats.{airtime_pct,cw_band}` | With `appc` on: percentage of the last ~15 s this radio spent transmitting, and the contention band (1–4) that percentage currently selects. Absent when `appc` is off. |
-| `lora.<n>.packets.<ms>` | LoRaMon: one node per on-air frame, keyed by start-ms — a packed string `r\|rssi\|snr\|dur\|bytes\|type\|ch\|desc\|cast[\|tag]` (rx) or `t\|txp\|dur\|bytes\|type\|wait\|ch\|own\|desc\|cast[\|tag]` (tx); `snr` is deci-dB, `type` is `0` Reticulum / `1` this straddle's own air protocol, SUPE / `2` traffic from an attached RNode client / `3` a frame whose CRC failed, `bytes` is payload bytes — everything but SUPE carries a 1-byte seq/split header on air and has it stripped, SUPE carries none and is recorded whole, in **both** directions — and the last two are what the frame waited before its first bit went on air, split because they are different facts: `wait` is what the **channel** cost (DIFS/backoff against somebody else's traffic) and `own` is what **we** cost ourselves (the radio held by an announce replay or a SUPE channel switch, a split still landing, or a deliberate pre-offer delay). Both are carried by the first frame of a burst only, and drawn in the viewers as a tick where the frame first wanted the air, then a mid-height run up to the bar — **dotted for ours, solid for contention**, in that order, so the pair reads left to right as the frame experienced it. Conflated, a busy channel and a busy radio look identical, and only one of them is somebody else's fault. `desc` names what the frame is — a code rather than a string, since there may be thousands of these and the name belongs in the viewer's table rather than on every record; `cast` is who it was aimed at (`0` broadcast, `1` unicast for us, `2` unicast for somebody else), which the device has to decide because a viewer cannot — it turns on which addresses mean US, and that lives in the peer table — and which is what both viewers colour by. `cast` and `tag` answer different questions and neither is derived from the other: an exchange frame is *with* the peer and *for* us, so resolving its tag against our own addresses would call our own traffic somebody else's. Broadcast is read off `desc`, a frame belonging to one of our exchanges is ours by construction, and only what is left is looked up. Then `tag` is the three bytes naming the node it concerns, present only where there is one to take, and inside a SUPE exchange naming the **peer the exchange is with** rather than the address on the frame, so a whole burst answers "who was this with" the same way. Together with `lora.<n>.peers.*` those are what let a bar on the graph say `GOT · 88B · tdeck` on hover — the tag itself appears only where it resolves to nobody, since once there is a name the hex is the part nobody reads — and what puts a peer's name in a pill beside a whole burst once the view is zoomed wide enough to hold it. Written only with [loramon](../loramon) staged, and then only while one of its apps is open (`sys.stats.{web,lcd}_loramon`); deleted past 1 h. See INTERNALS §12. |
-| `lora.<n>.peers.<slot>` | The neighbourhood, one node per peer-table slot: `"<num>\|<supe>\|<tags…>\|<names…>\|<loss>\|<rssi>\|<snr>\|<q>\|<heard_s>\|<flags>\|<ratestep>"`, a field left empty where it is not known. `num` is the number `lora n` prints beside the node, so a viewer with no name to show falls back to the same `#4` the console does. Tags are the three-byte prefixes that resolve an address to this node, comma-joined and deduplicated; names are the first word of each announced LXMF name on its destinations. Published rather than derived, because the clustering lives in the peer table and nothing outside this straddle can rebuild it — a viewer sees frames, not the announces and proofs that grouped them. Written only with [loramon](../loramon) staged, and then only while a web reader says it is looking (`sys.stats.web_peers`); deleted when a slot empties. Read by LoRaMon, which names the node behind a frame's tag; and there for graph views. On-device surfaces do not read it — they are in the same binary as the peer table and ask it directly (`loraNameForTag`), since serialising a fact so the same firmware can parse it back is a round trip for nothing. |
-| `lora.<n>.meas.<slot>.{tags,name,loss_to,loss_from,to_ts,from_ts,rssi,snr,peer_txp,txp,heard_ts}` | SUPE's measurements of one neighbour, per peer-table slot, republished every 15 s while the table holds anyone and a frame has moved since the last publication, and deleted when the slot empties. `tags` is the comma-joined six-hex prefixes the node answers to (its destination hashes, identities and node key) — a reader that holds a destination hash finds the node by the hash's first six characters; `name` is its announced first-word names. `loss_to` is the us→them path loss in dB, from the peer's own report of how our frame landed; `loss_from` is them→us, a frame heard here against the power the peer stated for it; `to_ts`/`from_ts` are the unix seconds of those readings. `rssi`/`snr` (dBm, dB×10) are the strongest level heard from it, `peer_txp` the power it last stated, `txp` what we last transmitted to it at, `heard_ts` when it was last heard. A field is absent when it is not known — only a SUPE peer states a power, so a plain Reticulum neighbour carries no loss. Read by lxmf (Ping, contact bars) and the web contact list. `lora n` prints the same losses with their ages. |
+| `lora.<n>.packets.<ms>` | LoRaMon: one node per on-air frame, keyed by start-ms — a packed string `r\|rssi\|snr\|dur\|bytes\|type\|ch\|desc\|cast[\|tag[\|to\|subj\|hash]]` (rx) or `t\|txp\|dur\|bytes\|type\|wait\|ch\|own\|desc\|cast[\|tag[\|to\|subj\|hash]]` (tx); `snr` is deci-dB, `type` is `0` Reticulum / `1` this straddle's own air protocol, SUPE / `2` traffic from an attached RNode client / `3` a frame whose CRC failed, `bytes` is payload bytes — everything but SUPE carries a 1-byte seq/split header on air and has it stripped, SUPE carries none and is recorded whole, in **both** directions — and the last two are what the frame waited before its first bit went on air, split because they are different facts: `wait` is what the **channel** cost (DIFS/backoff against somebody else's traffic) and `own` is what **we** cost ourselves (the radio held by an announce replay or a SUPE channel switch, a split still landing, or a deliberate pre-offer delay). Both are carried by the first frame of a burst only, and drawn in the viewers as a tick where the frame first wanted the air, then a mid-height run up to the bar — **dotted for ours, solid for contention**, in that order, so the pair reads left to right as the frame experienced it. Conflated, a busy channel and a busy radio look identical, and only one of them is somebody else's fault. `desc` names what the frame is — a code rather than a string, since there may be thousands of these and the name belongs in the viewer's table rather than on every record. It is the Reticulum header read out, not just its packet-type bits: the context byte says what a packet is *for* and the destination type what it is, so a `PATH_REQUEST` is not `DATA` and the `PATH_RESPONSE` answering one is not an ordinary `ANNOUNCE`. Names are the defining protocol's own — RNS's all-caps constants verbatim, this straddle's frames under a `SUPE_` prefix — so a bar on the graph, a Reticulum log line and the source all say the same word. A frame that failed its CRC is named nothing at all, since nothing in it decoded; `cast` is who it was aimed at (`0` broadcast, `1` unicast for us, `2` unicast for somebody else, `3` ours by a link identifier), which the device has to decide because a viewer cannot — it turns on which addresses mean US, and that lives in the peer table. Being aimed at everyone is decided by what the frame IS (`loraMonIsBroadcast`) and never by an address lookup: Reticulum broadcasts in four shapes — an announce, the `PATH_REQUEST` that asks for one, the `PATH_RESPONSE` that answers it, and a tunnel synthesis — and a kind missing from that list reads as somebody else's unicast. The two control destinations carry no `tag` at all, since their address is a constant every node computes and names no node — and which is what both viewers colour by. `cast` and `tag` answer different questions and neither is derived from the other: an exchange frame is *with* the peer and *for* us, so resolving its tag against our own addresses would call our own traffic somebody else's. Broadcast is read off `desc`, a frame belonging to one of our exchanges is ours by construction, and only what is left is looked up. Then `tag` is the three bytes naming the node it concerns, present only where there is one to take, and inside a SUPE exchange naming the **peer the exchange is with** rather than the address on the frame, so a whole burst answers "who was this with" the same way. Together with `lora.<n>.peers.*` those are what let a bar on the graph say `SUPE_GOT · 88B · tdeck` on hover — the tag itself appears only where it resolves to nobody, since once there is a name the hex is the part nobody reads — and what puts a peer's name in a pill beside a whole burst once the view is zoomed wide enough to hold it. `to`, `subj` and `hash` are the **detail** fields, written only while a viewer's `detailed` toggle is on (`sys.stats.{web,lcd}_details`) and absent otherwise — which is why the tag's slot is written empty rather than omitted when they follow it. `to` is where the packet was going and how far it has come (`3f2a11 h2`), which `tag` does not answer: `tag` names the node *this hop* was addressed to, and on a packet in transport that is the relay. `subj` is what the packet is **about**, and what that means is given by `desc` — the address a `PATH_REQUEST` asks for, the packet hash a `PROOF` proves, the link id a `LINKREQUEST` creates, the aspect an `ANNOUNCE` serves, the far end of an established link — and is empty where the kind has nothing of its own to say. `hash` is the packet's **own** hash, six hex characters of it, on everything that is not itself a proof: it is the name a proof for that packet will carry, so a viewer can join the two (the browser draws a line between them). Its own field rather than a case of `subj` because the packets most often proven — a link's data — have a subject worth keeping as well. All of it is cleartext: the header, and the payloads of the packets that carry none. What a packet carries past that is encrypted and stays unsaid. Written only with [loramon](../loramon) staged, and then only while one of its apps is open (`sys.stats.{web,lcd}_loramon` — the web key counted only while that browser's link is up, `webrtc.up`, since a tab that vanished cannot lower its own); deleted past 1 h. See INTERNALS §12. |
+| `lora.<n>.peers.<slot>` | The neighbourhood, one node per peer-table slot: `"<num>\|<supe>\|<tags…>\|<names…>\|<loss>\|<rssi>\|<snr>\|<q>\|<heard_s>\|<flags>\|<ratestep>"`, a field left empty where it is not known. `num` is the number `lora n` prints beside the node, so a viewer with no name to show falls back to the same `#4` the console does. Tags are the three-byte prefixes that resolve an address to this node, comma-joined and deduplicated; names are the first word of each announced LXMF name on its destinations. Published rather than derived, because the clustering lives in the peer table and nothing outside this straddle can rebuild it — a viewer sees frames, not the announces and proofs that grouped them. Written only with [loramon](../loramon) staged, and then only while a web reader says it is looking (`sys.stats.web_peers`, counted only while that reader's link is up — `webrtc.up`); deleted when a slot empties. Read by LoRaMon, which names the node behind a frame's tag; and there for graph views. On-device surfaces do not read it — they are in the same binary as the peer table and ask it directly (`loraNameForTag`), since serialising a fact so the same firmware can parse it back is a round trip for nothing. |
+| `lora.<n>.meas.<slot>.{tags,name,loss_to,snr_to,txp_to,to_ts,loss_from,snr_from,peer_txp,from_ts,rssi,snr,txp,heard_ts}` | SUPE's measurements of one neighbour, per peer-table slot, republished every 15 s while the table holds anyone and a frame has moved since the last publication, and deleted when the slot empties. `tags` is the comma-joined six-hex prefixes the node answers to (its destination hashes, identities and node key) — a reader that holds a destination hash finds the node by the hash's first six characters; `name` is its announced first-word names. Each direction is a path loss with the reading it was measured from: `loss_to` is us→them in dB from the peer's own report of how our frame landed, with `snr_to` (dB×10) the signal-to-noise it reported, `txp_to` (dBm) the power that frame of ours went out at and `to_ts` the unix second of the reading; `loss_from`/`snr_from`/`peer_txp`/`from_ts` are the same for them→us, a frame heard here against the power the peer stated for it. `rssi`/`snr` (dBm, dB×10) are the LAST level heard from the node and `heard_ts` when — the newest reading rather than the best one, since an envelope describes a row's whole life and says nothing about where the link is now; `txp` is what we last transmitted to it at. A field is absent when it is not known — only a SUPE peer states a power, so a plain Reticulum neighbour carries no loss at all and `rssi`/`snr`/`txp` are the whole of what is known about it. Those three are always present; `txp` falls back to the radio's configured power, which is what every frame leaves at where no per-peer power has been decided (nothing sent yet, or SUPE compiled out). Read by lxmf (Ping, contact bars) and the web contact list. `lora n` prints the same readings with their ages. |
 | `rns.pill.lora.*` | The top status line's LoRa pill (yellow `ffd400`, order 4, titled "LoRa"), written through rnsd: `L` and the number of other nodes heard, summed over every slot — a board with two radios still has one LoRa neighbourhood. Published while any slot is enabled, at 0 as readily as at 3, and taken down by the switch rather than by the tick (turning the last radio off stops the interface task). The colour and the title are published from boot regardless, because the network graph draws LoRa links between other nodes on a board whose own radio is off. See [rns/README](../rns/README.md#status-line-pills). |
 | `lora.<n>.chans` | The channel list the channel plan puts in force: `<freqHz>,<bwHz>` per channel, `\|`-separated, index = channel, `0` = the configured (calling) frequency. A single entry means no agility, which is how a viewer knows not to draw the extra graphs. Rewritten on a config apply. |
 | `lora.<n>.rssi` | The newest channel-RSSI sample set: `<ms>\|<ch0 dBm>\|<ch1 dBm>\|…`, one field per channel in `chans`, taken once a second **while a LoRaMon app is open** — with no viewer the radio is not sampled at all, so an idle node holds no per-second wake for it. The timestamp is in the value so a viewer can tell a fresh reading from a repeat; a channel that could not be measured this tick is an **empty field**, and a tick skipped entirely (the radio was busy, or the configured channel was not quiet enough to leave) republishes nothing at all — both read as gaps. Live only: no history is kept on the device. Absent, along with the sampling tick itself, without [loramon](../loramon) staged. See INTERNALS §18.3. |
@@ -243,24 +243,42 @@ lora <n> up | down            enable / disable one radio
 lora [<n>] n[eighbors] [-v]   observed direct neighbours, one numbered block per
                               node: every hash it owns with its aspect and
                               announced name, then a capability line
-                              ( TRANSPORT, ROAMING, SUPE STEP <k>, TX <dBm>,
+                              ( TRANSPORT, ROAMING, SUPE BUDGET <k>,
                                 EST <dBm>, USE <dBm> )
-                              — SUPE STEP is how far up the modulation rate table
-                              this pair can actually go, from both nodes'
-                              announced capabilities; STEP 0 is a real answer
-                              and means there is no rung above calling.
-                              TX is what a probe measured, EST what
+                              — SUPE BUDGET is how far up the modulation rate
+                              table this pair can actually go, from both nodes'
+                              announced capabilities; BUDGET 0 is a real answer
+                              and means there is no rung above hailing.
+                              EST is what
                               reciprocity infers from frames overheard, USE the
-                              power the last frame to it went out at — no
+                              power a frame to it goes out at — no
                               tilde when the peer itself reported what it heard
                               from us, `~` from a path loss measured the other
-                              way round, `~~` from EST alone.
-                              A `path loss` line follows for any node with a
-                              reading: `us->them <dB> (<age>)` from the peer's
-                              own report of how our frame landed, `them->us
-                              <dB> (<age>)` from a frame heard here against the
-                              power the peer stated for it; `?` where that
-                              direction has never been measured.
+                              way round and assumed reciprocal.
+                              With SUPE off on this radio there is no
+                              derivation to report: every frame goes out at the
+                              configured `tx_power` and USE says exactly that,
+                              while EST is absent — the request it names rides
+                              the protocol this radio is not speaking, so it
+                              would be an estimate driving nothing. The path
+                              losses stay: they are measurements, and they age
+                              in place until something states a power again
+                              (the peer's own announces keep them→us current).
+                              Then one line per measured direction:
+                              `us->them <dB> path loss, SNR <dB> @ tx <dBm>
+                              (<mW>), <age> ago` from the peer's own report of
+                              how our frame landed, and `them->us …` from a
+                              frame heard here against the power the peer
+                              stated for it. The loss leads because it is the
+                              link's own property whatever either end
+                              transmits at; the SNR says whether the link is
+                              weak or merely quiet; the power is what the loss
+                              was measured against, in watts beside the dBm.
+                              A direction nobody has measured has no line.
+                              A node outside the protocol states no power, so
+                              it can have no loss in either direction — it gets
+                              `last heard @ <dBm> / SNR <dB>, <age> ago`
+                              instead, which -v adds for every node.
                               This device's own rows (and an attached RNode
                               client's) come last, under their own heading:
                               they are what the radio hears itself saying, not
@@ -276,15 +294,26 @@ lora [<n>] n[eighbors] [-v]   observed direct neighbours, one numbered block per
                               which is what separates a neighbour from a memory,
                               so it is not detail and rides every medium's
                               listing alike.
+                              A node nothing has been heard from for two hours
+                              is dropped from the table altogether — off this
+                              listing, out of the pill's count, withdrawn from
+                              rnsd's neighbourhood — and the next frame from it
+                              builds a fresh row. Links that have gone quiet
+                              for ten minutes are likewise gone from the
+                              listing — off the node's hash lines, out of the
+                              header's open-link count, out of -v's link
+                              section: nothing announces a link ending, so
+                              silence is the only evidence there is.
                               -v adds the announce count, identities, signal
                               envelope, proof-based link quality, last-hour
                               traffic and link_ids.
                               Spelled either way; any prefix from `n` works.
-                              A SUPE node also lists its `tags`: the
-                              three-byte prefixes it answers to, which is what
-                              every SUPE log line names a node by. SUPE nodes
-                              only — for anyone else a tag is a detail of a
-                              protocol they do not speak.
+                              A SUPE node also lists its `ident`: the
+                              three-byte identity prefixes it answers to, which
+                              is what a SUPE log line names a node by and what
+                              a hail names its sender by. SUPE nodes
+                              only — for anyone else these name a protocol they
+                              do not speak.
                               (see INTERNALS §13)
                               This is the RICH view of the same nodes every
                               interface answers for through rnsd's shared table
@@ -298,6 +327,97 @@ lora [<n>] n[eighbors] [-v]   observed direct neighbours, one numbered block per
                               claim. What stays here is what does not fit a shape
                               every medium must fill: link ids, identity
                               prefixes, the negotiated rate step, the derived power.
+lora [<n>] p[robe] <num>      one round trip to a neighbour, then the link it
+                              measured: `rnprobe` to the node's
+                              `rnstransport.probe` address — the hash every
+                              node has and the one that answers a probe by
+                              itself — narrated as it goes, and then what this
+                              radio measured doing it, at the margin:
+
+                                  us->them 57 dB path loss, SNR 12 dB @ tx -9 dBm (126 µW), 0s ago
+                                  them->us 53 dB path loss, SNR 12 dB @ tx -9 dBm (126 µW), 0s ago
+
+                              **Everything printed is from this probe.** A loss
+                              line appears only where the probe's own exchange
+                              produced it, and is then milliseconds old; a
+                              reading older than the probe is left to `lora n`,
+                              which dates what it prints. Each line carries the
+                              power its reading was measured against, so the
+                              level at either end follows by subtraction and
+                              gets no line of its own.
+                              Where there is no loss at all — a node that
+                              states no power, or a radio with SUPE off — this
+                              radio's own two halves ARE the measurement, and
+                              they are printed instead:
+
+                                  sent at -9 dBm (126 µW), heard back at -62 dBm / SNR 12.0 dB
+
+                              the power the probe's frames radiated and how the
+                              answer came back, neither of which needs the
+                              protocol. A probe over another path transmitted
+                              nothing here and was answered elsewhere, so it
+                              prints neither half rather than a stale one
+                              standing in.
+                              The hashes and capabilities are `lora n`'s
+                              business and are not repeated.
+                              Only when a proof comes back. A probe that draws
+                              nothing has said so already, and printing what
+                              the radio knew beforehand under it would invite
+                              that to be read as the probe's own result.
+                              The two halves answer different questions, which
+                              is why they are printed together. The round trip
+                              says the node is reachable and what the whole
+                              path costs; the lines say what the link itself is
+                              doing. This is the one command that MAKES a
+                              measurement rather than reporting the last one
+                              that happened by.
+                              The path is Reticulum's to choose, not this
+                              radio's, and hearing a node is not the same as
+                              having a path to it: with another interface
+                              between the two nodes, or a transport node
+                              relaying, the probe takes that instead. Anything
+                              but one hop says so in a note — the round trip is
+                              then that path's and not this link's, and
+                              `rnpath <hash>` says which way it went.
+                              Blocks the console up to ~15 s, which outlives the
+                              ~5 s a `spangap cli` reply is framed for: an
+                              answered probe over a quick link lands well
+                              inside it, a slow or unanswered one is better run
+                              from an interactive session, or its tail is cut.
+                              A node that has not announced a transport probe
+                              address (or whose announce this radio has not
+                              heard) is named as such rather than probed at
+                              something else.
+lora [<n>] f[orget] <num>     drop a neighbour from the table — `<num>` is the
+lora [<n>] f[orget] all       number this radio's `lora n` printed beside it,
+                              `all` is every node out there (never this
+                              device's own rows). EVERYTHING about it goes: its
+                              hashes and identities, its link stubs, its signal
+                              and path-loss measurements, the adaptive power's
+                              learned offset and failure floor, its outstanding
+                              proof expectations, whether it speaks SUPE and at
+                              what budget, any hail owed to it or schedule held
+                              with it, and the records published about its slot
+                              (`lora.<n>.peers.<slot>`, `lora.<n>.meas.<slot>`).
+                              rnsd is told the node is gone, so it leaves the
+                              shared neighbourhood and NetGraph too. Nothing is
+                              kept: a belief that survives this is exactly the
+                              belief being corrected — a node that has moved,
+                              been reflashed or been reconfigured is described
+                              by a table that learned it before any of that.
+                              The next frame from it builds a fresh row from
+                              what that frame proves, which is also why this is
+                              not a block: forgetting is not ignoring.
+                              An exchange already on the air is left to finish —
+                              it is a conversation the far end is timing
+                              against, not a memory, and what it files on its
+                              way out is a fresh measurement.
+                              With no radio index, `all` takes every radio and a
+                              number takes radio 0, since a number belongs to
+                              one radio's listing.
+                              The numbers are positions in that listing, not
+                              names, so they close up behind a forget: read
+                              `lora n` again before naming the next one.
 lora [<n>] a[nnounce]         repeat every announce this node originated, then
                               announcement — now, rather than on demand only.
                               Each announce takes the channel on its own like

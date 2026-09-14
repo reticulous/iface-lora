@@ -1586,8 +1586,66 @@ transfer:
   browser mirror sees removals — unlike the implicit ~1 Hz ephemeral
   republish-merge, which never nulls a removed key (that asymmetry is why
   add/delete works here but a merge-only scheme couldn't expire on the browser).
-- **Gated on a viewer.** Recording runs only while `sys.stats.web_loramon` or
-  `sys.stats.lcd_loramon` is set (`loraMonWatched`), the actmon gating pattern.
+  A removal made while no browser is attached reaches nobody, and the dump on
+  the next connect is a merge that cannot retract it either, so the packet and
+  peer subtrees are declared snapshot-authoritative in the panel: the browser
+  drops them as a dump begins and the dump refills them.
+- **A packet is named from its whole header, not its type bits.**
+  `loraMonDescribe` runs the same `rnsParse` the observer does and reads the
+  three cleartext fields that say what a packet is, in this order: the CONTEXT
+  byte (what it is *for* — resource machinery, link lifecycle, a request or its
+  response), then the DESTINATION TYPE for the cases with no context of their
+  own, and the packet-type bits underneath both. The bits alone cannot tell a
+  path request from any other `DATA` packet, nor a path response from an
+  ordinary `ANNOUNCE`, and both used to read that way. A path request is
+  identified by its ADDRESS — the `rnstransport.path.request` destination, whose
+  hash is a constant of the protocol (`SHA-256` of the name, its first ten bytes
+  hashed again, the first sixteen of that) computed once at first use. Names are
+  the defining protocol's own, so the graph and a Reticulum log say one word;
+  codes are wire and append-only. A CRC failure is named nothing: reading a type
+  out of corrupted bytes is a confident guess, and the bar is already purple.
+- **The detail fields cost, so they are asked for.** `sys.stats.{web,lcd}_details`
+  (same link gate as the watch keys) turns on `monExtFill`, which fills `to` and
+  `subj` per record — a deeper read of every frame on the radio task, ~34 bytes
+  more in every record node, ~50 more in every queued `IfMsg` and in the batch
+  ahead of it. Only cleartext is read: the header, and the payloads of packets
+  that carry no encryption (an announce, a path request, a plain destination).
+  The two SHA-256 cases — a link request's link id, and the packet's own hash
+  for records with nothing better to say — are skipped for the head of a split,
+  because a hash over half a packet is not that packet's hash. `to` is the
+  destination and the hop count, which `tag` deliberately is not: `tag` names
+  the node THIS HOP was addressed to (the relay, on a packet in transport),
+  which is the neighbour a person watching the air is dealing with and what the
+  peer pills want. `hash` is the packet's own, on everything that is not itself
+  a proof — a proof names the hash of what it proves, so the two join, and the
+  browser draws the join rather than printing it.
+- **Broadcast is what a frame IS, never an address lookup.** `loraMonIsBroadcast`
+  is the whole list, and both directions in the bridge ask it. Reticulum
+  broadcasts in four shapes — `ANNOUNCE`, `PATH_REQUEST`, `PATH_RESPONSE`,
+  `TUNNEL_SYNTHESIZE` — and a kind left off the list falls through to
+  `loraMonCastOf`, which looks the frame's address up among ours, does not find
+  it, and calls the whole kind somebody else's unicast: grey on every graph. The
+  two control destinations also carry no `tag`, since their address is a
+  constant of the protocol and names no node. The same trap caught the proofs:
+  everything that asks "is this a proof" must ask `loraMonIsProof`, because
+  `LRPROOF`, `LINKPROOF` and `RESOURCE_PRF` were `LMD_RNS_PROOF` until the
+  context byte was read — the pending-elicitor lookup that names the peer behind
+  a proof is one such caller, and `annTrainChain` wants `PATH_RESPONSE` beside
+  `ANNOUNCE` for the same reason.
+- **Gated on a viewer, and the web viewer on its link.** Recording runs only
+  while `sys.stats.lcd_loramon` is set, or `sys.stats.web_loramon` is set **and
+  `webrtc.up` is 1** (`loraMonWatched`), the actmon gating pattern. The link
+  half is what makes the gate hold: a tab raises its own flag and can only lower
+  it while it is still there, so a tab that crashed, slept or lost its WiFi
+  leaves the flag standing forever — and with it a 1 Hz radio sample, a 1 Hz
+  interface beat against light sleep, and a subtree climbing to `LORA_MON_CAP`
+  for a viewer that is gone. `webrtc.up` is the link itself (published by
+  spangap-web's webrtc task while DTLS and SCTP are both up), so the falling
+  edge arrives within seconds of the tab vanishing whether or not the tab got a
+  word in — and the rising edge restarts recording on reconnect without the
+  browser having to ask again. The cost is that a web flag set by hand on a node
+  with no browser session does nothing; `sys.stats.lcd_loramon` is the CLI's
+  flag. `sys.stats.web_peers` carries the same gate, for the same reason.
   The flag is cached (`s_monWatched`, read as `loraMonOpen()`) and updated by a
   storage subscription on the watch keys the moment a viewer opens or closes —
   the callback wakes both tasks (`loraNudge` + an `IFM_KICK` on the record
@@ -1622,7 +1680,13 @@ transfer:
   than the one-hour window behind the extrapolation as a new boot and follow it
   back, because the firmware expires its own nodes at an hour and can never
   publish one that old. The RSSI tick checks it too, since on a quiet channel it
-  is the only thing publishing.
+  is the only thing publishing. A reboot the browser was *disconnected* for
+  never reaches that test — it is usually the reboot that dropped the link, and
+  an uptime under an hour leaves the new records nowhere near an hour behind —
+  so the panel throws the anchor away on every completed dump instead
+  (`syncEpoch`, loramon INTERNALS): a reconnect is a new session, and the first
+  record of it sets the clock. `restarted()` is the backstop for a restart that
+  somehow does not cost the link.
 - **Byte counts differ by one between directions.** A transmit record exempts
   our own air protocol from the split-header subtraction (`doneType ==
   LORA_PKT_OURS ? 0 : 1`); the receive path does not, and hands the record the
@@ -1693,7 +1757,7 @@ every RNS implementation. Surfaced by `lora neighbors` (all radios) /
 radio, `gp_alloc`'d at first `radioStart` and kept across config cycles and
 `rns stop`).
 
-- **Tap points.** `neiObserve()` is called with each whole (reassembled) RNS
+- **Tap points.** `peersObserve()` is called with each whole (reassembled) RNS
   packet: from `deliverInbound` (rx, before the rnsd gate, with the same-call
   rssi/snr) and `beginTx` (tx, carrying the packet's `LORA_ORIG_*`). It decodes
   the RNS header only — no payload crypto.
@@ -1831,8 +1895,16 @@ radio, `gp_alloc`'d at first `radioStart` and kept across config cycles and
   relayer announces for itself the row is real and every later rebroadcast
   attributes to it. The same frame identifies
   *us* symmetrically: a rebroadcast we transmit stamps our own transport
-  identity as transport_id, which becomes (or merges into) a `us … transit`
-  row — the identity this node is known by on the air when it relays.
+  identity as transport_id — the identity this node is known by on the air when
+  it relays, and the only place it ever surfaces, since µR's Transport keeps an
+  identity of its own (`transport_identity`, distinct from the one rnsd's
+  destinations hang off) and nothing announces it. It is filed as one more
+  identity on the **existing local row**, tagging it `transit`, rather than
+  minted as a row of its own: a fresh row would list as a second `us` holding
+  nothing but an identity nobody announced, which is what the listing would show
+  until the next own announce folded it away. A row is allocated only when that
+  endpoint has none yet — we can relay before we have ever announced — and
+  `observeAnnounce`'s local fold joins the two when we do.
 - **Handing the clustering to rnsd.** rnsd builds one neighbourhood for every
   medium and groups a node's destinations by asking the interface who
   transmitted them — free on a point-to-point medium, impossible per packet on a
@@ -1865,46 +1937,152 @@ radio, `gp_alloc`'d at first `radioStart` and kept across config cycles and
   IFAC frames (bit 0x80) are skipped; on an IFAC network the table stays empty
   and the CLI says so. Eviction throughout is oldest-first (local entries are
   never evicted).
-- **`neiIsLocal()` vs `isUs`.** Every RF-layer guard that means "this traffic
-  terminates at our transmitter" tests `neiIsLocal(e)` = `isUs || isRnode`:
+- **A node silent for two hours is gone** (`NEI_GONE_MS`, `peersExpire`). The
+  table is a claim about the neighbourhood *now*, and nothing ever says goodbye
+  — silence is the only evidence there is in either direction — so a row nothing
+  has been heard from for that long is retired outright rather than left to age
+  into an eviction: off `lora n`, out of the pill's count, withdrawn from rnsd.
+  "Heard" is the fresher of `lastHeardMs` and a SUPE peer's `supeHeardMs`, since
+  a protocol event names a node without any frame of its own being sampled. Two
+  hours is well past the last-hour rollup and past the furthest LoRaMon reads
+  back, so nothing that still has a frame to resolve loses the row it resolves
+  through. Local rows never retire — this device does not stop being itself when
+  the air is quiet.
+- **Retiring is not just freeing the slot** (`peersRetire`, shared by expiry and
+  by `peersAlloc`'s eviction). The slot index *is* the node's identity to
+  everything outside this table — rnsd's origin key, the queue's peer id, the
+  hash store's `node` field — so a retired row takes its rnsd declaration and
+  every hash filed against the slot with it. A stub left behind would attribute
+  the departed node's traffic to whoever is handed the slot next.
+- **Probing on demand** (`lora [<n>] p[robe] <num>`). The listing reports
+  measurements that traffic happened to produce; this is the one verb that
+  produces some. It resolves the number through the same `peersWalk` the printer
+  uses, takes the row's `rnstransport.probe` destination — the hash every node
+  has, and the only one that answers a probe by itself (`PROVE_ALL`, upstream's
+  own convention) — and hands it to rnsd's `rnsdProbe()`, which is `rnprobe`'s
+  own probe factored out for the purpose. Probing any other aspect of the node
+  would put a meaningless payload in front of an application and then wait on a
+  proof that application decides whether to give, so a row without that address
+  is told so instead.
+  What it prints afterwards is measured against a mark taken before the probe —
+  `millis()` and `LoraRadio::txFrames` — so nothing older than the verb itself
+  can appear under it. First `cliPrintLink`, the same renderer the listing
+  indents under each node, here at the margin with no pad and with its `since`
+  filter set, because in this verb the measurement is the answer rather than a
+  detail beneath a node, and a loss from ten minutes ago printed under a probe
+  reads as the probe's own. It returns whether it printed, and where it did the
+  verb stops: each loss line already carries the power its reading was measured
+  against, so the level at either end follows by subtraction, and a raw level
+  beside it would be a *different* frame's — the proof packet's rather than the
+  exchange frame's — inviting a subtraction that does not balance.
+  Where it printed nothing, this radio's own two halves are the measurement:
+  the frame counter having moved gives `txPwrNow`, what the probe's frames
+  radiated, and the row having been heard since the mark gives
+  `rssiLast`/`snrLast10`. A transmit power and a level need no protocol at all,
+  which is what makes that line the answer for a peer that states nothing about
+  itself and for a radio with SUPE switched off, where no path loss can exist.
+  A filtered `cliPrintLink` call leaves the raw-level fallback to the unfiltered
+  form for the same reason: this caller has a better line for it.
+  All of it only where a proof came back. A probe that drew nothing has already
+  said so, and the readings under it would be the ones the radio held
+  beforehand, read as the probe's own result. The hashes
+  and the capability line are `lora n`'s business and were on screen a moment
+  ago. It is read *after* the probe and re-resolved by destination hash rather
+  than through the row pointer, which the radio task may have merged or retired
+  during the wait. What it then shows includes the probe's own traffic — the
+  point of the pairing: a round trip says the node is reachable and what the
+  path costs, the two lines say what the link is doing. The path
+  is Reticulum's to choose, so a neighbour whose current path runs over another
+  interface is probed over that one — hearing a node is not having a path to
+  it — and any hop count but one prints a note saying the round trip belongs to
+  that path rather than to this link.
+  The failure to find a probe address names the row it looked at, because the
+  likeliest reason to see it is that the number moved: numbers are positions in
+  the listing, and a node whose identities have not been joined yet is exactly
+  the row that holds destinations and no transport probe among them. A moment
+  later `peersMergeInto` folds it into the node it belongs to and the numbers
+  shift back.
+- **Forgetting on demand** (`lora [<n>] f[orget] <num>|all`, `peersForget`). A
+  table that learned a node before it moved, was reflashed or was reconfigured
+  describes a node that no longer exists, and there is no way to correct a
+  belief except to drop it — so this drops all of them. `peersForgetRow` goes in
+  the order the references run: the link rows first, while the hashes naming
+  them still resolve to this row; then the proof expectations against its
+  destinations, since an answer to one would score against a row rebuilt from a
+  single frame; then `supeForgetPeer`, which offers every address the row
+  answers to (node key, identities, destination hashes) to `supeEngForget` —
+  the engine files against whichever of them it happened to see, and a hail
+  owed or a schedule held is state about a node like any other; then the two
+  publications about the slot (`loraPeerPubForget` — neither publisher's beat
+  can be relied on to run, one needing a LoRaMon viewer and the other a frame in
+  motion); and finally `peersRetire`, which takes rnsd's declaration and the
+  hash store's entries with it. What is deliberately NOT torn down is a meeting
+  already on the air: it is a conversation the far end is timing against rather
+  than a memory, and what it files on its way out is fresh measurement. The next
+  frame from the node builds a new row, which is the point — forgetting is not
+  ignoring.
+  It runs on the radio task through the same request/notify handshake as the
+  manual transmit (`fgtReq` → `peersForgetPoll` → `fgtResGen`), because the
+  table is that task's and a row freed under a walk is a dangling row; only a
+  parked task (`rns stop`, when nothing can be walking it) is served inline.
+- **`peersIsLocal()` vs `isUs`.** Every RF-layer guard that means "this traffic
+  terminates at our transmitter" tests `peersIsLocal(e)` = `isUs || isRnode`:
   eviction protection, the adaptive-power skips, the own-hash cluster and
   `probeOwnFirst4`, the announce-count and hash-advert walks, and
-  `neiDestIsLocal()` behind relay detection and next-hop selection. A packet
+  `peersDestIsLocal()` behind relay detection and next-hop selection. A packet
   addressed to the client's identities is delivered over the wire, so the radio
   must no more probe, power-adapt or route toward it than toward ourselves.
   Guards that genuinely mean "our own identities" keep plain `isUs`.
-  `neiWalk` emits both local rows in pass 0 numbered `0`, and refuses `0` as a
-  lookup — naming node `0` would be aiming the radio at this device. The
-  listing header reads `… and us`, `… and rnode`, or `… and us + rnode`.
+  `peersWalk` emits both local rows in pass 0 numbered `0`, and refuses `0` as a
+  lookup — naming node `0` would be aiming the radio at this device.
+  The local rows print last, under a `this device:` heading of their own —
+  they are what the radio hears itself saying, not who is out there, and in the
+  numbered list `us` reads as a neighbour. The heading names the RNode client
+  when there is one.
 
 ### 13.1 What `lora n` prints
 
 ```
-lora/0 neighbors: 2 others and us, 0 open links (observing 17m)
+lora/0 neighbors: 2 others, 0 open links (observing 17m)
 
-  us   6b87eb8bdbcd51dee010c5a20fd65ef9 rnstransport.probe
-       4e0521019085fd7dc7f9fb53e8c8d1a7 lxmf.delivery  "xiao"
+  1    d10d5106bcaa65df4a8c50a56d8f05f7 rnstransport.probe  3m ago
+       6793e13ec79d1c1b1372885105aa5cf7 rnsh  12m ago
+       04e893bce336c889329b89fd61a66ac5 lxmf.delivery  "Rop"  3m ago
+       ( TRANSPORT, SUPE BUDGET 3, USE -9 )
+       us->them 94 dB path loss, SNR 7 dB @ tx -9 dBm (126 µW), 4m ago
+       them->us 91 dB path loss, SNR 10 dB @ tx +22 dBm (158 mW), 3m ago
 
-  1    d10d5106bcaa65df4a8c50a56d8f05f7 rnstransport.probe
-       6793e13ec79d1c1b1372885105aa5cf7 rnsh
-       04e893bce336c889329b89fd61a66ac5 lxmf.delivery  "Rop"
-       ( TRANSPORT, SUPE, TX -9 )
+  2    71cdbfd09e0ea8f0ab17dd06cd0c6e3f rnstransport.probe  41m ago
+       b9351473........................ (link)
+       ( ROAMING )
+       last heard @ -104 dBm / SNR -3.0 dB, 41m ago
 
-  2    71cdbfd09e0ea8f0ab17dd06cd0c6e3f rnstransport.probe
-       b9351473........................ (not seen yet)
-       ( ROAMING, SUPE )
+this device:
+
+  us   6b87eb8bdbcd51dee010c5a20fd65ef9 rnstransport.probe  2m ago
+       4e0521019085fd7dc7f9fb53e8c8d1a7 lxmf.delivery  "xiao"  2m ago
 ```
 
-One numbered block per node — `us` first, then `1`, `2`, … — and **one line per
-hash**: full hash, aspect label, then the announced display name in quotes where
-the announce carried one. That name and that aspect label both come out of
+One numbered block per node — `1`, `2`, …, then this device's own rows last —
+and **one line per hash**: full hash, aspect label, the announced display name
+in quotes where the announce carried one, and when that hash was last heard.
+That name and that aspect label both come out of
 rnsd — `rnsdAnnounceName` and `rnsdAspectLabel` — rather than out of a decoder
 of our own: app_data is bytes an application chose, a name is only what survives
 being checked as text, and the node that sees every announce on every medium
 owns the rule. A second copy here would drift, and a drifted copy shows a
 different name on this pane than on every other surface of the same device. The
-transport hash leads each block, being the one hash every node has. A hash
-linked to a node but never heard directly prints as
+transport hash leads each block, being the one hash every node has. A hash a
+linkage frame filed against a node — a link identifier above all — prints as
+`<first-4>........ (link)`, only four bytes of it ever having been on the air;
+once that link has been quiet past `NEI_LINK_QUIET_MS` it is **not printed at
+all**, the listing being the neighbourhood as it is rather than as it was. The
+same cutoff governs the header's open-link count and `-v`'s link section
+(`linkIsOpen`), so nothing on this pane calls a dead session open. The tables
+keep both rows regardless — the hash is what a frame recorded an hour ago
+resolves through, and the link row is what a late frame of that session files
+against. A node with nothing but a four-byte claim to its name — a
+SUPE announcement heard before any Reticulum announce — prints that as
 `<first-4>........ (not seen yet)`.
 
 A capability line closes each non-`us` block:
@@ -1913,17 +2091,37 @@ A capability line closes each non-`us` block:
 |---|---|
 | `TRANSPORT` | it relayed someone else's frame to us — a rebroadcast announce naming itself as `transport_id`, or any HEADER_2 frame at hops > 0 that does |
 | `ROAMING` | its node-flags bit (a moving node wants more margin) |
-| `SUPE` (`RF_PROTO_NAME`) | it has spoken our air protocol to us — a SUPE announcement, or a 0x04 power request |
-| `EST <dBm>` | the power this node needs toward that peer, *inferred* by reciprocity from frames we overheard over the last three bucket-ring slots, crediting the peer with `s.lora.assumed_peer_txp` (default 22). It is the only source there is for a peer that does not speak our air protocol; for anything that does, a stated power replaces the assumed one and an exchange's reports (READY, the answering GOT) replace the direction (§15.2). |
-| `USE <dBm>` | what the last frame to this node went out at, and the tildes say how much of it was guessed: none when the peer itself reported the level our frame landed at, `~` from a path loss measured the other way round, `~~` from `EST` alone (§15). Absent means the configured `tx_power` — no evidence, or none of it fresh |
+| `SUPE BUDGET <k>` (`RF_PROTO_NAME`) | its SUPE announcement has been heard, and `<k>` is how far up the modulation rate table this pair can go — the ladder for the two nodes' families, capped by each end's announced top step. `BUDGET 0` is a real answer: the pair has no rung above hailing. A node that has spoken our air protocol without announcing (a 0x04 power request) tags plain `SUPE` |
+| `EST <dBm>` | the power this node needs toward that peer, *inferred* by reciprocity from frames we overheard over the last three bucket-ring slots, crediting the peer with `s.lora.assumed_peer_txp` (default 22). It is the only source there is for a peer that does not speak our air protocol; for anything that does, a stated power replaces the assumed one and an exchange's reports (READY, the answering GOT) replace the direction (§15.2). Printed only while the controller runs (`apEnabled`): the `0x04` request it names rides SUPE, so a radio not speaking it asks nobody anything |
+| `USE <dBm>` | what a frame to this node goes out at, and the tildes say how much of it was guessed: none when the peer itself reported the level our frame landed at, `~` from a path loss measured the other way round and assumed reciprocal (§15). Absent means the configured `tx_power` — no evidence, or none of it fresh. With the controller off the tag *is* the configured `tx_power`, stated plainly: `apTxPower` returns it for every frame, and `Neighbor::apPwr`/`apSrc` are display caches written only inside `apDerive`, so a row that still holds them is describing a transmission this radio would no longer make |
+
+Then one line per direction the radio has measured — the path loss, the
+signal-to-noise of the frame it was read from, the power that frame went out at
+in dBm and in watts, and the age of the reading. The loss leads because it is
+the one number that describes the link whatever either end transmits at
+(§15.1); the SNR beside it is what separates a weak link from a quiet one at the
+same level; the power is what the loss was measured against, and the watts are
+the half a reader can feel — 22 dBm and −9 dBm are three orders of magnitude
+apart and neither number says so. Both come from `fmtPower` in spangap-core's
+`compat.h`, so every surface that shows a power shows it the same way.
+
+A direction with no reading has no line, and a node outside SUPE has neither:
+it states no power, so nothing it sends can be turned into a loss. What it has
+is the level this radio read, and that is printed instead —
+`last heard @ -104 dBm / SNR -3.0 dB, 41m ago`. It is the **last** reading and
+not the envelope because the envelope spans the row's entire life: a node that
+walked out of range an hour ago still shows the −60 dBm it once managed, which
+is exactly the number nobody should be reading a link off. `-v` prints that line
+for every node, loss or no loss.
 
 Identities are the **join, not the display**: they build the rows but appear
-only under `-v`, which also adds the signal envelope, link quality, the
-last-hour rollup and the link_id section.
+only under `-v`, which also adds the signal envelope (`rssi min..max`, undated —
+the last-heard line carries the age), link quality, the last-hour rollup and the
+link_id section.
 
-Node numbers come from `neiWalk`, which the printer and the CLI's node
-resolver share, so the numbers on screen are always the ones the resolver
-accepts. The resolver takes a node number, a hex hash or prefix, or any unique
+Node numbers come from `peersWalk`, which the printer, `lora forget` and the
+CLI's node resolver share, so the numbers on screen are always the ones a
+command accepts. The resolver takes a node number, a hex hash or prefix, or any unique
 substring of an announced name; a 4+ byte hex hash that matches nothing is
 still accepted, so an off-table node can be probed. Both verbs abbreviate —
 `lora n` … `lora neighbours`, `lora a` … `lora announce`.
@@ -2013,7 +2211,7 @@ rank, and a node we have heard nothing from opens at the configured `tx_power`.
 
 | tier | evidence | margin |
 |---|---|---|
-| `AP_SRC_REPORT` | the peer stated the level our own frame landed at — READY or GOT reporting the HAIL, an opening GOT or the burst, whichever it answers: the only measurements of the direction we transmit in | `SUPE_TARGET_MARGIN_DB` |
+| `AP_SRC_REPORT` | the peer stated the level our own frame landed at — READY or GOT reporting the HAIL, an opening GOT or the burst, whichever it answers, and the END of an exchange we answered reporting our READY or GOT: the only measurements of the direction we transmit in | `SUPE_TARGET_MARGIN_DB` |
 | `AP_SRC_PAIR` | a frame heard here with the power the peer stated for it (§10's pairs, either the calling one or the step one, whichever is fresher) | `+ AP_RECIP_MARGIN_DB` |
 | `AP_SRC_NONE` | neither is fresh — **and every node outside SUPE, permanently**, since both tiers above need a power the peer stated | the configured `tx_power` |
 
@@ -2107,6 +2305,18 @@ did not name itself (`sender_ident=0`) leaves no row to resolve, and the answer
 takes the cap. Nothing needs third-party reach: no frame carries a hold, a
 reservation or a hint for anyone but its addressee, so there is no frame that
 must go out at maximum for somebody else's sake.
+
+**The answering side is measured too, and END is what does it.** Every frame
+that quotes a level back — READY, the opening GOT, the answering GOT — answers
+whoever opened the leg, so every report they carry flows to the hailer. A node
+that only ever answers would sit at `AP_SRC_PAIR` for ever against a peer it
+exchanges with constantly, paying the reciprocity margin for a measurement the
+exchange could have handed it. So END carries a reading of its own: the sender's
+reading of the peer's last frame, which on the answering side is its READY or
+GOT. `onEnd` files it through the same `apFileReport` as any other report,
+resolved against `SupeMeet::lastTxp`/`lastTxCfg` — what WE last put on the air,
+since the END cannot name which of our frames it heard and the last one is the
+frame it must have heard to be answering at all.
 
 **The burst's power is resolved where the burst flies, on the report just
 received.** The answer's reading — READY's of the HAIL or of our opening GOT
@@ -2659,9 +2869,10 @@ channel plan 0 — one channel, one immediate exchange (everything on the callin
   rate step 0:                    the frames, at the calling rate and the hail's
                                power, handed up as they land — nothing else
   rate step ≥1:                   both retune to the confirmed SF; the burst,
-                               END (3+n: the burst's power, a salt, one
-                               CRC-8 per frame), then BYE / RESEND / the
-                               answering GOT and its burst, as under a plan
+                               END (5+n: the burst's power, a salt, how B's
+                               answer landed here, one CRC-8 per frame), then
+                               BYE / RESEND / the answering GOT and its burst,
+                               as under a plan
 
 channel plan 1 — a channel plan (nine 500 kHz channels; the hail's hash seeds two
            time slots at +100 and +200..223 ms, each a channel and a derived word,
@@ -2672,7 +2883,9 @@ channel plan 1 — a channel plan (nine 500 kHz channels; the hail's hash seeds 
                                the hailed party speaks first, because the hail
                                asked it a question
   A→B  the frames      × n     at the confirmed rate step, flip-gap apart
-  A→B  END         3+n B   the checksum list IS the sequence
+  A→B  END         5+n B   the checksum list IS the sequence, and the
+                               reading is how B's answer landed here — B's
+                               only measurement of its own direction
   B→A  BYE               1 B   -or- RESEND (one repair round) -or- the
                                answering GOT (11+⌈n/8⌉: reading, repair mask,
                                B's count and length) with B's burst behind it
@@ -2865,8 +3078,12 @@ calling-rate burst flies at the hail's) — filed through `SUPE_EV_PAIR`, or
 against the link for the one peer that can never be named. `SUPE_EV_REPORT`
 carries the peer's account of our own transmission: every READY and GOT
 reports how the frame it answers was heard — the hail, our opening GOT, or
-the burst — which is the direction we transmit in, filed into `apFileReport`
-and consumed by the very next `txp_open` ask. The closing BYE/RESEND is the
+the burst — and every END reports how the peer's last frame reached its sender,
+which on the answering side is our own READY or GOT. That is the direction we
+transmit in, filed into `apFileReport` and consumed by the very next `txp_open`
+ask. READY and GOT always answer the side that opened the leg, so without END's
+reading a node that only ever answers would never measure its own direction at
+all (§15.5). The closing BYE/RESEND is the
 arrival proof (`SUPE_EV_TRAIN_OK`); an exchange dying after contact with our
 burst unconfirmed is `SUPE_EV_TRAIN_LOST`, and only that — missed slots, wide
 expiries and hail-backs feed nothing.

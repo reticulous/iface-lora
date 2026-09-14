@@ -88,6 +88,12 @@ static inline bool supeIsTypeByte(uint8_t b) {
 #define SUPE_LEVEL_MIN_DBM  (-192)
 #define SUPE_LEVEL_MAX_DBM  (63)
 
+/* The top of the range doubles as "no reading". +63 dBm is two kilowatts at the
+ * antenna and no receiver on earth reports it, so a field that must be present
+ * on the wire whether or not there is a measurement behind it says so with this
+ * rather than with a zero — 0 dBm is a level a real frame can arrive at. */
+#define SUPE_LEVEL_NONE     SUPE_LEVEL_MAX_DBM
+
 static inline uint8_t supeEncLevel(int dbm) {
     if (dbm < SUPE_LEVEL_MIN_DBM) dbm = SUPE_LEVEL_MIN_DBM;
     if (dbm > SUPE_LEVEL_MAX_DBM) dbm = SUPE_LEVEL_MAX_DBM;
@@ -535,9 +541,17 @@ struct SupeGot {
     uint8_t mask[SUPE_MASK_MAX];        /* bit i set: frame i is missing */
 };
 
+/* END — "that was my train, here is its checksum list, and here is how your
+ * last frame reached me." The reading is what makes the exchange teach BOTH
+ * ends: READY and GOT quote a level back to whoever opened the leg, so without
+ * this the answering party would learn only the direction it receives in, for
+ * ever (§15.2). Absent readings ride as SUPE_LEVEL_NONE. */
 struct SupeEnd {
     int8_t  pwrDbm;                     /* what the train it closes went out at */
     uint8_t salt;                       /* random — this goodbye's freshness (§7) */
+    bool    haveHeard;                  /* the reading below is one */
+    int16_t heardRssi;                  /* the peer's last frame, as it reached us */
+    int8_t  heardSnrQ;
     uint8_t count;                      /* implicit in the frame length */
     uint8_t csum[SUPE_TRAIN_MAX];
 };
@@ -552,7 +566,7 @@ struct SupeResendF {
 #define SUPE_READY_LEN         9
 #define SUPE_GOT_LEN         11
 #define SUPE_GOT_ANS_BASE    11        /* + maskLen */
-#define SUPE_END_BASE      3        /* + count */
+#define SUPE_END_BASE      5        /* + count */
 #define SUPE_BYE_LEN           1
 #define SUPE_RESEND_BASE       1        /* + maskLen */
 

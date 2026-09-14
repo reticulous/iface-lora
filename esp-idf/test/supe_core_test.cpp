@@ -279,6 +279,21 @@ static void testEndCodec(void) {
     eqi(d.pwrDbm, 5,
         "the train's power rides — stated after the fact, chosen on the report");
     ok(memcmp(d.csum, t.csum, 4) == 0, "the checksum list IS the sequence");
+    ok(!d.haveHeard,
+       "no reading rides as the sentinel, not as a zero — 0 dBm is a level");
+
+    /* The reading: how the peer's last frame reached the sender. It is the
+     * answering side's only measurement of the direction it transmits in. */
+    t.haveHeard = true;
+    t.heardRssi = -103;
+    t.heardSnrQ = supeEncSnrQ(-45);
+    n = supeEncEnd(f, sizeof f, &t);
+    ok(supeDecEnd(f, n, &d), "it decodes with a reading");
+    ok(d.haveHeard, "the reading is there");
+    eqi(d.heardRssi, -103, "the level rides");
+    eqi(supeDecSnr10(d.heardSnrQ), -45, "and its signal-to-noise, quarter-dB");
+    eqi(d.pwrDbm, 5, "beside the train's own power, which is a different fact");
+
     t.count = SUPE_TRAIN_MAX + 1;
     ok(supeEncEnd(f, sizeof f, &t) == 0, "a count past the train cap refuses");
 }

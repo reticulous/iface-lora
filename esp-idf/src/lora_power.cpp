@@ -420,12 +420,14 @@ int8_t apOpenPowerAt(LoraRadio* r, Neighbor* e, const SupeCfg* cfg) {
 
 /* The peer's account of our own transmission, from the MANIFEST that closes a
  * detour: the level it read, and the power we sent at. */
-void apFileReport(LoraRadio* r, Neighbor* e, int16_t rssi, int8_t ourTxp) {
+void apFileReport(LoraRadio* r, Neighbor* e, int16_t rssi, int16_t snr10,
+                  int8_t ourTxp) {
     if (!e) return;
-    e->haveApRpt = true;
-    e->apRptRssi = rssi;
-    e->apRptTxp  = ourTxp;
-    e->apRptMs   = millis();
+    e->haveApRpt  = true;
+    e->apRptRssi  = rssi;
+    e->apRptSnr10 = snr10;
+    e->apRptTxp   = ourTxp;
+    e->apRptMs    = millis();
     if (logIsVerbose(TAG))
         verb("lora/%d supe: peer read our %d dBm at %d dBm (loss %d dB)",
             r->idx, (int)ourTxp, (int)rssi, (int)ourTxp - (int)rssi);
@@ -435,18 +437,20 @@ void apFileReport(LoraRadio* r, Neighbor* e, int16_t rssi, int8_t ourTxp) {
  * states for it. Never a bare level — a path loss stays true while either end
  * adapts its own power (SUPE.md §10). Step 0 is the hailing configuration;
  * anything else files as the detour pair. */
-void supeFilePair(LoraRadio* r, Neighbor* e, int16_t rssi, int8_t peerTxp,
-                  uint8_t step) {
+void supeFilePair(LoraRadio* r, Neighbor* e, int16_t rssi, int16_t snr10,
+                  int8_t peerTxp, uint8_t step) {
     if (!e) return;
     uint32_t now = millis();
     if (step == 0) {
-        e->havePair = true;
-        e->pairRssi = rssi;
-        e->pairTxp  = peerTxp;
-        e->pairMs   = now;
+        e->havePair  = true;
+        e->pairRssi  = rssi;
+        e->pairSnr10 = snr10;
+        e->pairTxp   = peerTxp;
+        e->pairMs    = now;
     } else {
         e->haveStepPair  = true;
         e->stepRssi      = rssi;
+        e->stepSnr10     = snr10;
         e->stepTxp       = peerTxp;
         e->stepPairStep  = step;
         e->stepPairMs    = now;

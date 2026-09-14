@@ -245,23 +245,26 @@ static void noteSimple(SupeEngine* e, const uint8_t tag[SUPE_TAG_LEN], uint8_t e
 }
 
 static void notePair(SupeEngine* e, const uint8_t tag[SUPE_TAG_LEN],
-                     const SupeCfg* cfg, int16_t rssi, int8_t txp) {
+                     const SupeCfg* cfg, int16_t rssi, int16_t snr10, int8_t txp) {
     if (!tagUsable(tag)) return;
     SupePeerNote n = {};
     n.ev = SUPE_EV_PAIR;
     n.cfg = *cfg;
     n.rssiDbm = rssi;
+    n.snr10 = snr10;
     n.txpDbm = txp;
     e->host->peer_note(e->host->ctx, tag, &n);
 }
 
 static void noteReport(SupeEngine* e, const uint8_t tag[SUPE_TAG_LEN],
-                       const SupeCfg* cfg, int16_t theirReading, int8_t ourTxp) {
+                       const SupeCfg* cfg, int16_t theirReading, int8_t theirSnrQ,
+                       int8_t ourTxp) {
     if (!tagUsable(tag)) return;
     SupePeerNote n = {};
     n.ev = SUPE_EV_REPORT;
     n.cfg = *cfg;
     n.rssiDbm = theirReading;
+    n.snr10 = supeDecSnr10(theirSnrQ);
     n.txpDbm = ourTxp;
     e->host->peer_note(e->host->ctx, tag, &n);
 }
@@ -277,6 +280,16 @@ static void noteUnanswered(SupeEngine* e, const uint8_t tag[SUPE_TAG_LEN], int8_
                   + (e->host->rand32(e->host->ctx) % SUPE_HAIL_INTERVAL_JIT_MS);
     n.triedTxpDbm = txp;
     e->host->peer_note(e->host->ctx, tag, &n);
+}
+
+/* What we have just put on the air in this meeting, and what it flew at. The
+ * peer's END states how our last frame reached it and cannot name which frame
+ * that was; this is the other half of that measurement, and without the power
+ * behind it a level is not a path loss (§15.1). */
+static void noteOurTx(SupeMeet* m, int8_t txp, const SupeCfg* cfg) {
+    m->lastTxp = txp;
+    m->lastTxCfg = *cfg;
+    m->haveLastTx = true;
 }
 
 /* ─────────────── owed hails ─────────────── */
@@ -456,6 +469,27 @@ static SupeSched* schedAlloc(SupeEngine* e) {
         if (!victim || (int32_t)(s->epochMs - victim->epochMs) < 0) victim = s;
     }
     return victim;                     /* full: displace the oldest */
+}
+
+/* Forget a node (supe_engine.h): the hail we owe it, the schedules we hold with
+ * it, the proof returns filed against it. A proof return names its node by four
+ * bytes and a tag is three, so the match is on the three the protocol addresses
+ * by — the same prefix every other lookup here uses. The meeting is deliberately
+ * untouched. */
+void supeEngForget(SupeEngine* e, const uint8_t tag[SUPE_TAG_LEN]) {
+    if (!e || !tagUsable(tag)) return;
+    for (int i = 0; i < SUPE_OWED_MAX; i++) {
+        SupeOwed* o = &e->owed[i];
+        if (o->used && memcmp(o->ident, tag, SUPE_TAG_LEN) == 0) o->used = false;
+    }
+    for (int i = 0; i < SUPE_SCHED_MAX; i++) {
+        SupeSched* s = &e->sched[i];
+        if (s->used && s->haveTag && memcmp(s->tag, tag, SUPE_TAG_LEN) == 0) schedFree(e, s);
+    }
+    for (int i = 0; i < SUPE_PROOFRET_MAX; i++) {
+        SupeProofRet* r = &e->pret[i];
+        if (r->used && memcmp(r->node4, tag, SUPE_TAG_LEN) == 0) r->used = false;
+    }
 }
 
 static SupeSched* schedFindLive(SupeEngine* e, const uint8_t tag[SUPE_TAG_LEN],
@@ -1021,6 +1055,7 @@ void supeEngLaunch(SupeEngine* e) {
         e->plainOnce = offer;
         return;
     }
+    {   SupeCfg hc = hailCfgOf(e); noteOurTx(m, txp, &hc); }
     if (built) e->hailsOut++; else { e->hailBacksOut++; e->owedHails++; }
     eLog(e, true, "supe: HAIL %02x%02x%02x %u frames ceiling %u txp=%d%s",
          tag[0], tag[1], tag[2], (unsigned)h.count, (unsigned)h.budgetCeil,
@@ -1114,6 +1149,13 @@ static void openAsHailed(SupeEngine* e, SupeSched* s) {
         m->hailRssi = s->heardRssi;
         m->hailSnrQ = s->heardSnrQ;
     }
+    /* The hail is the last thing we heard from this peer, and our own END will
+     * quote it back — the schedule carried it across the wait. */
+    if (m->haveHail) {
+        m->lastRssi = m->hailRssi;
+        m->lastSnrQ = m->hailSnrQ;
+        m->haveLast = true;
+    }
     m->beganMs = eNow(e);
     m->worstRssi = 127;
     m->ourTxp = meetTxp(e, m->tag, m->haveTag, m->chan, &m->slotCfg);
@@ -1165,6 +1207,7 @@ static void openAsHailed(SupeEngine* e, SupeSched* s) {
             finishMeeting(e, false, "GOT would not transmit");
             return;
         }
+        noteOurTx(m, m->ourTxp, &m->slotCfg);
         enterTxPhase(m, SUPE_M_GOT_TX);
         eLog(e, true, "supe: GOT ch%u %u frames, propose budget %u, txp=%d",
              (unsigned)m->chan, (unsigned)hv.count, (unsigned)top, (int)m->ourTxp);
@@ -1192,6 +1235,7 @@ static void openAsHailed(SupeEngine* e, SupeSched* s) {
         finishMeeting(e, false, "READY would not transmit");
         return;
     }
+    noteOurTx(m, m->ourTxp, &m->slotCfg);
     enterTxPhase(m, SUPE_M_READY_TX);
     eLog(e, true, "supe: READY budget %u txp=%d for %u frames%s",
          (unsigned)budget, (int)m->ourTxp, (unsigned)m->exCount,
@@ -1271,6 +1315,7 @@ static void slotSpeakWide(SupeEngine* e, SupeSched* s, uint8_t k) {
         finishMeeting(e, false, "GOT would not transmit");
         return;
     }
+    noteOurTx(m, m->ourTxp, &m->slotCfg);
     e->slotsSpoken++;
     if (s->nSpoke < 255) s->nSpoke++;
     enterTxPhase(m, SUPE_M_GOT_TX);
@@ -1542,6 +1587,7 @@ static void fireNext(SupeEngine* e) {
         finishMeeting(e, false, "train frame would not transmit");
         return;
     }
+    noteOurTx(m, m->trainTxp, &m->cfg);
     m->txNext = (uint8_t)(idx + 1);
     if (m->txFired < 255) m->txFired++;
     enterTxPhase(m, m->txMaskAny ? SUPE_M_REPAIR_TX : SUPE_M_TRAIN_TX);
@@ -1554,6 +1600,14 @@ static void sendEnd(SupeEngine* e) {
     SupeEnd t = {};
     t.pwrDbm = m->trainTxp;
     t.salt   = (uint8_t)e->host->rand32(e->host->ctx);
+    /* How the peer's last frame reached us — its READY or GOT where we hailed,
+     * its hail where we answered one. This is the only measurement of the
+     * direction the PEER transmits in that the peer will ever get from this
+     * exchange, since the frames that quote a level back (READY, GOT) all
+     * answer whoever opened the leg (§15.2). */
+    t.haveHeard = m->haveLast;
+    t.heardRssi = m->lastRssi;
+    t.heardSnrQ = m->lastSnrQ;
     t.count  = m->tx.count;
     memcpy(t.csum, m->tx.csum, m->tx.count);
     size_t n = supeEncEnd(m->txEnd, sizeof m->txEnd, &t);
@@ -1562,6 +1616,7 @@ static void sendEnd(SupeEngine* e) {
         finishMeeting(e, false, "END would not transmit");
         return;
     }
+    noteOurTx(m, m->trainTxp, &m->cfg);
     m->txEndLen = (uint8_t)n;
     memcpy(m->lastEnd, m->txEnd, n);
     m->lastEndLen = (uint8_t)n;
@@ -1610,6 +1665,7 @@ static void sendClose(SupeEngine* e) {
         finishMeeting(e, false, "close would not transmit");
         return;
     }
+    noteOurTx(m, m->ourTxp, &m->cfg);   /* the close rides the train's tuning */
     enterTxPhase(m, SUPE_M_CLOSE_TX);
 }
 
@@ -1647,6 +1703,7 @@ static void alignTrain(SupeEngine* e, const SupeEnd* t) {
 static void noteLast(SupeMeet* m, int16_t rssi, int16_t snr10) {
     m->lastRssi = rssi;
     m->lastSnrQ = supeEncSnrQ(snr10);
+    m->haveLast = true;
 }
 
 /* A hail naming one of our addresses. Regime 0: answer it a turnaround later,
@@ -1662,7 +1719,7 @@ static void onHail(SupeEngine* e, const uint8_t* f, uint16_t len,
      * immediately — and hearing the node at all is presence. */
     if (h.haveIdent) {
         noteSimple(e, h.ident, SUPE_EV_ALIVE);
-        notePair(e, h.ident, &hail, rssi, h.pwrDbm);
+        notePair(e, h.ident, &hail, rssi, snr10, h.pwrDbm);
     }
     if (!supeEngTagIsOurs(e, h.tag)) { e->rxForeign++; return; }
     if (e->expired) { e->rxDiscard++; return; }
@@ -1722,6 +1779,7 @@ static void onHail(SupeEngine* e, const uint8_t* f, uint16_t len,
         m->haveHail = true;
         m->hailRssi = rssi;
         m->hailSnrQ = supeEncSnrQ(snr10);
+        noteLast(m, rssi, snr10);   /* the hail is what our END will report */
         m->beganMs = now;
         deferSend(e, SUPE_PEND_HAIL_ANSWER, SUPE_FLIP_MS);
         return;
@@ -1787,7 +1845,7 @@ static bool answerIsOurs(SupeEngine* e, const uint8_t hash[SUPE_HASH_LEN]) {
 /* Our hail was answered, or a rendezvous was kept: the schedule is consumed,
  * the run ends, and the hail's reading — the one measurement of the direction
  * we transmit in at the hailing configuration — is filed. */
-static void hailAnswered(SupeEngine* e, const SupeReady* g, int16_t rssi) {
+static void hailAnswered(SupeEngine* e, const SupeReady* g, int16_t rssi, int16_t snr10) {
     SupeMeet* m = &e->m;
     /* The train the hail described. Held since the hail where nothing else
      * needed the host's buffer; rebuilt here where something did — a slot
@@ -1814,12 +1872,12 @@ static void hailAnswered(SupeEngine* e, const SupeReady* g, int16_t rssi) {
     if (m->haveTag) {
         noteSimple(e, m->tag, SUPE_EV_ALIVE);
         noteSimple(e, m->tag, SUPE_EV_ANSWERED);
-        notePair(e, m->tag, &m->slotCfg, rssi, g->pwrDbm);
+        notePair(e, m->tag, &m->slotCfg, rssi, snr10, g->pwrDbm);
         if (m->fromHail) {
             SupeCfg hail = hailCfgOf(e);
-            noteReport(e, m->tag, &hail, g->heardRssi, m->hailTxp);
+            noteReport(e, m->tag, &hail, g->heardRssi, g->heardSnrQ, m->hailTxp);
         } else {
-            noteReport(e, m->tag, &m->slotCfg, g->heardRssi, m->ourTxp);
+            noteReport(e, m->tag, &m->slotCfg, g->heardRssi, g->heardSnrQ, m->ourTxp);
         }
     }
     if (m->fromHail) {
@@ -1849,6 +1907,7 @@ static void sendReady(SupeEngine* e) {
         finishMeeting(e, false, "READY would not transmit");
         return;
     }
+    noteOurTx(m, m->ourTxp, &m->slotCfg);
     enterTxPhase(m, SUPE_M_READY_TX);
     eLog(e, true, "supe: READY budget %u txp=%d for %u frames%s",
          (unsigned)m->budget, (int)m->ourTxp, (unsigned)m->exCount,
@@ -1864,7 +1923,7 @@ static void onGot(SupeEngine* e, const uint8_t* f, uint16_t len,
         if (!supeDecGot(f, len, 0, &hv) || hv.answering) { e->rxDiscard++; return; }
         if (!answerIsOurs(e, hv.g.hash)) { e->rxForeign++; return; }
         noteLast(m, rssi, snr10);
-        hailAnswered(e, &hv.g, rssi);
+        hailAnswered(e, &hv.g, rssi, snr10);
 
         /* The peer's train comes first; ours rides the answering turn. The
          * budget is ours to confirm: never above their proposal, never above
@@ -1903,8 +1962,8 @@ static void onGot(SupeEngine* e, const uint8_t* f, uint16_t len,
         noteLast(m, rssi, snr10);
         m->laterEnd = true;
         m->ourTrainConfirmed = true;
-        notePair(e, m->tag, &m->cfg, rssi, hv.g.pwrDbm);
-        noteReport(e, m->tag, &m->cfg, hv.g.heardRssi, m->trainTxp);
+        notePair(e, m->tag, &m->cfg, rssi, snr10, hv.g.pwrDbm);
+        noteReport(e, m->tag, &m->cfg, hv.g.heardRssi, hv.g.heardSnrQ, m->trainTxp);
         m->ourTrainRssi = hv.g.heardRssi;
         m->ourTrainSnrQ = hv.g.heardSnrQ;
         m->haveOurRead = true;
@@ -1913,6 +1972,7 @@ static void onGot(SupeEngine* e, const uint8_t* f, uint16_t len,
             nt.ev = SUPE_EV_TRAIN_OK;
             nt.cfg = m->cfg;
             nt.rssiDbm = hv.g.heardRssi;
+            nt.snr10 = supeDecSnr10(hv.g.heardSnrQ);
             nt.txpDbm = m->trainTxp;
             nt.haveLevel = true;
             if (m->haveTag) e->host->peer_note(e->host->ctx, m->tag, &nt);
@@ -1947,7 +2007,7 @@ static void onReady(SupeEngine* e, const uint8_t* f, uint16_t len,
 
     if (answerToHail) {
         /* The hailed party holds nothing for us: our train follows. */
-        hailAnswered(e, &g, rssi);
+        hailAnswered(e, &g, rssi, snr10);
         m->listener = false;
     } else {
         /* Our GOT is confirmed: attention, budget, ceiling. The schedule it
@@ -1961,8 +2021,8 @@ static void onReady(SupeEngine* e, const uint8_t* f, uint16_t len,
         if (m->haveTag) {
             noteSimple(e, m->tag, SUPE_EV_ALIVE);
             noteSimple(e, m->tag, SUPE_EV_ANSWERED);
-            notePair(e, m->tag, &m->slotCfg, rssi, g.pwrDbm);
-            noteReport(e, m->tag, &m->slotCfg, g.heardRssi, m->ourTxp);
+            notePair(e, m->tag, &m->slotCfg, rssi, snr10, g.pwrDbm);
+            noteReport(e, m->tag, &m->slotCfg, g.heardRssi, g.heardSnrQ, m->ourTxp);
         }
     }
     /* Stands in for the train's own reading until an answering GOT carries
@@ -2008,7 +2068,15 @@ static void onEnd(SupeEngine* e, const uint8_t* f, uint16_t len,
         eLog(e, true, "supe: END count %u against declared %u",
              (unsigned)t.count, (unsigned)m->exCount);
     if (m->haveTag && m->anyRx)
-        notePair(e, m->tag, &m->cfg, m->worstRssi, t.pwrDbm);
+        notePair(e, m->tag, &m->cfg, m->worstRssi, supeDecSnr10(m->worstSnrQ), t.pwrDbm);
+    /* The END's own reading: how OUR last frame reached the peer. It is the
+     * answering side's only measurement of the direction it transmits in —
+     * READY and GOT quote a level back to whoever opened the leg, and the
+     * answerer opens nothing — so without this it would never learn it (§15.2).
+     * Which frame of ours the peer heard it cannot say, so it resolves against
+     * the last we transmitted: the frame it must have heard to be answering. */
+    if (m->haveTag && t.haveHeard && m->haveLastTx)
+        noteReport(e, m->tag, &m->lastTxCfg, t.heardRssi, t.heardSnrQ, m->lastTxp);
     m->peerTrainTxp = t.pwrDbm;
     m->havePeerTxp = true;
     if (len <= sizeof m->lastEnd) {
@@ -2061,6 +2129,7 @@ static void answerEnd(SupeEngine* e) {
                 finishMeeting(e, false, "answering GOT would not transmit");
                 return;
             }
+            noteOurTx(m, m->ourTxp, &m->cfg);   /* it follows their train, at its tuning */
             m->repairExpect = m->missCount;     /* their repairs ride their close */
             enterTxPhase(m, SUPE_M_GOT_TX);
             return;

@@ -1178,6 +1178,7 @@ static void loraTaskMain(void*) {
                     loraMonDwell(r, millis());
             }
             manualTxPoll(r);    /* CLI tx/tx_psa/tx_prot; holds the radio while active */
+            peersForgetPoll(r); /* CLI forget; the table is this task's to edit */
             agcResetPoll(r);    /* front-end recalibration; skips a busy radio */
 #if !defined(CONFIG_LORA_NO_SUPE)
             /* The enable switch, applied where it is read. Nothing about the

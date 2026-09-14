@@ -86,6 +86,11 @@ uint32_t supeNextDeadlineMs(LoraRadio* r);
 void     supeTagAdd(LoraRadio* r, const uint8_t* addr, bool perm, uint32_t ttlMs);
 void     supeTagRelease(LoraRadio* r, const uint8_t* addr);
 void     supeProofRetFile(LoraRadio* r, const uint8_t phash[16], const uint8_t node4[4]);
+/* Drop every piece of engine state about one node of the peer table — under
+ * each of the addresses it answers to, since the engine files against whichever
+ * of them it saw. Paired with `lora forget`: a row goes and nothing about it
+ * may outlive it, least of all in the protocol that decides whether to hail it. */
+void     supeForgetPeer(LoraRadio* r, const struct Neighbor* e);
 void     supeAnnArm(LoraRadio* r);
 void     supeAnnCancel(LoraRadio* r);
 /* An announce this interface had never put on air just went out — ours for a

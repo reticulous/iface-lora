@@ -591,7 +591,9 @@ size_t supeEncEnd(uint8_t* out, size_t cap, const SupeEnd* t) {
     out[0] = SUPE_T_END;
     out[1] = supeEncLevel(t->pwrDbm);
     out[2] = t->salt;
-    memcpy(out + 3, t->csum, t->count);
+    out[3] = supeEncLevel(t->haveHeard ? t->heardRssi : SUPE_LEVEL_NONE);
+    out[4] = (uint8_t)(t->haveHeard ? t->heardSnrQ : 0);
+    memcpy(out + SUPE_END_BASE, t->csum, t->count);
     return n;
 }
 
@@ -599,10 +601,13 @@ bool supeDecEnd(const uint8_t* f, size_t len, SupeEnd* out) {
     if (len < SUPE_END_BASE + 1 || f[0] != SUPE_T_END) return false;
     size_t count = len - SUPE_END_BASE;
     if (count > SUPE_TRAIN_MAX) return false;
-    out->pwrDbm = (int8_t)supeDecLevel(f[1]);
-    out->salt   = f[2];
-    out->count  = (uint8_t)count;
-    memcpy(out->csum, f + 3, count);
+    out->pwrDbm    = (int8_t)supeDecLevel(f[1]);
+    out->salt      = f[2];
+    out->heardRssi = supeDecLevel(f[3]);
+    out->heardSnrQ = (int8_t)f[4];
+    out->haveHeard = out->heardRssi != SUPE_LEVEL_NONE;
+    out->count     = (uint8_t)count;
+    memcpy(out->csum, f + SUPE_END_BASE, count);
     return true;
 }
 

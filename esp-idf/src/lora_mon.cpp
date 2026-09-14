@@ -79,6 +79,13 @@ struct IfMsg {
     int16_t  snr10;      /* MON rx: deci-dB */
     uint8_t  nch;        /* RSSI: how many of chRssi carry a reading */
     int16_t  chRssi[LORA_CH_MAX];   /* RSSI: dBm per channel, index = channel */
+#if CONFIG_STRADDLE_LORAMON
+    /* MON: the two detail fields, empty unless a viewer asked for them. They
+     * ride in the message rather than being looked up on the interface task
+     * because the frame they are read from exists only on the radio task, and
+     * only for as long as the record takes to post. */
+    LoraMonExt ext;
+#endif
 };
 /* Deep enough for a burst of frames to land
  * inside ~500 ms without the storage side having to keep up frame for frame.
@@ -98,14 +105,21 @@ static QueueHandle_t s_ifq = nullptr;
  * radio task's code: a call site asks the same question either way. */
 #if CONFIG_STRADDLE_LORAMON
 static volatile bool s_monWatched = false;
+/* The same, for the `detailed` toggle. Its own flag because it is its own
+ * appetite: a viewer may watch the traffic for hours and want the detail for a
+ * minute of it, and the fields cost a deeper read of every frame here and ~34
+ * bytes in every record node for as long as the ring holds it. */
+static volatile bool s_monDetail = false;
 #else
 static constexpr bool s_monWatched = false;
+static constexpr bool s_monDetail  = false;
 #endif
 
 /* The radio task's read of it: true while a LoRaMon viewer (web or LCD) is
  * open. What hangs off this is not just recording but wake cycles — see
  * rssiSamplePoll and nextDeadline. */
 bool loraMonOpen(void) { return s_monWatched; }
+bool loraMonDetail(void) { return s_monDetail; }
 
 /* Post to the interface task. Never blocks: a full queue means the storage side
  * is behind, and dropping telemetry is the correct answer. Returns false so the
@@ -123,7 +137,11 @@ static bool ifPost(const IfMsg* m) {
  * frames. Publishing on the wrong one costs a rewrite of every peer row on
  * every stats beat for a reader that is not there. */
 static bool loraPeersWatched(void) {
-    return storageGetInt("sys.stats.web_peers", 0) != 0;
+    /* A browser-only key, so it is gated on the browser's link for the same
+     * reason the web half of loraMonWatched() is: the tab that raised it is the
+     * only party that can lower it, and a vanished tab never gets to. */
+    return storageGetInt("sys.stats.web_peers", 0) != 0 &&
+           storageGetInt("webrtc.up", 0) != 0;
 }
 
 /* The neighbourhood, one node per peer-table slot, for anything that has to
@@ -242,11 +260,23 @@ static void publishPeers(LoraRadio* r) {
  *
  *   lora.<n>.meas.<slot>.tags       6-hex prefixes the node answers to
  *   lora.<n>.meas.<slot>.name       announced first-word names
- *   lora.<n>.meas.<slot>.loss_to    dB, us→them          .to_ts    unix s of that reading
- *   lora.<n>.meas.<slot>.loss_from  dB, them→us          .from_ts  unix s of that reading
- *   lora.<n>.meas.<slot>.rssi       dBm, strongest heard .snr      dB×10, best heard
- *   lora.<n>.meas.<slot>.peer_txp   dBm the peer stated  .txp      dBm we last sent to it at
- *   lora.<n>.meas.<slot>.heard_ts   unix s last heard
+ *   lora.<n>.meas.<slot>.loss_to    dB, us→them          .snr_to   dB×10 the peer reported
+ *   lora.<n>.meas.<slot>.txp_to     dBm we sent it at    .to_ts    unix s of that reading
+ *   lora.<n>.meas.<slot>.loss_from  dB, them→us          .snr_from dB×10 read here
+ *   lora.<n>.meas.<slot>.peer_txp   dBm the peer stated  .from_ts  unix s of that reading
+ *   lora.<n>.meas.<slot>.rssi       dBm, LAST heard      .snr      dB×10, last heard
+ *   lora.<n>.meas.<slot>.heard_ts   unix s last heard    .txp      dBm we last sent to it at
+ *
+ * Only the two losses need SUPE — they are a level and a power the OTHER end
+ * stated, and nobody outside the protocol states one. `rssi`, `snr` and `txp`
+ * are always there: a level this radio read, and the power this radio sent at.
+ *
+ * Each direction is a loss with the reading it was measured from — the frame's
+ * signal-to-noise and the power it went out at — because a loss alone cannot
+ * say whether a link is weak or merely quiet, and the two numbers it is the
+ * difference of are what a person reads. rssi/snr are the LAST reading and not
+ * the best one: an envelope describes a row's whole life, so a node that walked
+ * out of range an hour ago would go on publishing the level it once managed.
  *
  * Separate fields rather than a packed string: the readers are other firmware
  * tasks and the browser, each after one or two of them, and storage deduplicates
@@ -290,22 +320,47 @@ static void publishMeas(LoraRadio* r) {
         };
         int      lossFrom = 0;
         uint32_t fromMs   = 0;
-        bool     haveFrom = peersLossFrom(e, &lossFrom, &fromMs);
+        int16_t  snrFrom  = 0;
+        int8_t   peerTxp  = 0;
+        bool     haveFrom = peersLossFrom(e, &lossFrom, &fromMs, &snrFrom, &peerTxp);
 
         storageBegin();
         storageSet((base + ".tags").c_str(), tags);
         storageSet((base + ".name").c_str(), names);
         setOr("loss_from", haveFrom,        lossFrom);
+        setOr("snr_from",  haveFrom,        snrFrom);
+        setOr("peer_txp",  haveFrom,        peerTxp);
         setOr("from_ts",   haveFrom,        haveFrom ? tsOf(fromMs) : 0);
         setOr("loss_to",   e->haveApRpt,    (int)e->apRptTxp - (int)e->apRptRssi);
+        setOr("snr_to",    e->haveApRpt,    e->apRptSnr10);
+        setOr("txp_to",    e->haveApRpt,    e->apRptTxp);
         setOr("to_ts",     e->haveApRpt,    e->haveApRpt ? tsOf(e->apRptMs) : 0);
-        setOr("rssi",      e->haveSig,      e->rssiMax);
-        setOr("snr",       e->haveSig,      e->snrMax10);
-        setOr("peer_txp",  e->havePair,     e->pairTxp);
-        setOr("txp",       e->haveApLastTxp, e->apLastTxp);
+        setOr("rssi",      e->haveSig,      e->rssiLast);
+        setOr("snr",       e->haveSig,      e->snrLast10);
+        /* The power our last frame to this peer went out at. Always present:
+         * where no per-peer power has been decided — nothing sent yet, or SUPE
+         * compiled out, which is every peer — every frame leaves at the radio's
+         * configured power, and that IS the answer. It is the only half of a
+         * link a node outside the protocol can state, so it must not go
+         * missing with the protocol. */
+        storageSet((base + ".txp").c_str(),
+                   e->haveApLastTxp ? (int)e->apLastTxp : (int)r->cfgTxp);
         setOr("heard_ts",  e->lastHeardMs != 0, e->lastHeardMs ? tsOf(e->lastHeardMs) : 0);
         storageEnd();
     }
+}
+
+/* One forgotten slot, off both publications at once (lora_mon.h). Neither
+ * publisher's own beat can be relied on to do it: the neighbourhood record is
+ * written only while a LoRaMon viewer is open, and the measurements only when a
+ * frame has moved — and a radio that has just forgotten everyone may hear
+ * nothing for hours. */
+void loraPeerPubForget(LoraRadio* r, int slot) {
+    char k[48];
+    snprintf(k, sizeof k, "lora.%d.peers.%d", r->idx, slot);
+    storageDeleteTree(k);
+    snprintf(k, sizeof k, "lora.%d.meas.%d", r->idx, slot);
+    storageDeleteTree(k);
 }
 
 /* True while any radio's table holds a neighbour worth publishing. */
@@ -396,10 +451,35 @@ void publishPill(void) {
  * straddle's two viewers, and is in the image only when one of them is. */
 #if CONFIG_STRADDLE_LORAMON
 
-/* True while a LoRaMon viewer (web or LCD) is open — gates recording. */
+/* True while a LoRaMon viewer (web or LCD) is open — gates recording.
+ *
+ * The browser's flag counts only while its link is up. A tab raises that flag
+ * about itself and can only lower it while it is still there: one that crashed,
+ * slept or lost its WiFi leaves it standing, and recording for a viewer that is
+ * gone costs a 1 Hz radio sample, a 1 Hz interface beat against light sleep and
+ * a subtree growing to LORA_MON_CAP — until something reboots. `webrtc.up` is
+ * the link itself, so the falling edge arrives within seconds of the tab
+ * vanishing, whether or not the tab got a word in. An LCD viewer is local and
+ * needs no link. The same gate is what the CPU sampler applies to its own web
+ * flag (spangap-core pm.cpp).
+ *
+ * It costs one thing worth knowing: a web flag set by hand on a node with no
+ * browser session (`store set sys.stats.web_loramon 1`) no longer records.
+ * `sys.stats.lcd_loramon` is the flag to set from the CLI. */
 static bool loraMonWatched(void) {
-    return storageGetInt("sys.stats.web_loramon", 0) ||
+    return (storageGetInt("sys.stats.web_loramon", 0) &&
+            storageGetInt("webrtc.up", 0)) ||
            storageGetInt("sys.stats.lcd_loramon", 0);
+}
+
+/* A viewer wants the detail fields too. Same shape and the same link gate; a
+ * detail flag left standing by a vanished tab would cost a third more heap per
+ * record for a reader that is gone. Meaningless without a viewer open, and
+ * cheap enough to ask that way round rather than tracking the pair. */
+static bool loraMonDetailWatched(void) {
+    return (storageGetInt("sys.stats.web_details", 0) &&
+            storageGetInt("webrtc.up", 0)) ||
+           storageGetInt("sys.stats.lcd_details", 0);
 }
 
 /* Delete published packet nodes older than the 1-hour window, and enforce the
@@ -425,8 +505,8 @@ static void loraMonExpire(LoraRadio* r, uint32_t now) {
 
 /* Publish one packet node `lora.<n>.packets.<ms>` holding a packed string:
  *
- *   r|rssi|snr|dur|bytes|type|ch|desc|cast[|tag]
- *   t|txp|dur|bytes|type|wait|ch|own|desc|cast[|tag]
+ *   r|rssi|snr|dur|bytes|type|ch|desc|cast[|tag[|to|subj|hash]]
+ *   t|txp|dur|bytes|type|wait|ch|own|desc|cast[|tag[|to|subj|hash]]
  *   a|ch|dur[|tag]
  *
  * The last is a DWELL: the radio was tuned to that channel and listening for
@@ -435,7 +515,9 @@ static void loraMonExpire(LoraRadio* r, uint32_t now) {
  * direction; snr is deci-dB; ch is the channel, 0 being the reticulum hailing
  * channel; desc is what the frame is (LMD_*); cast is who it was aimed at
  * (LMC_*); tag is six hex characters naming the peer, absent when unknown.
- * Then age old nodes out.
+ * `to`, `subj` and `hash` are the detail fields (LoraMonExt) and ride only
+ * while a viewer has the `detailed` toggle on — which is why the tag's slot is
+ * written empty rather than omitted when they follow it. Then age old nodes out.
  *
  * The dwell is what makes a viewer able to say where the radio *was*, which no
  * frame record can: a slot attended in silence, a meeting's channel held open,
@@ -446,7 +528,9 @@ static void loraMonExpire(LoraRadio* r, uint32_t now) {
  * INTERFACE TASK ONLY — this is the storage half of a record. */
 static void loraMonRecordOne(LoraRadio* r, const IfMsg* m) {
     if (!r->mon.pktMs || !r->mon.pktCap) return;
-    char key[40], val[56];
+    /* Big enough for the longest record plus both detail fields at their full
+     * width and the tag slot they need in front of them. */
+    char key[40], val[120];
 
     /* A stay on one channel is ONE record that grows, not one per beat. The
      * radio sits on the hailing channel whenever it is doing nothing, so a node
@@ -502,11 +586,23 @@ static void loraMonRecordOne(LoraRadio* r, const IfMsg* m) {
      * finds the field absent has the same answer as one that finds it empty.
      * A dwell carries one too — it is a meeting's slot, and the slot belongs to
      * the peer for its whole width whether or not a frame landed in it. */
-    if (m->tag[0] | m->tag[1] | m->tag[2]) {
-        size_t o = strlen(val);
-        snprintf(val + o, sizeof val - o, "|%02x%02x%02x",
-                 m->tag[0], m->tag[1], m->tag[2]);
-    }
+    size_t o = strlen(val);
+    bool haveTag = (m->tag[0] | m->tag[1] | m->tag[2]) != 0;
+    bool haveExt = m->ext.to[0] != '\0' || m->ext.subj[0] != '\0' ||
+                   m->ext.hash[0] != '\0';
+    if (haveTag)
+        o += snprintf(val + o, sizeof val - o, "|%02x%02x%02x",
+                      m->tag[0], m->tag[1], m->tag[2]);
+    /* The detail fields sit behind the tag, so the tag's slot has to be there
+     * to be counted past — empty where there was no tag to put in it. They are
+     * absent altogether while nobody asked for them, which is what makes the
+     * toggle worth having: a record written with the detail off is the record
+     * it always was. */
+    else if (haveExt)
+        o += snprintf(val + o, sizeof val - o, "|");
+    if (haveExt)
+        snprintf(val + o, sizeof val - o, "|%s|%s|%s",
+                 m->ext.to, m->ext.subj, m->ext.hash);
     storageSet(key, val);
 
     loraMonExpire(r, m->t_ms);                           /* age out + free a slot if full */
@@ -607,6 +703,191 @@ bool loraMonSenderOf(const uint8_t* f, size_t len, uint8_t type, uint8_t out[3])
     return true;
 }
 
+/* The two well-known Reticulum control destinations, hashed the way RNS hashes
+ * a destination that has no identity behind it: SHA-256 of "<app>.<aspects>",
+ * the first ten bytes of that hashed again, the first sixteen of the result.
+ * Computed once and kept — they are constants of the protocol, not of this
+ * node, and they are the only way to tell a path request from any other plain
+ * broadcast: nothing in the header says so, the ADDRESS does. */
+static uint8_t s_ctrlPathReq[16], s_ctrlTunnel[16];
+static bool    s_ctrlHashed = false;
+static void monCtrlHashes(void) {
+    if (s_ctrlHashed) return;
+    static const char* const kNames[2] = { "rnstransport.path.request",
+                                           "rnstransport.tunnel.synthesize" };
+    uint8_t* const out[2] = { s_ctrlPathReq, s_ctrlTunnel };
+    for (int i = 0; i < 2; i++) {
+        uint8_t h1[RNSD_HASH_LEN], h2[RNSD_HASH_LEN];
+        rnsdSha256((const uint8_t*)kNames[i], strlen(kNames[i]), h1);
+        rnsdSha256(h1, 10, h2);          /* NAME_HASH_LENGTH is 80 bits */
+        memcpy(out[i], h2, 16);
+    }
+    s_ctrlHashed = true;
+}
+
+#if CONFIG_STRADDLE_LORAMON
+/* Up to `max` characters of a cleartext payload, for the packets that have one:
+ * a PLAIN destination is unencrypted by definition. Anything unprintable ends
+ * the copy rather than becoming a dot — a field that stops early says "that is
+ * all the text there was", which is true, where a run of dots would suggest
+ * bytes worth looking at. */
+static void monText(char* dst, size_t max, const uint8_t* p, size_t n) {
+    size_t w = 0;
+    for (size_t i = 0; i < n && w + 1 < max; i++) {
+        if (p[i] < 0x20 || p[i] > 0x7e) break;
+        dst[w++] = (char)p[i];
+    }
+    dst[w] = '\0';
+}
+
+/* The two detail fields, read out of one frame. Everything here is CLEARTEXT —
+ * the header, which is never encrypted, and the payloads of the packets that
+ * carry none (an announce, a path request, a plain destination). What a packet
+ * carries past that is behind a key this node does not have, and the fields
+ * stay empty rather than guess.
+ *
+ * `complete` is false for the head of a split packet: its header is all there,
+ * so everything read out of the header still holds, but a hash taken over half
+ * a packet is not that packet's hash and must not be offered as one.
+ *
+ * RADIO TASK, and only while a viewer asked for the detail. */
+static void monExtFill(LoraRadio* r, const uint8_t* f, size_t len,
+                       uint8_t type, uint8_t desc, bool complete,
+                       LoraMonExt* ext) {
+    char hx[7];
+    if (type == LORA_PKT_OURS) {
+        /* Our own protocol has no Reticulum header to read. What it does carry,
+         * where it carries anything, is who is speaking — and that is the fact
+         * a person watching an exchange wants beside it. */
+        uint8_t s[3];
+        if (loraMonSenderOf(f, len, type, s)) {
+            loraHex(hx, s, 3);
+            snprintf(ext->subj, sizeof ext->subj, "%s", hx);
+        }
+        return;
+    }
+    if (type == LORA_PKT_BAD) return;        /* nothing in it was readable */
+
+    RnsHdr h;
+    if (len < 2 || !rnsParse(f + 1, len - 1, &h)) return;
+    monCtrlHashes();
+
+    /* Where the packet is going, and how far it has come. The record's `tag`
+     * names the node THIS HOP was addressed to — on a packet in transport that
+     * is the relay, which is the neighbour a person watching the air is dealing
+     * with and what the peer pills want. This is the other end of the journey,
+     * which nothing else in the record carries. */
+    loraHex(hx, h.dest, 3);
+    snprintf(ext->to, sizeof ext->to, "%s h%u", hx, (unsigned)h.hops);
+
+    switch (desc) {
+    case LMD_RNS_PATHREQ: {
+        /* The whole point of the packet, and not its destination: the address
+         * being asked about rides in the payload, followed by the asking
+         * transport's own identity where the request carries one. */
+        if (h.dataLen < 16) break;
+        char req[7]; loraHex(req, h.data, 3);
+        if (h.dataLen >= 32) {
+            char by[7]; loraHex(by, h.data + 16, 3);
+            snprintf(ext->subj, sizeof ext->subj, "%s by %s", req, by);
+        } else {
+            snprintf(ext->subj, sizeof ext->subj, "%s", req);
+        }
+        break;
+    }
+    case LMD_RNS_ANNOUNCE:
+    case LMD_RNS_PATHRESP: {
+        /* What the announced destination IS — the aspect behind its name hash,
+         * which sits in the clear behind the public key. rnsd holds the only
+         * table that can turn one back into a name, and it is the one fact
+         * about an announce that a person reads rather than decodes. */
+        if (h.dataLen < 74) break;
+        const uint8_t* nameHash = h.data + 64;
+        const char* label = rnsNameLabel(nameHash);
+        if (label) snprintf(ext->subj, sizeof ext->subj, "%s", label);
+        else { loraHex(hx, nameHash, 3); snprintf(ext->subj, sizeof ext->subj, "?%s", hx); }
+        break;
+    }
+    case LMD_RNS_LINKREQ: {
+        /* The link this packet creates. Every later packet of that session is
+         * addressed to it, so it is what joins a link's setup to its traffic —
+         * the one thread through an otherwise opaque conversation. */
+        if (!complete) break;
+        uint8_t lid[16];
+        rnsPacketHash(&h, f + 1, len - 1, true, lid);
+        loraHex(hx, lid, 3);
+        snprintf(ext->subj, sizeof ext->subj, "%s", hx);
+        break;
+    }
+    case LMD_RNS_PROOF:
+    case LMD_RNS_LRPROOF:
+    case LMD_RNS_LINKPROOF:
+    case LMD_RNS_RESPROOF: {
+        /* The packet being proven. An explicit proof carries its full 32-byte
+         * hash ahead of the signature, which is exactly what every other record
+         * here puts in this field — so a proof and the frame it answers meet on
+         * the graph. An implicit proof is signature alone and names nothing. */
+        if (h.dataLen >= 96) { loraHex(hx, h.data, 3);
+                               snprintf(ext->subj, sizeof ext->subj, "%s", hx); }
+        break;
+    }
+    case LMD_RNS_PLAIN:
+    case LMD_RNS_TUNNEL:
+        monText(ext->subj, sizeof ext->subj, h.data, h.dataLen);
+        break;
+    case LMD_RNS_CACHEREQ:
+        /* The packet it is asking for, by the same hash every other record
+         * here carries — so a cache request and what answers it meet. */
+        if (h.dataLen >= 16) { loraHex(hx, h.data, 3);
+                               snprintf(ext->subj, sizeof ext->subj, "%s", hx); }
+        break;
+    case LMD_RNS_LINKDATA:  case LMD_RNS_CHANNEL:   case LMD_RNS_REQUEST:
+    case LMD_RNS_RESPONSE:  case LMD_RNS_KEEPALIVE: case LMD_RNS_LINKIDENT:
+    case LMD_RNS_LINKCLOSE: case LMD_RNS_LINKRTT:   case LMD_RNS_COMMAND:
+    case LMD_RNS_CMDSTATUS: case LMD_RNS_RESPART:   case LMD_RNS_RESADV:
+    case LMD_RNS_RESREQ:    case LMD_RNS_RESHMU:
+    case LMD_RNS_RESCANCEL: case LMD_RNS_RESCANCEL_RX: {
+        /* A packet on an established link is addressed to the link and says
+         * nothing else about who it is with — the payload that would is
+         * encrypted. The peer table watched the link being set up, though, so
+         * the destination it was dialled to is on file. */
+        NeiLink* L = r->nei ? peersLinkFindBy3(r->nei, h.dest) : nullptr;
+        if (L && L->haveDest) { loraHex(hx, L->dest, 3);
+                                snprintf(ext->subj, sizeof ext->subj, "%s", hx); }
+        break;
+    }
+    default:
+        break;                       /* the kind has nothing of its own to say */
+    }
+
+    /* And what this packet IS, for everything that is not a proof: the hash a
+     * proof for it will carry, so a viewer can join the two. Its own field, not
+     * a case of `subj`, because the packets most often proven — a link's data —
+     * already have a subject worth keeping. A hash taken over the head of a
+     * split is not the packet's hash, so a split head carries none. */
+    if (complete && !loraMonIsProof(desc)) {
+        uint8_t ph[16];
+        rnsPacketHash(&h, f + 1, len - 1, false, ph);
+        loraHex(hx, ph, 3);
+        snprintf(ext->hash, sizeof ext->hash, "%s", hx);
+    }
+}
+
+#endif  /* CONFIG_STRADDLE_LORAMON — the detail fields */
+
+/* Aimed at everyone, by what the frame IS — see the header. */
+bool loraMonIsBroadcast(uint8_t desc) {
+    return desc == LMD_RNS_ANNOUNCE  || desc == LMD_ANNOUNCE ||
+           desc == LMD_RNS_PATHRESP  || desc == LMD_RNS_PATHREQ ||
+           desc == LMD_RNS_TUNNEL;
+}
+
+/* A proof of something, in any of its shapes — see the header. */
+bool loraMonIsProof(uint8_t desc) {
+    return desc == LMD_RNS_PROOF     || desc == LMD_RNS_LRPROOF ||
+           desc == LMD_RNS_LINKPROOF || desc == LMD_RNS_RESPROOF;
+}
+
 /* What one recorded frame IS and who it concerns, resolving which half of a
  * split it holds from the record stream itself.
  *
@@ -627,7 +908,9 @@ bool loraMonSenderOf(const uint8_t* f, size_t len, uint8_t type, uint8_t out[3])
  * RADIO TASK — called from the rx drain and from TxDone. */
 void loraMonClassify(LoraRadio* r, uint8_t dir, const uint8_t* f, size_t len,
                      uint8_t type, uint32_t now,
-                     uint8_t* desc, uint8_t* whole, uint8_t tag[3]) {
+                     uint8_t* desc, uint8_t* whole, uint8_t tag[3],
+                     LoraMonExt* ext) {
+    if (ext) { ext->to[0] = '\0'; ext->subj[0] = '\0'; }
     LoraRadio::MonSplit* ms = &r->monSplit[dir ? 1 : 0];
     bool split = type != LORA_PKT_OURS && len >= 1 && (f[0] & RNODE_FLAG_SPLIT);
     /* A head whose tail never came does not get to claim the next one. */
@@ -654,6 +937,15 @@ void loraMonClassify(LoraRadio* r, uint8_t dir, const uint8_t* f, size_t len,
     *desc  = loraMonDescribe(f, len, type);
     *whole = *desc;
     loraMonTagOf(f, len, type, tag);
+    /* The control destinations name no node. Their address is a constant every
+     * node computes the same way, so carrying it as the frame's tag would put
+     * one meaningless six-hex "peer" above every path request on the graph, and
+     * group them into a run as though they were a conversation with it. */
+    if (*desc == LMD_RNS_PATHREQ || *desc == LMD_RNS_TUNNEL)
+        tag[0] = tag[1] = tag[2] = 0;
+#if CONFIG_STRADDLE_LORAMON
+    if (ext && s_monDetail) monExtFill(r, f, len, type, *desc, !split, ext);
+#endif
     if (split) {
         ms->pend = true;
         ms->seq  = (uint8_t)(f[0] & 0xF0);
@@ -712,23 +1004,82 @@ uint8_t loraMonDescribe(const uint8_t* f, size_t len, uint8_t type) {
             default: return LMD_NONE;
         }
     }
+    /* A frame that failed its CRC decoded to nothing. Reading a packet type out
+     * of bytes the air corrupted puts a confident name on the graph that is
+     * true only by luck — and the bar is already purple, which says the whole
+     * of what can honestly be said about it. */
+    if (type == LORA_PKT_BAD) return LMD_NONE;
+
     /* Everything else flew behind this interface's own framing byte, and the
      * Reticulum header begins right after it. A split's TAIL carries no header
      * and must not reach here — the caller knows which half it holds and names
-     * a tail LMD_RNS_SPLIT itself. */
-    if (len < 2) return type == LORA_PKT_RNODE ? LMD_RNODE : LMD_NONE;
-    switch (f[1] & 0x03) {
-        case 0x00: return LMD_RNS_DATA;
-        case 0x01: return LMD_RNS_ANNOUNCE;
-        case 0x02: return LMD_RNS_LINKREQ;
-        default:   return LMD_RNS_PROOF;
+     * a tail LMD_RNS_SPLIT itself.
+     *
+     * Three cleartext fields decide the name, in this order: the CONTEXT byte,
+     * which says what the packet is for and is the same whatever carries it;
+     * then the DESTINATION TYPE for the cases with no context of their own; and
+     * the packet-type bits underneath both. A packet type alone cannot tell a
+     * path request from any other data packet, nor a path response from an
+     * ordinary announce — which is how both used to read. */
+    RnsHdr h;
+    if (len < 2 || !rnsParse(f + 1, len - 1, &h))
+        return type == LORA_PKT_RNODE ? LMD_RNODE : LMD_NONE;
+
+    switch (h.ptype) {
+    case NEI_PT_ANNOUNCE:
+        return h.ctx == NEI_CTX_PATH_RESP ? LMD_RNS_PATHRESP : LMD_RNS_ANNOUNCE;
+    case NEI_PT_LINKREQ:
+        return LMD_RNS_LINKREQ;
+    case NEI_PT_PROOF:
+        switch (h.ctx) {
+            case NEI_CTX_LRPROOF:   return LMD_RNS_LRPROOF;
+            case NEI_CTX_LINKPROOF: return LMD_RNS_LINKPROOF;
+            case NEI_CTX_RES_PRF:   return LMD_RNS_RESPROOF;
+            default:                return LMD_RNS_PROOF;
+        }
+    default: break;                                   /* NEI_PT_DATA */
+    }
+
+    switch (h.ctx) {
+        case NEI_CTX_RESOURCE:  return LMD_RNS_RESPART;
+        case NEI_CTX_RES_ADV:   return LMD_RNS_RESADV;
+        case NEI_CTX_RES_REQ:   return LMD_RNS_RESREQ;
+        case NEI_CTX_RES_HMU:   return LMD_RNS_RESHMU;
+        case NEI_CTX_RES_ICL:   return LMD_RNS_RESCANCEL;
+        case NEI_CTX_RES_RCL:   return LMD_RNS_RESCANCEL_RX;
+        case NEI_CTX_CACHE_REQ: return LMD_RNS_CACHEREQ;
+        case NEI_CTX_REQUEST:   return LMD_RNS_REQUEST;
+        case NEI_CTX_RESPONSE:  return LMD_RNS_RESPONSE;
+        case NEI_CTX_COMMAND:   return LMD_RNS_COMMAND;
+        case NEI_CTX_CMD_STAT:  return LMD_RNS_CMDSTATUS;
+        case NEI_CTX_CHANNEL:   return LMD_RNS_CHANNEL;
+        case NEI_CTX_KEEPALIVE: return LMD_RNS_KEEPALIVE;
+        case NEI_CTX_LINKIDENT: return LMD_RNS_LINKIDENT;
+        case NEI_CTX_LINKCLOSE: return LMD_RNS_LINKCLOSE;
+        case NEI_CTX_LRRTT:     return LMD_RNS_LINKRTT;
+        default: break;                               /* no context of its own */
+    }
+
+    switch (h.dtype) {
+    case NEI_DT_PLAIN:
+        /* A plain destination is unencrypted by definition, so what it is
+         * turns on WHICH destination — and the two that matter are constants
+         * of the protocol every node computes the same way. */
+        monCtrlHashes();
+        if (memcmp(h.dest, s_ctrlPathReq, 16) == 0) return LMD_RNS_PATHREQ;
+        if (memcmp(h.dest, s_ctrlTunnel,  16) == 0) return LMD_RNS_TUNNEL;
+        return LMD_RNS_PLAIN;
+    case NEI_DT_GROUP: return LMD_RNS_GROUP;
+    case NEI_DT_LINK:  return LMD_RNS_LINKDATA;
+    default:           return LMD_RNS_DATA;           /* SINGLE, no context */
     }
 }
 
 void loraMonPush(LoraRadio* r, uint8_t dir, uint32_t t_ms, uint16_t dur_ms,
                         uint16_t bytes, int16_t rssi, int16_t snr10, int8_t txp,
                         uint8_t type, uint16_t wait_ms, uint16_t own_ms,
-                        uint8_t desc, const uint8_t tag[3], uint8_t cast) {
+                        uint8_t desc, const uint8_t tag[3], uint8_t cast,
+                        const LoraMonExt* ext) {
 #if CONFIG_STRADDLE_LORAMON
     /* Airtime rollup runs whether or not a viewer is open — the hour it covers
      * is longer than a viewer is typically up, so it can't be built on demand.
@@ -777,6 +1128,11 @@ void loraMonPush(LoraRadio* r, uint8_t dir, uint32_t t_ms, uint16_t dur_ms,
     m.desc = desc;
     m.cast = cast;
     if (tag) memcpy(m.tag, tag, 3);
+#if CONFIG_STRADDLE_LORAMON
+    if (ext && s_monDetail) m.ext = *ext;
+#else
+    (void)ext;
+#endif
     if (!ifPost(&m)) r->mon.monDropped++;
 }
 
@@ -1112,6 +1468,7 @@ static void loraIfTaskMain(void*) {
              * a close drops the published subtree. */
             bool w = loraMonWatched();
             s_monWatched = w;
+            s_monDetail  = loraMonDetailWatched();
             if (prevWatch && !w)
                 for (int i = 0; i < kNumRadios; i++) loraMonClear(&s_radios[i]);
             prevWatch = w;
@@ -1179,6 +1536,7 @@ static void loraIfTaskMain(void*) {
 static void onWatchChange(const char* /*key*/, const char* /*val*/) {
 #if CONFIG_STRADDLE_LORAMON
     s_monWatched = loraMonWatched();
+    s_monDetail  = loraMonDetailWatched();
 #endif
     IfMsg m = {};
     m.kind  = IFM_KICK;
@@ -1200,6 +1558,14 @@ void loraMonStart(void) {
 #if CONFIG_STRADDLE_LORAMON
         storageSubscribeChanges("sys.stats.web_loramon", onWatchChange);
         storageSubscribeChanges("sys.stats.lcd_loramon", onWatchChange);
+        /* The `detailed` toggle on either surface. Its own keys: it is asked
+         * for and dropped mid-session, and every record written between the two
+         * carries a third more than the rest. */
+        storageSubscribeChanges("sys.stats.web_details", onWatchChange);
+        storageSubscribeChanges("sys.stats.lcd_details", onWatchChange);
+        /* The browser half of the watch is gated on the link, so the link going
+         * down closes a web viewer as surely as the viewer closing does. */
+        storageSubscribeChanges("webrtc.up",             onWatchChange);
 #endif
         /* Not a viewer's key: the stats flush and the pill are held back on a
          * node no UI can reach (uiTelemetryWanted), so the interface task has

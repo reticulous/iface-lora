@@ -167,6 +167,18 @@ void manualTxPoll(LoraRadio* r) {
     if (!r->txActive) manualTxFinish(r, true, "sent");
 }
 
+/* Service a pending `lora forget`, on the task that owns the peer table. It is
+ * a table edit and nothing else — no radio state, no air — so unlike a manual
+ * transmit it refuses nothing and waits for nothing: a radio that is down still
+ * holds a table, and forgetting is exactly what someone asks of a radio they
+ * have just reconfigured. */
+void peersForgetPoll(LoraRadio* r) {
+    if (!r->fgtReq) return;
+    r->fgtReq = false;
+    r->fgtResN = peersForget(r, r->fgtNum);
+    r->fgtResGen = r->fgtResGen + 1;      /* release the CLI's poll loop */
+}
+
 /* ─────────────── CLI ─────────────── */
 
 static const char* foundStr(const LoraRadio* r) {
@@ -318,6 +330,77 @@ static void cliAgo(char* b, size_t n, uint32_t now, uint32_t then) {
     else                snprintf(b, n, "%uh", (unsigned)(s / 3600));
 }
 
+/* A link still worth calling open. Nothing announces a teardown, so silence
+ * past NEI_LINK_QUIET_MS is the only evidence there is that a session is over
+ * — and a listing that counts one as open is describing a neighbourhood that
+ * has moved on. The row stays in the table either way: it is what a frame
+ * recorded an hour ago resolves through. */
+static bool linkIsOpen(const NeiLink* L, uint32_t now) {
+    return (uint32_t)(now - L->lastMs) <= NEI_LINK_QUIET_MS;
+}
+
+/* The link as this radio has measured it: one line per direction that has a
+ * path loss — the loss, the signal-to-noise of the frame it was read from, and
+ * the power that frame went out at in both units (§15.1). The loss leads
+ * because it is the link's own property whatever either end transmits at; the
+ * SNR says whether the link is weak or merely quiet; the power is what the loss
+ * was measured against. `us->them` is the peer's own report of how our frame
+ * landed, `them->us` a frame heard here against the power the peer stated for
+ * it, and a direction nobody has measured has no line — only a SUPE peer states
+ * a power, and without one a level is not a loss.
+ *
+ * With no loss at all, the level this radio read is the whole of what is known
+ * and is printed instead; `always` adds it beside a loss too (that is `-v`).
+ *
+ * `pad` is what each line is indented with: the listing tucks these under a
+ * node's block, `lora probe` prints them at the margin as the whole of its
+ * answer. One rendering either way, so the two surfaces cannot come to describe
+ * the same measurement differently.
+ *
+ * `since` (0 = no filter) drops any reading taken before that millis(): a
+ * caller reporting on something it just did shows what that produced and
+ * nothing else, since a loss from ten minutes ago printed under a probe reads
+ * as the probe's own answer. Such a caller owns the raw-level line too — it
+ * has a better one — so the fallback belongs to the unfiltered form.
+ *
+ * Returns whether anything was printed, which is what a caller with a fallback
+ * of its own needs to know. */
+static bool cliPrintLink(const Neighbor* e, uint32_t now, const char* pad, bool always,
+                         uint32_t since = 0) {
+    bool printed = false;
+    char ago[16], pw[16];
+    int      lossFrom = 0;
+    uint32_t fromMs   = 0;
+    int16_t  snrFrom  = 0;
+    int8_t   peerTxp  = 0;
+    bool     haveFrom = peersLossFrom(e, &lossFrom, &fromMs, &snrFrom, &peerTxp);
+    if (since) {
+        if (haveFrom && (int32_t)(fromMs - since) < 0) haveFrom = false;
+    }
+    if (e->haveApRpt && !(since && (int32_t)(e->apRptMs - since) < 0)) {
+        cliAgo(ago, sizeof ago, now, e->apRptMs);
+        cliPrintf("%sus->them %d dB path loss, SNR %.0f dB @ tx %+d dBm (%s), %s ago\n",
+                  pad, (int)e->apRptTxp - (int)e->apRptRssi,
+                  (double)e->apRptSnr10 / 10.0, (int)e->apRptTxp,
+                  fmtPower(e->apRptTxp, pw, sizeof pw), ago);
+        printed = true;
+    }
+    if (haveFrom) {
+        cliAgo(ago, sizeof ago, now, fromMs);
+        cliPrintf("%sthem->us %d dB path loss, SNR %.0f dB @ tx %+d dBm (%s), %s ago\n",
+                  pad, lossFrom, (double)snrFrom / 10.0, (int)peerTxp,
+                  fmtPower(peerTxp, pw, sizeof pw), ago);
+        printed = true;
+    }
+    if (!since && (always || (!haveFrom && !e->haveApRpt)) && e->haveSig) {
+        cliAgo(ago, sizeof ago, now, e->lastHeardMs);
+        cliPrintf("%slast heard @ %d dBm / SNR %.1f dB, %s ago\n",
+                  pad, (int)e->rssiLast, (double)e->snrLast10 / 10.0, ago);
+        printed = true;
+    }
+    return printed;
+}
+
 /* `local` selects which half of the table this pass prints: the neighbourhood,
  * or this device's own rows. They are two different subjects and the walk hands
  * them out in one sequence, so the filter is here. */
@@ -363,16 +446,17 @@ static void cliPrintNode(Neighbor* e, int num, void* ud) {
     }
     /* Hashes a linkage frame said mean this node — a link identifier above all
      * — which we have never heard announced. Only the first four bytes were
-     * ever on the air, hence the ellipsis. A timed-out one is still listed:
-     * nothing announces a link ending, so silence is all we have, and the row
-     * stays because a frame from an hour ago still resolves through it. */
+     * ever on the air, hence the ellipsis. A timed-out one is left out: this is
+     * a picture of the neighbourhood as it is, and a link that has been silent
+     * past NEI_LINK_QUIET_MS is over. The row itself stays in the store, where
+     * a frame recorded an hour ago still resolves through it. */
     for (int l = 0; ; l++) {
         uint8_t h4[4];
         if (!peersHashAt(c->r->nei, e, l, h4)) break;
         NeiHash* h = peersHashFind(c->r->nei, h4, 4);
-        cliPrintf(RNSD_PEER_ROW_FMT "%02x%02x%02x%02x........................ (link%s)\n",
-                  first ? lbl : "", h4[0], h4[1], h4[2], h4[3],
-                  h && h->timedOut ? ", timed out" : "");
+        if (h && h->timedOut) continue;
+        cliPrintf(RNSD_PEER_ROW_FMT "%02x%02x%02x%02x........................ (link)\n",
+                  first ? lbl : "", h4[0], h4[1], h4[2], h4[3]);
         first = false;
     }
     if (first) {   /* nothing but a bare node key */
@@ -458,52 +542,41 @@ static void cliPrintNode(Neighbor* e, int num, void* ud) {
         } else if (e->ourProto) add(RF_PROTO_NAME);
 #endif
         /* What we would ask this node to transmit at — the power request's own
-         * number. Only for a node that speaks our protocol, since that is the
-         * only node the request is ever sent to; against anyone else it would
-         * be an estimate driving nothing. */
+         * number. Only where the request is a thing this radio sends: it rides
+         * our air protocol, so a radio not speaking it asks nobody anything,
+         * and a node outside the protocol would not parse it. An estimate
+         * driving nothing is not worth a tag. */
         int est10;
-        if (e->ourProto &&
+        if (apEnabled(c->r) && e->ourProto &&
             peersEstimateCliff10(c->r, e, c->now, &est10, nullptr, nullptr)) {
             char t[24];
             snprintf(t, sizeof t, "EST %.0f", (double)est10 / 10.0);
             add(t);
         }
-        /* USE is the power the last frame to this node went out at, and the
-         * tilde says how much of it was guessed: none for the peer's own report
-         * of what it heard from us, one for a path loss measured the other way
-         * round and assumed reciprocal. Absent means the node is being
-         * transmitted to at the configured power — no evidence, none of it
-         * recent enough, or a node that does not speak the protocol and so
-         * never states a power to derive one from. */
-        if (e->apSrc != AP_SRC_NONE) {
-            char t[16];
+        /* USE is the power a frame to this node goes out at. With the
+         * controller running it is what the last one was derived at, and the
+         * tilde says how much of that was guessed: none for the peer's own
+         * report of what it heard from us, one for a path loss measured the
+         * other way round and assumed reciprocal; absent means the derivation
+         * had nothing fresh to work from and the configured power stands.
+         *
+         * With the controller off — this radio not speaking the protocol —
+         * there is no guessing to report and nothing stale to print: every
+         * frame goes out at exactly the configured `tx_power`, so that is what
+         * the tag says. The derived numbers a row still holds describe a
+         * transmission this radio would no longer make. */
+        char t[16];
+        if (!apEnabled(c->r)) {
+            snprintf(t, sizeof t, "USE %d", (int)c->r->cfgTxp);
+            add(t);
+        } else if (e->apSrc != AP_SRC_NONE) {
             snprintf(t, sizeof t, "USE %s%d",
                      e->apSrc == AP_SRC_REPORT ? "" : "~", (int)e->apPwr);
             add(t);
         }
         if (o) cliPrintf(RNSD_PEER_ROW_PAD "( %s )\n", f);
 
-        /* Path loss, both directions, each with the age of its reading — the
-         * one number that describes the link whatever either end transmits at
-         * (§15.1). us->them is the peer's own report of how our frame landed;
-         * them->us is a frame heard here against the power the peer stated for
-         * it. `?` is unmeasured: only a SUPE peer states a power, and a
-         * direction nobody has reported yet has no loss to print. */
-        int      lossFrom = 0;
-        uint32_t fromMs   = 0;
-        bool     haveFrom = peersLossFrom(e, &lossFrom, &fromMs);
-        if (haveFrom || e->haveApRpt) {
-            char to[32] = "?", from[32] = "?";
-            if (e->haveApRpt) {
-                cliAgo(ago, sizeof ago, c->now, e->apRptMs);
-                snprintf(to, sizeof to, "%d dB (%s)", (int)e->apRptTxp - (int)e->apRptRssi, ago);
-            }
-            if (haveFrom) {
-                cliAgo(ago, sizeof ago, c->now, fromMs);
-                snprintf(from, sizeof from, "%d dB (%s)", lossFrom, ago);
-            }
-            cliPrintf(RNSD_PEER_ROW_PAD "path loss  us->them %s  them->us %s\n", to, from);
-        }
+        cliPrintLink(e, c->now, RNSD_PEER_ROW_PAD, c->verbose);
     }
 
     if (c->verbose) {
@@ -512,10 +585,12 @@ static void cliPrintNode(Neighbor* e, int num, void* ud) {
             cliPrintf(RNSD_PEER_ROW_PAD "id:%s\n", hex);
         }
         if (e->haveSig) {
-            cliAgo(ago, sizeof ago, c->now, e->lastHeardMs);
-            cliPrintf(RNSD_PEER_ROW_PAD "rssi %d..%d dBm  snr %.1f..%.1f dB  heard %s ago\n",
+            /* The whole row's span, against the last-heard line's newest
+             * reading above it — the age belongs to that one, so it is not
+             * repeated here. */
+            cliPrintf(RNSD_PEER_ROW_PAD "envelope  rssi %d..%d dBm  snr %.1f..%.1f dB\n",
                       (int)e->rssiMin, (int)e->rssiMax,
-                      (double)e->snrMin10 / 10.0, (double)e->snrMax10 / 10.0, ago);
+                      (double)e->snrMin10 / 10.0, (double)e->snrMax10 / 10.0);
         }
         if (e->haveQuality)
             cliPrintf(RNSD_PEER_ROW_PAD "q %u/255 (%u/%u proofs)%s\n",
@@ -557,7 +632,7 @@ static void cliPrintNeighbors(int i, bool verbose) {
         else if (e->isUs) nUs++;
     }
     for (int k = 0; k < NEI_LINKS_MAX; k++)
-        if (st->links[k].used) nLinks++;
+        if (st->links[k].used && linkIsOpen(&st->links[k], now)) nLinks++;
 
     char ago[16];
     cliAgo(ago, sizeof ago, now, st->sinceMs);
@@ -585,7 +660,7 @@ static void cliPrintNeighbors(int i, bool verbose) {
     if (!verbose) return;
     for (int k = 0; k < NEI_LINKS_MAX; k++) {
         NeiLink* L = &st->links[k];
-        if (!L->used) continue;
+        if (!L->used || !linkIsOpen(L, now)) continue;
         char lid[33], dst[36];
         loraHex(lid, L->linkId, 16);
         if (L->haveDest) loraHex(dst, L->dest, 16);
@@ -849,6 +924,193 @@ static void cliSupe(int idx, const char* sub, const char* arg) {
  * observed links, negotiated power). */
 static bool cliIsNeighbors(const char* t) { return rnsdIsNeighborsVerb(t); }
 
+/* `lora [<n>] p[robe] <num>` — one round trip to a neighbour, then what this
+ * radio knows about it. The probe is `rnprobe`'s, to the node's
+ * `rnstransport.probe` destination: a Reticulum packet with a delivery proof
+ * behind it, which is the only way to measure a round trip at all.
+ *
+ * The two halves answer different questions and that is the point of putting
+ * them together. The round trip says the node is reachable and how long the
+ * whole path takes; the block under it says what the link itself is doing —
+ * path loss each way, the power it took, how the last frame landed. And the
+ * block is read AFTER the probe, so what it shows includes the probe's own
+ * traffic: this is the one command that makes a measurement rather than
+ * reporting the last one that happened by.
+ *
+ * The path is Reticulum's to choose, not this radio's. A direct neighbour
+ * answers at one hop over the radio it was heard on — the narration says how
+ * many — but a node this radio can hear whose path currently runs somewhere
+ * else is probed over that path, and the round trip is that path's. */
+static void cliProbe(int idx, const char* arg) {
+    LoraRadio* r  = &s_radios[idx];
+    NeiState*  st = r->nei;
+    if (!arg || !*arg) { cliPrintf("usage: lora %d probe <num>\n", idx); return; }
+    char* end = nullptr;
+    long  v = strtol(arg, &end, 10);
+    if (end == arg || *end || v <= 0) {
+        cliPrintf("probe what? a node number from `lora %d n`\n", idx);
+        return;
+    }
+    if (!st) { cliPrintf("lora/%d: no neighbours (the radio has never been up)\n", idx); return; }
+    int num = (int)v;
+    Neighbor* e = peersWalk(st, num, nullptr, nullptr);
+    if (!e) {
+        cliPrintf("lora/%d: no node %d — the numbers are `lora %d n`'s\n", idx, num, idx);
+        return;
+    }
+
+    /* The transport probe destination and nothing else. It is the hash every
+     * node has, it is the one that answers a probe by itself (PROVE_ALL), and
+     * it is the line this listing puts first. Probing some other aspect of the
+     * node would send a meaningless payload to an application and wait on a
+     * proof that application decides whether to give. */
+    uint8_t dest[16];
+    bool have = false;
+    for (int d = 0; d < e->nDests && !have; d++) {
+        const NeiDest* nd = &e->dests[d];
+        const char* asp = nd->haveName ? rnsNameLabel(nd->nameHash) : nullptr;
+        if (asp && strcmp(asp, "rnstransport.probe") == 0) {
+            memcpy(dest, nd->hash, 16);
+            have = true;
+        }
+    }
+    if (!have) {
+        /* Name the row, because the likeliest reason to be reading this is that
+         * the number now means a different node than it did a moment ago. The
+         * numbers are positions in the listing: a row arriving or being folded
+         * into another renumbers everything after it, and a node whose
+         * identities have not been joined yet is exactly the row with
+         * destinations and no transport probe among them. */
+        char first[33] = "(no hash of its own)";
+        if (e->nDests)          loraHex(first, e->dests[0].hash, 16);
+        else if (e->haveNode4)  snprintf(first, sizeof first, "%02x%02x%02x%02x…",
+                                         e->node4[0], e->node4[1], e->node4[2], e->node4[3]);
+        cliPrintf("lora/%d: node %d is %s and has no rnstransport.probe address here.\n"
+                  "        Either it has not announced one (a node answers probes only\n"
+                  "        with s.rnsd.respond_to_probes), this radio has not heard that\n"
+                  "        announce yet, or the numbers have moved since you read them —\n"
+                  "        they are positions in `lora %d n`, not names.\n",
+                  idx, num, first, idx);
+        return;
+    }
+
+    char names[NEI_NAME_MAX * 3];
+    peersNodeNames(e, names, sizeof names);
+    char hex[33];
+    loraHex(hex, dest, 16);
+    cliPrintf("lora/%d probe node %d%s%s  %s\n", idx, num,
+              names[0] ? " " : "", names, hex);
+
+    /* The mark everything below is measured against: nothing older than the
+     * moment this verb started is this verb's answer. */
+    uint32_t t0  = millis();
+    uint64_t tx0 = r->txFrames;
+
+    /* rnsd narrates the probe as it goes and blocks this task until it
+     * settles; the row may have been merged or retired underneath by then, so
+     * the listing is resolved again rather than through the old pointer. */
+    rnsd_probe_t res = {};
+    rnsdProbe("rnstransport.probe", dest, 32, 15, &res);
+
+    /* Nothing came back: the narration has already said so, and that IS the
+     * answer. Printing what the radio knew beforehand under a probe that failed
+     * invites it to be read as the probe's own result. */
+    if (res.status != RNSD_DEST_STATUS_DELIVERED) return;
+
+    /* Where the probe actually went. Reticulum sends on the path it holds, and
+     * a neighbour this radio hears is not automatically the path to it: with
+     * another interface between the two nodes — or a transport node relaying —
+     * the packet takes that instead, and the round trip above is that path's
+     * rather than this radio's. One hop is the direct case and needs no note.
+     * `rnpath <hash>` says which way it went. */
+    if (res.hops != 1)
+        cliPrintf("note: %u hops — the probe did NOT take this radio's direct link.\n"
+                  "      That round trip is another path's. `rnpath %s` says which\n"
+                  "      way it went; anything below is this radio's own air.\n",
+                  (unsigned)res.hops, hex);
+
+    Neighbor* now = peersFindByDest(st, dest);
+    if (!now) {
+        cliPrintf("lora/%d: node %d is gone from the table\n", idx, num);
+        return;
+    }
+
+    /* The path losses, where this probe is what produced them: a loss needs a
+     * power the far end stated, so these appear for a peer inside the protocol
+     * and are then milliseconds old. An older reading is left to `lora n`,
+     * which dates what it prints. Each line carries the power its reading was
+     * measured against, so the level at either end follows by subtraction and
+     * needs no line of its own. */
+    if (cliPrintLink(now, millis(), "", /*always=*/false, /*since=*/t0)) return;
+
+    /* Nothing stated a power, so there is no loss to have — and this radio's
+     * own two halves are the measurement: what the probe's frames radiated, and
+     * how the answer came back. Neither needs the protocol, and both are this
+     * probe's by construction. A probe that took another path transmitted
+     * nothing here and was answered elsewhere, so neither half appears rather
+     * than a stale one standing in. */
+    bool ourTx = r->txFrames > tx0;
+    bool heard = now->haveSig && (int32_t)(now->lastHeardMs - t0) >= 0;
+    if (ourTx || heard) {
+        char pw[16];
+        if (ourTx) cliPrintf("sent at %+d dBm (%s)", (int)r->txPwrNow,
+                             fmtPower(r->txPwrNow, pw, sizeof pw));
+        if (heard) cliPrintf("%sheard back at %d dBm / SNR %.1f dB",
+                             ourTx ? ", " : "",
+                             (int)now->rssiLast, (double)now->snrLast10 / 10.0);
+        cliPrintf("\n");
+    }
+}
+
+/* `lora [<n>] f[orget] <num>|all` — drop a node from the table, by the number
+ * `lora n` printed beside it. Everything about it goes: its addresses, its
+ * links, its measurements, and whether it speaks our air protocol. Nothing is
+ * kept "just in case" — a belief that survives a forget is exactly the belief
+ * somebody is trying to correct, and the table is a claim about the
+ * neighbourhood NOW, rebuilt from the next frame the node sends.
+ *
+ * The work happens on the radio task (peersForgetPoll), which owns the table.
+ * The exception is a parked task — `rns stop` — where nothing else can be
+ * walking it and waiting would only time out. */
+static void cliForget(int idx, const char* arg) {
+    LoraRadio* r = &s_radios[idx];
+    if (!arg || !*arg) { cliPrintf("usage: lora %d forget <num>|all\n", idx); return; }
+    int num = -1;                                   /* -1 = every node out there */
+    if (!cliVerbIs(arg, "all", 1)) {
+        char* end = nullptr;
+        long  v = strtol(arg, &end, 10);
+        if (end == arg || *end || v <= 0) {
+            cliPrintf("forget what? a node number from `lora %d n`, or all\n", idx);
+            return;
+        }
+        num = (int)v;
+    }
+    if (!r->nei) {
+        cliPrintf("lora/%d: nothing to forget (the radio has never been up)\n", idx);
+        return;
+    }
+    int n;
+    if (!s_task || s_stop) {
+        n = peersForget(r, num);
+    } else {
+        uint32_t gen = r->fgtResGen;
+        r->fgtNum = num;
+        r->fgtReq = true;
+        xTaskNotifyGive(s_task);
+        for (int i = 0; i < 100 && r->fgtResGen == gen; i++) delay(20);   /* ≤ 2 s */
+        if (r->fgtResGen == gen) {
+            cliPrintf("lora/%d forget: no result (timeout)\n", idx);
+            return;
+        }
+        n = r->fgtResN;
+    }
+    if (n < 0) {
+        cliPrintf("lora/%d: no node %d — the numbers are `lora %d n`'s\n", idx, num, idx);
+        return;
+    }
+    cliPrintf("lora/%d forgot %d node%s\n", idx, n, n == 1 ? "" : "s");
+}
+
 /* Pointer into `orig` just past the first `skip` whitespace-separated tokens,
  * with the remaining text kept verbatim (embedded spaces included). Returns null
  * if there are fewer than `skip` tokens; may point at the terminating NUL (empty
@@ -953,6 +1215,8 @@ void cliLora(const char* args) {
         cliPrintf("%-*s status for one radio\n",            CLI_HELP_COL, "lora <n>");
         cliPrintf("%-*s enable/disable (no <n> = all)\n",   CLI_HELP_COL, "lora [<n>] up|down");
         cliPrintf("%-*s observed direct neighbours (-v for detail)\n", CLI_HELP_COL, "lora [<n>] n[eighbors]");
+        cliPrintf("%-*s round trip to a neighbour, then what this radio knows\n", CLI_HELP_COL, "lora [<n>] p[robe] <num>");
+        cliPrintf("%-*s forget a neighbour, or every one — by its `n` number\n", CLI_HELP_COL, "lora [<n>] f[orget] <num>|all");
 #if !defined(CONFIG_LORA_NO_SUPE)
         cliPrintf("%-*s repeat every announce, then our SUPE announcement\n", CLI_HELP_COL, "lora [<n>] a[nnounce]");
 #else
@@ -976,6 +1240,19 @@ void cliLora(const char* args) {
         for (int i = 0; i < kNumRadios; i++) cliPrintNeighbors(i, v);
         return;
     }
+    /* `lora f[orget] all` with no index means every radio — there is no number
+     * to be ambiguous about, and "all" said of a neighbourhood means all of it.
+     * A number belongs to one radio's listing, so that form takes radio 0 like
+     * every other index-less verb here. */
+    if (cliVerbIs(tok[0], "forget", 1)) {
+        const char* a = nt > 1 ? tok[1] : nullptr;
+        if (a && cliVerbIs(a, "all", 1))
+            for (int i = 0; i < kNumRadios; i++) cliForget(i, a);
+        else
+            cliForget(0, a);
+        return;
+    }
+    if (cliVerbIs(tok[0], "probe", 1)) { cliProbe(0, nt > 1 ? tok[1] : nullptr); return; }
     if (cliVerbIs(tok[0], "announce", 1)) { cliAnnounce(0); return; }   /* no index → radio 0 */
 #if !defined(CONFIG_LORA_NO_SUPE)
     if (cliVerbIs(tok[0], "supe", 1)) {                       /* likewise */
@@ -1011,6 +1288,8 @@ void cliLora(const char* args) {
         cliPrintNeighbors((int)idx, nt > 2 && strcmp(tok[2], "-v") == 0);
         return;
     }
+    if (cliVerbIs(cmd, "probe", 1))  { cliProbe((int)idx, nt > 2 ? tok[2] : nullptr); return; }
+    if (cliVerbIs(cmd, "forget", 1)) { cliForget((int)idx, nt > 2 ? tok[2] : nullptr); return; }
     /* `lora [<n>] a[nnounce]` — replay every buffered announce, then the radio
      * check, now rather than at the next beat. The beat restarts from here. */
     if (cliVerbIs(cmd, "announce", 1)) { cliAnnounce((int)idx); return; }

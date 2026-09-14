@@ -175,8 +175,9 @@ void   apHeard(Neighbor* e, uint32_t now);
 #if !defined(CONFIG_LORA_NO_SUPE)
 /* The same, resolved where the frame is about to fly — a granted detour step. */
 int8_t apOpenPowerAt(LoraRadio* r, Neighbor* e, const SupeCfg* cfg);
-void   supeFilePair(LoraRadio* r, Neighbor* e, int16_t rssi, int8_t peerTxp,
-                    uint8_t step);
+void   supeFilePair(LoraRadio* r, Neighbor* e, int16_t rssi, int16_t snr10,
+                    int8_t peerTxp, uint8_t step);
 /* The peer's account of our own frame: what it read, at what we sent. */
-void   apFileReport(LoraRadio* r, Neighbor* e, int16_t rssi, int8_t ourTxp);
+void   apFileReport(LoraRadio* r, Neighbor* e, int16_t rssi, int16_t snr10,
+                    int8_t ourTxp);
 #endif  /* CONFIG_LORA_NO_SUPE */

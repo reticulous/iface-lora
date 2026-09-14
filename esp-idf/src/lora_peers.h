@@ -45,8 +45,17 @@ struct LoraRadio;
 #define NEI_HASHES_MAX       48      /* shared: hashes linked to a node by 0x03 */
 /* Silence that means a link is over. Nothing announces a teardown, so this is
  * the only evidence available; generous, because the cost of calling a live
- * link dead is only that it sorts first for eviction. */
+ * link dead is only that it sorts first for eviction. A link the printer calls
+ * over is not listed at all — the row survives for resolution, not for display. */
 #define NEI_LINK_QUIET_MS    (10u * 60u * 1000u)
+/* Silence that means a node is gone. A neighbour is a claim about the radio
+ * neighbourhood NOW, and a row nothing has been heard from for this long is a
+ * memory, so it is retired outright: off `lora n`, out of the count the status
+ * pill shows, withdrawn from rnsd's neighbourhood. Well past the last-hour
+ * rollup and past the furthest LoRaMon reads back, so nothing that still has a
+ * frame to resolve loses the row it resolves through. Local rows are never
+ * retired — this device does not stop being itself when the air is quiet. */
+#define NEI_GONE_MS          (2u * 60u * 60u * 1000u)
 
 struct NeiBucket {                  /* one 5-minute rollup slot */
     uint32_t absIdx;                /* millis()/NEI_BUCKET_MS this slot holds */
@@ -85,8 +94,13 @@ struct Neighbor {
     uint8_t  nIds;
     NeiDest  dests[NEI_DESTS_MAX];
     uint8_t  nDests;
-    /* Signal envelope over rx frames provably transmitted by this node. */
+    /* Signal envelope over rx frames provably transmitted by this node, and the
+     * newest reading of the pair — the envelope describes the whole history of
+     * a row and says nothing about where the link is NOW, which is the one
+     * number a node outside the protocol offers at all (no stated power, so no
+     * path loss). `lastHeardMs` times both. */
     bool     haveSig;
+    int16_t  rssiLast, snrLast10;
     int16_t  rssiMin, rssiMax;
     int16_t  snrMin10, snrMax10;
     uint32_t lastHeardMs;
@@ -146,19 +160,23 @@ struct Neighbor {
      * wants to know which is which, and because the fresher of them wins. */
     bool     havePair;
     int16_t  pairRssi;
+    int16_t  pairSnr10;
     int8_t   pairTxp;
     uint32_t pairMs;
     bool     haveStepPair;
     int16_t  stepRssi;
+    int16_t  stepSnr10;
     int8_t   stepTxp;
     uint8_t  stepPairStep;
     uint32_t stepPairMs;
-    /* The peer's own account of what OUR frame landed at, from the MANIFEST
-     * that closes a detour: the level it read, and the power we sent at. The
-     * only measurement of the us→them direction that exists — everything else
-     * is reciprocal — so it outranks every pair. */
+    /* The peer's own account of what OUR frame landed at — a READY or GOT
+     * answering us, or the END that closes an exchange we answered: the level
+     * and signal-to-noise it read, and the power we sent at. The only
+     * measurement of the us→them direction that exists — everything else is
+     * reciprocal — so it outranks every pair. */
     bool     haveApRpt;
     int16_t  apRptRssi;
+    int16_t  apRptSnr10;
     int8_t   apRptTxp;
     uint32_t apRptMs;
     /* Reachability (SUPE.md §12): the run and the hold. Cleared only by an
@@ -294,17 +312,26 @@ struct NeiState {
 
 typedef void (*PeersVisitFn)(Neighbor* e, int num, void* ud);
 
-/* The them→us path loss, in dB, and the millis() of the reading it came from:
- * the fresher of the hailing pair and the step pair, since either pair answers
- * for the loss (SUPE.md §10) and the newer one describes the link as it is now.
- * False when neither exists — only a SUPE peer states a power, and without one
- * a level is not a loss. The us→them direction is `haveApRpt` alone. */
-static inline bool peersLossFrom(const Neighbor* e, int* loss, uint32_t* ms) {
-    if (e->havePair && (!e->haveStepPair || (int32_t)(e->pairMs - e->stepPairMs) >= 0)) {
-        *loss = (int)e->pairTxp - (int)e->pairRssi; *ms = e->pairMs; return true;
-    }
-    if (e->haveStepPair) {
-        *loss = (int)e->stepTxp - (int)e->stepRssi; *ms = e->stepPairMs; return true;
+/* The them→us path loss, in dB, with the reading it came from: the fresher of
+ * the hailing pair and the step pair, since either pair answers for the loss
+ * (SUPE.md §10) and the newer one describes the link as it is now. `snr10` is
+ * that frame's signal-to-noise as this radio measured it and `peerTxp` the
+ * power the peer stated for it — the two numbers the loss is the difference of,
+ * kept because a loss alone cannot say whether a link is weak or merely quiet.
+ * Every out-parameter but the loss may be null.
+ * False when neither pair exists — only a SUPE peer states a power, and without
+ * one a level is not a loss. The us→them direction is `haveApRpt` alone. */
+static inline bool peersLossFrom(const Neighbor* e, int* loss, uint32_t* ms,
+                                 int16_t* snr10 = nullptr, int8_t* peerTxp = nullptr) {
+    const bool step = !e->havePair ||
+                      (e->haveStepPair && (int32_t)(e->pairMs - e->stepPairMs) < 0);
+    if (step ? e->haveStepPair : e->havePair) {
+        *loss = step ? (int)e->stepTxp - (int)e->stepRssi
+                     : (int)e->pairTxp - (int)e->pairRssi;
+        if (ms)      *ms      = step ? e->stepPairMs : e->pairMs;
+        if (snr10)   *snr10   = step ? e->stepSnr10  : e->pairSnr10;
+        if (peerTxp) *peerTxp = step ? e->stepTxp    : e->pairTxp;
+        return true;
     }
     return false;
 }
@@ -313,6 +340,18 @@ static inline bool peersLossFrom(const Neighbor* e, int* loss, uint32_t* ms) {
  * attached RNode client — rather than a node out on the air. Every RF-layer
  * guard that means "this traffic terminates at our transmitter" tests this. */
 static inline bool peersIsLocal(const Neighbor* e) { return e->isUs || e->isRnode; }
+
+/* When this node was last heard from, by any evidence there is: a frame it
+ * provably transmitted, and — for a SUPE peer — a protocol event that named it
+ * without any frame of its own being sampled. Whichever is fresher, since
+ * either one means the node is still out there. */
+static inline uint32_t peersLastHeard(const Neighbor* e) {
+    uint32_t ms = e->lastHeardMs;
+#if !defined(CONFIG_LORA_NO_SUPE)
+    if (e->supeHeardMs && (int32_t)(e->supeHeardMs - ms) > 0) ms = e->supeHeardMs;
+#endif
+    return ms;
+}
 
 /* The stable id a queued packet carries for its peer: the row's index. */
 static inline uint16_t peersIdOf(const NeiState* st, const Neighbor* e) {
@@ -349,6 +388,18 @@ Neighbor* peersFindByDest(NeiState* st, const uint8_t dest[16]);
 bool      peersDestIsLocal(NeiState* st, const uint8_t dest[16]);
 Neighbor* peersFindClaim4(NeiState* st, const uint8_t b4[4]);
 Neighbor* peersAlloc(NeiState* st, uint32_t now);
+/* Free a row and everything that pointed at it: rnsd's copy of the node and
+ * every hash the shared store filed against the slot. A slot handed out again
+ * is a different device, so anything still resolving through the old occupant
+ * has to go with it. */
+void      peersRetire(NeiState* st, Neighbor* e);
+/* Forget one node, or every node out there (`num` < 0): its rows, its link
+ * stubs, its proof expectations, the protocol's state for it and everything
+ * published about its slot. Nothing about it survives — not its addresses, not
+ * a measurement, not that it speaks our air protocol — and the next frame from
+ * it builds a fresh row from what that frame proves. Returns how many rows
+ * went, or -1 when `num` names nobody. Radio task only. */
+int       peersForget(LoraRadio* r, int num);
 NeiDest*  peersAddDest(NeiState* st, Neighbor* e, const uint8_t dest[16], uint32_t now);
 Neighbor* peersEnsureDest(NeiState* st, const uint8_t dest[16], uint32_t now);
 void      peersSample(Neighbor* e, int16_t rssi, int16_t snr10, uint32_t now);

@@ -475,7 +475,7 @@ static void hPeerNote(void* ctx, const uint8_t tag[SUPE_TAG_LEN],
             if (e) {
                 bool hail = (n->cfg.sf == (uint8_t)r->cfgSf &&
                              n->cfg.bwHz == (uint32_t)r->cfgBwHz);
-                supeFilePair(r, e, n->rssiDbm, n->txpDbm, hail ? 0 : 1);
+                supeFilePair(r, e, n->rssiDbm, n->snr10, n->txpDbm, hail ? 0 : 1);
                 e->supeHeardMs = now;
             } else if (L && L->ours) {
                 L->havePair = true;
@@ -489,12 +489,12 @@ static void hPeerNote(void* ctx, const uint8_t tag[SUPE_TAG_LEN],
              * against what we sent — the one measurement of the direction we
              * transmit in, and the freshest input the train power resolves on
              * (§15). */
-            if (e) apFileReport(r, e, n->rssiDbm, n->txpDbm);
+            if (e) apFileReport(r, e, n->rssiDbm, n->snr10, n->txpDbm);
             break;
         case SUPE_EV_TRAIN_OK:
             if (e) {
                 if (n->haveLevel) {
-                    apFileReport(r, e, n->rssiDbm, n->txpDbm);
+                    apFileReport(r, e, n->rssiDbm, n->snr10, n->txpDbm);
                     /* The ratchet moves only on reported headroom — thin
                      * margin holds (§15). */
                     int marginDeci = (int)n->rssiDbm * 10
@@ -710,7 +710,8 @@ static bool supeTryLock(LoraRadio* r) {
 
 /* ─────────────── ANNOUNCE (SUPE.md §9) ─────────────── */
 
-static void annIngest(LoraRadio* r, const uint8_t* f, size_t len, int16_t rssi) {
+static void annIngest(LoraRadio* r, const uint8_t* f, size_t len, int16_t rssi,
+                      int16_t snr10) {
     SupeAnn a;
     if (!supeDecAnn(f, len, &a)) return;
     if (!r->nei) return;
@@ -777,7 +778,7 @@ static void annIngest(LoraRadio* r, const uint8_t* f, size_t len, int16_t rssi) 
             e->supeSeen = false;
             e->ourProto = false;
             e->supeHeardMs = now;
-            supeFilePair(r, e, rssi, a.pwrDbm, 0);
+            supeFilePair(r, e, rssi, snr10, a.pwrDbm, 0);
             continue;
         }
         bool first = !e->supeSeen;
@@ -789,7 +790,7 @@ static void annIngest(LoraRadio* r, const uint8_t* f, size_t len, int16_t rssi) 
         e->ourProto    = true;
         /* The power byte is what makes the frame worth hearing: the reading
          * and the stated power together are path loss, not a bare level. */
-        supeFilePair(r, e, rssi, a.pwrDbm, 0);
+        supeFilePair(r, e, rssi, snr10, a.pwrDbm, 0);
         if (first && logIsDebug(TAG))
             dbg("lora/%d supe: %02x%02x%02x speaks SUPE (family %u, ceiling %u, max %d dBm)",
                 r->idx, a.ids[i][0], a.ids[i][1], a.ids[i][2],
@@ -974,7 +975,7 @@ void supeOnFrame(LoraRadio* r, const uint8_t* f, size_t len,
     if (len >= 1 && f[0] == SUPE_T_ANNOUNCE) {
         /* Always read: this is the world picture, not an invitation. */
         r->supe->eng.rxFrames++;
-        annIngest(r, f, len, rssi);
+        annIngest(r, f, len, rssi, snr10);
     } else if (supeReady(r)) {
         /* Everything else IS an invitation, and answering one is speaking. */
         uint32_t discards = r->supe->eng.rxDiscard;
@@ -1213,6 +1214,20 @@ void supeProofRetFile(LoraRadio* r, const uint8_t phash[16], const uint8_t node4
     if (!supeReady(r)) return;
     supeLock(r);
     supeEngProofRetFile(&r->supe->eng, phash, node4);
+    supeUnlock(r);
+}
+
+/* `lora forget` reaching the protocol (lora_supe.h). Every address the row
+ * answers to is offered, because the engine files against whichever one it saw:
+ * a node key from an announcement, an identity, a destination hash. Not gated
+ * on `supeReady` — a radio that has stopped speaking SUPE still HOLDS what it
+ * learned, and leaving that behind is exactly the memory this is here to drop. */
+void supeForgetPeer(LoraRadio* r, const Neighbor* e) {
+    if (!supeMounted(r) || !e) return;
+    supeLock(r);
+    if (e->haveNode4) supeEngForget(&r->supe->eng, e->node4);
+    for (int i = 0; i < e->nIds; i++)   supeEngForget(&r->supe->eng, e->ids[i]);
+    for (int d = 0; d < e->nDests; d++) supeEngForget(&r->supe->eng, e->dests[d].hash);
     supeUnlock(r);
 }
 
