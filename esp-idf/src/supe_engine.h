@@ -307,7 +307,7 @@ struct SupeMeet {
     uint8_t  txEndLen;
     bool     ourTrainConfirmed;    /* anything of theirs answered our END */
     bool     laterEnd;         /* an answering GOT promised a return train,
-                                    * so a END later than ours will close the
+                                    * so an END later than ours will close the
                                     * meeting: the one we hold is not the goodbye
                                     * until that one arrives */
     /* incoming */
@@ -331,7 +331,7 @@ struct SupeMeet {
      * the peer's last frame reached the sender, and the sender cannot say which
      * of ours that was — so the receiver resolves it against its own last
      * transmission, which is the frame the peer must have heard to answer at
-     * all. A level without the power behind it is not a path loss (§15.1), and
+     * all. A level without the power behind it is not a path loss (§15), and
      * the power is ours to remember. */
     int8_t   lastTxp;
     SupeCfg  lastTxCfg;

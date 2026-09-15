@@ -118,7 +118,7 @@ static uint32_t trainWorstMs(const SupeEngine* e, uint8_t count, const SupeCfg* 
 }
 
 /* The answer deadline is sized to the largest of the three frames that may
- * answer a END, since which arrives is the answer itself. */
+ * answer an END, since which arrives is the answer itself. */
 static uint32_t answerDeadlineMs(const SupeEngine* e, const SupeCfg* c) {
     return SUPE_TURNAROUND_MS
            + toaFrameMs(e, c, SUPE_GOT_ANS_BASE + SUPE_MASK_MAX, false)
@@ -285,7 +285,7 @@ static void noteUnanswered(SupeEngine* e, const uint8_t tag[SUPE_TAG_LEN], int8_
 /* What we have just put on the air in this meeting, and what it flew at. The
  * peer's END states how our last frame reached it and cannot name which frame
  * that was; this is the other half of that measurement, and without the power
- * behind it a level is not a path loss (§15.1). */
+ * behind it a level is not a path loss (§15). */
 static void noteOurTx(SupeMeet* m, int8_t txp, const SupeCfg* cfg) {
     m->lastTxp = txp;
     m->lastTxCfg = *cfg;
@@ -1604,7 +1604,7 @@ static void sendEnd(SupeEngine* e) {
      * its hail where we answered one. This is the only measurement of the
      * direction the PEER transmits in that the peer will ever get from this
      * exchange, since the frames that quote a level back (READY, GOT) all
-     * answer whoever opened the leg (§15.2). */
+     * answer whoever opened the leg (§11). */
     t.haveHeard = m->haveLast;
     t.heardRssi = m->lastRssi;
     t.heardSnrQ = m->lastSnrQ;
@@ -1669,7 +1669,7 @@ static void sendClose(SupeEngine* e) {
     enterTxPhase(m, SUPE_M_CLOSE_TX);
 }
 
-/* Align the buffered arrivals against a END's checksum list: a greedy
+/* Align the buffered arrivals against an END's checksum list: a greedy
  * leftmost ordered-subsequence match. Conservative on collisions — when in
  * doubt, ask for more (§8). */
 static void alignTrain(SupeEngine* e, const SupeEnd* t) {
@@ -2072,7 +2072,7 @@ static void onEnd(SupeEngine* e, const uint8_t* f, uint16_t len,
     /* The END's own reading: how OUR last frame reached the peer. It is the
      * answering side's only measurement of the direction it transmits in —
      * READY and GOT quote a level back to whoever opened the leg, and the
-     * answerer opens nothing — so without this it would never learn it (§15.2).
+     * answerer opens nothing — so without this it would never learn it (§11).
      * Which frame of ours the peer heard it cannot say, so it resolves against
      * the last we transmitted: the frame it must have heard to be answering. */
     if (m->haveTag && t.haveHeard && m->haveLastTx)
@@ -2089,7 +2089,7 @@ static void onEnd(SupeEngine* e, const uint8_t* f, uint16_t len,
     deferSend(e, SUPE_PEND_ANSWER, SUPE_FLIP_MS);
 }
 
-/* The answer a END calls for, one train gap after it arrived. */
+/* The answer an END calls for, one train gap after it arrived. */
 static void answerEnd(SupeEngine* e) {
     SupeMeet* m = &e->m;
     if (m->listener && m->leg == 0) {

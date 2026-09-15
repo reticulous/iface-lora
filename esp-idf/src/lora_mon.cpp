@@ -250,7 +250,7 @@ static void publishPeers(LoraRadio* r) {
  * LORA_MEAS_MS while the table holds anyone — for a reader outside this binary
  * that holds a destination hash and wants to know the link to it: lxmf's Ping
  * and its contact bars, the web contact list. The measurement is a path loss
- * (§15.1): a level read here against the power the other side stated for it,
+ * (§15): a level read here against the power the other side stated for it,
  * in each direction one exists for. `loss_from` is them→us, the fresher of the
  * hailing pair and the step pair; `loss_to` is us→them, the peer's own account
  * of how our frame landed. A field is absent when it is not known — only a

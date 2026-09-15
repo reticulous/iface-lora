@@ -554,7 +554,7 @@ static void testDialogueFull(void) {
 
     eqi(A.eng.meetingsDone, 1, "A counts one meeting");
     eqi(B.eng.meetingsDone, 1, "B counts one meeting");
-    eqi(g_typeCount[SUPE_T_END], 1, "the train was closed by a END");
+    eqi(g_typeCount[SUPE_T_END], 1, "the train was closed by an END");
     eqi(g_typeCount[SUPE_T_BYE], 1, "…and answered by a BYE");
     eqi((long)B.delivered.size(), 2, "B delivered the whole train at the close");
     ok(dByte(B.delivered, 0, 0) == 0x02 && dByte(B.delivered, 1, 0) == 0x12,
@@ -577,7 +577,7 @@ static void testDialogueFull(void) {
     /* The answering side measures the direction it transmits in too. B never
      * opened a leg, so no READY or GOT ever quoted a level back to it; A's END
      * is what carries B's READY as A read it, and without that B would learn
-     * only the direction it receives in, for ever (§15.2). */
+     * only the direction it receives in, for ever (§11). */
     bool bReport = false;
     int16_t bRssi = 0;
     for (auto& nt : B.notes)

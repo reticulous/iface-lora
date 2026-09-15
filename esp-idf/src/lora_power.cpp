@@ -321,7 +321,7 @@ int8_t apOpenPower(LoraRadio* r, Neighbor* e) {
 /* Both tiers are fed by frames that state the power they went out at, and those
  * frames are SUPE's — so with SUPE compiled out there is no evidence to derive
  * from, and estimating from the level a peer's frames arrive with here is
- * exactly what §15.4 refuses to do. Every peer gets the configured power. The
+ * exactly what §15 refuses to do. Every peer gets the configured power. The
  * ratchet's entry points stay, and do nothing: their callers are the delivery
  * paths, which are not gated on the protocol. */
 int8_t apOpenPower(LoraRadio* r, Neighbor*) { return r->cfgTxp; }

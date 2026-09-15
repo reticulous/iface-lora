@@ -341,7 +341,7 @@ static bool linkIsOpen(const NeiLink* L, uint32_t now) {
 
 /* The link as this radio has measured it: one line per direction that has a
  * path loss — the loss, the signal-to-noise of the frame it was read from, and
- * the power that frame went out at in both units (§15.1). The loss leads
+ * the power that frame went out at in both units (§15). The loss leads
  * because it is the link's own property whatever either end transmits at; the
  * SNR says whether the link is weak or merely quiet; the power is what the loss
  * was measured against. `us->them` is the peer's own report of how our frame

@@ -59,9 +59,9 @@
 #define SUPE_TYPE_MAX      0xDF
 #define SUPE_T_HAIL        0xC2   /* main channel: traffic waiting, this train, answer me */
 #define SUPE_T_ANNOUNCE    0xC3   /* main channel: identities + capabilities */
-#define SUPE_T_GOT        0xC4   /* READY with a train behind it */
+#define SUPE_T_GOT         0xC4   /* READY with a train behind it */
 #define SUPE_T_READY       0xC5   /* the receiver's terms: budget, ceiling, reading */
-#define SUPE_T_END     0xC6   /* the train's power + checksums */
+#define SUPE_T_END         0xC6   /* the train's power + checksums */
 #define SUPE_T_BYE         0xC7   /* everything accounted for */
 #define SUPE_T_RESEND      0xC8   /* one repair round's bitmask */
 
@@ -306,7 +306,7 @@ double supeAirtimeSeconds(int sf, int bw_hz, int cr_denom, int preamble,
  * next one lands in the same buffer. The receiver itself stays open throughout
  * — it is never restarted between frames, since a fresh startReceive begins
  * with standby and would abort the preamble already being demodulated. It is
- * what a send that follows our OWN frame is parked for (a END after the
+ * what a send that follows our OWN frame is parked for (an END after the
  * train) and the per-frame pad in a train's budgeted length. Between two
  * frames of one train it is not parked but PAID — the frame is fired from
  * tx-done, and servicing that costs the peer's rx side the same interval to
@@ -520,7 +520,7 @@ struct SupeHail {
 /* READY — the receiver's terms: "heard you; fly at this budget, no more than
  * this many frames; here is how the frame I am answering reached me."
  * Always nine bytes. GOT is READY with a train behind it — the same fields,
- * then a count and a length of its sender's own; answering a END it adds
+ * then a count and a length of its sender's own; answering an END it adds
  * the repair bitmask over the peer's train. */
 struct SupeReady {
     uint8_t hash[SUPE_HASH_LEN];        /* which hail this answers */
@@ -545,7 +545,7 @@ struct SupeGot {
  * last frame reached me." The reading is what makes the exchange teach BOTH
  * ends: READY and GOT quote a level back to whoever opened the leg, so without
  * this the answering party would learn only the direction it receives in, for
- * ever (§15.2). Absent readings ride as SUPE_LEVEL_NONE. */
+ * ever (§11). Absent readings ride as SUPE_LEVEL_NONE. */
 struct SupeEnd {
     int8_t  pwrDbm;                     /* what the train it closes went out at */
     uint8_t salt;                       /* random — this goodbye's freshness (§7) */
@@ -564,9 +564,9 @@ struct SupeResendF {
 #define SUPE_HAIL_LEN         10
 #define SUPE_HAIL_ID_LEN      13
 #define SUPE_READY_LEN         9
-#define SUPE_GOT_LEN         11
-#define SUPE_GOT_ANS_BASE    11        /* + maskLen */
-#define SUPE_END_BASE      5        /* + count */
+#define SUPE_GOT_LEN          11
+#define SUPE_GOT_ANS_BASE     11        /* + maskLen */
+#define SUPE_END_BASE          5        /* + count */
 #define SUPE_BYE_LEN           1
 #define SUPE_RESEND_BASE       1        /* + maskLen */
 
