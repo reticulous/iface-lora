@@ -220,6 +220,13 @@ Nothing else may claim the same exemption without the same argument.
 
 `EspIdfHal : public RadioLibHal` is ~200 lines of stateless plumbing.
 
+The per-radio `hal` is a `RadioLibHal*`, because this is the one seam a build
+can replace: on ESP-IDF's Linux host target `src/host/` supplies a `VirtualHal`
+over a model of an SX1262 instead, and the rest of this file — the task, the
+IRQ handling, the RX/TX paths — runs unchanged against it. The level-triggered
+re-fire this section relies on is reproduced there deliberately. See
+`reticulous/sim/INTERNALS.md`.
+
 - **Shared bus.** `init()` brings the bus up through `spiHelperInitBus`
   (idempotent — multiple radios and a future LCD/SD driver can call it), then
   adds one SPI device per radio. `CONFIG_LORA_SPI_HOST` is the **1-based**

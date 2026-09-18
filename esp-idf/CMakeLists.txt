@@ -16,6 +16,16 @@ set(LORA_SRCS
     "src/rolling.cpp"
 )
 
+# On the host the bus is a chip model in the same process and the medium is a
+# UDP socket, so the ESP-IDF SPI HAL is replaced rather than configured.
+if(IDF_TARGET STREQUAL "linux")
+    list(REMOVE_ITEM LORA_SRCS "src/esp_idf_hal.cpp")
+    list(APPEND LORA_SRCS
+        "src/host/virtual_hal.cpp"
+        "src/host/virtual_sx126x.cpp"
+        "src/host/ether_task.cpp")
+endif()
+
 # SUPE, whole. CONFIG_LORA_NO_SUPE leaves it out of the image; every call site
 # in the sources above is gated on the same symbol, so nothing here is referenced
 # in that build. supe.cpp is SUPE's pure core, deliberately free of ESP-IDF,

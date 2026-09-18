@@ -210,7 +210,9 @@ struct LoraRadio {
     int             idx;
     const LoraSlot* slot;
 
-    EspIdfHal*      hal;
+    /* The bus underneath a radio is not always a bus: on a host it is a chip
+     * model, behind a HAL of its own. Nothing above this line cares which. */
+    RadioLibHal*    hal;
     Module*         mod;
     PhysicalLayer*  radio;        /* RadioLib base; concrete class per slot chip */
     int             found;        /* -1 unprobed, 0 absent, 1 detected */

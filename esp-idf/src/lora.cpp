@@ -35,6 +35,11 @@
  */
 #include "lora_priv.h"
 
+#if CONFIG_IDF_TARGET_LINUX
+#include "host/ether_task.h"
+#include "host/virtual_hal.h"
+#endif
+
 #include "lora_fem.h"
 #if CONFIG_STRADDLE_NETGRAPH
 #include "netgraph.h"     /* netgraphContributeIface — our `if` line's tail */
@@ -1002,6 +1007,12 @@ static void loraTaskMain(void*) {
      * so we only touch RF hardware when a radio is enabled. The board's
      * peripheral power rail (if any) is already up — the buildable owns
      * it (e.g. hw-lilygo-tdeck's tdeckPowerInit), not this interface. */
+#if CONFIG_IDF_TARGET_LINUX
+    /* The medium comes up before the radios do, so a model's very first
+     * mode and carrier reach it. */
+    etherStart();
+#endif
+
     for (int i = 0; i < kNumRadios; i++) {
         LoraRadio* r = &s_radios[i];
 
@@ -1012,24 +1023,33 @@ static void loraTaskMain(void*) {
          * on SPI3 while the board's shared bus (LCD + SD) lived on SPI2, and the
          * two controllers fought over the same pins (blank panel, SD DMA
          * failures, no LoRa TX). Mirrors fs.cpp's SD-host mapping. */
+#if CONFIG_IDF_TARGET_LINUX
+        /* The bus is a chip model in this process; there is nothing to claim
+         * and nothing that can fail to come up. */
+        auto* vhal = new VirtualHal(i, r->slot);
+        r->hal = vhal;
+        r->hal->init();
+#else
         const spi_host_device_t loraHost =
             (spi_host_device_t)(CONFIG_LORA_SPI_HOST - 1);
-        r->hal = new EspIdfHal(loraHost,
-                               CONFIG_LORA_SCK_PIN, CONFIG_LORA_MOSI_PIN,
-                               CONFIG_LORA_MISO_PIN, r->slot->cs);
+        auto* ehal = new EspIdfHal(loraHost,
+                                   CONFIG_LORA_SCK_PIN, CONFIG_LORA_MOSI_PIN,
+                                   CONFIG_LORA_MISO_PIN, r->slot->cs);
+        r->hal = ehal;
         r->hal->init();
         /* A HAL that did not come up is a radio that cannot be talked to, and
          * building the rest of the stack on it is how a shortage of internal
          * DMA memory (the bus wants descriptors; WiFi and BLE got there first)
          * turns into a panic inside the SPI driver rather than a line in the
          * log. Shelve the radio and carry on: the device is still a device. */
-        if (!r->hal->ready()) {
+        if (!ehal->ready()) {
             err("lora/%d: SPI bus unavailable — radio disabled", i);
-            delete r->hal;
+            delete ehal;
             r->hal  = nullptr;
             r->found = 0;      /* absent, as far as the rest of the straddle is concerned */
             continue;
         }
+#endif
 
         r->mod   = new Module(r->hal, r->slot->cs, r->slot->dio1,
                               r->slot->rst, r->slot->busy);
