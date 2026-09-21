@@ -53,8 +53,6 @@ bool registerWithRnsd(LoraRadio* r) {
     reg.bitrate = r->curBitrate;
     reg.mode    = r->curMode;
     reg.in = reg.out = 1;
-    reg.fwd = (r->curMode == RNS_IFACE_MODE_FULL || r->curMode == RNS_IFACE_MODE_GATEWAY) ? 1 : 0;
-    reg.rpt = 0;
     reg.ifac_size = r->curIfacSize;
     reg.announce_cap = r->curAnnounceCap;
     reg.rx_signal = 1;   /* inbound data frames carry the 4-byte RSSI/SNR prefix */
