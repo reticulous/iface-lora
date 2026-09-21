@@ -58,7 +58,7 @@ Neighbor* peersFindClaim4(NeiState* st, const uint8_t b4[4]) {
  * silently attribute the old node's traffic to the new one. */
 void peersRetire(NeiState* st, Neighbor* e) {
     if (!st || !e) return;
-    if (e->used && e->rnsdDecl) peersRnsdWithdraw(st, e);
+    if (e->used && e->rnsdDecl) peersRnsdWithdraw(st, e, /*moved=*/false);
     uint8_t node = (uint8_t)(e - st->nei);
     for (int i = 0; i < NEI_HASHES_MAX; i++)
         if (st->hashes[i].used && st->hashes[i].node == node) st->hashes[i].used = false;
@@ -503,8 +503,11 @@ void peersMergeInto(NeiState* st, Neighbor* dst, Neighbor* src) {
     }
     /* Two rows became one, so the node rnsd holds for the absorbed one is a
      * node that no longer exists — withdraw it, and re-declare the survivor,
-     * whose label may have gained a name from what it just absorbed. */
-    if (src->rnsdDecl) peersRnsdWithdraw(st, src);
+     * whose label may have gained a name from what it just absorbed. The
+     * destinations moved into this row a few lines up and are as reachable as
+     * they were a moment ago, so the withdrawal says so: nothing left the air,
+     * and the routes to them must survive the re-filing. */
+    if (src->rnsdDecl) peersRnsdWithdraw(st, src, /*moved=*/true);
     dst->rnsdDecl = false;
     src->used = false;
 }
@@ -775,11 +778,13 @@ void peersInit(LoraRadio* r) {
  * Zero timeout, result ignored: this runs on the radio task in the receive
  * path, where blocking is the receiver going deaf. A dropped declaration costs
  * one announce interval — the next announce re-declares. */
-static void peersRnsdAux(NeiState* st, const Neighbor* e, bool up, const char* label) {
+static void peersRnsdAux(NeiState* st, const Neighbor* e, bool up, bool moved,
+                         const char* label) {
     if (!st) return;
     rnsd_iface_peer_t m = {};
     m.op = RNSD_IFACE_AUX_PEER;
     m.up = up ? 1 : 0;
+    m.moved = moved ? 1 : 0;
     snprintf(m.iface, sizeof m.iface, "lora/%u", (unsigned)st->radio);
     peersRnsdKey(peersIdOf(st, e), m.key);
     if (label) safeStrncpy(m.label, label, sizeof m.label);
@@ -799,12 +804,12 @@ void peersRnsdDeclare(NeiState* st, Neighbor* e) {
                      e->node4[0], e->node4[1], e->node4[2], e->node4[3]);
         else label[0] = '\0';
     }
-    peersRnsdAux(st, e, true, label);
+    peersRnsdAux(st, e, true, false, label);
     e->rnsdDecl = true;
 }
 
-void peersRnsdWithdraw(NeiState* st, const Neighbor* e) {
-    peersRnsdAux(st, e, false, nullptr);
+void peersRnsdWithdraw(NeiState* st, const Neighbor* e, bool moved) {
+    peersRnsdAux(st, e, false, moved, nullptr);
 }
 
 /* RF is going down: outstanding proofs can't return — drop them, uncounted. */

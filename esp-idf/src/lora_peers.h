@@ -464,4 +464,7 @@ void      peersAbandonPends(LoraRadio* r);
  * has no per-packet sender to hand over, so the clustering this table already
  * did is the attribution. Fire-and-forget from the radio task. */
 void      peersRnsdDeclare (NeiState* st, Neighbor* e);
-void      peersRnsdWithdraw(NeiState* st, const Neighbor* e);
+/* `moved` separates a row absorbed into another from a node that has gone
+ * quiet: both retire the key, but only a departure invalidates what rnsd
+ * routes to and through it. */
+void      peersRnsdWithdraw(NeiState* st, const Neighbor* e, bool moved);

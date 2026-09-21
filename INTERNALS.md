@@ -1138,8 +1138,9 @@ The two deadlines are computed in `radioStart` from the live modem parameters
   remain valid on the key for a deliberate LoRa backbone (set `s.lora.<n>.mode`
   by hand) but are kept out of the settings picker (`straddle.yaml`,
   `LoraPanel.vue`) to avoid footgunning airtime;
-- `in = out = 1`, `fwd = 1` for `FULL`/`GATEWAY` (forwarding/transport modes),
-  `rpt = 0`;
+- `in = out = 1` — what the medium can do; whether this node carries other
+  nodes' traffic is `s.rnsd.transport_enabled` and belongs to the node, not to
+  a radio;
 - `announce_cap` from `s.lora.<n>.announce_cap` (percent, default
   `RNS_IFACE_ANNOUNCE_CAP_DEFAULT` = 2) — the max share of interface bandwidth
   announces may use; `point_to_point` is left 0 (LoRa is a shared radio medium
@@ -1925,7 +1926,10 @@ radio, `gp_alloc`'d at first `radioStart` and kept across config cycles and
   shared listing (and NetGraph) group exactly as `lora n` does. `peersMergeInto`
   withdraws the absorbed row's key and re-declares the survivor, and `peersAlloc`
   withdraws before reusing a slot, so rnsd never holds a node this table no
-  longer has. Everything is fire-and-forget at zero timeout — it runs on the
+  longer has. A merge's withdrawal sets `moved`: the destinations went into the
+  surviving row a moment earlier and are as reachable as they were, so the key
+  is retired while rnsd's routes to and through them stand. A withdrawal without
+  it means the node is off the air, and rnsd drops those routes. Everything is fire-and-forget at zero timeout — it runs on the
   radio task in the receive path, and a dropped declaration costs one announce
   interval, since every announce re-declares.
 - **Anonymous transit.** Every rx frame at wire hops ≥ 1 was transmitted by an
