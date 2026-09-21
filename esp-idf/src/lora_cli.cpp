@@ -1328,8 +1328,27 @@ void cliLora(const char* args) {
         storageSet(sk(kb, sizeof kb, idx, "coding_rate"), atoi(val));
         cliPrintf("lora/%ld cr = 4/%d\n", idx, atoi(val));
     } else if (strcmp(cmd, "txp") == 0) {
-        storageSet(sk(kb, sizeof kb, idx, "tx_power"), atoi(val));
-        cliPrintf("lora/%ld txp = %d dBm\n", idx, atoi(val));
+        /* `max` and `min` are the board's own ends of the range, so a script
+         * that wants everything this antenna reaches need not carry a number
+         * that is only right for one board. The radio publishes the same two
+         * figures as `lora.<n>.tx_power_{max,min}` once it has probed. */
+        LoraRadio* r = &s_radios[idx];
+        int want;
+        if (strcmp(val, "max") == 0 || strcmp(val, "min") == 0) {
+            /* Both ends come from the calibration, which does not exist until
+             * the part has been probed — before that the range reads 0..0, and
+             * writing that would store a power nobody chose. */
+            if (r->maxTxDbm <= r->minTxDbm) {
+                cliPrintf("lora/%ld: this radio's range is not known yet — "
+                          "bring it up first (`lora up`), then ask again\n", idx);
+                return;
+            }
+            want = (val[1] == 'a') ? r->maxTxDbm : r->minTxDbm;
+        } else {
+            want = atoi(val);
+        }
+        storageSet(sk(kb, sizeof kb, idx, "tx_power"), want);
+        cliPrintf("lora/%ld txp = %d dBm\n", idx, want);
     } else if (strcmp(cmd, "preamble") == 0) {
         storageSet(sk(kb, sizeof kb, idx, "preamble"), atoi(val));
         cliPrintf("lora/%ld preamble = %d\n", idx, atoi(val));

@@ -440,6 +440,27 @@ static bool radioStart(LoraRadio* r) {
      * asking for something no setting produces. Clamp what the user asked for
      * to the range and say so, rather than accepting a number the hardware
      * will silently ignore. */
+    /* A radio nobody has ever set a power on takes this board's ceiling. Unset
+     * reads as 0 dBm, and 0 is a number nobody chose: on a bare part it is
+     * 22 dB below what the antenna reaches, and on an amplified board it is
+     * not a power the hardware can even produce. It also leaves the settings
+     * field blank, so the first thing a new node says about its radio is
+     * nothing.
+     *
+     * The ceiling is the honest answer because it is the board's own claim
+     * about its antenna, and full power is what a node is for until somebody
+     * decides otherwise. Written back as well as used, so the field has a
+     * figure in it and the choice survives as a choice — and written only when
+     * absent, so a power a person set is never overridden. Here rather than
+     * where the range is computed, because here is where it is read: seeding
+     * it later would leave this radio running at 0 until its next start. */
+    if (r->maxTxDbm > r->minTxDbm && !storageExists(sk(kb, sizeof kb, r->idx, "tx_power"))) {
+        txp = r->maxTxDbm;
+        storageSet(sk(kb, sizeof kb, r->idx, "tx_power"), txp);
+        info("lora/%d tx_power unset — taking this board's %d dBm ceiling",
+             r->idx, txp);
+    }
+
     if (txp > r->maxTxDbm) {
         /* Name where the ceiling came from. On a board with no TX_CAL entry it
          * is not a fact about this board at all — it is the part's register
