@@ -61,6 +61,11 @@ public:
     /** The noise floor this receiver reports when nothing is arriving. */
     static constexpr int kNoiseFloorDbm = -110;
 
+    /** How far a frame must lead one already being demodulated to take the
+     *  receiver off it. The medium decides the same question with the same
+     *  margin when it rules on a frame that shared the air. */
+    static constexpr int kCaptureDb = 6;
+
     /* The state, and the timer callbacks that reach it. Defined in the
      * implementation file and opaque everywhere else. */
     struct Impl;

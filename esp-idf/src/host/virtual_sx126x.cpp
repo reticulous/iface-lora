@@ -150,7 +150,15 @@ struct VirtualSx126x::Impl {
 
     uint8_t  rxLen = 0, rxPtr = 0;
     uint8_t  rssiPkt = 220, snrPkt = 40, sigRssiPkt = 220;
-    int      inFlightLevel = 0;      /* 0 = nothing arriving */
+
+    /* The air, and the one frame being demodulated out of it. A receiver
+     * follows a single frame at a time: the rest is energy, which is what an
+     * instantaneous RSSI reads and what carrier sense acts on. */
+    int      airLevel = 0;           /* the strongest level in flight */
+    int64_t  airEndUs = 0;           /* when the last of it is over */
+    int      lockId = 0;             /* the frame this receiver is following */
+    int      lockLevel = 0;
+    int64_t  lockEndUs = 0;
 
     int      txId = 0;
 
@@ -346,7 +354,11 @@ void VirtualSx126x::transfer(const uint8_t* out, size_t len, uint8_t* in)
 
     case CMD_SET_TX: {
         setMode(d, "TX", ST_TX);
-        double toa = loraToaSeconds(d->sf, (int)d->bwHz, d->cr + 4, d->preamble,
+        /* `cr` is already the denominator of 4/n, which is what the formula
+         * takes — a frame timed with anything outside 5..8 comes back as no
+         * time on the air at all, and then nothing in the medium can ever
+         * collide with anything. */
+        double toa = loraToaSeconds(d->sf, (int)d->bwHz, d->cr, d->preamble,
                                     d->payloadLen, d->hdrImplicit, d->crcOn);
         double tSym = (double)((uint32_t)1 << d->sf) / (double)d->bwHz;
         int64_t now = esp_timer_get_time();
@@ -468,7 +480,8 @@ void VirtualSx126x::transfer(const uint8_t* out, size_t len, uint8_t* in)
     case CMD_GET_RSSI_INST:
         if (len >= 3) {
             /* The chip's -x/2 encoding, and nothing at all outside RX. */
-            int dbm = d->inFlightLevel ? d->inFlightLevel : VirtualSx126x::kNoiseFloorDbm;
+            int dbm = esp_timer_get_time() < d->airEndUs
+                          ? d->airLevel : VirtualSx126x::kNoiseFloorDbm;
             in[2] = strcmp(d->mode, "RX") == 0 ? (uint8_t)(-2 * dbm) : 0xFF;
         }
         break;
@@ -522,7 +535,10 @@ void VirtualSx126x::transfer(const uint8_t* out, size_t len, uint8_t* in)
 
     /* Leaving RX abandons whatever was arriving. */
     if (op == CMD_SET_STANDBY || op == CMD_SET_SLEEP || op == CMD_SET_FS || op == CMD_SET_TX) {
-        d->inFlightLevel = 0;
+        d->airLevel = 0;
+        d->airEndUs = 0;
+        d->lockId = 0;
+        d->lockEndUs = 0;
         d->pendingValid = false;
         if (d->tPre) esp_timer_stop(d->tPre);
         if (d->tHdr) esp_timer_stop(d->tHdr);
@@ -592,7 +608,6 @@ static void rxEndCb(void* arg)
         if (!d->pendingEnd.headerOk) bits |= IRQ_HEADER_ERR;
         d->pendingValid = false;
     }
-    d->inFlightLevel = 0;
     portEXIT_CRITICAL(&d->mux);
     if (bits) raise(d, bits);
 }
@@ -601,9 +616,30 @@ static void rxEndCb(void* arg)
 
 void VirtualSx126x::onRxBegin(const VirtualRxBegin& f)
 {
+    int64_t now = esp_timer_get_time();
     portENTER_CRITICAL(&d->mux);
     if (strcmp(d->mode, "RX") != 0) { portEXIT_CRITICAL(&d->mux); return; }
-    d->inFlightLevel = f.levelDbm;
+
+    /* Energy first: every frame in the air raises the instantaneous reading,
+     * whether or not this receiver is following it. */
+    if (now >= d->airEndUs) d->airLevel = 0;
+    if (f.levelDbm > d->airLevel || d->airLevel == 0) d->airLevel = f.levelDbm;
+    if (now + (f.tEnd - f.t0) > d->airEndUs) d->airEndUs = now + (f.tEnd - f.t0);
+
+    /* Then the demodulator, which follows one frame at a time. A frame that
+     * starts while another is being demodulated is not received at all unless
+     * it leads the one in progress by the capture margin, in which case the
+     * receiver drops what it had and takes the louder frame instead. Without
+     * this the chip would hand up whichever frame ended last and the medium's
+     * verdict — which says only one of them survived — would mean nothing. */
+    bool busy = now < d->lockEndUs;
+    if (busy && f.levelDbm < d->lockLevel + kCaptureDb) {
+        portEXIT_CRITICAL(&d->mux);
+        return;
+    }
+    d->lockId    = f.id;
+    d->lockLevel = f.levelDbm;
+    d->lockEndUs = now + (f.tEnd - f.t0);
     portEXIT_CRITICAL(&d->mux);
 
     /* The sender's stamps are its own clock's; only the gaps between them mean
@@ -616,6 +652,8 @@ void VirtualSx126x::onRxEnd(const VirtualRxEnd& f)
 {
     portENTER_CRITICAL(&d->mux);
     if (strcmp(d->mode, "RX") != 0) { portEXIT_CRITICAL(&d->mux); return; }
+    if (f.id != d->lockId) { portEXIT_CRITICAL(&d->mux); return; }
+    d->lockEndUs = 0;
     size_t n = f.len > sizeof(d->pendingPayload) ? sizeof(d->pendingPayload) : f.len;
     if (f.payload && n) memcpy(d->pendingPayload, f.payload, n);
     d->pendingLen = n;
