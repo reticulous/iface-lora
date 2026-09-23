@@ -454,17 +454,20 @@ void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
         } else if (isTx && h.hdr2) {
             /* Our own rebroadcast stamps OUR transport identity as the
              * transport_id — the exact frame neighbours identify us by, so
-             * learn "who we are" from it symmetrically. This is the only way
-             * the transport identity surfaces here at all: it hangs off no
-             * destination rnsd announces, so no announce of ours ever names
-             * it. It belongs on the local row as one more name this device
-             * answers to, not on a row of its own. */
+             * learn "who we are" from it symmetrically. rnsd relays under the
+             * node identity, the one its management announce is on, so once
+             * that announce has gone out the identity is already on the local
+             * row and this finds it; before then — a node can relay before it
+             * has announced anything — this is where it first surfaces. It
+             * belongs on the local row as one more name this device answers
+             * to, not on a row of its own. An RNode client's rebroadcast names
+             * the client's own transport identity, which it may never announce. */
             Neighbor* e = peersFindByIdentity(st, h.transportId);
             if (!e) {
                 /* It is not a second node: the transport identity is another
                  * name for the endpoint this frame came from. File it on that
                  * endpoint's row. Minting one instead would list a second `us`
-                 * holding nothing but an identity nobody has announced — a row
+                 * holding nothing but an identity not yet announced — a row
                  * with no hash to print — until our next own announce folded it
                  * away. Only if the endpoint has no row yet does one get made:
                  * we can relay before we have ever announced, and the fold in

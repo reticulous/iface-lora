@@ -299,8 +299,8 @@ static bool csmaAdvance(LoraRadio* r, bool prime) {
     if (!r->lbt) return true;                       /* LBT off → blind transmit */
 
     if (r->appc) {
-        /* csmaStart drives the shared stall warning and lbt_timeout valve, so
-         * it is stamped here for both regimes. */
+        /* csmaStart drives the shared stall warning, so it is stamped here
+         * for both regimes. */
         if (r->csmaPhase == CSMA_IDLE) r->csmaStart = xTaskGetTickCount();
         return csmaClearAppc(r, prime);
     }
@@ -313,7 +313,7 @@ static bool csmaAdvance(LoraRadio* r, bool prime) {
             /* New frame: begin an inter-frame (DIFS) listen. */
             r->csmaCw = CSMA_CW_MIN;
             r->csmaPhase = CSMA_DIFS;
-            r->csmaStart = now;                     /* start the lbt_timeout clock */
+            r->csmaStart = now;                     /* start the stall clock */
             r->csmaDifsStart = busy ? 0 : now;      /* 0 = free window not begun */
             return false;
 
@@ -368,8 +368,8 @@ bool csmaClear(LoraRadio* r) {
 }
 
 /* Abandon any channel-access attempt in progress: the next frame contends from
- * scratch. Used when the queue drains, when a frame is shed by the lbt_timeout
- * valve, and when the probe takes or releases the radio. Under appc this also
+ * scratch. Used when the queue drains and when the probe takes or releases
+ * the radio. Under appc this also
  * discards the frozen backoff — upstream would carry it into the next frame,
  * but here the machine is shared by three producers and stale progress must not
  * leak from one to another. */

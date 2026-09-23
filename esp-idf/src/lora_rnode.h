@@ -122,5 +122,6 @@ void rnodeApplyTransports(void);
 void rnodeSettleOff(void);
 void rnodeDropSession(void);
 int  onRnodeConnect(int handle, const void* data, size_t len);
+bool onRnodeBusy(const void* data, size_t len);
 void onRnodeRecv(int handle, size_t bytesAvail);
 void onRnodeDisconnect(int ref);

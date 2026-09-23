@@ -841,7 +841,7 @@ floor snaps down fast and creeps up slowly, so an active channel can't inflate
 its own reference; busy = `rssi > floor + CSMA_RSSI_MARGIN_DB`). Sensing is
 shared by two backoff modes, selected per radio by `s.lora.<n>.appc` inside
 the `s.lora.<n>.lbt` gate; both drive the same `CsmaPhase`, so the stall
-warning, the `lbt_timeout` valve and `nextDeadline()` are mode-agnostic.
+warning and `nextDeadline()` are mode-agnostic.
 
 *Exponential channel plan (`appc=0`).* The classic form:
 
@@ -891,6 +891,28 @@ one bit it sees. `drainOneOutbound` runs the SUPE classifier on the head
 (hold / drop / offer / plain), wins the channel, and transmits; the inbound direction
 is zero-copy too (`rnsdInject` builds the rx_signal-prefixed block and hands it
 over with `itsSendOwned`, freeing it itself on the one failure path).
+
+**Messages before announces.**
+
+```
+pushed:   announce A1, announce A2, data D1, announce A3, proof P1
+queue:    D1  P1  A1  A2  A3        head first
+```
+
+A packet not marked `LORAQ_F_ANNOUNCE` — link, data, proof, path request — is
+placed behind the last such packet and ahead of every queued announce
+(`loraqPush`), so each kind keeps its arrival order and an announce never
+holds a message back. An announce is a flood: a neighbour's repeat covers it,
+and a second or two later costs it nothing, while every other packet has a
+timer running on it somewhere — a link establishment, a proof window, a
+resource. Only ingress reorders (`queueFill`, `annReplayFill`), and ingress is
+closed while a SUPE exchange runs, so the queue the engine is walking does not
+move under it; its burst frames are found by their heap blocks in any case.
+SUPE's own control frames never enter the queue. A head announce waiting for
+the channel is simply overtaken: channel access belongs to the radio, not to
+the packet, so whatever is the head when the channel clears flies. The
+announce run (`annTrainChain`, §14) chains only while the head is an announce,
+so a message arriving mid-run ends the run and contends on its own.
 
 **The verbose level has to be compiled in.** `ESP_LOGV` is dropped at build time
 unless `CONFIG_LOG_MAXIMUM_LEVEL` allows it, and the IDF default stops at debug —
@@ -1031,8 +1053,8 @@ to one `slotTicks` late, over-crediting the backoff by at most that much.
   unintended command key leak, and reproducing it would defeat the mechanism, so
   `csmaClearAppc` clears it.
 - *Access state is abandoned when the queue drains.* `csmaResetAccess()` discards
-  a frozen backoff when nothing is queued, when a frame is shed by
-  `lbt_timeout`, and when an announce replay takes or releases the radio. Upstream would
+  a frozen backoff when nothing is queued and when an announce replay takes or
+  releases the radio. Upstream would
   carry it into the next frame; here the machine is shared by three producers
   (queued RNS traffic, the announce replay, manual CLI transmits) and stale progress must not
   leak between them.
@@ -1047,14 +1069,15 @@ to one `slotTicks` late, over-crediting the backoff by at most that much.
 - *`CSMA_POST_TX_YIELD_SLOTS` is not implemented* — upstream defines it but never
   references it.
 
-**Interaction with `lbt_timeout`.** Per the table above, a band-4 radio can
-legitimately wait 5.22 s at SF10 and 5.80 s at SF11/SF12 — past the 5000 ms
-default — so a saturated slow link will shed frames the mechanism intended to
-merely delay. SF9 and below stay well inside the rate step in every band. Upstream
-has no equivalent valve and never faces this. The default is left alone (an
-unbounded outbound queue is the worse failure), but `s.lora.<n>.lbt_timeout`
-should be raised, or set to `0`, on an SF10+ link expected to run deep into
-band 3 or 4.
+**A busy channel never costs a queued frame.** The head of the queue waits for
+the channel however long that takes — a band-4 radio legitimately waits 5.22 s
+at SF10 and 5.80 s at SF11/SF12 — as RNode firmware's does. What bounds the
+wait is the queue: `LORAQ_CAP` (16) packets, `LORAQ_PEER_CAP` (8) to one peer,
+and `queueFill` takes nothing from rnsd while it is full, so rnsd's `itsSend`
+gives up after 100 ms and drops the packet with `ITS send dropped`. A wedged
+channel therefore refuses new traffic, which is what upstream's queue-full
+error does to the host, and sheds nothing it already holds. The stall warning
+names the wait once per frame after a second.
 
 **One floor per channel, carried across retunes (`csmaFloorSwitch`).** The
 tracker snaps down to the first sample below it and creeps *up* at 2% of the gap
@@ -1808,20 +1831,22 @@ radio, `gp_alloc`'d at first `radioStart` and kept across config cycles and
   the key a SUPE claim is filed under — and `peersMergeInto` folds the two.
   Claims never cross the us/them boundary: an unauthenticated assertion must not
   reach our own row.
-- **The transport identity is a key of its own, and nothing announces it.** A
-  node's Transport instance holds its own identity, separate from the one its
-  destinations hang off, and Reticulum never announces it: it appears on the air
-  only as the first address field of a packet in transport — which is to say, as
-  the tag of every packet relayed *towards* that node. So the announce join
-  cannot supply it, and a relayed announce's claim to it is unverifiable, which
-  is why `observeAnnounce` refuses to mint a row from one. The one place it
-  arrives attributably is a **SUPE announcement**: a node learns its own
-  transport identity from the announces it relays (its `isTx`+HEADER_2 branch)
-  and lists it with the rest, so `annIngest` files every announced identity that
-  matches no row of its own as a hash meaning that node. Without that, a
-  neighbour's transport identity is knowable to nobody, every packet in transit
-  through it resolves to `LORAQ_PEER_NONE`, and transit — most of what a gateway
-  carries — never leaves the shared channel.
+- **The transport identity: announced on this firmware, not on every stack.**
+  It appears on the air as the first address field of a packet in transport —
+  the tag of every packet relayed *towards* that node. rnsd relays under its
+  node identity, the one `rnstransport.remote.management` is announced on, so
+  for a neighbour running this firmware the ordinary announce join files it on
+  the neighbour's row. Stock Reticulum keeps a transport identity apart from the
+  ones its destinations hang off and never announces it, and a relayed
+  announce's claim to it is unverifiable, which is why `observeAnnounce` refuses
+  to mint a row from one. For such a node the one place it arrives attributably
+  is a **SUPE announcement**: a node learns its own transport identity from the
+  announces it relays (its `isTx`+HEADER_2 branch) and lists it with the rest,
+  so `annIngest` files every announced identity that matches no row of its own
+  as a hash meaning that node. Without either, a neighbour's transport identity
+  is knowable to nobody, every packet in transit through it resolves to
+  `LORAQ_PEER_NONE`, and transit — most of what a gateway carries — never
+  leaves the shared channel.
 - **Two lookups, deliberately different.** `peersFindBy4` answers "which node is
   this next hop", searching `node4`, destinations and the hash store —
   link identifiers and the transport identity above. `tagNode` (in `lora_supe`)
@@ -1911,13 +1936,14 @@ radio, `gp_alloc`'d at first `radioStart` and kept across config cycles and
   attributes to it. The same frame identifies
   *us* symmetrically: a rebroadcast we transmit stamps our own transport
   identity as transport_id — the identity this node is known by on the air when
-  it relays, and the only place it ever surfaces, since µR's Transport keeps an
-  identity of its own (`transport_identity`, distinct from the one rnsd's
-  destinations hang off) and nothing announces it. It is filed as one more
-  identity on the **existing local row**, tagging it `transit`, rather than
-  minted as a row of its own: a fresh row would list as a second `us` holding
-  nothing but an identity nobody announced, which is what the listing would show
-  until the next own announce folded it away. A row is allocated only when that
+  it relays. rnsd relays under its node identity, so once its management
+  announce has gone out that identity is already on the local row and the frame
+  finds it there; an RNode client's rebroadcast names the client's own
+  transport identity, which a stock stack never announces. Either way it is
+  filed as one more identity on the **existing local row**, tagging it
+  `transit`, rather than minted as a row of its own: a fresh row would list as a
+  second `us` holding nothing but an identity not yet announced, which is what
+  the listing would show until the next own announce folded it away. A row is allocated only when that
   endpoint has none yet — we can relay before we have ever announced — and
   `observeAnnounce`'s local fold joins the two when we do.
 - **Handing the clustering to rnsd.** rnsd builds one neighbourhood for every
@@ -2543,6 +2569,17 @@ client re-dials every 2.5 s until the endpoint frees. `onRnodeConnect` also reje
 while the endpoint is disabled or `s_stop` is set; `rns stop` drops an existing
 session before parking.
 
+The one takeover allowed is **TCP over TCP**, in the port's busy handler
+(`onRnodeBusy`): a TCP client arriving while a TCP session holds the port is a
+client that has reconnected, whose old socket takes seconds to be noticed
+closed, or one the operator means to replace, and a session nobody is on would
+otherwise time out the newcomer's detect. The handler drops the held session
+and lets the port retry the connect. Serial and Bluetooth sessions are never
+taken over, and none of the three takes over a TCP session but TCP. A session
+is named by its handle (`onRnodeConnect` returns it as the port's serverRef), so
+the disconnect of a session already replaced is ignored rather than ending the
+session that replaced it.
+
 State is one static `RnodeState`: handle, bound radio, the KISS decoder, an
 inbound carry (a frame can complete mid-chunk and park a packet — the bytes after
 it in the same read must not be lost), one parked decoded packet, and the
@@ -3061,12 +3098,17 @@ per further unanswered run to `SUPE_HOLD_MAX_MS` — or to
 `SUPE_HOLD_PRESENT_MAX_MS` while the peer has been heard within
 `SUPE_PRESENT_MS`, since a fault at a peer we can hear is likelier transient.
 A held peer's traffic is queued, not refused, and waits out its own queue lifetime;
-what this costs is that other peers' packets behind it in the FIFO wait too,
+what this costs is that other peers' packets behind it in the queue wait too,
 bounded by that queue lifetime. Under an asymmetric link this is the whole
 difference between backing off and calling for ever.
 
-**Which schedule gets a contested moment: the narrow one.** `slotService` walks
-the table twice, narrow before wide (§7 of the spec). **A wide schedule nobody
+**Which schedule gets a contested moment: the narrow one, and our own hail's
+before a received hail's.** `slotService` walks the table three times: narrow
+schedules from our own hails, then narrow schedules from hails we received,
+then wide (§7 of the spec gives narrow over wide). Our own hail's slot is where
+its answer arrives, and a READY that finds us away on another schedule's channel
+is a hail gone unanswered, which after three puts the peer on hold; a received
+hail walked past costs a hail-back. **A wide schedule nobody
 attends is dropped, not spent**: one that has spoken `SUPE_SCHED_GIVEUP_SPOKE`
 times without an answer is freed and the traffic hails instead.
 

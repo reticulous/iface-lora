@@ -305,8 +305,6 @@ struct LoraRadio {
     float           chFloor[LORA_CH_MAX];  /* each channel's floor as this radio last
                                             * left it, indexed by channel; the hailing
                                             * channel is 0 (csmaFloorSwitch) */
-    uint32_t        lbtTimeoutMs;    /* drop a frame LBT can't clear within this (s.lora.<i>.lbt_timeout) */
-    TickType_t      lbtTimeoutTicks; /* lbtTimeoutMs in ticks; 0 = never drop */
 
     /* APPC: adaptive contention window (s.lora.<i>.appc), inside the lbt gate.
      * Its own slot/DIFS timing, since RNode sizes those differently from the

@@ -15,6 +15,11 @@ struct LoraRadio;
  *           window is drawn from a band chosen by our own recent airtime. */
 #define CSMA_CW_MIN          2       /* initial CW exponent → up to 2^2 = 4 slots */
 #define CSMA_CW_MAX          6       /* CW ceiling → up to 2^6 = 64 slots */
+/* How long a beat waits for the channel before standing down: a SUPE
+ * announce or hail offer comes round again, and a manual tx_psa reports the
+ * wait instead. Queued data has no such bound — the head waits for the
+ * channel however long that takes, and a full queue refuses new packets. */
+#define CSMA_BEAT_GIVEUP_MS  5000
 #define CSMA_RSSI_MARGIN_DB  6.0f    /* dB above noise floor that reads as busy */
 #define CSMA_NOISE_FLOOR_DBM (-105.0f)  /* initial noise-floor estimate, dBm at the
                                          * antenna connector. The only absolute

@@ -359,10 +359,6 @@ static bool radioStart(LoraRadio* r) {
     if (r->slotTicks < 1) r->slotTicks = 1;
     r->difsTicks = 2 * r->slotTicks;
     r->lbt = storageGetInt(sk(kb, sizeof kb, r->idx, "lbt"), 1) != 0;
-    /* Hidden safety valve: if LBT can't win the channel within lbt_timeout ms the
-     * frame is dropped rather than backing off forever. 0 = never drop. */
-    r->lbtTimeoutMs = (uint32_t)storageGetInt(sk(kb, sizeof kb, r->idx, "lbt_timeout"), 5000);
-    r->lbtTimeoutTicks = r->lbtTimeoutMs ? pdMS_TO_TICKS(r->lbtTimeoutMs) : 0;
     r->csmaCw = CSMA_CW_MIN;
     r->csmaStalled = false;
     csmaNoiseFloorReset(r);
@@ -1027,6 +1023,7 @@ static void loraTaskMain(void*) {
      * what makes the single-session policy hold across both. */
     itsServerPortOpen(RNODE_ITS_PORT, /*packetBased=*/false, /*maxHandles=*/1, 4096, 4096);
     itsServerOnConnect(RNODE_ITS_PORT, onRnodeConnect);
+    itsServerOnBusy(RNODE_ITS_PORT, onRnodeBusy);
     itsServerOnRecv(RNODE_ITS_PORT, onRnodeRecv);
     itsServerOnDisconnect(RNODE_ITS_PORT, onRnodeDisconnect);
     storageSubscribeChanges("s.lora", onCfgChange);   /* covers the rnode group too */
@@ -1298,11 +1295,22 @@ static void loraTaskMain(void*) {
                         nowMs - lastWarnMs > 5000) {
                         lastWarnMs = nowMs;
                         LoraRadio* r = &s_radios[0];
+                        /* The inputs nextDeadline() reads that are not
+                         * otherwise named below: every one of them can pin
+                         * the deadline at zero on a station that is
+                         * otherwise idle. */
+                        int neiPend = 0;
+                        if (r->nei)
+                            for (int p = 0; p < NEI_PEND_MAX; p++)
+                                if (r->nei->pend[p].used) neiPend++;
+                        int irqPend = (r->running && !r->txActive &&
+                                       radioIrqLinePending(r)) ? 1 : 0;
 #if !defined(CONFIG_LORA_NO_SUPE)
                         warn("lora hot loop: 500 zero-deadline passes in %lu ms: "
                              "supeD=%lu airD=%lu offer=%d ann=%d annSoon=%d "
                              "csma=%d q=%u "
-                             "txA=%d split=%d mtx=%d its=%u",
+                             "txA=%d split=%d mtx=%d its=%u "
+                             "cfg=%d irq=%d agc=%d mon=%d nei=%d replay=%d",
                              (unsigned long)(nowMs - winStartMs),
                              (unsigned long)supeNextDeadlineMs(r),
                              (unsigned long)airtimeNextDeadlineMs(r, nowMs),
@@ -1313,16 +1321,21 @@ static void loraTaskMain(void*) {
                              (int)r->txActive, (int)r->splitPending,
                              (int)r->mtxReq,
                              (unsigned)(r->rnsdHandle >= 0
-                                        ? itsBytesAvailable(r->rnsdHandle) : 0));
+                                        ? itsBytesAvailable(r->rnsdHandle) : 0),
+                             (int)s_cfgPend, irqPend, (int)(r->agcResetMs != 0),
+                             (int)loraMonOpen(), neiPend, (int)r->annReplay);
 #else
                         warn("lora hot loop: 500 zero-deadline passes in %lu ms: "
-                             "csma=%d q=%u txA=%d split=%d mtx=%d its=%u",
+                             "csma=%d q=%u txA=%d split=%d mtx=%d its=%u "
+                             "cfg=%d irq=%d agc=%d mon=%d nei=%d replay=%d",
                              (unsigned long)(nowMs - winStartMs),
                              (int)r->csmaPhase, (unsigned)loraqDepth(&r->q),
                              (int)r->txActive, (int)r->splitPending,
                              (int)r->mtxReq,
                              (unsigned)(r->rnsdHandle >= 0
-                                        ? itsBytesAvailable(r->rnsdHandle) : 0));
+                                        ? itsBytesAvailable(r->rnsdHandle) : 0),
+                             (int)s_cfgPend, irqPend, (int)(r->agcResetMs != 0),
+                             (int)loraMonOpen(), neiPend, (int)r->annReplay);
 #endif
                     }
                     zeros = 0;

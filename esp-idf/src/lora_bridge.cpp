@@ -1053,26 +1053,12 @@ void drainOneOutbound(LoraRadio* r) {
                      r->csmaPhase == CSMA_DIFS ? "difs" : "backoff",
                      r->csmaCw, (double)r->noiseFloor);
         }
-        /* Channel never cleared within lbt_timeout → drop the head frame instead
-         * of blocking the outbound queue behind a wedged-busy channel. */
-        if (r->lbtTimeoutTicks && waited >= r->lbtTimeoutTicks) {
-            LoraPkt* p = loraqAt(&r->q, 0);
-            size_t   n = p ? p->len : 0;
-            queueDiscardHead(r);
-            r->txDropped++;
-            /* Consumers gate send-failure attribution on this counter at
-             * settle time, so it is mirrored the moment a frame is shed —
-             * the coalesced stats flush alone lags up to a second. */
-            {
-                char b[48];
-                storageSet(rk(b, sizeof b, r->idx, "stats.tx_dropped"),
-                           (int)(r->txDropped & 0x7fffffff));
-            }
-            err("lora/%d LBT: channel busy > %u ms, dropped %u B frame",
-                r->idx, (unsigned)r->lbtTimeoutMs, (unsigned)n);
-            csmaResetAccess(r);         /* re-arm access state for the next frame */
-            r->csmaStalled = false;
-        }
+        /* A busy channel never costs a queued frame: the head waits for the
+         * channel however long that takes, as RNode firmware's does. What
+         * bounds the wait is the queue itself — full, it takes nothing more
+         * from rnsd (queueFill), whose send then drops the packet at ITS
+         * after its 100 ms — so a wedged channel refuses new traffic rather
+         * than shedding what it already holds. */
         return;
     }
     r->csmaStalled = false;

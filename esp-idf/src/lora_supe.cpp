@@ -958,7 +958,7 @@ static void supeAnnBeat(LoraRadio* r, uint32_t now) {
     if (csmaClear(r)) {
         supeAnnSend(r);
         r->txWaitMs = csmaGrantWaitMs(r);   /* same restatement as the hail's */
-    } else if (r->lbtTimeoutMs && now - ss->annTryMs > r->lbtTimeoutMs) {
+    } else if (now - ss->annTryMs > CSMA_BEAT_GIVEUP_MS) {
         ss->annPending = false;
         ss->annNextMs  = now + supeAnnGap(r);
         csmaResetAccess(r);
@@ -1051,6 +1051,11 @@ void supePoll(LoraRadio* r) {
     uint32_t now = millis();
     s_hosts[r->idx].logLevel = supeLogLevel();
 
+    /* The airtime ledger's verdict beat runs whether or not SUPE is on: the
+     * ledger exists from the mount, and a verdict left due is a deadline the
+     * task reads as zero on every pass. */
+    airtimePoll(r);
+
     /* Switched off: no meetings, no seeds, no slots — but an identity to find
      * and an announcement to keep making, which is the whole of what a silent
      * node owes the neighbourhood. */
@@ -1063,7 +1068,6 @@ void supePoll(LoraRadio* r) {
 
     supeEngTagExpire(e, now);
     supeIdentRefresh(r);
-    airtimePoll(r);
     /* The dialect deadline is days out, so it re-checks at most hourly, riding
      * whatever pass other work causes — it holds no wake of its own, and a
      * node idle past its expiry catches up on the announce beat's pass before
@@ -1127,8 +1131,8 @@ void supePoll(LoraRadio* r) {
              * mark, so what channel access just cost is restated for the
              * record — otherwise the graph shows a seed that never waited. */
             r->txWaitMs = csmaGrantWaitMs(r);
-        } else if (r->lbtTimeoutMs && e->offerArmed &&
-                   now - e->offerJitterUntilMs > r->lbtTimeoutMs) {
+        } else if (e->offerArmed &&
+                   now - e->offerJitterUntilMs > CSMA_BEAT_GIVEUP_MS) {
             /* A channel that never frees must not hold the queue behind a
              * hail forever: give it up, the packet takes the main channel on
              * the ordinary path. An owed hail that cannot win the channel is
@@ -1157,6 +1161,12 @@ uint32_t supeNextDeadlineMs(LoraRadio* r) {
      * settle window supePoll will do nothing with it — so it must not hold a
      * wake either. The window's own deadline is the task's. */
     if (loraCfgQuiet()) return UINT32_MAX;
+    /* Nor while a frame of our own is going out: supePoll stands down for it
+     * (a due slot must not retune the chip from under the transmit), so a
+     * deadline already past would be answered with nothing and asked again at
+     * once, for the whole airtime. TxDone wakes the task, and the pass it
+     * starts services whatever fell due. */
+    if (r->txActive) return UINT32_MAX;
     SupeState* ss = r->supe;
     uint32_t now = millis(), best = UINT32_MAX;
     auto soon = [&](uint32_t at) {

@@ -206,7 +206,6 @@ once, because the client is holding a 0.25 s validation window open.
 | `s.lora.<n>.mode` | `"access_point"` | RNS interface mode: `full`, `gateway`, `access_point`, `roaming`, `boundary`. It sets how long a route learned over this radio is kept and whether the node discovers paths on behalf of others; it does not decide whether traffic is forwarded, which is `s.rnsd.transport_enabled` alone. |
 | `s.lora.<n>.lbt` | `1` | Listen-before-talk: CSMA/CA carrier-sense before each transmit. `0` = blind transmit (no sensing). Live. On a quiet, single-node band you can turn it off to skip the sensing; on a shared band leave it on. |
 | `s.lora.<n>.appc` | `1` | Adaptive p-persistent CSMA — see below. Sizes the random backoff by how much of the recent past *this radio* spent transmitting, instead of growing it on collisions. Only has an effect while `lbt` is on. `0` reverts to the exponential-backoff channel plan. Live. |
-| `s.lora.<n>.lbt_timeout` | `5000` | Drop a frame LBT can't clear within this many ms (`0` = never drop, block the queue instead). Note that a fully-loaded `appc` radio can legitimately back off for 5.2 s at SF10 and 5.8 s at SF11/SF12, past this default, so a congested slow link will shed frames — raise it or set `0` if that matters more than queue latency. SF9 and below stay inside it in every band. |
 | `s.lora.<n>.agc_reset` | `300` | Seconds between recalibrations of the SX126x analog front end (`0` = off; SX126x only). An SX126x that has heard a strong signal can leave its receive gain latched at that setting and stop hearing, and neither standby nor a fresh receive resets it — only powering the front end down does. This tick does that, plus a full block calibration, on an otherwise idle radio; a busy radio defers to the next tick. It is the one periodic wake the radio task holds without a consumer asking for it, which is why the period is minutes rather than the minute other firmwares use: the cost is a wake plus a few ms of chip work, and the bound it buys is how long a latched receiver can stay deaf. |
 | `s.lora.<n>.fem_rx_lna` | `1` | Keep the board's external receive amplifier (the front-end module's LNA) in the RX path. It is the front end's standing cost — about 8 mA for as long as the radio listens, more than the SX1262 itself — bought for about 20 dB of gain ahead of the chip. `0` routes reception round it: a solar or small-battery node may prefer the range loss. Only a **KCT8103L** front end (Heltec V4.3) can switch its LNA out, so the row shows only where that part was detected; on a GC1109 board (V4 ≤ 4.2) the LNA is always in line and the setting is inert. Live. |
 | `s.lora.<n>.ifac_netname` | `""` | IFAC network name. Empty = open (non-IFAC) interface. |
@@ -495,8 +494,8 @@ lora <n> tx <string>          blind-transmit <string> as one explicit-header
                               everything else is literal ASCII, spaces included.
                               Up to 255 bytes. No carrier-sense.
 lora <n> tx_psa <string>      same as tx, but runs the normal listen-before-talk
-                              carrier-sense first (honours lbt / appc /
-                              lbt_timeout). "psa" = polite-send-after-sense.
+                              carrier-sense first (honours lbt / appc; gives
+                              up after 10 s). "psa" = polite-send-after-sense.
 lora <n> tx_prot <ms>         emit an explicit header that announces a long 4/8
                               packet, then cut the carrier before its body — every
                               explicit-header receiver on the channel commits its

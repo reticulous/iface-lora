@@ -470,6 +470,26 @@ static_assert(sizeof(net_connect_t) != sizeof(serial_handler_connect_t),
               "tcp and serial door payloads must differ in size");
 #endif
 
+/* The port's one handle is taken and another client is at the door. A TCP
+ * client arriving while a TCP session holds the port takes it over: the
+ * earlier socket is one whose far end has gone — a client that reconnects
+ * has closed its old socket, and the close takes seconds to be noticed here —
+ * or one the operator means to replace, and either way the newcomer's detect
+ * would otherwise time out against a session nobody is on. A serial or
+ * Bluetooth session is never taken over, and a TCP session is never taken
+ * over by either: that refusal is what keeps a takeover from disturbing the
+ * console. Returning false makes the port retry the connect once the victim
+ * is gone. */
+bool onRnodeBusy(const void* /*data*/, size_t len) {
+    bool arrivingTcp = len != sizeof(serial_handler_connect_t) &&
+                       len != sizeof(rnode_door_connect_t);
+    if (s_rnode.handle < 0 || s_stop || !arrivingTcp || s_rnode.door != RNODE_VIA_TCP)
+        return true;
+    info("lora/%d rnode: a new TCP client replaces the attached one", s_rnode.radio);
+    rnodeDropSession();
+    return false;
+}
+
 int onRnodeConnect(int handle, const void* data, size_t len) {
     /* One session at a time, across every transport. Enforced here as well as
      * by the port's single handle, because the refusal is what keeps a serial
@@ -507,13 +527,15 @@ int onRnodeConnect(int handle, const void* data, size_t len) {
     S.radio  = rnodeRadioIdx();
     S.door   = door;
     info("lora/%d rnode: client attached over %s", S.radio, via);
-    return 0;
+    /* The handle is the session's name: a disconnect names it back, so one for
+     * a session already replaced cannot end the session that replaced it. */
+    return handle;
 }
 
 void onRnodeRecv(int /*handle*/, size_t /*bytesAvail*/) { rnodePump(); }
 
-void onRnodeDisconnect(int /*ref*/) {
-    if (s_rnode.handle < 0) return;
+void onRnodeDisconnect(int ref) {
+    if (s_rnode.handle < 0 || ref != s_rnode.handle) return;
     info("lora/%d rnode: client detached", s_rnode.radio);
     s_rnode.handle   = -1;
     s_rnode.txLen    = 0;

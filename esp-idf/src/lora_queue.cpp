@@ -41,7 +41,20 @@ bool loraqPush(LoraQueue* q, uint8_t* bytes, uint16_t len, uint32_t now_ms,
             q->dropsPeerCap++;
         }
     }
-    LoraPkt* p = &q->e[q->n++];
+    /* Messages before announces: a packet that is not an announce goes in
+     * behind the last one that is not, ahead of every queued announce, so
+     * the queue is always the unicast traffic first, in arrival order, then
+     * the announces, in arrival order. An announce that waits a little longer
+     * loses nothing — it is a flood, and a neighbour's repeat covers it — while
+     * data, link and proof packets have somebody's timer running on them. */
+    uint8_t at = q->n;
+    if (!(flags & LORAQ_F_ANNOUNCE)) {
+        at = 0;
+        while (at < q->n && !(q->e[at].flags & LORAQ_F_ANNOUNCE)) at++;
+        for (uint8_t k = q->n; k > at; k--) q->e[k] = q->e[k - 1];
+    }
+    q->n++;
+    LoraPkt* p = &q->e[at];
     p->bytes         = bytes;
     p->len           = len;
     p->first_seen_ms = now_ms;

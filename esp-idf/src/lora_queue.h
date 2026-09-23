@@ -1,8 +1,7 @@
 /**
  * lora_queue — the one seam between the bridge and the radio. What arrives is
  * enqueued; what transmits is dequeued; nothing else passes. Holds packets as
- * heap blocks it owns, refcounted, with a per-peer cap and a global cap
- * (plans/structuring-lora-code.md §4).
+ * heap blocks it owns, refcounted, with a per-peer cap and a global cap.
  *
  * Pure: no ESP-IDF, RadioLib or FreeRTOS — host-compilable by test/.
  * Single-threaded by contract; the caller serialises access.
@@ -15,7 +14,7 @@
  *      sees: its send toward us blocks briefly, then it warns and drops
  *      (rns/esp-idf/src/rnsd.cpp, iface out).
  *
- * Deliberately absent from LoraPkt, each for a reason (§4): no modulation,
+ * Deliberately absent from LoraPkt, each for a reason: no modulation,
  * channel or power — not known at enqueue, decided at negotiation for a whole
  * train; no expiry — first_seen_ms is the fact, age limits are read by
  * whoever looks; no type — SUPE control frames never enter the queue.
@@ -58,7 +57,9 @@ struct LoraPkt {
 };
 
 struct LoraQueue {
-    LoraPkt  e[LORAQ_CAP];     /* FIFO — e[0] is the head */
+    LoraPkt  e[LORAQ_CAP];     /* e[0] is the head: everything that is not an
+                                * announce, in arrival order, then the
+                                * announces, in arrival order (loraqPush) */
     uint8_t  n;
     uint32_t dropsPeerCap;     /* packets shed by the per-peer cap */
 };
@@ -70,7 +71,9 @@ bool loraqAccepting(const LoraQueue* q);
 
 /** Enqueue a heap block. Ownership transfers on true; on false the caller
  *  still owns `bytes`. The per-peer cap is applied here: at the cap, the
- *  peer's oldest queued packet is dropped to make room. */
+ *  peer's oldest queued packet is dropped to make room. A packet without
+ *  LORAQ_F_ANNOUNCE is placed ahead of every queued announce, behind the
+ *  packets that are not announces. */
 bool loraqPush(LoraQueue* q, uint8_t* bytes, uint16_t len, uint32_t now_ms,
                uint16_t peer_id, const uint8_t* tag3, uint8_t refs, uint8_t flags);
 

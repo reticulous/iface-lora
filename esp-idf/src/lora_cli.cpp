@@ -145,8 +145,7 @@ void manualTxPoll(LoraRadio* r) {
             r->mtxPhase    = MTXP_LBT;
             csmaResetAccess(r);
             r->csmaStart   = xTaskGetTickCount();
-            r->mtxDeadline = r->csmaStart +
-                (r->lbtTimeoutTicks ? r->lbtTimeoutTicks : pdMS_TO_TICKS(10000));
+            r->mtxDeadline = r->csmaStart + pdMS_TO_TICKS(2 * CSMA_BEAT_GIVEUP_MS);
             return;
         }
         r->mtxPhase = MTXP_TX;
@@ -1189,8 +1188,9 @@ static void cliManualTx(long idx, const char* cmd, const char* rest) {
     uint32_t gen = r->mtxResGen;
     r->mtxReq = true;
     if (s_task) xTaskNotifyGive(s_task);
-    /* RAW/PROT complete in a few ms; PSA can back off up to lbt_timeout. Cap the
-     * wait well past the worst case (SF12 APPC + a busy channel). */
+    /* RAW/PROT complete in a few ms; PSA backs off for as long as the channel
+     * is busy. Cap the wait well past the worst case (SF12 APPC + a busy
+     * channel). */
     for (int i = 0; i < 400 && r->mtxResGen == gen; i++) delay(50);   /* ≤ 20 s */
     if (r->mtxResGen == gen) { cliPrintf("lora/%ld %s: no result (timeout)\n", idx, cmd); return; }
     cliPrintf("lora/%ld %s: %s%s\n", idx, cmd,

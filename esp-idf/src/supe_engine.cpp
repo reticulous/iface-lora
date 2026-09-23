@@ -1419,12 +1419,18 @@ static void slotService(SupeEngine* e) {
      * that touch the radio defer; the bookkeeping runs on every tick. A
      * declined slot is walked past, not retried. */
     bool rxBusy = e->host->rx_busy && e->host->rx_busy(e->host->ctx);
-    /* Narrow schedules first: a hail outranks a rendezvous (§7). */
-    for (int pass = 0; pass < 2; pass++)
+    /* Narrow schedules first: a hail outranks a rendezvous (§7). Among the
+     * narrow ones, the schedule of our own hail outranks one from a hail we
+     * received: the answer we listen for there is the whole of our exchange,
+     * and a READY that finds us away on another schedule's channel is a hail
+     * gone unanswered — three of those and the peer holds us. A received
+     * hail we walk past costs a hail-back. */
+    for (int pass = 0; pass < 3; pass++)
     for (int i = 0; i < SUPE_SCHED_MAX; i++) {
         SupeSched* s = &e->sched[i];
         if (!s->used) continue;
-        if (s->wide != (pass == 1)) continue;
+        int rank = s->wide ? 2 : (s->weHailed ? 0 : 1);
+        if (rank != pass) continue;
         if (s->consumed) { schedFree(e, s); continue; }
         if ((int32_t)(now - (s->epochMs + schedHorizon(s) + 2 * SUPE_SLOT_GUARD_MS)) >= 0) {
             schedExpire(e, s, now);

@@ -911,6 +911,50 @@ static void testCrossedHails(void) {
     eqi(A.eng.unanswered, 0, "A's crossed schedule was consumed, not scored");
 }
 
+/* Two narrow schedules with a slot at the same instant, the received hail's
+ * ahead of our own hail's in the table: the slot attended is our own hail's,
+ * where its answer arrives. */
+static void testOwnHailOutranksReceived(void) {
+    resetAir();
+    Node A = {}, B = {};
+    nodeInit(&A, "A", SUPE_REGIME_EU863);
+    nodeInit(&B, "B", SUPE_REGIME_EU863);
+    std::vector<Node*> aAlone = { &A };
+    wire(&A, &B);
+    pushPkt(&A, TAG, 5, 150, 0x11);
+    launchFrom(&A);
+    pumpOne(aAlone);                            /* the hail is out; nobody hears it */
+    eqi(A.eng.m.phase, SUPE_M_IDLE, "A holds its schedule and is home");
+    int own = -1, used = 0;
+    for (int i = 0; i < SUPE_SCHED_MAX; i++) {
+        if (!A.eng.sched[i].used) continue;
+        used++;
+        if (!A.eng.sched[i].wide && A.eng.sched[i].weHailed) own = i;
+    }
+    ok(own >= 0 && used == 1, "A's own hail installed one narrow schedule");
+    if (own < 0 || used != 1) return;
+
+    /* A hail somebody else sent us, seated ahead of ours, its first slot at
+     * the same instant as ours. Both are due now. */
+    SupeSched mine = A.eng.sched[own];
+    memset(&A.eng.sched[own], 0, sizeof(SupeSched));
+    SupeSched theirs = mine;
+    theirs.weHailed = false;
+    theirs.d.hash3[0] ^= 0xFF;
+    A.eng.sched[0] = theirs;
+    A.eng.sched[1] = mine;
+    for (int i = 0; i < 2; i++) {
+        SupeSched* s = &A.eng.sched[i];
+        s->nextSlot = 0;
+        s->consumed = false;
+        s->epochMs = g_now - s->d.slot[0].tMs;
+    }
+    supeEngOnTimer(&A.eng);
+    eqi(A.eng.m.phase, SUPE_M_SLOT_LISTEN, "A listens for the answer to its own hail");
+    eqi(A.eng.m.schedIdx, 1, "…on its own schedule, not the received one ahead of it");
+    eqi(A.eng.slotsSpoken, 0, "…and spoke at nobody's slot");
+}
+
 static void testSeedHashGate(void) {
     resetAir();
     Node A = {}, B = {};
@@ -998,7 +1042,31 @@ static void testNoStaleDeadlineInTxPhase(void) {
     eqi(A.eng.meetingsDone, 1, "the meeting still completes");
 }
 
+/* Messages before announces: whatever is not an announce goes ahead of every
+ * queued announce, and each kind keeps its own arrival order. */
+static void testQueueOrder(void) {
+    LoraQueue q;
+    loraqInit(&q);
+    auto push = [&](uint8_t id, bool announce) {
+        uint8_t* b = (uint8_t*)malloc(1);
+        b[0] = id;
+        ok(loraqPush(&q, b, 1, 0, LORAQ_PEER_NONE, nullptr, 1,
+                     announce ? LORAQ_F_ANNOUNCE : 0), "pushed");
+    };
+    push(1, true);
+    push(2, true);
+    push(3, false);
+    push(4, true);
+    push(5, false);
+    const uint8_t want[] = { 3, 5, 1, 2, 4 };
+    eqi(loraqDepth(&q), 5, "five queued");
+    for (uint8_t i = 0; i < 5; i++)
+        eqi(loraqAt(&q, i)->bytes[0], want[i], "data first, then announces, each in arrival order");
+    loraqFlush(&q);
+}
+
 int main(void) {
+    testQueueOrder();
     testDialogueLite();
     testDialogueFull();
     testDialogueGotFirst();
@@ -1012,6 +1080,7 @@ int main(void) {
     testWideRide();
     testOwedHailPlan();
     testCrossedHails();
+    testOwnHailOutranksReceived();
     testSeedHashGate();
     testVerdicts();
     testNoStaleDeadlineInTxPhase();
