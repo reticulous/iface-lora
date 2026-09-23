@@ -240,6 +240,7 @@ struct LoraRadio {
     int             rnsdHandle;
     bool            running;
     bool            enabled;
+    uint32_t        cfgPrint;
     uint8_t         curMode;
     uint32_t        curBitrate;
     /* Live modem params, kept for per-packet airtime accounting (the airtime

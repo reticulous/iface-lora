@@ -1287,9 +1287,16 @@ net endpoint registration on this task, where net requires it to originate.
 the radio in the sweep channel plan — nothing to coalesce with) and at task-loop entry
 and every `rns start` resume.
 
-`applyConfig(r)` reads `s.lora.<n>.enable`: disabled → `radioStop`; enabled →
-`radioStop` then `radioStart` (a cheap stop/start that avoids tracking which
-field changed).
+`applyConfig(r)` reads `s.lora.<n>.enable`: disabled → `radioStop`; enabled and
+not running → `radioStart`; enabled and running → `radioStop` then `radioStart`
+**only if the radio's settings changed**. Which fields changed is not tracked:
+`cfgFingerprint` hashes every key under `s.lora.<n>.` (minus the two live-read
+keys `onCfgChange` already excludes) and the apply compares it with the hash
+taken after the last start. A restart is not free — `radioStop` deregisters the
+interface from rnsd, which drops every route learned over it — so an apply that
+changed nothing must not restart. The RNode endpoint is the usual source of such
+applies: a client's configuration burst self-arms the apply even when every
+value it wrote was already in place (§17.4).
 
 **`radioStart`** reads the radio config, validates it (`freq > 0`, `bw > 0`,
 `sf ∈ [5,12]`, `cr ∈ [5,8]`, `txp ∈ [−9,22]`; sync word parsed with
@@ -2574,8 +2581,9 @@ frame is read and discarded**. `CMD_READY` therefore ships one `0x00` byte.
 airtime limits. The burst **always ends with `CMD_RADIO_STATE`**.
 
 Each is executed by writing the ordinary `s.lora.<n>.*` key on the bound radio,
-so it flows through the normal config path (§9) and re-registers with rnsd —
-and persists in NVS. Range checks: frequency and bandwidth against the same
+so it flows through the normal config path (§9) — restarting the radio and
+re-registering with rnsd only when a value actually changed — and persists in
+NVS. Range checks: frequency and bandwidth against the same
 bounds the unit bridge uses (§10), SF 5..12, CR 5..8, TX power clamped to 22 dBm.
 Each write calls `rnodeCfgTouched()`, which sets `echoPend` **and** arms the
 apply — self-arming even when every write was a no-op, so the echo always fires

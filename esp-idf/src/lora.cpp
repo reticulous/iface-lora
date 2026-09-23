@@ -684,6 +684,27 @@ static void loraPublishRowGates(LoraRadio* r) {
     storageEnd();
 }
 
+/* A radio's settings fingerprint: FNV-1a over every key=value under
+ * s.lora.<n>., minus the two keys read live (onCfgChange excludes them from
+ * the apply too). applyConfig restarts a running radio only when this moves. */
+static uint32_t s_printAcc;
+
+static void printFold(const char* key, const char* val) {
+    if (!key || strstr(key, ".SUPE.enable") || strstr(key, ".announce_interval")) return;
+    for (const char* p = key; *p; p++) s_printAcc = (s_printAcc ^ (uint8_t)*p) * 16777619u;
+    s_printAcc = (s_printAcc ^ '=') * 16777619u;
+    for (const char* p = val ? val : ""; *p; p++) s_printAcc = (s_printAcc ^ (uint8_t)*p) * 16777619u;
+    s_printAcc = (s_printAcc ^ '\n') * 16777619u;
+}
+
+static uint32_t cfgFingerprint(int idx) {
+    char prefix[16];
+    snprintf(prefix, sizeof prefix, "s.lora.%d.", idx);
+    s_printAcc = 2166136261u;
+    storageForEach(prefix, printFold);
+    return s_printAcc;
+}
+
 static void applyConfig(LoraRadio* r) {
     char kb[48];
     r->enabled = storageGetInt(sk(kb, sizeof kb, r->idx, "enable"), 0) != 0;
@@ -702,10 +723,18 @@ static void applyConfig(LoraRadio* r) {
         }
         return;
     }
-    /* If already running, stop and start to pick up new params. Cheap
-     * (~30 ms) and avoids tracking which fields changed. */
+    /* A running radio restarts only when its settings changed. Restarting is
+     * not free: radioStop deregisters from rnsd, which drops every route
+     * learned over this interface. Which field changed is not tracked — the
+     * whole s.lora.<n>. subtree is hashed and compared with the hash taken
+     * after the last start (a start may clamp and write back, so the
+     * reference is taken after it). The RNode endpoint arms an apply on every
+     * client configuration burst, values changed or not. */
+    const uint32_t print = cfgFingerprint(r->idx);
+    if (r->running && print == r->cfgPrint) return;
     if (r->running) radioStop(r);
     radioStart(r);
+    r->cfgPrint = cfgFingerprint(r->idx);
 }
 
 #if !defined(CONFIG_LORA_NO_SUPE)
