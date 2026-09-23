@@ -119,6 +119,41 @@ static uint32_t bwFromCode(uint8_t code)
     }
 }
 
+/* What the SX1262 radiates for a PA configuration and a SetTxParams power.
+ * The power register alone does not say: the chip reaches +14 dBm with the
+ * register at 20 and the PA throttled (paDutyCycle 1, hpMax 4), and RadioLib's
+ * setOutputPower picks exactly such throttled settings for every power below
+ * +22. The table is RadioLib's paOptTable, measured on hardware
+ * (jgromes/RadioLib#1628): entry i radiates i − 9 dBm. A triple the table does
+ * not name falls back to the datasheet's reference points — full PA radiates
+ * the register value, and the three throttled settings the datasheet lists for
+ * +20/+17/+14 sit 2/5/8 dB under it. */
+struct PaSetting { uint8_t dutyCycle, hpMax; int8_t paVal; };
+
+static const PaSetting kPaMeasured[32] = {
+    {2, 2, -5}, {2, 1, 0},  {1, 1, 3},  {1, 2, 0},  {1, 1, 6},  {1, 2, 3},
+    {2, 2, 2},  {4, 1, 6},  {1, 1, 11}, {2, 1, 11}, {1, 1, 14}, {2, 1, 14},
+    {1, 1, 20}, {1, 1, 22}, {2, 2, 11}, {3, 1, 21}, {1, 2, 17}, {4, 2, 13},
+    {1, 2, 20}, {1, 2, 22}, {2, 2, 21}, {3, 2, 21}, {1, 4, 19}, {1, 4, 20},
+    {3, 3, 20}, {2, 5, 19}, {1, 6, 22}, {2, 5, 22}, {3, 5, 22}, {3, 6, 22},
+    {4, 6, 22}, {4, 7, 22},
+};
+
+static int radiatedDbm(uint8_t dutyCycle, uint8_t hpMax, int8_t paVal)
+{
+    for (int i = 0; i < 32; i++) {
+        const PaSetting& s = kPaMeasured[i];
+        if (s.dutyCycle == dutyCycle && s.hpMax == hpMax && s.paVal == paVal)
+            return i - 9;
+    }
+    int offset = 0;
+    if      (dutyCycle == 3 && hpMax == 5) offset = -2;
+    else if (dutyCycle == 2 && hpMax == 3) offset = -5;
+    else if (dutyCycle == 2 && hpMax == 2) offset = -8;
+    int dbm = paVal + offset;
+    return dbm < -9 ? -9 : dbm > 22 ? 22 : dbm;
+}
+
 struct VirtualSx126x::Impl {
     int slot;
 
@@ -146,7 +181,9 @@ struct VirtualSx126x::Impl {
     bool     hdrImplicit = false;
     bool     crcOn = true;
     uint8_t  payloadLen = 0;
-    int      powerDbm = 14;
+    int      paVal = 14;
+    uint8_t  paDutyCycle = 4;
+    uint8_t  paHpMax = 7;
 
     uint8_t  rxLen = 0, rxPtr = 0;
     uint8_t  rssiPkt = 220, snrPkt = 40, sigRssiPkt = 220;
@@ -369,7 +406,7 @@ void VirtualSx126x::transfer(const uint8_t* out, size_t len, uint8_t* in)
         frame.tPre = now + (int64_t)((d->preamble + 4.25) * tSym * 1e6);
         frame.tHdr = frame.tPre + (int64_t)(8.0 * tSym * 1e6);
         frame.tEnd = now + (int64_t)(toa * 1e6);
-        frame.powerDbm = d->powerDbm;
+        frame.powerDbm = radiatedDbm(d->paDutyCycle, d->paHpMax, (int8_t)d->paVal);
         memcpy(txPayload, d->buf + d->txBase, d->payloadLen);
         frame.payload = txPayload;
         frame.len = d->payloadLen;
@@ -409,7 +446,14 @@ void VirtualSx126x::transfer(const uint8_t* out, size_t len, uint8_t* in)
         break;
 
     case CMD_SET_TX_PARAMS:
-        if (len >= 2) d->powerDbm = (int8_t)out[1];
+        if (len >= 2) d->paVal = (int8_t)out[1];
+        break;
+
+    case CMD_SET_PA_CONFIG:
+        if (len >= 3) {
+            d->paDutyCycle = out[1];
+            d->paHpMax     = out[2];
+        }
         break;
 
     case CMD_SET_BUFFER_BASE:
@@ -507,7 +551,6 @@ void VirtualSx126x::transfer(const uint8_t* out, size_t len, uint8_t* in)
     case CMD_SET_REGULATOR:
     case CMD_CALIBRATE:
     case CMD_CALIBRATE_IMAGE:
-    case CMD_SET_PA_CONFIG:
     case CMD_SET_DIO2_RF_SWITCH:
     case CMD_SET_DIO3_TCXO:
     case CMD_STOP_TIMER_ON_PRE:
