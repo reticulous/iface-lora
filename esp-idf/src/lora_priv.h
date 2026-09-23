@@ -48,14 +48,15 @@
 
 /* ─────────────── the medium's colour ───────────────
  *
- * Shared between the pill (lora_mon.cpp, published while a radio is enabled)
- * and the palette entry (lora.cpp's onInit, published from boot regardless).
- * The distinction matters because the network graph draws LoRa links between
- * OTHER nodes on a device with no radio switched on, and those lines are still
- * LoRa — a colour is a property of the medium, a pill of this node. */
+ * Carried by the pill (lora_mon.cpp, published while a radio is enabled). The
+ * palette entry — the same colour and placement, plus the medium's operator-
+ * facing name — is rnsd's, published from boot on every node whether or not
+ * this straddle is in the image, because the network graph draws LoRa links
+ * between OTHER nodes on a device with no radio at all and those lines are
+ * still LoRa. A colour is a property of the medium, a pill of this node. Keep
+ * these two values in step with rnsdPillPaletteInit() (rns, rnsd_peers.cpp). */
 #define LORA_PILL_COLOR "ffd400"
 #define LORA_PILL_ORDER 4
-#define LORA_PILL_TITLE "LoRa"
 
 #if defined(CONFIG_LORA0_CS_PIN)
 

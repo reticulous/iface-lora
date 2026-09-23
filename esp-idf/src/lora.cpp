@@ -1491,8 +1491,6 @@ void LoraService::onInit() {
 
     cliRegisterCmd("lora", cliLora);
 
-    rnsdPillColor("lora", LORA_PILL_COLOR, LORA_PILL_ORDER, LORA_PILL_TITLE);
-
     /* Contribute this class's configuration to the network-graph record. We
      * hand over FIELDS; netgraph composes the line and we never see a record —
      * the same division of labour as rnsdPillSet one layer up. */
@@ -1580,12 +1578,14 @@ void loraNameForTag(int radio, const char* tag, char* out, size_t outLen) {
 #else  /* ── no radios configured (CONFIG_LORA_COUNT = 0) ── */
 
 void LoraService::onInit() {
-    /* iface-lora staged but inert: no LoRa pins configured for this board.
-     * RadioLib links out; set CONFIG_LORA_COUNT and the pins to enable.
+    /* Staged but inert: this straddle is in the image (`--with
+     * reticulous/iface-lora`) on a board that declares no radio, so there are
+     * no pins to drive and RadioLib links out. Set CONFIG_LORA_COUNT and the
+     * pins to enable.
      *
-     * The colour is still published. A board with no radio at all still draws
-     * the community's LoRa links on its network graph, and they are still LoRa. */
-    rnsdPillColor("lora", LORA_PILL_COLOR, LORA_PILL_ORDER, LORA_PILL_TITLE);
+     * Nothing to publish either: the LoRa palette entry is rnsd's, stated
+     * whether or not this straddle is in the build, so the network graph draws
+     * the community's LoRa links in LoRa's colour regardless. */
 }
 
 bool loraPeerSummary(int, lora_peer_summary*) { return false; }

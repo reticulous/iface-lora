@@ -7,7 +7,18 @@
 #
 # Pins + per-radio type come from this component's own Kconfig (LORA_* /
 # LORAn_*), resolved from the buildable's sdkconfig. The board sets them in
-# its sdkconfig.defaults; staged-but-inert when CONFIG_LORA_COUNT=0.
+# its kconfig: block.
+#
+# The radio rides on the board, the way the on-device UI does: a board with a
+# modem additional_installs this straddle, so no buildable lists it and a
+# radioless board (hw-waveshare-28b) ships no LoRa settings section, no s.lora.*
+# keys and no LoRaMon tile. That board edge is gated `when: reticulous/rns`,
+# because this is a Reticulum interface and requires: rns below — ungated, a
+# buildable that is not a Reticulum node would pull the whole mesh in through
+# the board's modem. Staged on a board that declares no radio
+# (`--with reticulous/iface-lora`) it is inert: CONFIG_LORA_COUNT stays 0 and
+# RadioLib links out. LoRa's colour on the network graph is not this straddle's
+# to publish for that reason — rnsd states it, on every node.
 schema_version: 1
 name: reticulous/iface-lora
 prefix: rns_lora
@@ -24,6 +35,12 @@ requires:
 # additional_installs cycle.
 additional_installs:
   - reticulous/loramon
+# The radio brings its Bluetooth door too: rnode-ble is a Nordic UART Service
+# onto the RNode endpoint below, which is this straddle's, so it belongs to
+# whatever build has a radio rather than to the image. Soft, so `--without
+# rnode-ble` leaves the serial and TCP doors. Its requires: back-edge onto this
+# straddle is the same benign cycle loramon's is.
+  - reticulous/rnode-ble
 # Boot-registered Service: LoraService::onInit() self-registers with rnsd via
 # ITS; `requires: reticulous/rns` puts rnsd ahead of it in dependency-topo
 # order, so its port surface is up first.
