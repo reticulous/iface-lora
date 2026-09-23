@@ -881,6 +881,8 @@ static size_t supeAnnBuild(LoraRadio* r, uint8_t* f, size_t cap, uint8_t* countO
     }
     if (countOut) *countOut = count;
     if (count == 0) return 0;
+    for (uint8_t i = 0; i < count; i++)
+        supeTagAdd(r, ids[i], /*perm=*/true, 0);
     return supeEngBuildAnn(&r->supe->eng, f, cap, ids, count, r->cfgTxp, r->supeOn);
 }
 
