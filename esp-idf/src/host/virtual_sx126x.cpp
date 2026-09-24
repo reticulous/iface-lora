@@ -154,6 +154,25 @@ static int radiatedDbm(uint8_t dutyCycle, uint8_t hpMax, int8_t paVal)
     return dbm < -9 ? -9 : dbm > 22 ? 22 : dbm;
 }
 
+/* The status registers hold a level in one byte each: RSSI as −x/2 dBm
+ * unsigned, SNR as x/4 dB in two's complement. So each has two ends, RSSI 0
+ * and −127.5 dBm, SNR −32 and +31.75 dB, and a level past an end reads as that
+ * end. Cast straight into the byte it would wrap round instead: a link 54 dB
+ * over the noise would read −10 dB, and a frame at −129 dBm, which the ether
+ * delivers from SF9 up, would read −1 dBm, so the strongest links and the
+ * weakest would each pass for the other. */
+static uint8_t rssiRegister(int dbm)
+{
+    int v = -2 * dbm;
+    return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+}
+
+static uint8_t snrRegister(int db)
+{
+    int v = 4 * db;
+    return (uint8_t)(int8_t)(v < -128 ? -128 : v > 127 ? 127 : v);
+}
+
 struct VirtualSx126x::Impl {
     int slot;
 
@@ -526,7 +545,7 @@ void VirtualSx126x::transfer(const uint8_t* out, size_t len, uint8_t* in)
             /* The chip's -x/2 encoding, and nothing at all outside RX. */
             int dbm = esp_timer_get_time() < d->airEndUs
                           ? d->airLevel : VirtualSx126x::kNoiseFloorDbm;
-            in[2] = strcmp(d->mode, "RX") == 0 ? (uint8_t)(-2 * dbm) : 0xFF;
+            in[2] = strcmp(d->mode, "RX") == 0 ? rssiRegister(dbm) : 0xFF;
         }
         break;
 
@@ -643,9 +662,9 @@ static void rxEndCb(void* arg)
             d->buf[(uint8_t)(d->rxBase + i)] = d->pendingPayload[i];
         d->rxLen = (uint8_t)d->pendingLen;
         d->rxPtr = d->rxBase;
-        d->rssiPkt    = (uint8_t)(-2 * d->pendingEnd.rssiDbm);
+        d->rssiPkt    = rssiRegister(d->pendingEnd.rssiDbm);
         d->sigRssiPkt = d->rssiPkt;
-        d->snrPkt     = (uint8_t)(int8_t)(d->pendingEnd.snrDb * 4);
+        d->snrPkt     = snrRegister(d->pendingEnd.snrDb);
         bits = IRQ_RX_DONE;
         if (!d->pendingEnd.crcOk)   bits |= IRQ_CRC_ERR;
         if (!d->pendingEnd.headerOk) bits |= IRQ_HEADER_ERR;
