@@ -28,6 +28,7 @@ struct VirtualRxBegin {
     int     id;
     int64_t t0, tPre, tHdr, tEnd;   /* the sender's own microsecond stamps */
     int     levelDbm;
+    int     takes;                  /* 1 or 0 as the ether ruled; -1 when it did not say */
 };
 
 /** The same frame, finished: what it carried and how it came out. */

@@ -107,6 +107,8 @@ void handleMessage(const char* text, size_t len)
             f.tHdr     = jsonI64(root, "t_hdr", 0);
             f.tEnd     = jsonI64(root, "t_end", 0);
             f.levelDbm = jsonInt(root, "level", VirtualSx126x::kNoiseFloorDbm);
+            const cJSON* takes = cJSON_GetObjectItemCaseSensitive(root, "takes");
+            f.takes    = cJSON_IsBool(takes) ? (cJSON_IsTrue(takes) ? 1 : 0) : -1;
             chip->onRxBegin(f);
         }
     } else if (strcmp(type, "rx_end") == 0) {
