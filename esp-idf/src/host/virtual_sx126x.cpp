@@ -76,6 +76,15 @@ enum {
     IRQ_CRC_ERR           = 1u << 6,
 };
 
+/* How many symbols into a frame a receiver that has heard it from the start
+ * finds the preamble and raises PreambleDetected. A real modem finds it within
+ * a few symbols, long before the sync word that `t_pre` marks. Firmware that
+ * senses the channel by asking the demodulator measured a blind window of about
+ * 4 ms at SF7 and 125 kHz: three boards, 150 trials. So 4 symbols is an upper
+ * bound. Raised at the sync word instead, the same firmware is blind for the
+ * whole preamble: 29 ms at SF7 with 24 symbols, 46 ms at SF8 with 18. */
+constexpr double kPreambleFoundSymbols = 4.0;
+
 enum {
     REG_VERSION_STRING  = 0x0320,
     REG_IQ_CONFIG       = 0x0736,
@@ -201,7 +210,7 @@ struct VirtualSx126x::Impl {
 
     /* Every scheduled instant of a frame in flight, in or out. */
     esp_timer_handle_t tTxDone = nullptr;
-    esp_timer_handle_t tPre = nullptr, tHdr = nullptr, tEnd = nullptr;
+    esp_timer_handle_t tPre = nullptr, tSync = nullptr, tHdr = nullptr, tEnd = nullptr;
     VirtualRxEnd pendingEnd = {};
     uint8_t      pendingPayload[256] = {};
     size_t       pendingLen = 0;
@@ -347,6 +356,7 @@ static void setMode(VirtualSx126x::Impl* d, const char* mode, uint8_t bits)
  * SetRxTxFallbackMode named. */
 static void txDoneCb(void* arg);
 static void rxPreCb(void* arg);
+static void rxSyncCb(void* arg);
 static void rxHdrCb(void* arg);
 static void rxEndCb(void* arg);
 
@@ -584,6 +594,7 @@ void VirtualSx126x::transfer(const uint8_t* out, size_t len, uint8_t* in)
         d->lockEndUs = 0;
         d->pendingValid = false;
         if (d->tPre) esp_timer_stop(d->tPre);
+        if (d->tSync) esp_timer_stop(d->tSync);
         if (d->tHdr) esp_timer_stop(d->tHdr);
         if (d->tEnd) esp_timer_stop(d->tEnd);
     }
@@ -624,7 +635,12 @@ static void txDoneCb(void* arg)
 
 static void rxPreCb(void* arg)
 {
-    raise(((VirtualSx126x*)arg)->d, IRQ_PREAMBLE_DETECTED | IRQ_SYNC_WORD_VALID);
+    raise(((VirtualSx126x*)arg)->d, IRQ_PREAMBLE_DETECTED);
+}
+
+static void rxSyncCb(void* arg)
+{
+    raise(((VirtualSx126x*)arg)->d, IRQ_SYNC_WORD_VALID);
 }
 
 static void rxHdrCb(void* arg)
@@ -686,8 +702,13 @@ void VirtualSx126x::onRxBegin(const VirtualRxBegin& f)
     portEXIT_CRITICAL(&d->mux);
 
     /* The sender's stamps are its own clock's; only the gaps between them mean
-     * anything here, and they are measured from this instant. */
-    armOnce(&d->tPre, rxPreCb, this, f.tPre - f.t0);
+     * anything here, and they are measured from this instant. The preamble is
+     * found a few symbols in, and the sync word lands where `t_pre` says. */
+    int64_t syncUs = f.tPre - f.t0;
+    double tSym = (double)((uint32_t)1 << d->sf) / (double)d->bwHz;
+    int64_t foundUs = (int64_t)(kPreambleFoundSymbols * tSym * 1e6);
+    armOnce(&d->tPre, rxPreCb, this, foundUs < syncUs ? foundUs : syncUs);
+    armOnce(&d->tSync, rxSyncCb, this, syncUs);
     armOnce(&d->tHdr, rxHdrCb, this, f.tHdr - f.t0);
 }
 
