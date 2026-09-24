@@ -655,7 +655,27 @@ static void rxEndCb(void* arg)
     if (bits) raise(d, bits);
 }
 
+/* A frame's energy at this antenna until its end: what an instantaneous RSSI
+ * reads. */
+static void feelEnergy(VirtualSx126x::Impl* d, int64_t now, const VirtualRxBegin& f)
+{
+    if (now >= d->airEndUs) d->airLevel = 0;
+    if (f.levelDbm > d->airLevel || d->airLevel == 0) d->airLevel = f.levelDbm;
+    if (now + (f.tEnd - f.t0) > d->airEndUs) d->airEndUs = now + (f.tEnd - f.t0);
+}
+
 /* ---- What the ether hands back ---- */
+
+/* A frame this receiver walked in on: back from its own transmission, or out
+ * of standby, after the frame began. It missed the preamble, so there is
+ * nothing to demodulate, but the frame is on the air until it ends. */
+void VirtualSx126x::onEnergy(const VirtualRxBegin& f)
+{
+    int64_t now = esp_timer_get_time();
+    portENTER_CRITICAL(&d->mux);
+    if (strcmp(d->mode, "RX") == 0) feelEnergy(d, now, f);
+    portEXIT_CRITICAL(&d->mux);
+}
 
 void VirtualSx126x::onRxBegin(const VirtualRxBegin& f)
 {
@@ -665,9 +685,7 @@ void VirtualSx126x::onRxBegin(const VirtualRxBegin& f)
 
     /* Energy first: every frame in the air raises the instantaneous reading,
      * whether or not this receiver is following it. */
-    if (now >= d->airEndUs) d->airLevel = 0;
-    if (f.levelDbm > d->airLevel || d->airLevel == 0) d->airLevel = f.levelDbm;
-    if (now + (f.tEnd - f.t0) > d->airEndUs) d->airEndUs = now + (f.tEnd - f.t0);
+    feelEnergy(d, now, f);
 
     /* Then the demodulator, which follows one frame at a time. A frame that
      * starts while another is being demodulated is not received at all unless
