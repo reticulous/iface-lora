@@ -155,12 +155,18 @@ static int radiatedDbm(uint8_t dutyCycle, uint8_t hpMax, int8_t paVal)
 }
 
 /* The status registers hold a level in one byte each: RSSI as −x/2 dBm
- * unsigned, SNR as x/4 dB in two's complement. So each has two ends, RSSI 0
- * and −127.5 dBm, SNR −32 and +31.75 dB, and a level past an end reads as that
- * end. Cast straight into the byte it would wrap round instead: a link 54 dB
- * over the noise would read −10 dB, and a frame at −129 dBm, which the ether
- * delivers from SF9 up, would read −1 dBm, so the strongest links and the
- * weakest would each pass for the other. */
+ * unsigned, SNR as x/4 dB in two's complement. Cast straight into its byte, a
+ * level past either end wraps round: a link 54 dB over the noise would read
+ * −10 dB, and a frame at −129 dBm, which the ether delivers from SF9 up, would
+ * read −1 dBm, so the strongest links and the weakest would each pass for the
+ * other. RSSI therefore holds at its register's ends, 0 and −127.5 dBm.
+ *
+ * SNR stops well short of its register. A LoRa receiver's SNR estimate
+ * saturates a little above 10 dB however strong the link (an LR2021 on a desk
+ * read 14 dB at −16 dBm), so a link reads no more than +12 dB, and no less
+ * than the register's −32 dB. */
+static const int kSnrCeilingDb = 12;
+
 static uint8_t rssiRegister(int dbm)
 {
     int v = -2 * dbm;
@@ -169,7 +175,7 @@ static uint8_t rssiRegister(int dbm)
 
 static uint8_t snrRegister(int db)
 {
-    int v = 4 * db;
+    int v = 4 * (db > kSnrCeilingDb ? kSnrCeilingDb : db);
     return (uint8_t)(int8_t)(v < -128 ? -128 : v > 127 ? 127 : v);
 }
 
