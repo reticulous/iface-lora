@@ -671,12 +671,15 @@ void VirtualSx126x::onRxBegin(const VirtualRxBegin& f)
 
     /* Then the demodulator, which follows one frame at a time. A frame that
      * starts while another is being demodulated is not received at all unless
-     * it leads the one in progress by the capture margin, in which case the
-     * receiver drops what it had and takes the louder frame instead. Without
-     * this the chip would hand up whichever frame ended last and the medium's
-     * verdict — which says only one of them survived — would mean nothing. */
+     * it takes the receiver, in which case the receiver drops what it had and
+     * follows the new frame instead. The ether says whether it does, because
+     * the ether rules on which of the two survives; an ether that does not say
+     * is taken to mean the capture margin. Without this the chip would hand up
+     * whichever frame ended last and the medium's verdict — which says only
+     * one of them survived — would mean nothing. */
     bool busy = now < d->lockEndUs;
-    if (busy && f.levelDbm < d->lockLevel + kCaptureDb) {
+    bool takes = f.takes >= 0 ? f.takes == 1 : f.levelDbm >= d->lockLevel + kCaptureDb;
+    if (busy && !takes) {
         portEXIT_CRITICAL(&d->mux);
         return;
     }
