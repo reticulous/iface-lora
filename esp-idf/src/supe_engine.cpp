@@ -730,7 +730,13 @@ static void finishMeeting(SupeEngine* e, bool ok, const char* why) {
         SupeSched* s = schedInstall(e, m->lastEnd, m->lastEndLen, /*wide=*/true,
                                     /*weHailed=*/false, /*weTx0=*/m->weReceivedFinal,
                                     m->haveTag ? m->tag : nullptr, m->peerId, &cfg, eNow(e));
-        if (s) { s->lastRssi = m->lastRssi; s->lastSnrQ = m->lastSnrQ; }
+        if (s) {
+            s->lastRssi = m->lastRssi;
+            s->lastSnrQ = m->lastSnrQ;
+            s->haveLastTx = m->haveLastTx;
+            s->lastTxp = m->lastTxp;
+            s->lastTxCfg = m->lastTxCfg;
+        }
     }
     if (ok) {
         e->meetingsDone++;
@@ -1406,6 +1412,11 @@ static void slotListen(SupeEngine* e, SupeSched* s, uint8_t k) {
     m->hailCount = s->hailCount;
     m->hailLen = s->hailLen;
     m->budget = s->wide ? 0 : s->hailCeil;
+    /* A wide opener quotes how it read our last frame of the seeding meeting;
+     * nothing is transmitted in this window, so that frame is still our last. */
+    m->haveLastTx = s->wide && s->haveLastTx;
+    m->lastTxp = s->lastTxp;
+    m->lastTxCfg = s->lastTxCfg;
     m->txNext  = 0;                    /* reused as the window-extension count */
     m->deadlineMs = slotWindowCloseMs(e, s, k);
     s->nextSlot = (uint8_t)(k + 1);
@@ -1879,11 +1890,14 @@ static void hailAnswered(SupeEngine* e, const SupeReady* g, int16_t rssi, int16_
         noteSimple(e, m->tag, SUPE_EV_ALIVE);
         noteSimple(e, m->tag, SUPE_EV_ANSWERED);
         notePair(e, m->tag, &m->slotCfg, rssi, snr10, g->pwrDbm);
+        /* The reading is of a frame of ours, and is a path loss only against
+         * that frame's power: the hail's, or — at a wide slot, where we have
+         * sent nothing yet — our last of the seeding meeting. */
         if (m->fromHail) {
             SupeCfg hail = hailCfgOf(e);
             noteReport(e, m->tag, &hail, g->heardRssi, g->heardSnrQ, m->hailTxp);
-        } else {
-            noteReport(e, m->tag, &m->slotCfg, g->heardRssi, g->heardSnrQ, m->ourTxp);
+        } else if (m->haveLastTx) {
+            noteReport(e, m->tag, &m->lastTxCfg, g->heardRssi, g->heardSnrQ, m->lastTxp);
         }
     }
     if (m->fromHail) {

@@ -242,6 +242,12 @@ struct SupeSched {
     /* wide: the last thing heard from the peer, for the opener's `heard` */
     int16_t   lastRssi;
     int8_t    lastSnrQ;
+    /* wide: our last frame of the seeding meeting — the one the peer's own
+     * `heard` describes when it opens here, and so the power a report quoting
+     * it is filed against (§15) */
+    bool      haveLastTx;
+    int8_t    lastTxp;
+    SupeCfg   lastTxCfg;
     /* Why a schedule carried nothing, counted as it happens. */
     uint8_t   nOwnDue;        /* own slots whose moment arrived */
     uint8_t   nSpoke;         /* …opened with READY or GOT */

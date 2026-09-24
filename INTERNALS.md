@@ -2362,6 +2362,23 @@ resolved against `SupeMeet::lastTxp`/`lastTxCfg` — what WE last put on the air
 since the END cannot name which of our frames it heard and the last one is the
 frame it must have heard to be answering at all.
 
+**A report is filed against the power of the frame it describes, and never
+against a power this meeting has not yet chosen.** READY and GOT answering a
+hail describe the HAIL, so they resolve against the hail's stated power. The GOT
+that opens a wide slot describes our last frame of the *seeding* meeting (the
+speaker quotes `SupeSched::lastRssi`), and the listener has transmitted nothing
+in the window, so the wide schedule carries that meeting's
+`lastTxp`/`lastTxCfg` into `slotListen` and `hailAnswered` files against them.
+`SupeMeet::ourTxp` is unset at a wide slot, zero after `finishMeeting`, and a
+report filed against it understates the path loss by the whole power of the
+real frame. `AP_SRC_REPORT` outranks every pair for `AP_FRESH_MS`, so the
+controller would then derive a power the peer cannot hear, for READY and HAIL
+alike, and nothing corrects it: no frame of ours reaches the peer to bring a
+new report back, an unanswered hail never reaches the controller, and a
+Reticulum miss reaches it only once the peer has gone quiet, which a peer still
+hailing us never does. `testWideReportPower` holds every report on both sides
+of a wide meeting to the harness's fixed path loss.
+
 **The burst's power is resolved where the burst flies, on the report just
 received.** The answer's reading — READY's of the HAIL or of our opening GOT
 — is filed through `SUPE_EV_REPORT` into `apFileReport` before the engine asks

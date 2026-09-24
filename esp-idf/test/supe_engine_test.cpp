@@ -854,6 +854,48 @@ static void testWideRide(void) {
     g_wakeLateMs = 0;
 }
 
+/* Every report of our own transmission is a path loss only when it is filed
+ * with the power of the frame the peer read. The air here loses exactly 80 dB,
+ * so each report a node files must come to that. The wide listener is the case
+ * that matters: the GOT opening a rendezvous quotes how the peer read our last
+ * frame of the meeting that seeded it, and the listener transmitted nothing in
+ * the window, so that frame's power has to come from the seeding meeting. */
+static void checkReportsLoss80(const Node* n, const char* what) {
+    int reports = 0, wrong = 0;
+    for (auto& nt : n->notes) {
+        if (nt.ev != SUPE_EV_REPORT) continue;
+        reports++;
+        if ((int)nt.txpDbm - (int)nt.rssiDbm != 80) wrong++;
+    }
+    ok(reports > 0, what);
+    eqi(wrong, 0, "…and every report comes to the air's 80 dB path loss");
+}
+
+static void testWideReportPower(void) {
+    resetAir();
+    Node A = {}, B = {};
+    nodeInit(&A, "A", SUPE_REGIME_EU863);
+    nodeInit(&B, "B", SUPE_REGIME_EU863);
+    std::vector<Node*> air = { &A, &B };
+    wire(&A, &B);
+    A.peer.txpOpen = 9;                       /* distinct powers each way */
+    B.peer.txpOpen = 11;
+    pushPkt(&A, TAG, 5, 200, 0x11);
+    launchFrom(&A);
+    driveUntilDone(air, &A, 1, 20000);
+    eqi(A.eng.meetingsDone, 1, "the seeding meeting completed");
+
+    A.notes.clear();
+    B.notes.clear();
+    g_now += 200;
+    pushPkt(&B, IDENT_A, 9, 120, 0x33);
+    driveUntilDone(air, &B, 2, 20000);
+    eqi(B.eng.meetingsDone, 2, "the reply's meeting completed at a wide slot");
+    eqi(B.eng.hailsOut, 0, "…without a hail");
+    checkReportsLoss80(&A, "the wide listener filed a report of its own power");
+    checkReportsLoss80(&B, "the wide speaker filed a report of its own power");
+}
+
 /* The hailed party cannot take either slot (both channels read busy): it owes
  * a hail, sends it when the schedule has expired, and the hailer answers with
  * GOT. */
@@ -1078,6 +1120,7 @@ int main(void) {
     testRepair();
     testHole();
     testWideRide();
+    testWideReportPower();
     testOwedHailPlan();
     testCrossedHails();
     testOwnHailOutranksReceived();
