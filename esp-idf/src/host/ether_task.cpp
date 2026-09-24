@@ -131,6 +131,16 @@ void handleMessage(const char* text, size_t len)
             f.snrDb    = jsonInt(root, "snr", 10);
             chip->onRxEnd(f);
         }
+    } else if (strcmp(type, "energy") == 0) {
+        VirtualSx126x* chip = virtualChip(jsonInt(root, "slot", 0));
+        if (chip) {
+            VirtualRxBegin f = {};
+            f.id       = jsonInt(root, "id", 0);
+            f.t0       = jsonI64(root, "t0", 0);
+            f.tEnd     = jsonI64(root, "t_end", 0);
+            f.levelDbm = jsonInt(root, "level", VirtualSx126x::kNoiseFloorDbm);
+            chip->onEnergy(f);
+        }
     } else if (strcmp(type, "welcome") == 0) {
         info("ether: %s at t0 %lld", jsonStr(root, "mode", "real"),
              (long long)jsonI64(root, "t0", 0));

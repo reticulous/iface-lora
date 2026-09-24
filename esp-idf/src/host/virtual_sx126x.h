@@ -58,6 +58,11 @@ public:
     void onRxBegin(const VirtualRxBegin& f);
     void onRxEnd(const VirtualRxEnd& f);
 
+    /** A frame that was already on the air when this receiver started
+     *  listening: its energy until `tEnd`, and nothing to demodulate. Only
+     *  `t0`, `tEnd` and `levelDbm` are read. */
+    void onEnergy(const VirtualRxBegin& f);
+
     /** The noise floor this receiver reports when nothing is arriving. */
     static constexpr int kNoiseFloorDbm = -110;
 
