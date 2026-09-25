@@ -222,10 +222,16 @@ Nothing else may claim the same exemption without the same argument.
 
 The per-radio `hal` is a `RadioLibHal*`, because this is the one seam a build
 can replace: on ESP-IDF's Linux host target `src/host/` supplies a `VirtualHal`
-over a model of an SX1262 instead, and the rest of this file — the task, the
-IRQ handling, the RX/TX paths — runs unchanged against it. The level-triggered
-re-fire this section relies on is reproduced there deliberately. See
-`reticulous/sim/INTERNALS.md`.
+over SIMesh's model of an SX1262 (`SIMesh/radio`) instead, and the rest of this
+file — the task, the IRQ handling, the RX/TX paths — runs unchanged against it.
+The level-triggered re-fire this section relies on is reproduced there
+deliberately, by the board's GPIO shim. See `SIMesh/INTERNALS.md`.
+
+`VirtualHal` differs from `EspIdfHal` in two waits. BUSY always reads clear,
+because the model completes every command the moment it is handed one. And
+`delayMicroseconds` under one tick yields instead of sleeping: a sleep is a
+whole tick, and RadioLib's sub-millisecond waits around a mode change would
+each hold the radio out of receive for it.
 
 - **Shared bus.** `init()` brings the bus up through `spiHelperInitBus`
   (idempotent — multiple radios and a future LCD/SD driver can call it), then

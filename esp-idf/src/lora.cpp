@@ -36,8 +36,13 @@
 #include "lora_priv.h"
 
 #if CONFIG_IDF_TARGET_LINUX
-#include "host/ether_task.h"
 #include "host/virtual_hal.h"
+
+/* The station's identity and its two addresses come from the board straddle.
+ * Weak, so a build assembled without one still links and stays silent. */
+extern "C" __attribute__((weak)) int hwLinuxNodeId(void) { return 1; }
+extern "C" __attribute__((weak)) const char* hwLinuxBindAddr(void) { return "127.0.0.1"; }
+extern "C" __attribute__((weak)) const char* hwLinuxEtherAddr(void) { return ""; }
 #endif
 
 #include "lora_fem.h"
@@ -1056,8 +1061,9 @@ static void loraTaskMain(void*) {
      * it (e.g. hw-lilygo-tdeck's tdeckPowerInit), not this interface. */
 #if CONFIG_IDF_TARGET_LINUX
     /* The medium comes up before the radios do, so a model's very first
-     * mode and carrier reach it. */
-    etherStart();
+     * mode and carrier reach it. Idempotent: a virtual-time run has opened it
+     * already, at the board's bring-up. */
+    simradio_station_open(hwLinuxNodeId(), hwLinuxBindAddr(), hwLinuxEtherAddr());
 #endif
 
     for (int i = 0; i < kNumRadios; i++) {

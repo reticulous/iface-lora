@@ -8,10 +8,11 @@ shared SPI bus, each registering with `rnsd` as its own interface `lora/0`,
 `lora/1`, … A single task services every radio; the loop is chip-agnostic and
 only the per-chip bring-up dispatches by family.
 
-On ESP-IDF's Linux host target there is no SPI bus: `src/host/` puts a model of
-an SX1262 and a UDP link to a virtual medium where the bus would be, and the
-driver above runs unchanged. That is the simulated testbed — see
-`reticulous/sim/`.
+On ESP-IDF's Linux host target there is no SPI bus: `src/host/virtual_hal.cpp`
+is RadioLib's HAL over SIMesh's chip library (`SIMesh/radio`, which must sit
+beside this straddle in the workspace), a model of an SX1262 with a UDP link
+to a virtual medium, and the driver above runs unchanged. That is the
+simulated testbed — see [`SIMesh`](../SIMesh/README.md).
 
 ## Origins
 

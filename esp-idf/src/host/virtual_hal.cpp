@@ -9,8 +9,6 @@
 #include <cstring>
 
 namespace {
-const LoraSlot* s_pins[8] = {};
-
 /* RadioLib hands out a plain `void(*)(void)`; the shim calls a handler with an
  * argument. One trampoline per pin bridges the two without casting a function
  * pointer to a different signature. */
@@ -24,19 +22,20 @@ void isrTrampoline(void* arg)
 }
 }  // namespace
 
-/* The chip model raises its own interrupt line, and this is where it learns
- * which pin the board called it. */
-int virtualHalDio1Pin(int slot)
+/* The model moves DIO1 on whichever thread changed it — the driver's, or the
+ * one that received the frame — and the shim runs the handler right there,
+ * which is what an interrupt does. */
+void VirtualHal::onPin(void* ctx, int pin, int level)
 {
-    if (slot < 0 || slot >= (int)(sizeof(s_pins) / sizeof(s_pins[0]))) return -1;
-    return s_pins[slot] ? s_pins[slot]->dio1 : -1;
+    auto* self = (VirtualHal*)ctx;
+    if (pin == SIMRADIO_PIN_DIO1 && self && self->_pins && self->_pins->dio1 >= 0)
+        gpio_shim_set_level(self->_pins->dio1, (uint32_t)level);
 }
 
 VirtualHal::VirtualHal(int slot, const LoraSlot* pins)
     : RadioLibHal(MODE_INPUT, MODE_OUTPUT, LEVEL_LOW, LEVEL_HIGH, EDGE_RISING, EDGE_FALLING),
-      _slot(slot), _pins(pins), _chip(virtualChip(slot))
+      _slot(slot), _pins(pins), _chip(simradio_open(slot, onPin, this))
 {
-    if (slot >= 0 && slot < (int)(sizeof(s_pins) / sizeof(s_pins[0]))) s_pins[slot] = pins;
 }
 
 void VirtualHal::pinMode(uint32_t pin, uint32_t mode)
@@ -52,7 +51,7 @@ void VirtualHal::digitalWrite(uint32_t pin, uint32_t value)
         uint32_t was = _rstLevel;
         _rstLevel = value;
         gpio_shim_set_level((int)pin, value);
-        if (!was && value && _chip) _chip->reset();
+        if (!was && value && _chip) simradio_reset(_chip);
         return;
     }
     gpio_shim_set_level((int)pin, value);
@@ -90,14 +89,17 @@ void VirtualHal::delay(unsigned long ms)
     vTaskDelay(pdMS_TO_TICKS(ms) + 1);
 }
 
+/* The model completes every command the moment it is handed one and BUSY is
+ * never busy, so a wait shorter than a tick is time nothing needs: a yield,
+ * not a sleep that would hold the radio out of receive for a whole tick. A
+ * longer one sleeps. */
 void VirtualHal::delayMicroseconds(unsigned long us)
 {
-    if (us >= (unsigned long)portTICK_PERIOD_MS * 1000) {
-        vTaskDelay(pdMS_TO_TICKS(us / 1000) + 1);
+    if (us < (unsigned long)portTICK_PERIOD_MS * 1000) {
+        taskYIELD();
         return;
     }
-    int64_t until = esp_timer_get_time() + (int64_t)us;
-    while (esp_timer_get_time() < until) taskYIELD();
+    vTaskDelay(pdMS_TO_TICKS(us / 1000) + 1);
 }
 
 unsigned long VirtualHal::millis()
@@ -112,6 +114,6 @@ unsigned long VirtualHal::micros()
 
 void VirtualHal::spiTransfer(uint8_t* out, size_t len, uint8_t* in)
 {
-    if (_chip) _chip->transfer(out, len, in);
+    if (_chip) simradio_transfer(_chip, out, len, in);
     else if (in) memset(in, 0, len);
 }

@@ -1,11 +1,13 @@
 /**
- * VirtualHal — RadioLib's HAL over the GPIO shim and a chip model.
+ * VirtualHal — RadioLib's HAL over the GPIO shim and SIMesh's chip model.
  *
  * It stands where EspIdfHal stands on a board and answers the same questions:
  * pins through the shim, time through esp_timer, and an SPI transfer handed to
- * the slot's VirtualSx126x instead of to a bus. The pin-mode, level and
- * interrupt-trigger constants are the same values EspIdfHal uses, because
- * RadioLib stores them opaquely and hands them back.
+ * the slot's chip in the model (simradio.h) instead of to a bus. The model
+ * drives DIO1 through the shim, so the driver's interrupt path is the one it
+ * has on a board. The pin-mode, level and interrupt-trigger constants are the
+ * same values EspIdfHal uses, because RadioLib stores them opaquely and hands
+ * them back.
  */
 #pragma once
 
@@ -15,7 +17,7 @@
 #include "freertos/FreeRTOS.h"
 
 #include "../lora_radio.h"
-#include "virtual_sx126x.h"
+#include "simradio.h"
 
 class VirtualHal : public RadioLibHal {
 public:
@@ -57,8 +59,10 @@ public:
     void yield() override { taskYIELD(); }
 
 private:
+    static void onPin(void* ctx, int pin, int level);
+
     int             _slot;
     const LoraSlot* _pins;
-    VirtualSx126x*  _chip;
+    simradio_t*     _chip;
     uint32_t        _rstLevel = 1;
 };
