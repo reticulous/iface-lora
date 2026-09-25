@@ -620,9 +620,8 @@ void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
                     }
                 }
                 /* hops > 0: the LRPROOF came relayed — the dest is not a direct
-                 * neighbour, so it neither samples nor scores quality (§5 of
-                 * plans/adaptive-power.md: proof is end-to-end, power is
-                 * first-hop). */
+                 * neighbour, so it neither samples nor scores quality: proof
+                 * is end-to-end, power is first-hop. */
             }
         } else if (!isTx) {
             /* A delivery proof is addressed to the proved packet's truncated

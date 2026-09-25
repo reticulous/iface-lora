@@ -784,9 +784,9 @@ int shouldDetour(const SupePeerView* peer, const LoraQueue* q,
                  const SupeChanView* chans, uint32_t now,
                  uint32_t* wait_until_ms) {
     /* The one deliberately-open decision (SUPE.md §18): inputs are the peer,
-     * the queue and the channels; the answer is a policy question for
-     * plans/simulation.md §7. v0: a peer to meet is a meeting worth hailing —
-     * the shared-channel cost is one short frame per batch. */
+     * the queue and the channels, and the answer is policy. A peer to meet is
+     * a meeting worth hailing — the shared-channel cost is one short frame per
+     * batch. */
     (void)peer; (void)q; (void)chans; (void)now; (void)wait_until_ms;
     return DETOUR_NOW;
 }

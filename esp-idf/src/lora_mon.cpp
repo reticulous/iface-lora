@@ -40,7 +40,7 @@
  * The line between them is **flash**. A storage write can erase a sector, and an
  * erase blocks the instruction cache for milliseconds — which is survivable for
  * telemetry and fatal for a channel-access deadline. Keeping every storage op
- * off the radio task is what makes the timing arguments in plans/psa.md hold.
+ * off the radio task is what keeps the radio's channel-access deadlines.
  *
  * Traffic is one way, radio → interface, over a bounded queue that is never
  * allowed to block: a full queue drops the record and counts it. Telemetry
