@@ -142,7 +142,7 @@ static void deliverInbound(LoraRadio* r, const uint8_t* data, size_t len,
     peersObserve(r, data, len, false, rssi, snr, LORA_ORIG_RNSD, supeCargoPeer(r));
 #else
     /* No transaction to attribute it to: every packet is overheard in the clear. */
-    peersObserve(r, data, len, false, rssi, snr, LORA_ORIG_RNSD, 0);
+    peersObserve(r, data, len, false, rssi, snr, LORA_ORIG_RNSD, LORAQ_PEER_NONE);
 #endif
     /* One segment, two other endpoints. Only reassembled packets that are not
      * our own air protocol reach here, so the client sees exactly the Reticulum
@@ -915,18 +915,35 @@ void queueFill(LoraRadio* r) {
          * for the engine's classifier. Both are the observer's reading; the
          * engine itself never parses Reticulum. */
         uint16_t peer = LORAQ_PEER_NONE;
-        const uint8_t* nh = apNextHop4(r, b, len);
-        if (nh && r->nei) {
-            Neighbor* e = peersFindBy4(r->nei, nh);
-            if (e && !peersIsLocal(e)) peer = peersIdOf(r->nei, e);
-        }
         const uint8_t* tag3 = nullptr;
         RnsHdr h;
-        if (rnsParse(b, len, &h)) {
-            if (h.ptype == NEI_PT_ANNOUNCE)
-                flags |= LORAQ_F_ANNOUNCE;
-            else if (h.dtype == NEI_DT_SINGLE || h.dtype == NEI_DT_LINK)
-                tag3 = h.hdr2 ? h.transportId : h.dest;
+        const bool parsed = rnsParse(b, len, &h);
+        /* A link frame we relay is the exception to both. Its first address
+         * field is the link identifier, which both of the link's parties hold,
+         * so a hail tagged with it is answered by whichever of them hears it
+         * first — the one the frame came from as readily as the one it is for.
+         * The tag names the neighbour it is going to instead, by an address
+         * that neighbour alone holds; where that neighbour cannot be named the
+         * frame carries no tag and goes out as the broadcast it then is. */
+        bool relayed = false;
+        Neighbor* to = parsed ? peersLinkRelayHop(r->nei, &h, b, len, &relayed) : nullptr;
+        if (relayed) {
+            if (to) {
+                peer = peersIdOf(r->nei, to);
+                tag3 = peersNodeTag(to);
+            }
+        } else {
+            const uint8_t* nh = apNextHop4(r, b, len);
+            if (nh && r->nei) {
+                Neighbor* e = peersFindBy4(r->nei, nh);
+                if (e && !peersIsLocal(e)) peer = peersIdOf(r->nei, e);
+            }
+            if (parsed) {
+                if (h.ptype == NEI_PT_ANNOUNCE)
+                    flags |= LORAQ_F_ANNOUNCE;
+                else if (h.dtype == NEI_DT_SINGLE || h.dtype == NEI_DT_LINK)
+                    tag3 = h.hdr2 ? h.transportId : h.dest;
+            }
         }
         if (!loraqPush(&r->q, b, len, millis(), peer, tag3, /*refs=*/1, flags)) {
             free(b);              /* full between the check and the push */

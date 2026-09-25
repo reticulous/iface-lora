@@ -64,7 +64,11 @@ static Neighbor* tagNode(LoraRadio* r, const uint8_t tag[SUPE_TAG_LEN]) {
     /* Hashes some linkage frame said mean a node — a link identifier above all.
      * One shared store rather than a slice per row, so it is one lookup here
      * instead of a walk inside the loop above. A timed-out row still answers:
-     * a frame recorded an hour ago is still a frame for that node. */
+     * a frame recorded an hour ago is still a frame for that node. A link this
+     * node relays has two nodes behind its identifier, so its frames never
+     * queue under it: they carry the tag of the neighbour they go to
+     * (queueFill), and the identifier is only ever a tag here for a link this
+     * node is an end of. */
     if (NeiHash* h = peersHashFind(st, tag, SUPE_TAG_LEN))
         if (st->nei[h->node].used) return &st->nei[h->node];
     /* A link identifier we initiated resolves to the node the link request was

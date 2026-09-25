@@ -52,6 +52,12 @@ const uint8_t* apNextHop4(LoraRadio* r, const uint8_t* pkt, size_t len) {
      * either way and must reach everyone. */
     if (h.ptype == NEI_PT_ANNOUNCE) return nullptr;
     if (h.hdr2) return h.transportId;                 /* relayed: the next hop names itself */
+    /* A link frame we relay goes to the party it did not come from, which the
+     * identifier alone cannot say (peersLinkRelayHop); unknown, it is a
+     * broadcast and goes at the configured power. */
+    bool relayed = false;
+    Neighbor* to = peersLinkRelayHop(st, &h, pkt, len, &relayed);
+    if (relayed) return to ? peersNodeTag(to) : nullptr;
     if (h.ptype == NEI_PT_PROOF || h.dtype == NEI_DT_LINK) {
         /* Link traffic and link proofs are addressed to the link_id, so the
          * peer is the link's destination — but only where that destination is

@@ -395,7 +395,23 @@ void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
         st->seenNext = (uint8_t)((st->seenNext + 1) % NEI_SEEN_MAX);
         memcpy(sn->hash, ph, 16);
         sn->hops = h.hops;
+        sn->from = fromPeer;
         sn->ms = now ? now : 1;
+
+        /* The initiator's side of a link we relay, named by its cargo. A link
+         * request in the clear names nobody, but any frame of the link that
+         * arrives in an exchange names its sender, and a sender that is not
+         * the responder's side is the initiator's. The link proof is the
+         * responder's own frame, so it never names the initiator. */
+        if (h.dtype == NEI_DT_LINK && peersById(st, fromPeer) &&
+            !(h.ptype == NEI_PT_PROOF && h.ctx == NEI_CTX_LRPROOF)) {
+            NeiLink* L = peersLinkFind(st, h.dest);
+            if (L && L->relay && !L->ours && L->initHere &&
+                L->initPeer == LORAQ_PEER_NONE &&
+                (!L->respHere ||
+                 (L->respPeer != LORAQ_PEER_NONE && fromPeer != L->respPeer)))
+                L->initPeer = fromPeer;
+        }
 
         /* A relayed frame's transmitter is an in-range transport node even
          * when nothing names it. A rebroadcast announce (HEADER_2) is
@@ -534,6 +550,13 @@ void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
             Neighbor* nh = h.hdr2 ? peersFindBy4(st, h.transportId)
                                   : peersFindByDest(st, h.dest);
             if (nh && !peersIsLocal(nh)) peersAddLink4(st, nh, lid, now);
+            /* A request we relay: the node it goes to is the responder's side
+             * of the link, on this interface. */
+            if (h.hops >= 1 && !L->ours) {
+                L->relay = true;
+                L->respHere = true;
+                if (nh && !peersIsLocal(nh)) L->respPeer = peersIdOf(st, nh);
+            }
             /* A link identifier we terminate or relay for. Held for as long as
              * the link plausibly lives; a link that goes quiet takes its entry
              * with it. */
@@ -569,6 +592,18 @@ void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
                  * detourable. */
                 Neighbor* from = peersById(st, fromPeer);
                 if (from && !peersIsLocal(from)) peersAddLink4(st, from, lid, now);
+            } else if (!L->ours && !L->haveInitHops) {
+                /* Somebody else's request: the initiator's side of the link
+                 * is on this interface, and its frames arrive at the hop count
+                 * this one did. The first copy only, as rnsd forwards the
+                 * first and drops the rest as duplicates. Named where it
+                 * came as an exchange's cargo. */
+                L->relay = true;
+                L->initHere = true;
+                L->haveInitHops = true;
+                L->initHops = h.hops;
+                Neighbor* from = peersById(st, fromPeer);
+                if (from && !peersIsLocal(from)) L->initPeer = fromPeer;
             }
             L->haveSig = true;                             /* initiator's setup signal */
             L->lastRssi = rssi;
@@ -598,6 +633,17 @@ void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
                 L->lastMs = now;
                 L->frames++;
                 if (!isTx) { L->haveSig = true; L->lastRssi = rssi; L->lastSnr10 = snr10; }
+                /* On a link we relay, the proof is the responder's side
+                 * speaking: frames from that side arrive at this hop count.
+                 * The first copy, since the next is a neighbour's forward of
+                 * ours, one hop further along. */
+                if (!isTx && L->relay && !L->ours && !L->haveRespHops) {
+                    L->haveRespHops = true;
+                    L->respHops = h.hops;
+                    Neighbor* from = peersById(st, fromPeer);
+                    if (L->respPeer == LORAQ_PEER_NONE && from && !peersIsLocal(from))
+                        L->respPeer = fromPeer;
+                }
             }
             /* An LRPROOF we transmit is us accepting a link: its identifier is
              * an address that means us from here on. Belt to the inbound
@@ -686,9 +732,13 @@ void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
                  * host would stay unknown. Arriving as a detour's cargo it is
                  * not anonymous at all: the schedule belongs to one pair, and
                  * this came under it. That is the only handle the responder
-                 * ever gets, so it is taken on any frame and not just at setup. */
+                 * ever gets, so it is taken on any frame and not just at setup.
+                 * Never on a link we relay: its frames come from both sides,
+                 * and filing the identifier against whichever spoke last is
+                 * what would send the next frame back where it came from. */
                 Neighbor* from = peersById(st, fromPeer);
-                if (from && !peersIsLocal(from)) peersAddLink4(st, from, h.dest, now);
+                if (from && !peersIsLocal(from) && !L->relay)
+                    peersAddLink4(st, from, h.dest, now);
             }
         } else if (h.dtype == NEI_DT_SINGLE && isTx) {
             /* Every single-dest data packet we send or relay may attract a
@@ -724,6 +774,62 @@ void peersObserve(LoraRadio* r, const uint8_t* p, size_t len, bool isTx,
         break;
     }
     }
+}
+
+/* The far side of a relayed link frame (lora_peers.h). rnsd forwards a link
+ * frame with byte 0 and everything after the hop count unchanged and the hop
+ * count one above what it arrived with, so the truncated packet hash — which
+ * leaves the hop count out — finds the arrival in the recent-rx ring, and the
+ * hop count it arrived with is this one's less one. In order:
+ *   - one side on this interface: the frame can only be going to it;
+ *   - a link proof: always to the initiator;
+ *   - the arrival named its sender (exchange cargo): the other side;
+ *   - the two sides' frames arrive at different hop counts: whichever this
+ *     one's arrival matches is where it came from — the test rnsd itself
+ *     applies to tell a link's two directions apart;
+ *   - otherwise nothing says, and the answer is nobody. */
+Neighbor* peersLinkRelayHop(NeiState* st, const RnsHdr* h, const uint8_t* p, size_t len,
+                            bool* relayed) {
+    *relayed = false;
+    if (!st || h->hdr2 || h->dtype != NEI_DT_LINK || h->hops == 0) return nullptr;
+    if (h->ptype != NEI_PT_DATA && h->ptype != NEI_PT_PROOF) return nullptr;
+    *relayed = true;
+    NeiLink* L = peersLinkFind(st, h->dest);
+    if (!L || !L->relay || L->ours) return nullptr;
+    bool toInit;
+    if (L->initHere != L->respHere) {
+        toInit = L->initHere;
+    } else if (!L->initHere) {
+        return nullptr;
+    } else if (h->ptype == NEI_PT_PROOF && h->ctx == NEI_CTX_LRPROOF) {
+        toInit = true;
+    } else {
+        uint16_t from = LORAQ_PEER_NONE;
+        uint8_t ph[16];
+        rnsPacketHash(h, p, len, false, ph);
+        uint32_t now = millis();
+        for (int i = 0; i < NEI_SEEN_MAX; i++) {
+            const NeiSeen* sn = &st->seen[i];
+            if (sn->ms && (uint8_t)(sn->hops + 1) == h->hops &&
+                now - sn->ms < NEI_SEEN_WIN_MS && memcmp(sn->hash, ph, 16) == 0) {
+                from = sn->from;
+                break;
+            }
+        }
+        const uint8_t arrived = (uint8_t)(h->hops - 1);
+        if (from != LORAQ_PEER_NONE && from == L->respPeer) {
+            toInit = true;
+        } else if (from != LORAQ_PEER_NONE && from == L->initPeer) {
+            toInit = false;
+        } else if (L->haveInitHops && L->haveRespHops && L->initHops != L->respHops &&
+                   (arrived == L->initHops || arrived == L->respHops)) {
+            toInit = arrived == L->respHops;
+        } else {
+            return nullptr;
+        }
+    }
+    Neighbor* e = peersById(st, toInit ? L->initPeer : L->respPeer);
+    return (e && !peersIsLocal(e)) ? e : nullptr;
 }
 
 #endif  /* CONFIG_LORA0_CS_PIN */

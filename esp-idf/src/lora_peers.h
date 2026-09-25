@@ -239,6 +239,24 @@ struct NeiLink {
     bool     havePair;
     int16_t  pairRssi;
     int8_t   pairTxp;
+    /* A link this node relays has two parties on the air, and both carry the
+     * one identifier: the initiator's side, which the link request came from,
+     * and the responder's, which it was handed to and the proof comes back
+     * from. A frame of the link goes to the party it did not come from, so the
+     * identifier alone never says where one is going (peersLinkRelayHop).
+     * `initHere` / `respHere`: that side is on this interface — the request
+     * was received here, or transmitted here. A side that is not is on another
+     * interface, and nothing of the link leaves here towards it. `initPeer` /
+     * `respPeer`: the row of the neighbour on that side, LORAQ_PEER_NONE while
+     * nothing has named it. `initHops` / `respHops`: the wire hop count frames
+     * from that side arrive with — the request's and the proof's — which
+     * tells the two directions apart when they differ. `relay` is set by
+     * any request here that we neither dialled nor answer. */
+    bool     relay;
+    bool     initHere, respHere;
+    uint16_t initPeer, respPeer;
+    bool     haveInitHops, haveRespHops;
+    uint8_t  initHops, respHops;
 };
 
 struct NeiPend {                    /* an outstanding proof expectation */
@@ -270,6 +288,8 @@ struct NeiAnon {
 struct NeiSeen {
     uint8_t  hash[16];              /* truncated packet hash (hops-invariant) */
     uint8_t  hops;
+    uint16_t from;                  /* the row that provably sent it (a SUPE
+                                     * exchange's cargo), else LORAQ_PEER_NONE */
     uint32_t ms;
 };
 
@@ -412,6 +432,15 @@ void      peersQuality(LoraRadio* r, Neighbor* e, bool hit);
 NeiLink*  peersLinkFind(NeiState* st, const uint8_t linkId[16]);
 NeiLink*  peersLinkFindBy3(NeiState* st, const uint8_t b3[3]);
 NeiLink*  peersLinkEnsure(NeiState* st, const uint8_t linkId[16], uint32_t now);
+/* Where an outbound frame of a link this node relays goes: the neighbour on the
+ * far side from the one the same packet arrived from. `relayed` says whether
+ * the frame is a relayed link frame at all — a link-addressed data packet or
+ * proof at wire hops ≥ 1, since an endpoint sends at hops 0 — and when it is,
+ * a null answer means the neighbour cannot be named, and the frame goes out as
+ * a broadcast rather than to either party. Radio task only. */
+struct RnsHdr;
+Neighbor* peersLinkRelayHop(NeiState* st, const RnsHdr* h, const uint8_t* p, size_t len,
+                            bool* relayed);
 void      peersPendAdd(NeiState* st, const uint8_t phash[16], const uint8_t dest[16],
                      bool isLR, bool counted, uint32_t now);
 NeiPend*  peersPendTake(NeiState* st, const uint8_t phash[16]);
@@ -457,6 +486,10 @@ void      peersExpire(LoraRadio* r, uint32_t now);
 int       peersOtherCount(const NeiState* st);
 Neighbor* peersWalk(NeiState* st, int want, PeersVisitFn fn, void* ud);
 bool      peersNodeFirst4(const Neighbor* e, uint8_t out[4]);
+/* An address this node holds and no other does, for a SUPE tag that must name
+ * it alone: a destination it announced, else its node key, else an identity.
+ * Null when the row holds none. */
+const uint8_t* peersNodeTag(const Neighbor* e);
 bool      peersEstimateCliff10(const LoraRadio* r, const Neighbor* e,
                              uint32_t now, int* cliff10, uint32_t* samples,
                              uint32_t* buckets);

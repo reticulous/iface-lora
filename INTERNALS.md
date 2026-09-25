@@ -888,8 +888,10 @@ and the radio. `queueFill` pulls from rnsd's packet link zero-copy
 (`itsRecvRef` — the heap block lives in the queue untouched) and from the RNode
 client's parked packet (copied; that direction is a byte stream), alternating so
 neither endpoint starves the other. Each packet is stamped at ingress with its
-peer id and its tag — the first three bytes of its first address field — by the
-observer, so nothing downstream parses Reticulum. Backpressure has two levels:
+peer id and its tag — the first three bytes of its first address field, except
+on a link frame this node relays, whose tag is the next neighbour's own address
+(§ "A link we relay has two parties") — by the observer, so nothing downstream
+parses Reticulum. Backpressure has two levels:
 a per-peer cap drops that peer's oldest (invisible to rnsd; Reticulum tolerates
 loss), and the global cap simply stops consuming — rnsd's send toward us then
 blocks ~100 ms and drops with a warning (`rnsd.cpp`, iface out), which is the
@@ -1896,6 +1898,47 @@ cycles and `rns stop`).
     request carries no sender, and the session's own identify step is encrypted
     inside the link. `apNextHop4` hands back the identifier itself rather than a
     node, which is the honest answer.
+
+  **A link we relay has two parties, and the identifier names neither.** At a
+  transport in the middle both directions of a session carry the one link
+  identifier, and both neighbours hold it in their SUPE tag sets, so neither a
+  lookup of the identifier nor a hail tagged with it can say which way a frame
+  is going: a hail is answered by whichever party hears it first, and a frame
+  from the initiator reaches the initiator again. So a relayed link frame — a
+  link-addressed data packet or proof at wire hops ≥ 1, since an endpoint sends
+  at hops 0 — is never queued under the identifier. `peersLinkRelayHop` picks
+  the neighbour it goes to, and `queueFill` tags it with an address that
+  neighbour alone holds (`peersNodeTag`: an announced destination, else its
+  node key, else an identity), so the hail names one node and the per-peer
+  queue, the train and the power controller all see that node.
+
+  The link row keeps the two sides (`NeiLink` `init*` / `resp*`): the
+  initiator's side is where the request came from, recorded when a request not
+  for us is received here; the responder's side is the node the request is
+  handed to, recorded when we transmit it at hops ≥ 1. Either side may be on
+  another interface, and then every frame of the link leaving this one goes to
+  the side that is here. Each side has a neighbour row, once something names
+  it, and a hop count its frames arrive with. The responder's row comes from
+  the request's own next hop; the initiator's only from cargo, since a request
+  in the clear names no sender — any frame of the link arriving in an exchange
+  from a node that is not the responder's side names it. The hop counts are the
+  request's and the proof's, first copy only.
+
+  An outbound frame's direction is read from its arrival. rnsd forwards a link
+  frame with the hop count one above what it arrived with and every other byte
+  as it was, so the truncated packet hash finds the arrival in the recent-rx
+  ring (`NeiSeen`, which records the sender a transaction named). A link proof
+  goes to the initiator; a frame whose arrival named its sender goes to the
+  other side; a frame whose arrival hop count matches one side's and not the
+  other's came from that side, which is the same test rnsd applies to a link's
+  two directions. Where none of that answers — a frame that arrived in the
+  clear on a link whose two sides are the same number of hops away, as on
+  every two-hop link — the frame goes untagged, as a broadcast at the
+  configured power, which reaches the party it is for exactly as plain LoRa
+  does. The endpoint rule above (file the identifier against the node whose
+  cargo carried it) is not applied on a relayed link: its frames come from
+  both sides, and refiling on each would point the identifier at whichever
+  spoke last.
 - **Link quality (one byte).** Proof packets are addressed to the proved
   packet's truncated hash, so each elicitor we transmit (an LR, or an
   originated single-dest packet to a known direct neighbour — probes included)

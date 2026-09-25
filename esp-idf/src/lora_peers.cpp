@@ -62,6 +62,12 @@ void peersRetire(NeiState* st, Neighbor* e) {
     uint8_t node = (uint8_t)(e - st->nei);
     for (int i = 0; i < NEI_HASHES_MAX; i++)
         if (st->hashes[i].used && st->hashes[i].node == node) st->hashes[i].used = false;
+    for (int i = 0; i < NEI_LINKS_MAX; i++) {
+        NeiLink* L = &st->links[i];
+        if (!L->used) continue;
+        if (L->initPeer == node) L->initPeer = LORAQ_PEER_NONE;
+        if (L->respPeer == node) L->respPeer = LORAQ_PEER_NONE;
+    }
     memset(e, 0, sizeof(*e));
 }
 
@@ -258,6 +264,7 @@ NeiLink* peersLinkEnsure(NeiState* st, const uint8_t linkId[16], uint32_t now) {
     victim->used = true;
     memcpy(victim->linkId, linkId, 16);
     victim->lastMs = now;
+    victim->initPeer = victim->respPeer = LORAQ_PEER_NONE;
     return victim;
 }
 
@@ -423,6 +430,12 @@ void peersMergeInto(NeiState* st, Neighbor* dst, Neighbor* src) {
     for (int i = 0; i < NEI_HASHES_MAX; i++)
         if (st->hashes[i].used && st->hashes[i].node == from)
             st->hashes[i].node = to;
+    for (int i = 0; i < NEI_LINKS_MAX; i++) {
+        NeiLink* L = &st->links[i];
+        if (!L->used) continue;
+        if (L->initPeer == from) L->initPeer = to;
+        if (L->respPeer == from) L->respPeer = to;
+    }
     if (src->haveSig) {
         if (!dst->haveSig || src->rssiMin < dst->rssiMin)   dst->rssiMin  = src->rssiMin;
         if (!dst->haveSig || src->rssiMax > dst->rssiMax)   dst->rssiMax  = src->rssiMax;
@@ -754,6 +767,13 @@ bool peersNodeFirst4(const Neighbor* e, uint8_t out[4]) {
     if (e->haveNode4) { memcpy(out, e->node4, 4); return true; }
     /* No hash of its own, but something linked one to it. */
     return false;
+}
+
+const uint8_t* peersNodeTag(const Neighbor* e) {
+    if (e->nDests)    return e->dests[0].hash;
+    if (e->haveNode4) return e->node4;
+    if (e->nIds)      return e->ids[0];
+    return nullptr;
 }
 
 /* Passive peer table: allocated once, history kept across config cycles. A
