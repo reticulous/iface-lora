@@ -2261,6 +2261,14 @@ one of them and wrong for the other by that much. The main channel resolves
 against the calling configuration (`apOpenPower`); a granted step resolves
 against the step (`apOpenPowerAt`), on both sides of the transaction.
 
+The step itself is the receiver's choice (`chooseBudget` in `supe_engine.cpp`):
+the headroom the answered frame arrived with, less each step's margin cost
+(SUPE.md §14.3), must leave `SUPE_RATE_MARGIN_DB` (6 dB). That is below the
+power's `SUPE_TARGET_MARGIN_DB` (10 dB) because a step chosen too fast costs a
+repair or the next exchange one step lower, where too little power costs the
+link, and because the power is then resolved against the step's own
+sensitivity.
+
 ### 15.2 Three source ranks, best evidence first
 
 Each is gated on `AP_FRESH_MS` (10 minutes). Stale evidence falls to the next

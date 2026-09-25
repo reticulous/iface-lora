@@ -266,11 +266,19 @@ int16_t supeReqSnrDeci(uint8_t sf);
  *  required signal-to-noise for the spreading factor. */
 int16_t supeSensitivityDeci(const SupeCfg* c);
 
-/* The margin a link keeps after paying for a budget. Ten decibels is two step
- * widths of the fastest part of the ladder plus change: enough that ordinary
- * fading does not take a meeting out, and cheap because the alternative — the
- * budget below — costs 2.5 dB of rate rather than the link. */
+/* The margin the power controller aims to leave above the sensitivity of the
+ * configuration a frame flies at (lora_power.cpp), and the reported headroom
+ * over it that lets the ratchet trim further. Ten decibels: enough that
+ * ordinary fading does not take a meeting out, where too little power costs
+ * the link. */
 #define SUPE_TARGET_MARGIN_DB  10
+
+/* The margin a budget keeps after paying its step's margin cost out of the
+ * headroom the answered frame was heard with (chooseBudget). Six decibels, below
+ * the power controller's ten: a budget chosen too fast costs a repair or the
+ * next exchange one step lower, not the link, and the power a meeting flies at
+ * is resolved afterwards against the confirmed step's own sensitivity. */
+#define SUPE_RATE_MARGIN_DB     6
 
 /* ─────────────── airtime ───────────────
  *

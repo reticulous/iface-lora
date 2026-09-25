@@ -43,9 +43,9 @@ static int dByte(const std::vector<std::vector<uint8_t>>& v, size_t i, size_t j)
 
 static uint32_t g_now = 1000;
 static uint32_t g_rand = 12345;
-/* The SNR every frame lands with. 60 (6 dB) affords one budget step from
+/* The SNR every frame lands with. 20 (2 dB) affords one budget step from
  * SF7; 0 affords none, which is what a hailing-rate dialogue needs. */
-static int16_t g_airSnr10 = 60;
+static int16_t g_airSnr10 = 20;
 
 struct AirItem {
     bool     isTrain;
@@ -491,7 +491,7 @@ static void resetAir(void) {
     g_dropRepairs = false;
     g_trainSeen = 0;
     g_droppedCsums.clear();
-    g_airSnr10 = 60;
+    g_airSnr10 = 20;
     memset(g_typeCount, 0, sizeof g_typeCount);
 }
 

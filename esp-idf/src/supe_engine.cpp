@@ -1115,7 +1115,7 @@ static uint8_t chooseBudget(SupeEngine* e, uint8_t chan, uint8_t proposal,
     if (top > proposal)   top = proposal;
     if (top > e->ownTop)  top = e->ownTop;
     int headroomDeci = snr10 - (int)supeReqSnrDeci(readCfg->sf) + (int)readCfg->marginDeci;
-    int affordDeci = headroomDeci - SUPE_TARGET_MARGIN_DB * 10;
+    int affordDeci = headroomDeci - SUPE_RATE_MARGIN_DB * 10;
     uint8_t budget = 0;
     for (int i = 1; i <= top; i++)
         if ((int)lad[i].marginDeci <= affordDeci) budget = (uint8_t)i;
