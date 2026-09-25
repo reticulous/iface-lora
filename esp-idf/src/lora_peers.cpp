@@ -139,6 +139,7 @@ Neighbor* peersAlloc(NeiState* st, uint32_t now) {
         if (!victim || (int32_t)(peersLastHeard(victim) - peersLastHeard(e)) > 0) victim = e;
     }
     if (!victim) return nullptr;
+    if (victim->used) st->evicted++;
     peersRetire(st, victim);     /* leaves the slot cleared */
     victim->used = true;
     victim->lastHeardMs = now;
@@ -540,7 +541,10 @@ void peersExpire(LoraRadio* r, uint32_t now) {
     for (int i = 0; i < NEI_MAX; i++) {
         Neighbor* e = &st->nei[i];
         if (!e->used || peersIsLocal(e)) continue;
-        if ((uint32_t)(now - peersLastHeard(e)) > NEI_GONE_MS) peersRetire(st, e);
+        if ((uint32_t)(now - peersLastHeard(e)) > NEI_GONE_MS) {
+            peersRetire(st, e);
+            st->goneSilent++;
+        }
     }
 }
 

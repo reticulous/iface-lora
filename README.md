@@ -694,7 +694,12 @@ radio put it on the air, so the graph says so, and clicking a frame names it
 `RNode` — and `lora neighbors` grows a local `rnode` row beside `us`:
 
 ```
-lora/0 neighbors: 1 other and us + rnode, 0 open links (observing 4m)
+lora/0 neighbors: 1 other, 0 open links (observing 4m)
+  table 3 of 64 rows; 0 evicted, 0 gone silent
+
+  …
+
+this device (and the attached RNode client):
 
   us    6b87eb8bdbcd51dee010c5a20fd65ef9 rnstransport.probe
   rnode 9a1c4f...                        lxmf.delivery  "laptop"

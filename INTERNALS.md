@@ -1796,9 +1796,10 @@ before it is allowed to drive the `txp` register.
 A per-radio picture of the direct radio neighbourhood built **entirely from observing rx + tx RNS
 packets on the interface** — no rnsd API, no peer cooperation, works against
 every RNS implementation. Surfaced by `lora neighbors` (all radios) /
-`lora <n> neighbors`. All state is in-memory (`NeiState`, ~12 KB PSRAM per
-radio, `gp_alloc`'d at first `radioStart` and kept across config cycles and
-`rns stop`).
+`lora <n> neighbors`. All state is in-memory (`NeiState`, 59 KB per radio at
+`NEI_MAX` = 64 rows of about 890 B, `gp_alloc`'d at first `radioStart` — PSRAM
+where the board has it, internal RAM where it has none — and kept across config
+cycles and `rns stop`).
 
 - **Tap points.** `peersObserve()` is called with each whole (reassembled) RNS
   packet: from `deliverInbound` (rx, before the rnsd gate, with the same-call
@@ -2093,6 +2094,7 @@ radio, `gp_alloc`'d at first `radioStart` and kept across config cycles and
 
 ```
 lora/0 neighbors: 2 others, 0 open links (observing 17m)
+  table 3 of 64 rows; 0 evicted, 0 gone silent
 
   1    d10d5106bcaa65df4a8c50a56d8f05f7 rnstransport.probe  3m ago
        6793e13ec79d1c1b1372885105aa5cf7 rnsh  12m ago
@@ -2133,6 +2135,12 @@ resolves through, and the link row is what a late frame of that session files
 against. A node with nothing but a four-byte claim to its name — a
 SUPE announcement heard before any Reticulum announce — prints that as
 `<first-4>........ (not seen yet)`.
+
+The line under the header is the table itself: rows in use, this device's own
+included, of `NEI_MAX`; how many rows were **evicted**, taken from a node heard
+within `NEI_GONE_MS` to make room for a newcomer, which rnsd answers by dropping
+every route to and through that node; and how many were retired as **gone
+silent** after `NEI_GONE_MS` unheard. Both counts run from boot.
 
 A capability line closes each non-`us` block:
 

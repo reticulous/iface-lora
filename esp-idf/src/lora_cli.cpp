@@ -622,11 +622,12 @@ static void cliPrintNeighbors(int i, bool verbose) {
         return;
     }
     uint32_t now = millis();
-    int nUs = 0, nRnode = 0, nLinks = 0;
+    int nUs = 0, nRnode = 0, nLinks = 0, nRows = 0;
     int nNodes = peersOtherCount(st);
     for (int k = 0; k < NEI_MAX; k++) {
         Neighbor* e = &st->nei[k];
         if (!e->used) continue;
+        nRows++;
         if (e->isRnode)   nRnode++;
         else if (e->isUs) nUs++;
     }
@@ -635,9 +636,13 @@ static void cliPrintNeighbors(int i, bool verbose) {
 
     char ago[16];
     cliAgo(ago, sizeof ago, now, st->sinceMs);
-    cliPrintf("lora/%d neighbors: %d other%s, %d open link%s (observing %s)\n\n",
+    cliPrintf("lora/%d neighbors: %d other%s, %d open link%s (observing %s)\n",
               i, nNodes, nNodes == 1 ? "" : "s",
               nLinks, nLinks == 1 ? "" : "s", ago);
+    /* The table's own occupancy. An eviction takes a node heard within
+     * NEI_GONE_MS, and rnsd drops every route to and through it. */
+    cliPrintf("  table %d of %d rows; %u evicted, %u gone silent\n\n",
+              nRows, NEI_MAX, (unsigned)st->evicted, (unsigned)st->goneSilent);
     if (r->curIfacSize)
         cliPrintf("  note: ifac enabled — frames are masked, passive parse sees nothing\n\n");
 

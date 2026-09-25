@@ -16,7 +16,12 @@ struct LoraRadio;
  * name links; proofs we elicited close a per-neighbour delivery-quality loop.
  * IFAC frames are masked end-to-end and are skipped (the table stays empty on
  * an IFAC network). Surfaced by `lora [<n>] neighbors`. */
-#define NEI_MAX              24      /* neighbour entries per radio */
+#define NEI_MAX              64      /* neighbour entries per radio: a dense
+                                      * neighbourhood can hear dozens, and a row
+                                      * evicted for a newcomer is withdrawn from
+                                      * rnsd with every route through it. About
+                                      * 890 B a row, 59 KB a radio, from gp_alloc
+                                      * (PSRAM where there is any, else internal) */
 #define NEI_DESTS_MAX        8       /* dest hashes clustered per node */
 #define NEI_IDS_MAX          8       /* identities clustered per node — one
                                       * device legitimately runs several (its
@@ -33,10 +38,8 @@ struct LoraRadio;
                                       * the list this node's own announcement is
                                       * built from — so the pair loses the very
                                       * name that would have folded their rows
-                                      * together. Four was set before rnsh and
-                                      * lxmf each carried one. Costs 16 bytes
-                                      * per slot per row: 2 KB a radio at
-                                      * NEI_MAX. */
+                                      * together. Costs 16 bytes per slot per
+                                      * row: 8 KB a radio at NEI_MAX. */
 #define NEI_LINKS_MAX        12      /* observed links per radio */
 #define NEI_PEND_MAX         8       /* outstanding proof expectations per radio */
 #define NEI_PROOF_TIMEOUT_MS 30000   /* elicited proof must return within this */
@@ -300,6 +303,8 @@ struct NeiState {
     NeiSeen  seen[NEI_SEEN_MAX];
     uint8_t  seenNext;
     uint32_t sinceMs;               /* millis() at first allocation */
+    uint32_t evicted;               /* rows taken from a live node for a newcomer */
+    uint32_t goneSilent;            /* rows retired after NEI_GONE_MS unheard */
     /* Which row the packet peersObserve() just walked was attributed to, so the
      * caller can tell rnsd who transmitted it before handing it on. Valid only
      * until the next peersObserve; a shared medium usually cannot say, and
