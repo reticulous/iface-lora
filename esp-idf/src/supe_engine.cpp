@@ -8,6 +8,7 @@
  * IDF header, something has leaked in that belongs in lora_supe.cpp.
  */
 #include "supe_engine.h"
+#include "lora_toa.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -55,7 +56,7 @@ static SupeCfg hailCfgOf(const SupeEngine* e) {
     SupeCfg c;
     c.sf = e->hailSf;
     c.bwHz = e->hailBwHz;
-    c.ldro = (1000u << e->hailSf) > 16u * e->hailBwHz;
+    c.ldro = loraLdroRnode(e->hailSf, (int)e->hailBwHz);
     c.marginDeci = 0;
     return c;
 }

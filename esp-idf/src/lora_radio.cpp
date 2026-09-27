@@ -790,12 +790,7 @@ int16_t radioSetSf(LoraRadio* r, uint8_t sf) {
 /* Bandwidth at runtime, in kHz. A SUPE detour under a regime with a channel plan
  * is the only caller: regime 0 moves the spreading factor and nothing else.
  * Dispatched per chip like the rest — none of these live on PhysicalLayer.
- *
- * Note the low-data-rate optimisation is deliberately *not* set alongside it.
- * Both ends must hold it identically or neither decodes, and RadioLib's own
- * auto-LDRO applies the same "symbol longer than 16 ms" rule the ladder does, so
- * leaving it automatic is what keeps the two ends agreeing. supeResolve reports
- * the same verdict for the tests to check against; nothing writes the register. */
+ * The low-data-rate optimisation is set on its own (radioSetLdro), after both. */
 int16_t radioSetBw(LoraRadio* r, float bwKhz) {
     PhysicalLayer* p = r->radio;
     switch (r->slot->chip) {
@@ -811,6 +806,42 @@ int16_t radioSetBw(LoraRadio* r, float bwKhz) {
             return static_cast<LR11x0*>(p)->setBandwidth(bwKhz);
         case CHIP_LR2021:
             return static_cast<LR2021*>(p)->setBandwidth(bwKhz);
+    }
+    return RADIOLIB_ERR_UNKNOWN;
+}
+
+/* The LR2021 keeps its automatic-LDRO switch protected and has no forceLDRO;
+ * this reaches it the way a subclass would. */
+struct LR2021Ldro : LR2021 {
+    static int16_t force(LR2021* p, bool on, uint8_t sf) {
+        LR2021Ldro* q = static_cast<LR2021Ldro*>(p);
+        q->ldroAuto = false;
+        q->ldrOptimize = on ? RADIOLIB_LR2021_LORA_LDRO_ENABLED
+                            : RADIOLIB_LR2021_LORA_LDRO_DISABLED;
+        return p->setSpreadingFactor(sf);   /* re-sends the modulation parameters */
+    }
+};
+
+/* Low-data-rate optimisation, stated rather than left to RadioLib's automatic
+ * rule: both ends of a link must hold it identically, and the calling channel
+ * follows stock RNode's rule (loraLdroRnode) where RadioLib's differs. Forcing
+ * it turns the automatic rule off, so every change of spreading factor or
+ * bandwidth is followed by this. The SX128x has no such setting. */
+int16_t radioSetLdro(LoraRadio* r, bool on) {
+    PhysicalLayer* p = r->radio;
+    switch (r->slot->chip) {
+        case CHIP_SX1261: case CHIP_SX1262: case CHIP_SX1268: case CHIP_LLCC68:
+            return static_cast<SX126x*>(p)->forceLDRO(on);
+        case CHIP_SX1272:
+            return static_cast<SX1272*>(p)->forceLDRO(on);
+        case CHIP_SX1276: case CHIP_SX1277: case CHIP_SX1278:
+            return static_cast<SX1278*>(p)->forceLDRO(on);
+        case CHIP_SX1280: case CHIP_SX1281: case CHIP_SX1282:
+            return RADIOLIB_ERR_NONE;
+        case CHIP_LR1110: case CHIP_LR1120: case CHIP_LR1121:
+            return static_cast<LR11x0*>(p)->forceLDRO(on);
+        case CHIP_LR2021:
+            return LR2021Ldro::force(static_cast<LR2021*>(p), on, r->airSf);
     }
     return RADIOLIB_ERR_UNKNOWN;
 }

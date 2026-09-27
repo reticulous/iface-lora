@@ -136,6 +136,7 @@ int16_t radioSetCodingRate(LoraRadio* r, uint8_t crDenom);
 int16_t radioSyncWord(LoraRadio* r, uint8_t sync);
 int16_t radioSetSf(LoraRadio* r, uint8_t sf);
 int16_t radioSetBw(LoraRadio* r, float bwKhz);
+int16_t radioSetLdro(LoraRadio* r, bool on);
 double  loraAirtimeSeconds(int sf, int bw_hz, int cr_denom, int preamble,
                            int payload, bool implicitHeader);
 double  loraPacketAirtimeMs(const LoraRadio* r, const size_t* frameLens, int frames);

@@ -118,6 +118,7 @@ static bool hTune(void* ctx, uint8_t chan, const SupeCfg* c, uint8_t sync) {
     int16_t st = r->radio->setFrequency((float)supeChanFreq(r, chan) / 1.0e6f);
     if (st == RADIOLIB_ERR_NONE) st = radioSetBw(r, (float)c->bwHz / 1.0e3f);
     if (st == RADIOLIB_ERR_NONE) st = radioSetSf(r, c->sf);
+    if (st == RADIOLIB_ERR_NONE) { r->airSf = c->sf; st = radioSetLdro(r, c->ldro); }
     if (st == RADIOLIB_ERR_NONE) st = radioSyncWord(r, sync);
     if (st != RADIOLIB_ERR_NONE) {
         warn("lora/%d supe: retune failed: %s (%d)", r->idx, rlErrName(st), (int)st);
@@ -151,6 +152,8 @@ static void hTuneHome(void* ctx) {
     r->radio->setFrequency((float)r->cfgFreqHz / 1.0e6f);
     radioSetBw(r, (float)r->cfgBwHz / 1.0e3f);
     radioSetSf(r, (uint8_t)r->cfgSf);
+    r->airSf = (uint8_t)r->cfgSf;
+    radioSetLdro(r, loraLdroRnode(r->cfgSf, r->cfgBwHz));
     radioSyncWord(r, r->cfgSync);
     r->radio->setPreambleLength((size_t)r->cfgPreamble);
     const int8_t homeChip = rfChipDbm(r, r->cfgTxp);

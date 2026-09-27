@@ -352,6 +352,11 @@ static bool radioStart(LoraRadio* r) {
         publishState(r, "error");
         return false;
     }
+    r->airSf = (uint8_t)sf;
+    st = radioSetLdro(r, loraLdroRnode(sf, bw_hz));
+    if (st != RADIOLIB_ERR_NONE)
+        warn("lora/%d low-data-rate optimisation refused: %s (%d)",
+             r->idx, rlErrName(st), (int)st);
 
     /* CSMA/LBT: derive the slot time from the LoRa symbol time (2^SF / BW),
      * clamped to a sane range; DIFS is two slots. Enabled by default; a

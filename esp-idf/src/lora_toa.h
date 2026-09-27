@@ -18,6 +18,17 @@
 #include <math.h>
 #include <stdint.h>
 
+/* Low-data-rate optimisation on the calling channel, by stock RNode firmware's
+ * rule, integer truncation included: 2^SF / (BW / 1000) > 16. It differs from
+ * the true 16 ms symbol threshold at SF11/125k, SF12/250k and SF10/62.5k, and
+ * both ends of a link must agree or neither decodes, so the calling channel
+ * follows the firmware it shares the air with. SUPE's rate steps keep the true
+ * threshold (SUPE.md §14.3). */
+static inline bool loraLdroRnode(int sf, int bw_hz) {
+    if (sf <= 0 || bw_hz < 1000) return false;
+    return (long)((1L << sf) / (bw_hz / 1000)) > 16;
+}
+
 static inline double loraToaSeconds(int sf, int bw_hz, int cr_denom, int preamble,
                                     int payload, bool implicitHeader, bool crc) {
     if (sf <= 0 || bw_hz <= 0 || cr_denom < 5 || cr_denom > 8) return 0.0;
