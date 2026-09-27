@@ -57,8 +57,9 @@ struct LoraSlot {
 /* The IRQ flags the receiver latches. RadioLib's default set plus
  * PREAMBLE_DETECTED, which is what lets radioRxInProgress see a reception the
  * RSSI sense is blind to. These are the chip's IRQ *register* bits, not the DIO
- * mask — nothing extra reaches DIO1, so the line still means "a frame
- * completed" and an idle radio still holds no wake. */
+ * mask — DIO1 carries RX_DONE alone, so an idle radio holds no wake. A
+ * channel-access wait adds the reception bits to DIO1 for its own length
+ * (radioBusyWake). */
 #define LORA_RX_IRQ_FLAGS \
     (RADIOLIB_IRQ_RX_DEFAULT_FLAGS | (1UL << RADIOLIB_IRQ_PREAMBLE_DETECTED))
 
@@ -120,6 +121,8 @@ int16_t radioRxResume(LoraRadio* r);   /* after readData: a no-op where the chip
 void    radioRxDiscard(LoraRadio* r);  /* a packet that will not be read: empty a FIFO part's */
 bool    radioRxInProgress(LoraRadio* r);
 bool    radioIrqLinePending(const LoraRadio* r);
+bool    radioBusyWakeCapable(const LoraRadio* r);
+bool    radioBusyWake(LoraRadio* r, uint32_t bits);
 void    radioIrqClearAll(LoraRadio* r);
 bool    radioAgcReset(LoraRadio* r);
 void    agcResetPoll(LoraRadio* r);

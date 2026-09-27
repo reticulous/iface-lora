@@ -1306,7 +1306,7 @@ void rssiSamplePoll(LoraRadio* r) {
     if (!s_monWatched) return;
     if (!r->running || !r->enabled) return;
     if ((int32_t)(xTaskGetTickCount() - r->mon.rssiNext) < 0) return;
-    if (r->txActive || r->splitPending ||
+    if (r->txActive || splitHolding(r) ||
 #if !defined(CONFIG_LORA_NO_SUPE)
         supeHoldsRadio(r) ||
 #endif

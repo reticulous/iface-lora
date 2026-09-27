@@ -10,16 +10,17 @@
 /* Carrier sense: sample the channel and decide busy/free, tracking the noise
  * floor as the low envelope of RSSI (snap down fast, creep up slowly) so an
  * active channel can't inflate the reference it's compared against. Also busy
- * while a multi-frame reception is being reassembled (half-duplex). */
+ * while the second half of a split is due (splitHolding). */
 static bool channelBusy(LoraRadio* r) {
-    if (r->splitPending) return true;
+    r->csmaDemodBusy = false;
+    if (splitHolding(r)) return true;
     /* Ask the demodulator before measuring power. It is the only party that can
      * see a frame arriving below the noise floor, which LoRa routinely does, and
      * the answer is one register read — the same order of cost as the sense
      * itself. This is the prospective half of what csmaMediumHeld corrects after
      * the fact: together they mean a neighbour's frame is neither transmitted
      * over nor credited to us as free medium. */
-    if (radioRxInProgress(r)) return true;
+    if (radioRxInProgress(r)) { r->csmaDemodBusy = true; return true; }
     float rssi = channelRssi(r);
     /* `GetRssiInst` asked before the receiver is actually running answers
      * 0xFF, which decodes to −127.5 dBm — below the thermal noise of any
@@ -62,7 +63,7 @@ static bool channelBusy(LoraRadio* r) {
  * decodable below the noise, so a preamble the receiver has locked means the
  * channel is occupied whatever the power says. */
 bool csmaSenseClear(LoraRadio* r) {
-    if (r->splitPending) return false;
+    if (splitHolding(r)) return false;
     if (radioRxInProgress(r)) return false;
     float thresh = CSMA_CCA_DBM_125K
                  + 10.0f * log10f((float)r->airBwHz / 125000.0f);
@@ -125,8 +126,8 @@ void csmaFloorSwitch(LoraRadio* r, uint8_t from, uint8_t to) {
  * Carrier sense cannot be relied on to have noticed the transmission we just
  * decoded. LoRa demodulates below the noise floor (SF7 at −7.5 dB SNR), so a
  * frame received perfectly may never have risen above `noiseFloor +
- * CSMA_RSSI_MARGIN_DB`; and the sense is a point sample once per slot, not a
- * continuous watch, so even a strong frame can fall between two of them. The
+ * CSMA_RSSI_MARGIN_DB`; and the sense is a point sample, not a continuous
+ * watch, so even a strong frame can fall between two of them. The
  * receiver holds the one piece of evidence the sense lacks: it decoded
  * something, therefore the medium was occupied.
  *
@@ -177,7 +178,41 @@ static void appcRollBins(LoraRadio* r, uint32_t nowMs) {
 /* Credit one transmitted frame's time-on-air. Called per frame at TxDone, where
  * the duration is already computed for the LoRaMon record. Sole writer of the
  * bins, and it runs on the radio task. */
+/* The hailing channel's hour: one bin a minute, aged by the clock rather than a
+ * beat, so an idle radio holds no wake for it. */
+static void hailAirRoll(LoraRadio* r, uint32_t nowMs) {
+    uint32_t min = nowMs / 60000u;
+    uint32_t gap = min - r->hailAirMin;
+    if (gap >= HAIL_AIR_BINS) memset(r->hailAirMs, 0, sizeof r->hailAirMs);
+    else for (uint32_t k = 1; k <= gap; k++) r->hailAirMs[(r->hailAirMin + k) % HAIL_AIR_BINS] = 0;
+    r->hailAirMin = min;
+}
+
+bool hailAirSpent(LoraRadio* r) {
+    if (!r->hailAirLimitMs) return false;
+    hailAirRoll(r, millis());
+    uint32_t sum = 0;
+    for (int i = 0; i < HAIL_AIR_BINS; i++) sum += r->hailAirMs[i];
+    bool spent = sum >= r->hailAirLimitMs;
+    if (spent && !r->hailAirWarned)
+        warn("lora/%d hailing-channel airtime spent (%u of %u s this hour) — "
+             "holding transmissions", r->idx, (unsigned)(sum / 1000),
+             (unsigned)(r->hailAirLimitMs / 1000));
+    r->hailAirWarned = spent;
+    return spent;
+}
+
+/* While the budget is spent, nothing changes until the oldest minute leaves the
+ * window: wake then rather than every slot. */
+TickType_t hailAirWait(const LoraRadio* r) {
+    (void)r;
+    uint32_t ms = 60000u - millis() % 60000u;
+    return pdMS_TO_TICKS(ms) + 1;
+}
+
 void appcAddAirtime(LoraRadio* r, uint32_t durMs) {
+    hailAirRoll(r, millis());
+    r->hailAirMs[r->hailAirMin % HAIL_AIR_BINS] += durMs;
     if (!r->appc) return;
     appcRollBins(r, millis());
     r->appcBinCur += durMs;
@@ -262,6 +297,13 @@ static bool csmaClearAppc(LoraRadio* r, bool prime) {
         return false;
     }
     if (!free_) {                                   /* medium taken → restart DIFS */
+        /* Woken by the demodulator mid-wait rather than at a slot edge: keep
+         * the slots the medium read free before the one it went busy in. */
+        if (r->appcCwStart && radioBusyWakeCapable(r)) {
+            TickType_t slot = r->slotTicks;
+            TickType_t ran  = (TickType_t)(now - r->appcCwStart);
+            if (ran > slot) r->appcCwPassed += ((ran + slot - 1) / slot - 1) * slot;
+        }
         r->csmaPhase = CSMA_DIFS;
         r->appcDifsStart = 0;
         r->appcCwStart   = 0;                       /* stop counting; keep what passed */
@@ -292,7 +334,8 @@ static bool csmaClearAppc(LoraRadio* r, bool prime) {
 /* Advance the channel-access state machine. Returns true only on the tick the
  * medium is granted (DIFS observed idle, then a random backoff drained without
  * the channel going busy). Otherwise updates state and returns false; the
- * caller leaves the frame queued and nextDeadline() re-wakes at the next slot.
+ * caller leaves the frame queued and nextDeadline() wakes it when csmaSenseDue
+ * says the next sense is due.
  * cw grows on every busy encounter (exponential backoff) and resets after a
  * grant; with appc set, the window comes from the airtime band instead. */
 static bool csmaAdvance(LoraRadio* r, bool prime) {
@@ -341,8 +384,16 @@ static bool csmaAdvance(LoraRadio* r, bool prime) {
                 return true;
             }
             if ((int32_t)(now - r->csmaSlotDeadline) < 0) return false;  /* slot not up */
-            r->csmaSlotDeadline = now + r->slotTicks;
-            if (--r->csmaBackoff <= 0 && !prime) { r->csmaPhase = CSMA_IDLE; return true; }
+            if (radioBusyWakeCapable(r)) {
+                /* One wait may have covered several slots, all of them free. */
+                TickType_t n = 1 + (TickType_t)(now - r->csmaSlotDeadline) / r->slotTicks;
+                r->csmaSlotDeadline += n * r->slotTicks;
+                r->csmaBackoff = r->csmaBackoff > (int)n ? r->csmaBackoff - (int)n : 0;
+            } else {
+                r->csmaSlotDeadline = now + r->slotTicks;
+                --r->csmaBackoff;
+            }
+            if (r->csmaBackoff <= 0 && !prime) { r->csmaPhase = CSMA_IDLE; return true; }
             return false;
     }
     return true;
@@ -364,6 +415,7 @@ void csmaPrime(LoraRadio* r) {
 }
 
 bool csmaClear(LoraRadio* r) {
+    if (hailAirSpent(r)) return false;
     return csmaAdvance(r, /*prime=*/false);
 }
 
@@ -395,6 +447,77 @@ uint16_t csmaGrantWaitMs(const LoraRadio* r) {
     if (!r->lbt) return 0;
     uint32_t ms = (uint32_t)(xTaskGetTickCount() - r->csmaStart) * portTICK_PERIOD_MS;
     return (uint16_t)(ms > 0xFFFF ? 0xFFFF : ms);
+}
+
+/* Is the machine counting free medium — DIFS under way, or the backoff — so
+ * that until a deadline only the channel going busy can change it? */
+bool csmaWatching(const LoraRadio* r) {
+    if (!r->lbt) return false;
+    if (r->csmaPhase == CSMA_DIFS)
+        return (r->appc ? r->appcDifsStart : r->csmaDifsStart) != 0;
+    if (r->csmaPhase == CSMA_BACKOFF)
+        return !r->appc || r->appcCwStart != 0;
+    return false;
+}
+
+/* Is the machine held in DIFS by a reception the demodulator is following, so
+ * that until that reception ends or goes stale every sense reads the same? */
+static bool csmaHeldByDemod(const LoraRadio* r) {
+    return r->lbt && r->csmaDemodBusy && r->csmaPhase == CSMA_DIFS &&
+           (r->appc ? r->appcDifsStart : r->csmaDifsStart) == 0 && r->rxActiveStart != 0;
+}
+
+/* The chip IRQ bits whose arrival changes what the next sense would read: a
+ * frame beginning while the medium is counted free, or the reception that holds
+ * the channel reaching its header or failing it. RX_DONE is on DIO1 always. */
+uint32_t csmaWatchBits(const LoraRadio* r) {
+    if (!radioBusyWakeCapable(r)) return 0;
+    if (csmaWatching(r)) return r->irqPreamble | r->irqHdrValid;
+    if (csmaHeldByDemod(r)) return (r->rxHeaderSeen ? 0 : r->irqHdrValid) | r->irqHdrErr;
+    return 0;
+}
+
+/* Ticks until the machine next needs a sense. With the demodulator routed to
+ * DIO1 (busyWakeBits) a free stretch is one wait to where the per-slot senses
+ * would have decided — the end of DIFS, the last backoff slot, the slot edge
+ * the window fills at — and a busy channel ends it early; a reception holding
+ * the channel is one wait to where radioRxInProgress would call it stale, and
+ * its end ends it early. Otherwise — a busy reading only a poll can see, or a
+ * chip whose DIO routing is not reprogrammed — every slot. portMAX_DELAY:
+ * nothing is due until the channel goes busy (a primed backoff already
+ * drained). */
+TickType_t csmaSenseDue(const LoraRadio* r, TickType_t now) {
+    TickType_t slot = r->slotTicks;
+    TickType_t at;
+    if (r->busyWakeBits && csmaHeldByDemod(r)) {
+        at = r->rxActiveStart + (r->rxHeaderSeen ? r->rxPacketTicks : r->rxPreambleTicks) + 1;
+    } else if (!r->busyWakeBits || !csmaWatching(r)) {
+        if (r->appc || r->csmaPhase != CSMA_BACKOFF) return slot;
+        int32_t rem = (int32_t)(r->csmaSlotDeadline - now);
+        return rem > 0 ? (TickType_t)rem : 0;
+    } else if (r->appc) {
+        if (r->csmaPhase == CSMA_BACKOFF) {
+            /* Already covered (credit carried into this window): the next sense
+             * grants, a slot on. */
+            TickType_t left = r->appcCwPassed < r->appcCwTarget
+                            ? r->appcCwTarget - r->appcCwPassed : 0;
+            left = (left + slot - 1) / slot * slot;
+            at = r->appcCwStart + (left > slot ? left : slot);
+        } else {
+            at = r->appcDifsStart + (r->appcDifsTicks + slot - 1) / slot * slot;
+        }
+    } else {
+        if (r->csmaPhase == CSMA_BACKOFF) {
+            if (r->csmaBackoff <= 0) return portMAX_DELAY;
+            at = r->csmaSlotDeadline + (TickType_t)(r->csmaBackoff - 1) * slot;
+        } else {
+            at = r->csmaDifsStart + r->difsTicks;
+        }
+    }
+    /* Past due means this pass did not sense (something else held the radio):
+     * look again a slot on. */
+    int32_t rem = (int32_t)(at - now);
+    return rem > 0 ? (TickType_t)rem : slot;
 }
 
 #endif  /* CONFIG_LORA0_CS_PIN */

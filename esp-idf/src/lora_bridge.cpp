@@ -451,7 +451,21 @@ void bridgeFrameDeliver(LoraRadio* r, const uint8_t* frame, size_t pktLen) {
     bool     isSplit    = (header & RNODE_FLAG_SPLIT) != 0;
     size_t   payloadLen = pktLen - 1;
 
+    /* The partner of a first half follows it back to back: its preamble is
+     * due within a flip and one short frame's air. */
+    auto splitHoldFromNow = [r]() {
+        uint32_t ms = SPLIT_FLIP_MS + (uint32_t)lround(1000.0 * loraAirtimeSeconds(
+                          r->airSf, r->airBwHz, r->cfgCr, r->airPreamble, 1, r->airImplicit));
+        r->splitHoldUntil = xTaskGetTickCount() + pdMS_TO_TICKS(ms);
+    };
+
     if (!isSplit) {
+        /* A frame that is not a split half ends any split in progress: its
+         * partner is not coming, whoever sent it. */
+        if (r->splitPending) {
+            r->splitPending = false;
+            r->splitTimeouts++;
+        }
         size_t fl = pktLen;                        /* whole on-air frame (incl. header) */
         deliverInbound(r, frame + 1, payloadLen, loraPacketAirtimeMs(r, &fl, 1), 1);
         r->rxBytes += payloadLen;
@@ -461,6 +475,7 @@ void bridgeFrameDeliver(LoraRadio* r, const uint8_t* frame, size_t pktLen) {
         r->splitSeq      = seq;
         r->splitPending  = true;
         r->splitDeadline = xTaskGetTickCount() + pdMS_TO_TICKS(SPLIT_RX_TIMEOUT_MS);
+        splitHoldFromNow();
     } else if (r->splitSeq == seq) {
         if (r->splitLen + payloadLen <= sizeof(r->splitBuf)) {
             /* Two on-air frames, each with its own preamble/header/CRC. */
@@ -478,6 +493,7 @@ void bridgeFrameDeliver(LoraRadio* r, const uint8_t* frame, size_t pktLen) {
         r->splitLen      = payloadLen;
         r->splitSeq      = seq;
         r->splitDeadline = xTaskGetTickCount() + pdMS_TO_TICKS(SPLIT_RX_TIMEOUT_MS);
+        splitHoldFromNow();
     }
 
     /* A pending power request binds to the one RNS frame that follows it and to
@@ -568,6 +584,7 @@ void startTxFrame(LoraRadio* r, int idx) {
         return;
     }
     r->txActive       = true;
+    r->busyWakeBits   = 0;                         /* startTransmit set the DIO mask for TxDone */
     r->txFrameStartMs = millis();                  /* start-of-air, for the LoRaMon record */
     r->txDeadline     = xTaskGetTickCount() + r->txWatchTicks;
     gpio_intr_enable((gpio_num_t)r->slot->dio1);   /* arm DIO1 for this frame's TxDone */
@@ -974,9 +991,25 @@ void queueDiscardHead(LoraRadio* r) {
         rnodeSendReady();
 }
 
+/* Route to DIO1 the demodulator events that would change the next sense
+ * (csmaWatchBits), so a CSMA wait ends on them and not at the next slot. Under
+ * SUPE's lock: its timer steps may transmit, and a transmit owns the DIO mask. */
+static void csmaWatchSync(LoraRadio* r) {
+    uint32_t want = csmaWatchBits(r);
+    if (want == r->busyWakeBits) return;
+#if !defined(CONFIG_LORA_NO_SUPE)
+    supeLock(r);
+    radioBusyWake(r, want);
+    supeUnlock(r);
+#else
+    radioBusyWake(r, want);
+#endif
+}
+
 /* Drain one pending outbound packet for this radio if it's free.
- * Half-duplex: while a split RX is being reassembled OR a transmit is already
- * on-air (txActive) the queue and the ITS buffers simply hold what they hold,
+ * Half-duplex: while the second half of a split is due (splitHolding) OR a
+ * transmit is already on-air (txActive) the queue and the ITS buffers simply
+ * hold what they hold,
  * and we revisit once the radio is idle. */
 void drainOneOutbound(LoraRadio* r) {
     /* Run the wait clock before any of the blocking returns below, so it
@@ -1012,7 +1045,7 @@ void drainOneOutbound(LoraRadio* r) {
      * measures the load, and rides the very detour that is being waited for.
      * That wait is hundreds of milliseconds, so it is where most of the chances
      * to coalesce live. */
-    if (!r->running || r->splitPending) return;
+    if (!r->running || splitHolding(r)) return;
 #if !defined(CONFIG_LORA_NO_SUPE)
     if (supeXactLive(r)) return;
 #endif
@@ -1026,6 +1059,7 @@ void drainOneOutbound(LoraRadio* r) {
 
     if (loraqDepth(&r->q) == 0) {
         csmaResetAccess(r);         /* nothing queued → reset channel-access state */
+        csmaWatchSync(r);
         return;
     }
 
@@ -1038,7 +1072,7 @@ void drainOneOutbound(LoraRadio* r) {
     /* WAIT is our own timing — a live schedule the packet rides at its next
      * met slot, or the ladder's pause between seeds. It reserves nothing, so
      * channel access runs underneath it and is ready when the wait lifts. */
-    if (sv == SUPE_V_WAIT) { csmaPrime(r); return; }
+    if (sv == SUPE_V_WAIT) { csmaPrime(r); csmaWatchSync(r); return; }
     if (sv == SUPE_V_DROP) { queueDiscardHead(r); return; }
     /* A seed takes the channel on its own terms — after the pre-seed jitter,
      * from supePoll — so it stands down here rather than winning the medium
@@ -1047,7 +1081,9 @@ void drainOneOutbound(LoraRadio* r) {
     if (sv == SUPE_V_OFFER) return;   /* the glue launches it after the jitter */
 #endif
 
-    if (!csmaClear(r)) {            /* listen-before-talk not yet satisfied */
+    bool granted = csmaClear(r);
+    csmaWatchSync(r);
+    if (!granted) {                 /* listen-before-talk not yet satisfied */
         TickType_t waited = xTaskGetTickCount() - r->csmaStart;
         /* Radio contention is otherwise invisible until the drop valve fires —
          * name it explicitly once per frame so a "nothing went out" hunt can
@@ -1333,6 +1369,14 @@ static void serviceRadioLocked(LoraRadio* r) {
         r->txAborted = true;
         txRearmRx(r);
         r->txAborted = false;
+        return;
+    }
+
+    /* A demodulator event ended a CSMA wait (csmaWatchSync). The bit stays
+     * latched for radioRxInProgress and the sense that follows; only its route
+     * to DIO1 is dropped, which lowers the line again. */
+    if (!r->txActive && (flags & r->busyWakeBits) && radioBusyWake(r, 0)) {
+        gpio_intr_enable((gpio_num_t)r->slot->dio1);
         return;
     }
 

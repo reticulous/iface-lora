@@ -114,7 +114,7 @@ void manualTxPoll(LoraRadio* r) {
          * the other end is timing against, and it may be tuned off the hailing
          * channel entirely. Refuse rather than transmit into the middle of one;
          * the standoff has to run both ways or it is not one. */
-        if (r->splitPending || r->txActive
+        if (splitHolding(r) || r->txActive
 #if !defined(CONFIG_LORA_NO_SUPE)
             || supeHoldsRadio(r)
 #endif

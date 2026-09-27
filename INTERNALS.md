@@ -164,7 +164,8 @@ then constructs each radio + HAL and probes for presence (§4).
 wakes on an ITS message (an outbound packet from `rnsd`, or a config-change
 notify), a task notification from any radio's IRQ ISR, or a computed deadline.
 When outbound bytes are queued and a radio is free, `nextDeadline` returns 0 to
-drain on the next turn. With nothing pending — no queued outbound, no split-RX
+drain on the next turn with LBT off, and with LBT on the instant channel access
+next has something to decide (`csmaSenseDue`, §6). With nothing pending — no queued outbound, no split-RX
 in flight, no deferred stats flush, no unregistered radio, no config apply owed,
 no announce replay running, no proof expectation outstanding, no viewer open — it returns
 `portMAX_DELAY`, so an idle link blocks until a real ISR/ITS event and the chip
@@ -677,16 +678,22 @@ header bit 0       (0x01): SPLIT — this frame is part of a 2-frame split
 - RNS packet 255–500 B → two frames (first 254 B, then the remainder), both with
   the same random seq nibble, both SPLIT set; the receiver concatenates them.
 - The random seq nibble lets a receiver tell one sender's split from another's
-  interleaved on the air. A half-assembled split is dropped after
-  `SPLIT_RX_TIMEOUT_MS` (5 s), bumping `split_rx_timeout`.
+  interleaved on the air. A half-assembled split is dropped by the next frame
+  that is not a split half, as stock RNode firmware drops it, or after
+  `SPLIT_RX_TIMEOUT_MS` (5 s), either way bumping `split_rx_timeout`.
+- **A pending half holds our transmit only until its partner is due.** The
+  sender flies the second half back to back, so its preamble starts within
+  `SPLIT_FLIP_MS` and one short frame's air of the first half's end
+  (`splitHoldUntil`); until then `splitHolding` keeps this radio off the air.
+  After it, the demodulator answers for the channel as it does for any frame,
+  and the pending half holds nothing — a lost or corrupt second half costs the
+  packet, never the channel.
 - **A SUPE exchange drops its own orphan at the close.** Train frames reach the
   same reassembler (`hTrainDeliver` → `bridgeFrameDeliver`), and an exchange hands
   over everything it collected in one delivery, once. A half still pending after
   that batch is waiting for a frame the repair round already failed to recover,
   so it is dropped there rather than left to the timeout — the counter is the
-  same. Holding it was not merely idle: a pending split is state the rest of the
-  interface has to reason around, and reasoning around it wrongly is what put
-  five seconds of deafness after every lossy burst.
+  same.
 
 This is a self-contained framing local to this codebase — it is **not** RNode
 firmware, HDLC, or KISS, and there is no byte-stuffing. Constants:
@@ -830,11 +837,12 @@ air is safe because `queueSendHead` consumes the head the moment `beginTx` has
 copied the bytes out, so the in-flight packet is no longer in the queue for a
 later push — or a per-peer cap eviction — to touch.
 
-**Half-duplex coordination.** LoRa can't transmit while receiving, so a pending
-split RX must not be interrupted. `drainOneOutbound` early-outs while
-`r->splitPending` is set (or the radio isn't running, or `rnsd` isn't
-connected); the outbound packet stays in the ITS stream buffer and is revisited
-once the split completes or times out.
+**Half-duplex coordination.** LoRa can't transmit while receiving, so the
+second half of a split must not be transmitted over. `drainOneOutbound`
+early-outs while `splitHolding(r)` (§5), or the radio isn't running, or `rnsd`
+isn't connected; the outbound packet stays in the ITS stream buffer and is
+revisited once the partner's preamble is due, by which time the demodulator
+reports it if it is arriving.
 
 **Listen-before-talk (CSMA/CA).** Before a queued frame is transmitted it must
 pass `csmaClear(r)`, a non-blocking channel-access state machine. A sense is two
@@ -864,17 +872,52 @@ warning and `nextDeadline()` are mode-agnostic.
 *Adaptive channel plan (`appc=1`, the default) — see §6a.*
 
 Either way the machine is driven from the task loop: when access is deferred the
-frame stays queued and `nextDeadline()` wakes the task at the next slot boundary
-to re-sense (never at 0, which would peg the task). `lbt=0` reverts to blind
-transmit. The only other TX guard remains `splitPending`.
+frame stays queued and `nextDeadline()` wakes the task when the machine next has
+something to decide (`csmaSenseDue`), never at 0, which would peg the task.
+`lbt=0` reverts to blind transmit. The other TX guards are `splitHolding` (§5)
+and the hailing channel's airtime budget, below.
+
+**Sensing cadence: one wait per stretch, ended by the demodulator.**
+
+```
+queued ─ sense: free ─┐                      ┌─ sense: free → grant
+                      └── DIFS + backoff ────┘      (one wait, DIO1 armed)
+                            │ PREAMBLE_DETECTED / HEADER_VALID on DIO1
+                            └─→ wake ─ sense: busy → DIFS restarts, window frozen
+```
+
+While the machine counts free medium — DIFS under way, or the backoff — nothing
+but the channel going busy can change it before its deadline, so the task sleeps
+to that deadline in one wait: the end of DIFS, the last backoff slot, or the slot
+edge at which the adaptive window fills. `csmaWatchSync` routes the demodulator's
+`PREAMBLE_DETECTED` and `HEADER_VALID` to DIO1 for the length of that wait
+(`radioBusyWake`, a SetDioIrqParams while the chip stays in receive), so a frame
+starting ends it at once; `serviceRadio` then drops the routing, the bit stays
+latched, and the sense that follows reads busy. While the demodulator is following
+a reception that holds the channel, the wait runs to the instant
+`radioRxInProgress` would call that reception stale, and `HEADER_VALID`,
+`HEADER_ERR` and `RX_DONE` end it early. The deadlines are the ones per-slot
+sensing would reach — senses one slot apart from the last — so DIFS, the drawn
+backoff and the grant instant are unchanged; a wait woken mid-backoff counts the
+slots before the one the channel went busy in, as per-slot senses would have, and
+the exponential plan consumes every free slot the wait covered.
+
+The rule behind it: **a wait may sleep only across what an interrupt reports.**
+A busy reading only a poll can see — RSSI above the floor with no reception, the
+one-shot `csmaMediumHeld` mark, a split still landing — is re-sensed every slot,
+and so is every chip family other than the SX126x (`radioBusyWakeCapable`), whose
+DIO routing is not reprogrammed here. What the sleep gives up is an RSSI-only
+burst that starts and ends inside one wait; the sense at the wait's end still
+reads RSSI before a grant. The noise floor is tracked from the senses that
+happen — a few per frame rather than one per slot.
 
 **On the SPI cost.** Each sense is one `getIrqFlags()` and one `getRSSI(false)` —
-two SPI transactions, read at the DFS floor (the re-sense wakes are timeout-driven,
-so they don't boost the CPU). A transmit therefore issues a burst of these across
-its DIFS + backoff slots, which makes `spi_master` the dominant SPI source while
-traffic flows — but the transfers are ~55 µs APB holds at 80 MHz, ~0.1 % of wall
-time, so LBT costs no measurable power (confirmed by an `lbt 0`/`lbt 1` A/B: SPI
-halves, light-sleep % is unchanged). The chip *does* have a hardware
+two SPI transactions, read at the DFS floor (the waits are timeout- or
+DIO1-driven, so they don't boost the CPU). A transmit issues a handful of these —
+the first sense, the end of DIFS, the end of the backoff, one per slot while the
+channel reads busy on RSSI alone — plus one SetDioIrqParams to arm each wait and
+one to disarm it. The transfers are ~55 µs APB holds at 80 MHz, so LBT costs no
+measurable power. The chip *does* have a hardware
 alternative — `startChannelScan()` (Channel Activity Detection, CAD), a
 LoRa-preamble-aware sense that IRQs on `CadDone` — but it costs **more** SPI per sense (standby → DIO → clear → setCad
 → read result ≈ 6 transactions vs. 1) and drops RX to standby for each sense, so
@@ -1045,11 +1088,14 @@ The window is never widened on a busy encounter. All adaptation lives in the
 band, which is why a single loud neighbour does not push this radio into longer
 backoffs the way the exponential channel plan would.
 
-**Sensing cadence** stays `slotTicks` (10–20 ms) in both channel plans, not adaptive backoff's
-longer slot — the adaptive backoff slot is only the unit its target is counted in. Upstream
-senses every 3 ms, far finer than its own 24–100 ms slot, so keeping our existing
-cadence preserves the intent; the cost is that a medium going busy is noticed up
-to one `slotTicks` late, over-crediting the backoff by at most that much.
+**Sensing cadence** is `slotTicks` (10–20 ms) in both channel plans, not adaptive
+backoff's longer slot — the adaptive backoff slot is only the unit its target is
+counted in. Upstream senses every 3 ms, far finer than its own 24–100 ms slot. Here
+a free stretch is one wait to the `slotTicks` edge at which the window fills, ended
+early by the demodulator (§6, sensing cadence); a busy wake credits the whole
+`slotTicks` slots that passed before it. So a medium going busy is credited as free
+for at most the modem's preamble-detection latency, and one `slotTicks` where only
+RSSI shows it.
 
 **Deliberate divergences from upstream**, beyond the reimplementation itself:
 
@@ -1085,7 +1131,19 @@ and `queueFill` takes nothing from rnsd while it is full, so rnsd's `itsSend`
 gives up after 100 ms and drops the packet with `ITS send dropped`. A wedged
 channel therefore refuses new traffic, which is what upstream's queue-full
 error does to the host, and sheds nothing it already holds. The stall warning
-names the wait once per frame after a second.
+names the wait once per frame after a second. The one exception is a packet
+SUPE holds for a peer that meets: its queue lifetime runs (§19.4). A packet
+SUPE sends the plain way is ordinary traffic again, and waits like any other.
+
+**The hailing channel's airtime budget (`hailAirSpent`).** `csmaClear` grants
+nothing once this radio has spent `s.lora.<n>.airtime_limit` seconds on the
+hailing channel within the last hour — by default 100 s in 863–870 MHz, EN
+300 220's ceiling for a listen-before-talk transmitter, and no limit
+elsewhere. The hour is sixty one-minute bins (`hailAirMs`), credited where the
+APPC band is (`appcAddAirtime`) and aged by the clock, so an idle radio holds
+no wake for them. While the budget is spent the queue holds, `nextDeadline`
+wakes at the next minute boundary instead of every slot, and the exhaustion is
+logged once per spell.
 
 **One floor per channel, carried across retunes (`csmaFloorSwitch`).** The
 tracker snaps down to the first sample below it and creeps *up* at 2% of the gap
@@ -1125,8 +1183,8 @@ Carrier sense answers "is there power on this channel", which is not the questio
 a half-duplex radio needs answered before transmitting. LoRa demodulates *below*
 the noise floor — SF7 works at −7.5 dB SNR — so a frame being received perfectly
 may never rise above `floor + CSMA_RSSI_MARGIN_DB`, and the sense is a point
-sample once a slot rather than a continuous watch, so even a strong frame can
-fall between two of them. Transmitting over it destroys both frames.
+sample rather than a continuous watch, so even a strong frame can fall between
+two of them. Transmitting over it destroys both frames.
 
 The demodulator holds the evidence the sense lacks: it has locked onto a
 preamble, or validated a header. `radioRxInProgress` reads it for one register
@@ -1136,10 +1194,11 @@ credited to us as free medium.
 
 **Latching the evidence costs nothing.** `radioStartRx` — the single place any
 path re-enters RX — arms the receiver with `LORA_RX_IRQ_FLAGS`: RadioLib's
-default set plus `PREAMBLE_DETECTED`. That goes into the chip's IRQ *register*
-and not the DIO mask, so DIO1 keeps its one meaning (a frame completed), no extra
-interrupt fires, and an idle radio still holds no wake. `HEADER_VALID` is already
-in RadioLib's default set. SX127x has no preamble-detect IRQ to latch and reports
+default set plus `PREAMBLE_DETECTED`. That goes into the chip's IRQ *register*;
+the DIO mask carries `RX_DONE` alone, so no extra interrupt fires and an idle
+radio holds no wake. Only for the length of a channel-access wait are the
+reception bits routed to DIO1 as well (§6, sensing cadence), and the routing is
+dropped again on the wake. `HEADER_VALID` is already in RadioLib's default set. SX127x has no preamble-detect IRQ to latch and reports
 nothing rather than guessing; there, carrier sense and `csmaMediumHeld` stand
 alone.
 
@@ -2515,10 +2574,11 @@ bit of the maximum-power byte is part of the level.
 - **Re-enable the GPIO interrupt after every RX drain.** The HAL trampoline
   disables it on each fire; `drainRadioIrq` must `gpio_intr_enable` the radio's
   IRQ pin or the radio goes silent.
-- **Half-duplex: `splitPending` blocks all TX** until the second frame arrives or
-  the 5 s timeout fires. Outbound bytes sit in the ITS stream buffer meanwhile —
-  don't drain them in a narrow loop. It must **not** also stand the SUPE engine
-  down, and must not reach it as `rx_busy` either. Standing the engine down
+- **Half-duplex: `splitHolding` blocks TX** only until the second half's
+  preamble is due (§5); `splitPending` alone blocks nothing. Outbound bytes sit
+  in the ITS stream buffer meanwhile — don't drain them in a narrow loop. A
+  pending half must **not** stand the SUPE engine down, and must not reach it
+  as `rx_busy` either. Standing the engine down
   leaves its next event computed from a time slot already past, so the deadline pins
   at zero and the main loop spins for the whole timeout while no schedule can
   reach its horizon. Reporting it as `rx_busy` is the opposite error: that

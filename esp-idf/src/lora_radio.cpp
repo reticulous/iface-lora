@@ -398,8 +398,9 @@ void radioIrqCache(LoraRadio* r) {
  *
  * PREAMBLE_DETECTED is added to the *flags* — the chip's IRQ register — and not
  * to the DIO mask, so the modem records that it heard something without raising
- * DIO1 for it. The line keeps its single meaning (a frame completed) and an idle
- * radio still holds no wake; radioRxInProgress reads the record when it wants it.
+ * DIO1 for it. The mask is RX_DONE alone, so an idle radio holds no wake;
+ * radioRxInProgress reads the record when it wants it, and only a channel-access
+ * wait routes the reception bits to DIO1 (radioBusyWake).
  * Families whose timeout constant differs take their own arm; SX127x has no
  * preamble-detect IRQ to latch, so it keeps the plain call. */
 /* Drop whatever the chip holds of a packet that will not be read. On the
@@ -423,6 +424,7 @@ void radioRxDiscard(LoraRadio* r) {
 int16_t radioStartRx(LoraRadio* r) {
     PhysicalLayer* p = r->radio;
     radioRxDiscard(r);
+    r->busyWakeBits = 0;            /* startReceive programs the DIO mask afresh */
     switch (chipFamily(r->slot->chip)) {
         case FAM_SX126X:
             return p->startReceive(RADIOLIB_SX126X_RX_TIMEOUT_INF, LORA_RX_IRQ_FLAGS,
@@ -460,7 +462,7 @@ int16_t radioRxResume(LoraRadio* r) {
  * Carrier sense answers a different question and answers it worse: LoRa
  * demodulates below the noise floor, so a frame being received perfectly may
  * never rise above `noiseFloor + CSMA_RSSI_MARGIN_DB`, and the sense is a point
- * sample once a slot rather than a continuous watch. The demodulator has the
+ * sample rather than a continuous watch. The demodulator has the
  * evidence the sense lacks — it has locked onto a preamble, or validated a
  * header — and it costs one register read to ask.
  *
@@ -516,6 +518,34 @@ bool radioRxInProgress(LoraRadio* r) {
  * asleep beside a radio holding a completed frame. */
 bool radioIrqLinePending(const LoraRadio* r) {
     return r->slot->dio1 >= 0 && gpio_get_level((gpio_num_t)r->slot->dio1) != 0;
+}
+
+/* Can a CSMA wait be woken by the demodulator? On the SX126x SetDioIrqParams
+ * re-routes the IRQ bits to DIO1 while the chip stays in receive, and the
+ * preamble and header bits are latched there already (LORA_RX_IRQ_FLAGS). */
+bool radioBusyWakeCapable(const LoraRadio* r) {
+    return r->radio && r->irqPreamble && r->slot->dio1 >= 0 &&
+           chipFamily(r->slot->chip) == FAM_SX126X;
+}
+
+/* Route `bits` to DIO1 beside RX_DONE, or only RX_DONE again for 0. The
+ * receive IRQ flags stay as radioStartRx set them, so a bit that fired stays
+ * latched for radioRxInProgress. Receive only: a transmit owns the mask. */
+bool radioBusyWake(LoraRadio* r, uint32_t bits) {
+    if (bits == r->busyWakeBits) return true;
+    if (!radioBusyWakeCapable(r) || r->txActive) return false;
+    uint16_t irq  = (uint16_t)r->radio->getIrqMapped(LORA_RX_IRQ_FLAGS);
+    uint16_t dio1 = (uint16_t)(r->radio->getIrqMapped(RADIOLIB_IRQ_RX_DEFAULT_MASK) | bits);
+    const uint8_t d[8] = { (uint8_t)(irq >> 8), (uint8_t)irq,
+                           (uint8_t)(dio1 >> 8), (uint8_t)dio1, 0, 0, 0, 0 };
+    int16_t st = r->mod->SPIwriteStream((uint16_t)RADIOLIB_SX126X_CMD_SET_DIO_IRQ_PARAMS,
+                                        d, sizeof d, true, true);
+    if (st != RADIOLIB_ERR_NONE) {
+        warn("lora/%d DIO1 routing refused: %s (%d)", r->idx, rlErrName(st), (int)st);
+        return false;
+    }
+    r->busyWakeBits = bits;
+    return true;
 }
 
 /* Clear every IRQ the chip has raised. The recovery arm for a raised line with
@@ -604,7 +634,7 @@ void agcResetPoll(LoraRadio* r) {
     if (!r->agcResetMs || !r->running || !r->enabled) return;
     TickType_t now = xTaskGetTickCount();
     if ((int32_t)(now - r->agcNext) < 0) return;
-    if (r->txActive || r->splitPending ||
+    if (r->txActive || splitHolding(r) ||
 #if !defined(CONFIG_LORA_NO_SUPE)
         supeHoldsRadio(r) ||
 #endif

@@ -30,8 +30,8 @@
  * split-second frame or re-arms RX. The task is free for the whole airtime, so
  * nothing on its core is starved even at SF12. serviceRadio() reads the chip's IRQ
  * flags to decide what completed rather than guessing TX-vs-RX from state. The
- * radio is half-duplex, so we never start a transmit while a split RX is being
- * reassembled (splitPending) or another transmit is on-air (txActive).
+ * radio is half-duplex, so we never start a transmit while the second half of
+ * a split is due (splitHolding) or another transmit is on-air (txActive).
  */
 #include "lora_priv.h"
 
@@ -436,6 +436,14 @@ static bool radioStart(LoraRadio* r) {
     r->curBitrate = computeBitrate(sf, bw_hz, cr, preamble);
     r->cfgSf = sf; r->cfgBwHz = bw_hz; r->cfgCr = cr; r->cfgPreamble = preamble;
     r->cfgFreqHz = (uint32_t)freq_hz;
+    {
+        /* The hailing channel's airtime per hour, in seconds: -1 is the band's
+         * own ceiling where there is one this code knows, 0 is none. */
+        int lim = storageGetInt(sk(kb, sizeof kb, r->idx, "airtime_limit"), -1);
+        if (lim < 0)
+            lim = (freq_hz >= 863000000 && freq_hz <= 870000000) ? HAIL_AIR_ETSI_S : 0;
+        r->hailAirLimitMs = (uint32_t)lim * 1000u;
+    }
     r->airPreamble = preamble; r->airImplicit = false; r->airSf = (uint8_t)sf;
     r->airBwHz = bw_hz;
     r->chNow   = LORA_CH_HAIL;
@@ -897,10 +905,11 @@ static TickType_t nextDeadline(void) {
             if (d < soonest) soonest = d;
         }
         /* Outbound queued and radio free. With LBT off, loop immediately.
-         * With LBT on and channel access mid-procedure, wake at the next slot
-         * boundary to re-sense — never spin at 0, which would peg the task.
-         * Skipped while a transmit is on-air (txActive): the TxDone IRQ drives
-         * the next step, and drainOneOutbound would no-op anyway. */
+         * With LBT on and channel access mid-procedure, wake when the machine
+         * next has something to decide (csmaSenseDue) — never spin at 0, which
+         * would peg the task. Skipped while a transmit is on-air (txActive):
+         * the TxDone IRQ drives the next step, and drainOneOutbound would no-op
+         * anyway. */
         /* A raised IRQ line the ISR has not reported: the interrupt is disabled,
          * so nothing will wake us for it. Service on the next pass rather than
          * sleeping beside a radio holding a completed frame. serviceRadio always
@@ -945,7 +954,7 @@ static TickType_t nextDeadline(void) {
          * ask to be woken for it: with LBT off this term returns 0, which would
          * spend the whole window at full CPU instead of asleep. The window's own
          * deadline is the s_cfgPend term at the top. */
-        bool outReady = r->running && !r->splitPending && !r->txActive &&
+        bool outReady = r->running && !splitHolding(r) && !r->txActive &&
                         !loraCfgQuiet();
         bool outAvail = (r->rnsdHandle >= 0 && itsBytesAvailable(r->rnsdHandle) > 0) ||
                         loraqDepth(&r->q) > 0 ||
@@ -953,15 +962,11 @@ static TickType_t nextDeadline(void) {
                          (s_rnode.txLen > 0 || itsBytesAvailable(s_rnode.handle) > 0));
         if (outReady && outAvail) {
             if (!r->lbt) return 0;
-            /* Sensing cadence is the derived slot in both regimes — APPC's own
-             * slot is only the unit its backoff target is counted in, and is
-             * always the longer of the two, so re-sensing at slotTicks keeps
-             * carrier detection as responsive as it is without appc. */
-            TickType_t d = r->slotTicks;
-            if (!r->appc && r->csmaPhase == CSMA_BACKOFF) {
-                int32_t rem = (int32_t)(r->csmaSlotDeadline - now);
-                d = rem > 0 ? (TickType_t)rem : 0;
-            }
+            /* Counted in the derived slot in both regimes — APPC's own slot is
+             * only the unit its backoff target is counted in. A free stretch is
+             * one wait with the demodulator routed to DIO1 to end it; a busy
+             * channel only a poll can see is re-sensed every slot. */
+            TickType_t d = hailAirSpent(r) ? hailAirWait(r) : csmaSenseDue(r, now);
             if (d == 0) return 0;
             if (d < soonest) soonest = d;
         }
@@ -972,7 +977,9 @@ static TickType_t nextDeadline(void) {
             if (d < soonest) soonest = d;
         }
         if (r->splitPending) {
-            TickType_t d = (r->splitDeadline > now) ? (r->splitDeadline - now) : 0;
+            TickType_t at = splitHolding(r) ? r->splitHoldUntil : r->splitDeadline;
+            int32_t rem = (int32_t)(at - now);
+            TickType_t d = rem > 0 ? (TickType_t)rem : 0;
             if (d < soonest) soonest = d;
         }
         /* An announce replay in progress: it takes the channel one frame at a

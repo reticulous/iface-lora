@@ -66,6 +66,11 @@
 #define RNODE_MAX_PAYLOAD    254
 #define RNODE_FLAG_SPLIT     0x01
 #define SPLIT_RX_TIMEOUT_MS  5000
+#define SPLIT_FLIP_MS        30     /* sender's gap between halves, with margin */
+#define HAIL_AIR_BINS        60     /* one-minute bins: an hour */
+/* EN 300 220's ceiling for a listen-before-talk transmitter in 863–870 MHz:
+ * 100 s of air in any hour, per 200 kHz. The hailing channel's default there. */
+#define HAIL_AIR_ETSI_S      100
 
 
 /* Per-frame protocol class, published as the record's last field and coloured
@@ -265,6 +270,8 @@ struct LoraRadio {
     uint8_t         splitSeq;
     bool            splitPending;
     TickType_t      splitDeadline;
+    TickType_t      splitHoldUntil;  /* our own transmit stands off until the
+                                      * partner's preamble is due (splitHolding) */
 
     /* LoRaMon's OWN view of split framing, one per direction, and it cannot be
      * the reassembly state above.
@@ -302,6 +309,9 @@ struct LoraRadio {
     TickType_t      csmaSlotDeadline;/* next backoff slot boundary */
     TickType_t      csmaStart;       /* tick this frame's channel-access attempt began */
     bool            csmaStalled;     /* stall warning emitted for this frame (once) */
+    uint32_t        busyWakeBits;    /* chip IRQ bits routed to DIO1 beside RX_DONE
+                                      * while a CSMA wait watches the channel; 0 = none */
+    bool            csmaDemodBusy;   /* the last sense read busy on the demodulator's word */
     float           noiseFloor;      /* tracked channel noise floor, dBm */
     float           chFloor[LORA_CH_MAX];  /* each channel's floor as this radio last
                                             * left it, indexed by channel; the hailing
@@ -323,6 +333,12 @@ struct LoraRadio {
     uint32_t        appcBinIdx;      /* airtime bin (of the uptime hour) last touched */
     uint32_t        appcBinCur;      /* our on-air ms inside that bin … */
     uint32_t        appcBinPrev;     /* … and inside the one before it */
+    /* The hailing channel's transmit budget (hailAir*, lora_csma): on-air ms
+     * per minute over a sliding hour, against `airtime_limit`. */
+    uint32_t        hailAirMs[HAIL_AIR_BINS];
+    uint32_t        hailAirMin;      /* absolute minute the ring is aligned to */
+    uint32_t        hailAirLimitMs;  /* per hour; 0 = no limit */
+    bool            hailAirWarned;   /* "budget spent" said once per spell */
 
     /* Non-blocking TX: startTransmit() fires the chip and returns; the TxDone IRQ
      * (same DIO1 line as RX) wakes the task, which finishes and either sends the
@@ -535,6 +551,14 @@ struct LoraRadio {
     volatile uint32_t fgtResGen;     /* bumped when the request completes */
     int               fgtResN;       /* rows forgotten, or -1 for no such node */
 };
+
+/* Half of a split is in, and its partner, sent back to back, has not yet had
+ * time to start: a transmit of ours now would fall on it. Once its preamble
+ * is due the demodulator answers for the channel, as for any frame; the
+ * pending half itself holds nothing. */
+static inline bool splitHolding(const LoraRadio* r) {
+    return r->splitPending && (int32_t)(xTaskGetTickCount() - r->splitHoldUntil) < 0;
+}
 
 /* ─────────────── service-owned globals (lora.cpp) ─────────────── */
 
