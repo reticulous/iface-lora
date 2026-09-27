@@ -83,6 +83,16 @@ static Neighbor* tagNode(LoraRadio* r, const uint8_t tag[SUPE_TAG_LEN]) {
     return nullptr;
 }
 
+/* A proof is addressed to the hash of the packet it proves, which names no
+ * node; the relayer that brought that packet in was filed against it
+ * (supeProofRetFile), and the proof goes back the way the packet came. */
+static Neighbor* tagNode(LoraRadio* r, const uint8_t tag[SUPE_TAG_LEN]) {
+    if (Neighbor* e = tagNodeDirect(r, tag)) return e;
+    if (!r->supe) return nullptr;
+    const uint8_t* node4 = supeEngProofRetLookup(&r->supe->eng, tag);
+    return node4 ? tagNodeDirect(r, node4) : nullptr;
+}
+
 static NeiLink* tagLink(LoraRadio* r, const uint8_t tag[SUPE_TAG_LEN]) {
     return r->nei ? peersLinkFindBy3(r->nei, tag) : nullptr;
 }
@@ -744,19 +754,27 @@ static void annIngest(LoraRadio* r, const uint8_t* f, size_t len, int16_t rssi,
     Neighbor* keep = nullptr;
     uint8_t   orphan[SUPE_ANN_MAX];      /* ids this table could not place */
     uint8_t   nOrphan = 0;
+    auto resolve = [r](const uint8_t* id) {
+        Neighbor* e = peersFindByIdent4(r->nei, id);
+        if (!e) e = peersFindBy4(r->nei, id);
+        if (!e) e = peersFindClaim4(r->nei, id);
+        return e;
+    };
+    bool anyKnown = false;
+    for (int i = 0; i < a.count && !anyKnown; i++) anyKnown = resolve(a.ids[i]) != nullptr;
     for (int i = 0; i < a.count; i++) {
-        Neighbor* e = peersFindByIdent4(r->nei, a.ids[i]);
-        if (!e) e = peersFindBy4(r->nei, a.ids[i]);
-        if (!e) e = peersFindClaim4(r->nei, a.ids[i]);
-        if (!e && i > 0 && nOrphan < SUPE_ANN_MAX) orphan[nOrphan++] = (uint8_t)i;
-        /* Never met: this frame IS the introduction — it carries the identities
-         * and the capabilities together — so keep it rather than wait out an
-         * announce interval for the next one. Only four bytes of each identity
-         * are on the air, which is exactly what a claim row holds; the node's
-         * own Reticulum announce supplies the hash and folds the two together
-         * (observeAnnounce). Until then the row has no destination, so nothing
-         * routes to it and the claim can only ever answer for SUPE. */
-        if (!e && i == 0) {
+        Neighbor* e = resolve(a.ids[i]);
+        if (!e && (i > 0 || anyKnown) && nOrphan < SUPE_ANN_MAX) orphan[nOrphan++] = (uint8_t)i;
+        /* Never met, by any of its names: this frame IS the introduction — it
+         * carries the identities and the capabilities together — so keep it
+         * rather than wait out an announce interval for the next one. Only
+         * four bytes of each identity are on the air, which is exactly what a
+         * claim row holds; the node's own Reticulum announce supplies the hash
+         * and folds the two together (observeAnnounce). Until then the row has
+         * no destination, so nothing routes to it and the claim can only ever
+         * answer for SUPE. A node the table already holds under another of
+         * the names gets no row of its own for this one. */
+        if (!e && i == 0 && !anyKnown) {
             e = peersAlloc(r->nei, now);
             if (e) { memcpy(e->node4, a.ids[i], 4); e->haveNode4 = true; }
         }

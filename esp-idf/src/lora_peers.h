@@ -16,13 +16,20 @@ struct LoraRadio;
  * name links; proofs we elicited close a per-neighbour delivery-quality loop.
  * IFAC frames are masked end-to-end and are skipped (the table stays empty on
  * an IFAC network). Surfaced by `lora [<n>] neighbors`. */
-#define NEI_MAX              64      /* neighbour entries per radio: a dense
+#if defined(CONFIG_SPIRAM)
+#define NEI_MAX              128     /* neighbour entries per radio: a dense
                                       * neighbourhood can hear dozens, and a row
                                       * evicted for a newcomer is withdrawn from
-                                      * rnsd with every route through it. About
-                                      * 890 B a row, 59 KB a radio, from gp_alloc
-                                      * (PSRAM where there is any, else internal) */
-#define NEI_DESTS_MAX        8       /* dest hashes clustered per node */
+                                      * rnsd with every route through it — while
+                                      * a node takes two or three rows until its
+                                      * announcements fold them. About 1 KB a
+                                      * row from gp_alloc: PSRAM here, and half
+                                      * the rows where internal RAM holds them */
+#else
+#define NEI_MAX              64
+#endif
+#define NEI_DESTS_MAX        16      /* dest hashes clustered per node: a node
+                                      * can host a dozen and more */
 #define NEI_IDS_MAX          8       /* identities clustered per node — one
                                       * device legitimately runs several (its
                                       * transport, rnsh, lxmf, lxmproxy and nomad
@@ -40,12 +47,15 @@ struct LoraRadio;
                                       * name that would have folded their rows
                                       * together. Costs 16 bytes per slot per
                                       * row: 8 KB a radio at NEI_MAX. */
-#define NEI_LINKS_MAX        12      /* observed links per radio */
+#define NEI_LINKS_MAX        32      /* observed links per radio */
 #define NEI_PEND_MAX         8       /* outstanding proof expectations per radio */
 #define NEI_PROOF_TIMEOUT_MS 30000   /* elicited proof must return within this */
 #define NEI_BUCKETS          12      /* last-hour rollup: 12 × 5 min */
 #define NEI_BUCKET_MS        (5u * 60u * 1000u)
-#define NEI_HASHES_MAX       48      /* shared: hashes linked to a node by 0x03 */
+#define NEI_HASHES_MAX       128     /* shared: hashes linked to a node by 0x03 —
+                                      * every transport identity and link id in
+                                      * earshot; an evicted one sends that
+                                      * node's traffic plain (hashEvicted) */
 /* Silence that means a link is over. Nothing announces a teardown, so this is
  * the only evidence available; generous, because the cost of calling a live
  * link dead is only that it sorts first for eviction. A link the printer calls
@@ -128,10 +138,11 @@ struct Neighbor {
     bool     roaming;
     bool     ourProto;              /* has spoken our air protocol to us */
     /* rnsd has been told this row exists (RNSD_IFACE_AUX_PEER). Cleared on
-     * allocation, on a merge, and on every announce — an announce may have
-     * changed the name the row is labelled by, and a re-declaration is how that
-     * reaches rnsd. */
+     * allocation, on a merge, and by an announce that changed the name the row
+     * is labelled by (peersRnsdStale) — a re-declaration is how that reaches
+     * rnsd. */
     bool     rnsdDecl;
+    uint32_t rnsdLabelSum;       /* the label last declared, hashed */
     /* Adaptive TX power, as last resolved: what `lora <n>` prints, and nothing
      * else. The number is derived per frame at the configuration the frame is
      * about to fly at (lora_power.cpp), so nothing may read it back as state. */
@@ -325,6 +336,7 @@ struct NeiState {
     uint32_t sinceMs;               /* millis() at first allocation */
     uint32_t evicted;               /* rows taken from a live node for a newcomer */
     uint32_t goneSilent;            /* rows retired after NEI_GONE_MS unheard */
+    uint32_t hashEvicted;           /* live linked hashes displaced for a new one */
     /* Which row the packet peersObserve() just walked was attributed to, so the
      * caller can tell rnsd who transmitted it before handing it on. Valid only
      * until the next peersObserve; a shared medium usually cannot say, and
@@ -502,6 +514,8 @@ void      peersAbandonPends(LoraRadio* r);
  * has no per-packet sender to hand over, so the clustering this table already
  * did is the attribution. Fire-and-forget from the radio task. */
 void      peersRnsdDeclare (NeiState* st, Neighbor* e);
+/* Has the row's label moved since it was last declared? */
+bool      peersRnsdStale   (const Neighbor* e);
 /* `moved` separates a row absorbed into another from a node that has gone
  * quiet: both retire the key, but only a departure invalidates what rnsd
  * routes to and through it. */

@@ -246,19 +246,26 @@ static void observeAnnounce(LoraRadio* r, const RnsHdr* h, bool isTx,
     memcpy(mat + 10, idh, 16);
     rnsdSha256(mat, 26, sha);
     if (memcmp(sha, h->dest, 16) != 0) return;
-    /* signed_data; lora task only */
-    static uint8_t sd[16 + 64 + 10 + 10 + NEI_RATCHETSIZE + RNS_MTU];
-    size_t o = 0;
-    memcpy(sd + o, h->dest, 16); o += 16;
-    memcpy(sd + o, pub, 64);     o += 64;
-    memcpy(sd + o, nameH, 10);   o += 10;
-    memcpy(sd + o, randH, 10);   o += 10;
-    if (rat) { memcpy(sd + o, rat, NEI_RATCHETSIZE); o += NEI_RATCHETSIZE; }
-    memcpy(sd + o, appD, appLen); o += appLen;
-    if (!rnsdVerify(pub, sd, o, sig)) return;
 
     Neighbor* e = peersFindByIdentity(st, idh);
     Neighbor* d = peersFindByDest(st, h->dest);
+    /* The signature is what binds a destination to an identity in this table.
+     * A pair one row already holds was bound by a verified announce, and the
+     * next one from it is the same claim again: that is most announces on a
+     * settled channel, and verifying each costs this task tens of
+     * milliseconds it may owe a SUPE slot. */
+    if (!(e && e == d)) {
+        /* signed_data; lora task only */
+        static uint8_t sd[16 + 64 + 10 + 10 + NEI_RATCHETSIZE + RNS_MTU];
+        size_t o = 0;
+        memcpy(sd + o, h->dest, 16); o += 16;
+        memcpy(sd + o, pub, 64);     o += 64;
+        memcpy(sd + o, nameH, 10);   o += 10;
+        memcpy(sd + o, randH, 10);   o += 10;
+        if (rat) { memcpy(sd + o, rat, NEI_RATCHETSIZE); o += NEI_RATCHETSIZE; }
+        memcpy(sd + o, appD, appLen); o += appLen;
+        if (!rnsdVerify(pub, sd, o, sig)) return;
+    }
     if (!e && d && d->nIds == 0) {
         /* Dest-only entry (seen via LRPROOF/proof before any announce) — the
          * announce names its identity now. */
@@ -339,7 +346,7 @@ static void observeAnnounce(LoraRadio* r, const RnsHdr* h, bool isTx,
         st->lastObsValid = true;
         /* The name may have moved with this announce, and re-declaring is how
          * that reaches rnsd's label. */
-        e->rnsdDecl = false;
+        if (e->rnsdDecl && peersRnsdStale(e)) e->rnsdDecl = false;
     }
     /* An announce this radio had never put on air just went out — a
      * destination of ours announcing for the first time, or somebody else's

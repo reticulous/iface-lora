@@ -1804,10 +1804,11 @@ before it is allowed to drive the `txp` register.
 A per-radio picture of the direct radio neighbourhood built **entirely from observing rx + tx RNS
 packets on the interface** — no rnsd API, no peer cooperation, works against
 every RNS implementation. Surfaced by `lora neighbors` (all radios) /
-`lora <n> neighbors`. All state is in-memory (`NeiState`, 59 KB per radio at
-`NEI_MAX` = 64 rows of about 890 B, `gp_alloc`'d at first `radioStart` — PSRAM
-where the board has it, internal RAM where it has none — and kept across config
-cycles and `rns stop`).
+`lora <n> neighbors`. All state is in-memory (`NeiState`: `NEI_MAX` rows of
+about 1 KB — 128 on a board with PSRAM, 64 in internal RAM on one without —
+`gp_alloc`'d at first `radioStart` and kept across config cycles and `rns
+stop`; beside them `NEI_HASHES_MAX` = 128 linked hashes, `NEI_LINKS_MAX` = 32
+links and `NEI_DESTS_MAX` = 16 destinations a row).
 
 - **Tap points.** `peersObserve()` is called with each whole (reassembled) RNS
   packet: from `deliverInbound` (rx, before the rnsd gate, with the same-call
@@ -1820,7 +1821,11 @@ cycles and `rns stop`).
 - **The identity join is cryptographic.** For an announce at hops 0 the entry
   is accepted only after (a) `dest == H(name_hash ‖ H(pubkey)[:16])[:16]` and
   (b) the announce signature verifies (`rnsdVerify`, inline-safe on the lora
-  task). Both reads depend on the header's **context flag** (byte 0 bit
+  task). The signature is checked only where the announce would make a new
+  binding: a destination and identity one row already holds together were
+  joined by a verified announce, and the next announce from them — most of
+  them, on a settled channel — skips the tens of milliseconds a verification
+  costs the radio task. Both reads depend on the header's **context flag** (byte 0 bit
   `0x20`), the only thing that says whether a 32-byte ratchet sits between
   `random_hash` and the signature — the field itself is unmarked, and every
   destination rnsd hosts for a consumer announces one, so a parser that assumes
@@ -1857,7 +1862,9 @@ cycles and `rns stop`).
   is a **SUPE announcement**: a node learns its own transport identity from the
   announces it relays (its `isTx`+HEADER_2 branch) and lists it with the rest,
   so `annIngest` files every announced identity that matches no row of its own
-  as a hash meaning that node. Without either, a neighbour's transport identity
+  as a hash meaning that node. It resolves every identity in the frame before
+  acting, and mints a row only when none of them names one: a node the table
+  already holds under any of its names is never given a second row to merge. Without either, a neighbour's transport identity
   is knowable to nobody, every packet in transit through it resolves to
   `LORAQ_PEER_NONE`, and transit — most of what a gateway carries — never
   leaves the shared channel.
@@ -1868,7 +1875,11 @@ cycles and `rns stop`).
   `ids[]` too. The transport identity is the only identity a packet is ever
   addressed to, and it reaches `peersFindBy4` through the hash store rather than
   through `ids[]`; widening the search to `ids[]` would otherwise only ever fire
-  on a four-byte collision, so the asymmetry stays.
+  on a four-byte collision, so the asymmetry stays. What `tagNode` cannot place
+  directly it tries once more as a proof: a delivery proof is addressed to the
+  hash of the packet it proves, which names no node, so the relayer that brought
+  that packet in is filed against its hash (`supeProofRetFile`) and the proof's
+  tag resolves to that relayer — the proof goes back the way the packet came.
 - **Links.** An LR yields `link_id = H([flags&0x0F] ‖ raw[2:])[:16]` with LR
   data trimmed to the 64 ephemeral-key bytes (MTU signalling excluded), mapped
   to its dest. The hashed part excludes hops and the transport id, so every hop
@@ -2017,9 +2028,12 @@ cycles and `rns stop`).
   longer has. A merge's withdrawal sets `moved`: the destinations went into the
   surviving row a moment earlier and are as reachable as they were, so the key
   is retired while rnsd's routes to and through them stand. A withdrawal without
-  it means the node is off the air, and rnsd drops those routes. Everything is fire-and-forget at zero timeout — it runs on the
-  radio task in the receive path, and a dropped declaration costs one announce
-  interval, since every announce re-declares.
+  it means the node is off the air, and rnsd drops those routes. Everything is sent at zero timeout — it runs on the
+  radio task in the receive path. A declaration stands (`rnsdDecl`) once its
+  send got through, with a hash of the label it carried (`rnsdLabelSum`); an
+  announce re-declares only when the row's label has since moved
+  (`peersRnsdStale`), and a declaration that was dropped is simply tried again
+  at the next announce.
 - **Anonymous transit.** Every rx frame at wire hops ≥ 1 was transmitted by an
   in-range transport node even when nothing names it (HEADER_1 relays, relayed
   proofs, a silent access-point bridge, and a rebroadcast announce whose
@@ -2188,8 +2202,12 @@ SUPE announcement heard before any Reticulum announce — prints that as
 The line under the header is the table itself: rows in use, this device's own
 included, of `NEI_MAX`; how many rows were **evicted**, taken from a node heard
 within `NEI_GONE_MS` to make room for a newcomer, which rnsd answers by dropping
-every route to and through that node; and how many were retired as **gone
-silent** after `NEI_GONE_MS` unheard. Both counts run from boot.
+every route to and through that node; how many were retired as **gone
+silent** after `NEI_GONE_MS` unheard; and how many live **linked hashes** — a
+transport identity or link identifier a 0x03 or SUPE announcement tied to a
+row — were displaced from the shared store for a newer one, each of which
+sends that node's traffic plain until it is linked again. All three counts run
+from boot.
 
 A capability line closes each non-`us` block:
 

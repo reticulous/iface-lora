@@ -641,8 +641,10 @@ static void cliPrintNeighbors(int i, bool verbose) {
               nLinks, nLinks == 1 ? "" : "s", ago);
     /* The table's own occupancy. An eviction takes a node heard within
      * NEI_GONE_MS, and rnsd drops every route to and through it. */
-    cliPrintf("  table %d of %d rows; %u evicted, %u gone silent\n\n",
-              nRows, NEI_MAX, (unsigned)st->evicted, (unsigned)st->goneSilent);
+    cliPrintf("  table %d of %d rows; %u evicted, %u gone silent; "
+              "%u linked hashes evicted\n\n",
+              nRows, NEI_MAX, (unsigned)st->evicted, (unsigned)st->goneSilent,
+              (unsigned)st->hashEvicted);
     if (r->curIfacSize)
         cliPrintf("  note: ifac enabled — frames are masked, passive parse sees nothing\n\n");
 

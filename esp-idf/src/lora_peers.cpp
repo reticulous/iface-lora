@@ -357,6 +357,7 @@ void peersHashAdd(NeiState* st, Neighbor* e, const uint8_t* hash, uint32_t now) 
         if ((int32_t)(victim->lastMs - h->lastMs) > 0) victim = h;
     }
     if (!victim) return;
+    if (victim->used && !victim->timedOut) st->hashEvicted++;
     victim->used = true;
     victim->timedOut = false;
     memcpy(victim->hash4, hash, 4);
@@ -799,12 +800,12 @@ void peersInit(LoraRadio* r) {
  * SUPE association all end in ONE row — so the row is the answer, and these two
  * calls are how it crosses over.
  *
- * Zero timeout, result ignored: this runs on the radio task in the receive
- * path, where blocking is the receiver going deaf. A dropped declaration costs
- * one announce interval — the next announce re-declares. */
-static void peersRnsdAux(NeiState* st, const Neighbor* e, bool up, bool moved,
+ * Zero timeout: this runs on the radio task in the receive path, where
+ * blocking is the receiver going deaf. A dropped declaration costs one
+ * announce interval — the next announce re-declares. */
+static bool peersRnsdAux(NeiState* st, const Neighbor* e, bool up, bool moved,
                          const char* label) {
-    if (!st) return;
+    if (!st) return false;
     rnsd_iface_peer_t m = {};
     m.op = RNSD_IFACE_AUX_PEER;
     m.up = up ? 1 : 0;
@@ -812,24 +813,39 @@ static void peersRnsdAux(NeiState* st, const Neighbor* e, bool up, bool moved,
     snprintf(m.iface, sizeof m.iface, "lora/%u", (unsigned)st->radio);
     peersRnsdKey(peersIdOf(st, e), m.key);
     if (label) safeStrncpy(m.label, label, sizeof m.label);
-    itsSendAux("rnsd", RNSD_PORT_IFACE, &m, sizeof m, 0);
+    return itsSendAux("rnsd", RNSD_PORT_IFACE, &m, sizeof m, 0);
+}
+
+/* The label is what rnsd shows before an announce names the node, and what
+ * identifies it on a graph regardless: the names its destinations announced,
+ * else the node key the air identifies it by. */
+static void peersRnsdLabel(const Neighbor* e, char* label, size_t cap) {
+    peersNodeNames(e, label, cap);
+    if (!label[0] && e->haveNode4)
+        snprintf(label, cap, "%02x%02x%02x%02x",
+                 e->node4[0], e->node4[1], e->node4[2], e->node4[3]);
+}
+
+static uint32_t labelSum(const char* s) {
+    uint32_t h = 2166136261u;                       /* FNV-1a */
+    for (; *s; s++) h = (h ^ (uint8_t)*s) * 16777619u;
+    return h;
 }
 
 void peersRnsdDeclare(NeiState* st, Neighbor* e) {
     if (!st || !e || !e->used || peersIsLocal(e)) return;
-    /* The label is what rnsd shows before an announce names the node, and what
-     * identifies it on a graph regardless: the names its destinations announced,
-     * else the node key the air identifies it by. */
     char label[NEI_NAME_MAX * 2];
-    peersNodeNames(e, label, sizeof label);
-    if (!label[0]) {
-        if (e->haveNode4)
-            snprintf(label, sizeof label, "%02x%02x%02x%02x",
-                     e->node4[0], e->node4[1], e->node4[2], e->node4[3]);
-        else label[0] = '\0';
-    }
-    peersRnsdAux(st, e, true, false, label);
-    e->rnsdDecl = true;
+    peersRnsdLabel(e, label, sizeof label);
+    /* A declaration that did not get through is tried again at the next
+     * announce, as is one whose label has since changed (peersRnsdStale). */
+    e->rnsdDecl = peersRnsdAux(st, e, true, false, label);
+    e->rnsdLabelSum = labelSum(label);
+}
+
+bool peersRnsdStale(const Neighbor* e) {
+    char label[NEI_NAME_MAX * 2];
+    peersRnsdLabel(e, label, sizeof label);
+    return labelSum(label) != e->rnsdLabelSum;
 }
 
 void peersRnsdWithdraw(NeiState* st, const Neighbor* e, bool moved) {
