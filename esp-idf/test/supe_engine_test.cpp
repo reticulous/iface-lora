@@ -1045,6 +1045,49 @@ static void testVerdicts(void) {
     nodeInit(&C, "C", SUPE_REGIME_EU863);
     pushPkt(&C, TAG, LORAQ_PEER_NONE, 100, 0x11);
     eqi(supeEngVerdict(&C.eng), SUPE_V_PLAIN, "an unknown peer flies plainly");
+    g_now += SUPE_PATIENCE_MS + 1000;
+    eqi(supeEngVerdict(&C.eng), SUPE_V_PLAIN,
+        "…and a busy channel never costs it the queue: queue lifetime is SUPE's");
+    eqi(C.eng.dropsPatience, 0, "no patience drop for traffic SUPE never held");
+    loraqFlush(&C.q);
+}
+
+/* A head that must wait holds nothing behind it: the first packet that can act
+ * is moved up and acted on, and the waiting one keeps its place after it. */
+static void testHeadOfLine(void) {
+    resetAir();
+    static const uint8_t OTHER[3] = { 0x0e, 0x0e, 0x0e };
+    Node A = {};
+    nodeInit(&A, "A", SUPE_REGIME_EU863);
+    memcpy(A.peerTag, TAG, 3);
+    A.peer.known = true;
+    A.peer.peerId = 5;
+    A.peer.holdUntilMs = g_now + 60000;           /* unreachable, held */
+    pushPkt(&A, TAG, 5, 100, 0x11);
+    pushPkt(&A, OTHER, LORAQ_PEER_NONE, 100, 0x22);
+    eqi(supeEngVerdict(&A.eng), SUPE_V_PLAIN, "the packet behind a held peer's flies");
+    eqi(loraqAt(&A.q, 0)->bytes[0], 0x22, "…moved to the head to do so");
+    eqi(loraqAt(&A.q, 1)->bytes[0], 0x11, "…with the held one next");
+    loraqConsume(&A.q, 0);
+    eqi(supeEngVerdict(&A.eng), SUPE_V_WAIT, "alone, the held packet waits");
+    g_now += SUPE_PATIENCE_MS;
+    eqi(supeEngVerdict(&A.eng), SUPE_V_DROP, "…until its queue lifetime runs out");
+    loraqFlush(&A.q);
+}
+
+static void testQueuePromote(void) {
+    LoraQueue q;
+    loraqInit(&q);
+    for (uint8_t id = 1; id <= 4; id++) {
+        uint8_t* b = (uint8_t*)malloc(1);
+        b[0] = id;
+        ok(loraqPush(&q, b, 1, 0, LORAQ_PEER_NONE, nullptr, 1, 0), "pushed");
+    }
+    loraqPromote(&q, 2);
+    const uint8_t want[] = { 3, 1, 2, 4 };
+    for (uint8_t i = 0; i < 4; i++)
+        eqi(loraqAt(&q, i)->bytes[0], want[i], "promoted to the head, the rest in order");
+    loraqFlush(&q);
 }
 
 static void testNoStaleDeadlineInTxPhase(void) {
@@ -1109,6 +1152,7 @@ static void testQueueOrder(void) {
 
 int main(void) {
     testQueueOrder();
+    testQueuePromote();
     testDialogueLite();
     testDialogueFull();
     testDialogueGotFirst();
@@ -1126,6 +1170,7 @@ int main(void) {
     testOwnHailOutranksReceived();
     testSeedHashGate();
     testVerdicts();
+    testHeadOfLine();
     testNoStaleDeadlineInTxPhase();
     printf("%d checks, %d failed\n", g_run, g_fail);
     return g_fail ? 1 : 0;

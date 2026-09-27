@@ -21,6 +21,13 @@
  * that the answer still belongs to the event that caused it. */
 #define SUPE_ANN_SOON_MS     10000
 
+/* A pending announcement holds the outbound drain while it waits for the
+ * channel, so it waits briefly, and a busy channel costs it a retry soon after
+ * rather than a whole interval: a neighbour that has not heard it cannot meet
+ * us, or learn that we will not meet it. */
+#define SUPE_ANN_GIVEUP_MS   1000
+#define SUPE_ANN_RETRY_MS    30000
+
 /* The hold (SUPE.md §12): three hails unanswered in one run make the peer
  * unreachable, and no hail is sent to it for a while — its traffic is queued
  * and waits out its own patience. Declaring that is a bet that trying again is
@@ -37,15 +44,26 @@
 
 /* The boundary watchdog: a meeting that outlives every deadline inside it
  * holds the radio against the whole outbound queue. Generous — the longest
- * legal meeting is two train ceilings plus repairs and turnarounds. */
+ * legal meeting is two train ceilings plus repairs and turnarounds, and its
+ * control frames, which on a slow calling channel take most of a second
+ * each. */
 #define SUPE_MEET_WATCHDOG_MS 8000
+#define SUPE_MEET_CTL_FRAMES  10
+#define SUPE_MEET_CTL_BYTES   (SUPE_GOT_ANS_BASE + SUPE_MASK_MAX)
+
+static uint32_t supeMeetWatchdogMs(const LoraRadio* r) {
+    uint32_t ctlMs = (uint32_t)lround(1000.0 * loraAirtimeSeconds(
+                         r->cfgSf, r->cfgBwHz, r->cfgCr, r->cfgPreamble,
+                         SUPE_MEET_CTL_BYTES, false));
+    return SUPE_MEET_WATCHDOG_MS + SUPE_MEET_CTL_FRAMES * ctlMs;
+}
 
 /* ─────────────── tag resolution ───────────────
  *
  * The node (or link) behind a 3-byte tag. Tags are prefixes of the addresses
  * the peer table already indexes; a 3-byte match can collide, and the cost of
  * a collision here is one misfiled measurement, not a wrong delivery. */
-static Neighbor* tagNode(LoraRadio* r, const uint8_t tag[SUPE_TAG_LEN]) {
+static Neighbor* tagNodeDirect(LoraRadio* r, const uint8_t tag[SUPE_TAG_LEN]) {
     NeiState* st = r->nei;
     if (!st) return nullptr;
     for (int i = 0; i < NEI_MAX; i++) {
@@ -908,7 +926,8 @@ static size_t supeAnnBuild(LoraRadio* r, uint8_t* f, size_t cap, uint8_t* countO
     if (count == 0) return 0;
     for (uint8_t i = 0; i < count; i++)
         supeTagAdd(r, ids[i], /*perm=*/true, 0);
-    return supeEngBuildAnn(&r->supe->eng, f, cap, ids, count, r->cfgTxp, r->supeOn);
+    return supeEngBuildAnn(&r->supe->eng, f, cap, ids, count, r->cfgTxp,
+                           r->supeOn && !r->supe->eng.expired);
 }
 
 static void supeAnnFire(LoraRadio* r, const uint8_t* f, size_t n, uint8_t count) {
@@ -977,15 +996,15 @@ static void supeAnnBeat(LoraRadio* r, uint32_t now) {
         supeAnnArm(r);
     }
     if (!ss->annPending && !r->annReplay && r->annIntervalMin &&
-        !ss->eng.expired && (int32_t)(now - ss->annNextMs) >= 0)
+        (int32_t)(now - ss->annNextMs) >= 0)
         supeAnnArm(r);
     if (!ss->annPending) return;
     if (csmaClear(r)) {
         supeAnnSend(r);
         r->txWaitMs = csmaGrantWaitMs(r);   /* same restatement as the hail's */
-    } else if (now - ss->annTryMs > CSMA_BEAT_GIVEUP_MS) {
+    } else if (now - ss->annTryMs > SUPE_ANN_GIVEUP_MS) {
         ss->annPending = false;
-        ss->annNextMs  = now + supeAnnGap(r);
+        ss->annNextMs  = now + SUPE_ANN_RETRY_MS + (esp_random() % SUPE_ANN_RETRY_MS);
         csmaResetAccess(r);
         if (logIsDebug(TAG))
             dbg("lora/%d supe: announce gave up on a busy channel", r->idx);
@@ -1108,7 +1127,7 @@ void supePoll(LoraRadio* r) {
     /* Hard watchdog: a meeting that outlives every deadline inside it holds
      * the radio against the whole outbound queue. */
     if (e->m.phase >= SUPE_M_GOT_TX &&
-        (uint32_t)(now - e->m.beganMs) > SUPE_MEET_WATCHDOG_MS) {
+        (uint32_t)(now - e->m.beganMs) > supeMeetWatchdogMs(r)) {
         warn("lora/%d supe: meeting stuck in phase %u — standing down",
              r->idx, (unsigned)e->m.phase);
         supeEngAbort(e, "watchdog");
@@ -1157,11 +1176,12 @@ void supePoll(LoraRadio* r) {
              * record — otherwise the graph shows a seed that never waited. */
             r->txWaitMs = csmaGrantWaitMs(r);
         } else if (e->offerArmed &&
-                   now - e->offerJitterUntilMs > CSMA_BEAT_GIVEUP_MS) {
-            /* A channel that never frees must not hold the queue behind a
-             * hail forever: give it up, the packet takes the main channel on
-             * the ordinary path. An owed hail that cannot win the channel is
-             * simply left to expire at patience. */
+                   now - e->offerJitterUntilMs > SUPE_PATIENCE_MS / 2) {
+            /* A channel that has not freed for half a queue lifetime leaves
+             * no room for a series of hails: give it up while the packet is
+             * still young enough to take the main channel on the ordinary
+             * path. An owed hail that cannot win the channel is simply left
+             * to expire at patience. */
             e->offerArmed = false;
             e->plainOnce = true;
             csmaResetAccess(r);

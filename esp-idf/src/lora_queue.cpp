@@ -74,6 +74,13 @@ LoraPkt* loraqAt(LoraQueue* q, uint8_t i) {
     return i < q->n ? &q->e[i] : (LoraPkt*)0;
 }
 
+void loraqPromote(LoraQueue* q, uint8_t i) {
+    if (i == 0 || i >= q->n) return;
+    LoraPkt p = q->e[i];
+    for (uint8_t k = i; k > 0; k--) q->e[k] = q->e[k - 1];
+    q->e[0] = p;
+}
+
 void loraqConsume(LoraQueue* q, uint8_t i) {
     if (i >= q->n) return;
     if (q->e[i].refs > 1) { q->e[i].refs--; return; }

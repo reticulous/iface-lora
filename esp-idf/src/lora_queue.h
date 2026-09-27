@@ -43,6 +43,9 @@
 #define LORAQ_F_ANNOUNCE  0x10   /* a Reticulum announce, ours or replayed: rides
                                   * an announce run back to back with the one
                                   * before it (lora_bridge annTrainChain) */
+#define LORAQ_F_PLAIN     0x20   /* SUPE sent it the plain way: it waits for the
+                                  * channel like any frame, and queue lifetime
+                                  * no longer applies to it */
 
 struct LoraPkt {
     uint8_t*  bytes;           /* heap block we own; free() when refs hits 0 */
@@ -59,7 +62,9 @@ struct LoraPkt {
 struct LoraQueue {
     LoraPkt  e[LORAQ_CAP];     /* e[0] is the head: everything that is not an
                                 * announce, in arrival order, then the
-                                * announces, in arrival order (loraqPush) */
+                                * announces, in arrival order (loraqPush),
+                                * except where a packet was promoted past
+                                * ones that must wait (loraqPromote) */
     uint8_t  n;
     uint32_t dropsPeerCap;     /* packets shed by the per-peer cap */
 };
@@ -79,6 +84,9 @@ bool loraqPush(LoraQueue* q, uint8_t* bytes, uint16_t len, uint32_t now_ms,
 
 /** Peek entry i (0 = head); null past the tail. The queue keeps ownership. */
 LoraPkt* loraqAt(LoraQueue* q, uint8_t i);
+
+/** Move entry i to the head; the entries ahead of it keep their order. */
+void loraqPromote(LoraQueue* q, uint8_t i);
 
 /** One destination is done with entry i: refs--, removed and freed at zero. */
 void loraqConsume(LoraQueue* q, uint8_t i);

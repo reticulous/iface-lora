@@ -201,7 +201,7 @@ struct SupeProofRet {
  * found — is a hail-back to send at the first free moment: a hail with a
  * count of zero, tagged with the identity the hail carried. One per peer,
  * forgotten one patience after the hail it answers. */
-#define SUPE_OWED_MAX  4
+#define SUPE_OWED_MAX  8
 
 struct SupeOwed {
     bool     used;
@@ -211,7 +211,7 @@ struct SupeOwed {
 };
 
 /* ─────────────── schedules (SUPE.md §7) — a channel plan only ─────────────── */
-#define SUPE_SCHED_MAX  4
+#define SUPE_SCHED_MAX  8
 
 struct SupeSched {
     bool      used;

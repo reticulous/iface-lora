@@ -541,11 +541,10 @@ static bool radioStart(LoraRadio* r) {
     if (haveIfac)
         info("lora/%d SUPE off: an access code is configured, so the modem cannot "
              "read an address to match", r->idx);
-    if (canRun && supeExpired((uint32_t)time(nullptr))) {
+    bool expired = canRun && supeExpired((uint32_t)time(nullptr));
+    if (expired)
         warn("lora/%d SUPE dialect expired — this build stopped speaking it; reflash", r->idx);
-        canRun = false;
-    }
-    r->supeOn = supeWanted && canRun;
+    r->supeOn = supeWanted && canRun && !expired;
     if (canRun && !supeInit(r)) r->supeOn = false;
 #endif
     /* After the SUPE switch and outside its guard: the published list is the

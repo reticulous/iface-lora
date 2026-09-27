@@ -2330,7 +2330,9 @@ against the step (`apOpenPowerAt`), on both sides of the transaction.
 
 The step itself is the receiver's choice (`chooseBudget` in `supe_engine.cpp`):
 the headroom the answered frame arrived with, less each step's margin cost
-(SUPE.md §14.3), must leave `SUPE_RATE_MARGIN_DB` (6 dB). That is below the
+(SUPE.md §14.3), must leave `SUPE_RATE_MARGIN_DB` (6 dB), and the step is never above the
+proposal, our own ceiling, or the peer's as its announcement stated it (§8,
+"never above either node's capability limit"). The margin is below the
 power's `SUPE_TARGET_MARGIN_DB` (10 dB) because a step chosen too fast costs a
 repair or the next exchange one step lower, where too little power costs the
 link, and because the power is then resolved against the step's own
@@ -3068,7 +3070,11 @@ of zero at its first free moment, and the original hailer — hailed now, and
 holding the traffic — answers with GOT. On the air a hail-back is an
 ordinary hail. `SupeOwed` holds one per peer, forgotten one queue lifetime after
 the hail it answers; `owedDue` skips a peer whose fresh schedule we hold,
-since we speak there instead.
+since we speak there instead. Both tables hold eight (`SUPE_OWED_MAX`,
+`SUPE_SCHED_MAX`). Full, the owed table gives up the debt nearest its expiry,
+and the schedule table displaces its oldest — a received hail displaced before
+its slots were met is owed a hail-back, exactly as if they had passed unmet.
+Both say so in the log.
 
 ### 19.1 What gates it
 
@@ -3079,9 +3085,11 @@ since we speak there instead.
 | `s.lora.<n>.SUPE.afa` | the channel plan number (§18). Regime 0 answers in place; channel plan 1 derives schedules |
 | no access code | IFAC masks the frame from the flags byte on, so the modem cannot read an address and has nothing to match; `radioStart` says so once |
 
-Each channel plan version expires on the calendar date the build carries —
-`SUPE_EXPIRY_Y/M/D` in `supe.h` (`supeExpired`); past it the node neither
-sends nor accepts frames naming it and says so once.
+Each channel plan version expires three weeks after the build —
+`SUPE_EXPIRY_AFTER_BUILD_S` in `supe.h`, counted from spangap-core's
+`app_build_unix`, which every build regenerates (`supeExpired`); past it the
+node neither sends nor accepts frames naming it, says so once, and keeps its
+announcement beat with channel plan 0xF, so neighbours stop hailing it.
 
 #### 19.1.1 Building without SUPE (`CONFIG_LORA_NO_SUPE`)
 
@@ -3164,7 +3172,9 @@ framing / SUPE / discard on that rule alone; any change to receive dispatch
 preserves it. Assigned densely from the bottom: HAIL `0xC2`, ANNOUNCE `0xC3`,
 GOT `0xC4`, READY `0xC5`, END `0xC6`, BYE `0xC7`, RESEND `0xC8`. GOT is
 READY with a burst behind it — the same nine bytes, then a count and a length,
-then a repair mask when it answers an END — so one layout is written once.
+then a repair mask when it answers an END — so one layout is written once. A
+received HAIL or GOT may describe more frames than `SUPE_TRAIN_MAX`: it decodes,
+and the READY's count limit trims it (§8); only our own encoders refuse it.
 Inside a full exchange a non-SUPE frame is the burst's: `supeTrainCapture`
 buffers it (checksummed, counted) instead of the live delivery path, and the
 close replays the buffer in sequence through `bridgeFrameDeliver` — split
@@ -3175,15 +3185,39 @@ ordinary path delivers it at once.
 ### 19.4 The sender path
 
 The classifier (`supeEngVerdict`) runs on the head of the packet queue before
-anything contends for the medium, in this order: a packet older than
-`SUPE_PATIENCE_MS` → DROP, its own age and nothing else; a live schedule with
-its peer, or a hail or exchange with it under way → WAIT; not a SUPE peer →
-PLAIN, untouched, exactly as with the feature off; the peer in a hold, or in
-the interval after an unanswered hail → WAIT; otherwise OFFER, which arms a
-jittered launch. `supePoll` wins the channel through ordinary carrier sense
+anything contends for the medium, in this order: expired, untagged, already
+sent the plain way (`LORAQ_F_PLAIN`) or not a SUPE peer → PLAIN, untouched,
+exactly as with the feature off, and never subject to queue lifetime; a packet
+older than `SUPE_PATIENCE_MS` → DROP, its own age and nothing else; a live
+schedule with its peer, a hail or exchange with it under way, or another
+node's narrow slots still to be met → WAIT; the peer in a hold, or in the
+interval after an unanswered hail → WAIT; the one plain pass a failed launch
+asked for → PLAIN, marked; otherwise OFFER, which arms a jittered launch.
+
+**A head that must wait holds nothing behind it.** When the head's verdict is
+WAIT, the classifier asks the same questions of each packet behind it, without
+acting, and the first whose answer is anything else is moved to the head
+(`loraqPromote`) and classified there for real — so one held peer delays only
+its own traffic, and an announce or another peer's packet still flies. The
+same pass is how a stale packet behind a waiting head reaches its DROP.
+
+A hail's channel access is bounded by half the queue lifetime: a HAIL that has
+not won the calling channel by then is given up, and the packet marked for the
+plain path while it is still young enough to take it. `supePoll` wins the channel through ordinary carrier sense
 and `supeEngLaunch` emits the HAIL — building the burst first, since the hail
 describes it, and holding it until the answer or the run's end. A hail-back
 launches the same way, from `SupeOwed`, with a count of zero.
+
+**A burst never exceeds the channel plan's burst limit** (`trimToCeiling`): it
+is trimmed a frame at a time until it fits, and a burst whose first frame alone
+does not fit cannot ride an exchange at all — a hail for it is not sent and the
+packet takes the plain path; an answering side holding such a burst answers as
+though it held nothing (READY, or BYE after an END). Under plan 1 at the calling
+rate that is any full-size frame from SF9 up.
+
+**The meeting watchdog** (`supeMeetWatchdogMs`) allows `SUPE_MEET_WATCHDOG_MS`
+plus the air of ten control frames at the calling configuration, so a
+legitimate exchange on a slow calling channel is not cut off.
 
 **The run** (§12 of the spec): a hail unanswered — no READY or GOT by its
 deadline in channel plan 0, both slots unmet under a plan — is `SUPE_EV_UNANSWERED`,
@@ -3201,9 +3235,9 @@ peer unreachable: `absentUntilMs` holds it for `SUPE_HOLD_BASE_MS`, doubling
 per further unanswered run to `SUPE_HOLD_MAX_MS` — or to
 `SUPE_HOLD_PRESENT_MAX_MS` while the peer has been heard within
 `SUPE_PRESENT_MS`, since a fault at a peer we can hear is likelier transient.
-A held peer's traffic is queued, not refused, and waits out its own queue lifetime;
-what this costs is that other peers' packets behind it in the queue wait too,
-bounded by that queue lifetime. Under an asymmetric link this is the whole
+A held peer's traffic is queued, not refused, and waits out its own queue
+lifetime; other peers' packets behind it are moved past it and go (the head
+promotion above). Under an asymmetric link this is the whole
 difference between backing off and calling for ever.
 
 **Which schedule gets a contested moment: the narrow one, and our own hail's

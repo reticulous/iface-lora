@@ -87,9 +87,16 @@ const SupeChan* supeRegimeChans(uint8_t regime, int* count) {
 
 /* ─────────────── expiry ─────────────── */
 
-/* __DATE__ is "Mmm dd yyyy" with a space-padded day. The app descriptor carries
- * the same timestamp; taking it from the compiler keeps this file free of
- * ESP-IDF and so keeps it testable on a host. */
+/* The expiry counts from the build, so the build time must be the image's and
+ * not this file's last compile: under ESP-IDF it is spangap-core's
+ * `app_build_unix`, regenerated on every build. The host test build has no
+ * spangap-core and reads the compiler's __DATE__/__TIME__ instead, "Mmm dd
+ * yyyy" with a space-padded day. */
+#ifdef ESP_PLATFORM
+extern "C" const uint32_t app_build_unix;
+
+uint32_t supeBuildUnix(void) { return app_build_unix; }
+#else
 static int monthFromDate(const char* d) {
     static const char* kM = "JanFebMarAprMayJunJulAugSepOctNovDec";
     for (int i = 0; i < 12; i++)
@@ -119,9 +126,10 @@ uint32_t supeBuildUnix(void) {
     int32_t days = daysFromCivil(year, mon, day);
     return (uint32_t)(days * 86400 + hh * 3600 + mm * 60 + ss);
 }
+#endif
 
 uint32_t supeExpiryUnix(void) {
-    return (uint32_t)daysFromCivil(SUPE_EXPIRY_Y, SUPE_EXPIRY_M, SUPE_EXPIRY_D) * 86400u;
+    return supeBuildUnix() + SUPE_EXPIRY_AFTER_BUILD_S;
 }
 
 bool supeExpired(uint32_t nowUnix) {
@@ -502,7 +510,6 @@ bool supeDecHail(const uint8_t* f, size_t len, SupeHail* out) {
     uint8_t version = (uint8_t)(f[1] & 0x0F);
     const SupeRegime* g = supeRegime(regime);
     if (!g || g->version != version) return false;
-    if (f[8] > SUPE_TRAIN_MAX) return false;
     out->regime  = regime;
     out->version = version;
     memcpy(out->tag, f + 2, SUPE_TAG_LEN);
@@ -570,7 +577,6 @@ bool supeDecGot(const uint8_t* f, size_t len, uint8_t peerCount, SupeGot* out) {
     if (len == SUPE_GOT_LEN) answering = false;
     else if (peerCount > 0 && len == ansLen) answering = true;
     else return false;
-    if (f[9] > SUPE_TRAIN_MAX) return false;
     decReadyBody(f, &out->g);
     out->count     = f[9];
     out->lenByte   = f[10];

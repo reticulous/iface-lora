@@ -304,7 +304,14 @@ static void owedAdd(SupeEngine* e, const uint8_t ident[SUPE_TAG_LEN], uint16_t p
         if (c->used && memcmp(c->ident, ident, SUPE_TAG_LEN) == 0) { o = c; break; }
         if (!c->used && !o) o = c;
     }
-    if (!o) o = &e->owed[0];
+    if (!o) {
+        /* Full: the debt nearest its expiry is the one least worth paying. */
+        o = &e->owed[0];
+        for (int i = 1; i < SUPE_OWED_MAX; i++)
+            if ((int32_t)(e->owed[i].expiryMs - o->expiryMs) < 0) o = &e->owed[i];
+        eLog(e, false, "supe: owed hails full — %02x%02x%02x displaced",
+             o->ident[0], o->ident[1], o->ident[2]);
+    }
     /* One owed hail per peer: a later hail renews the expiry and nothing else. */
     o->used = true;
     memcpy(o->ident, ident, SUPE_TAG_LEN);
@@ -469,7 +476,13 @@ static SupeSched* schedAlloc(SupeEngine* e) {
         if (!s->used) return s;
         if (!victim || (int32_t)(s->epochMs - victim->epochMs) < 0) victim = s;
     }
-    return victim;                     /* full: displace the oldest */
+    /* Full: displace the oldest. A hail we were to answer there and now will
+     * not is owed a hail-back, exactly as if its slots had passed unmet. */
+    if (!victim->wide && !victim->weHailed && !victim->consumed && victim->haveTag)
+        owedAdd(e, victim->tag, victim->peerId, victim->epochMs);
+    eLog(e, false, "supe: schedules full — %02x%02x%02x displaced",
+         victim->d.hash3[0], victim->d.hash3[1], victim->d.hash3[2]);
+    return victim;
 }
 
 /* Forget a node (supe_engine.h): the hail we owe it, the schedules we hold with
@@ -821,73 +834,65 @@ static void notePlain(SupeEngine* e, uint8_t why, const LoraPkt* p) {
          tag[0], tag[1], tag[2], kWhy[why < 5 ? why : 0]);
 }
 
-uint8_t supeEngVerdict(SupeEngine* e) {
-    LoraPkt* p = loraqAt(e->q, 0);
-    uint32_t now = eNow(e);
+/* One packet's verdict. `head` commits it: the log lines, the counters, the
+ * one plain pass and the offer's arming belong to the packet about to be
+ * acted on; a packet looked at behind a waiting head is only asked. */
+static uint8_t verdictOf(SupeEngine* e, LoraPkt* p, uint32_t now, bool head) {
     if (e->expired) {
-        e->offerArmed = false;
-        notePlain(e, PLAIN_EXPIRED, p);
+        if (head) notePlain(e, PLAIN_EXPIRED, p);
         return SUPE_V_PLAIN;
     }
-    if (!p) { e->offerArmed = false; return SUPE_V_PLAIN; }
     if (!(p->flags & LORAQ_F_HAVE_TAG)) {
-        e->offerArmed = false;
-        notePlain(e, PLAIN_NO_TAG, p);
+        if (head) notePlain(e, PLAIN_NO_TAG, p);
+        return SUPE_V_PLAIN;
+    }
+    if (p->flags & LORAQ_F_PLAIN) return SUPE_V_PLAIN;
+
+    /* Plain or SUPE is decided before queue lifetime is: a packet for a node
+     * that does not meet is ordinary traffic, and a busy channel never costs
+     * ordinary traffic its place in the queue. */
+    SupePeerView pv;
+    if (!e->host->peer_get(e->host->ctx, p->tag, &pv) || !pv.known) {
+        if (head) notePlain(e, PLAIN_NOT_PEER, p);
         return SUPE_V_PLAIN;
     }
 
-    /* Patience is per packet, from the moment it was queued (§12): the run
-     * drops nothing, and a packet leaves at its own age, whatever the run is
-     * doing. Well inside the daemon's own timer, so its retry never goes into
-     * the air beside a copy the modem still holds. */
+    /* Queue lifetime is per packet, from the moment it was queued (§12): the
+     * run drops nothing, and a packet leaves at its own age, whatever the run
+     * is doing. Well inside the daemon's own timer, so its retry never goes
+     * into the air beside a copy the modem still holds. */
     if ((uint32_t)(now - p->first_seen_ms) >= SUPE_PATIENCE_MS) {
-        e->dropsPatience++;
-        e->offerArmed = false;
-        eLog(e, true, "supe: %uB for %02x%02x%02x dropped at patience",
-             (unsigned)p->len, p->tag[0], p->tag[1], p->tag[2]);
+        if (head) {
+            e->dropsPatience++;
+            eLog(e, true, "supe: %uB for %02x%02x%02x dropped at patience",
+                 (unsigned)p->len, p->tag[0], p->tag[1], p->tag[2]);
+        }
         return SUPE_V_DROP;
     }
 
     /* A live schedule with this peer: the packet rides the next met slot
      * rather than contending on the shared channel. */
-    if (schedLiveFor(e, p->tag, p->peer_id)) {
-        e->offerArmed = false;
-        return SUPE_V_WAIT;
-    }
+    if (schedLiveFor(e, p->tag, p->peer_id)) return SUPE_V_WAIT;
     if (e->m.phase != SUPE_M_IDLE && e->m.haveTag &&
         (memcmp(e->m.tag, p->tag, SUPE_TAG_LEN) == 0 ||
-         (e->m.peerId != LORAQ_PEER_NONE && e->m.peerId == p->peer_id))) {
-        e->offerArmed = false;
+         (e->m.peerId != LORAQ_PEER_NONE && e->m.peerId == p->peer_id)))
         return SUPE_V_WAIT;                /* its hail or meeting is running right now */
-    }
     /* Somebody else's slots are still to be met: no hail goes out into them
      * (schedNarrowLive). The offer stays unarmed and is asked again after. */
-    if (schedNarrowLive(e)) {
-        e->offerArmed = false;
-        return SUPE_V_WAIT;
-    }
+    if (schedNarrowLive(e)) return SUPE_V_WAIT;
 
-    SupePeerView pv;
-    if (!e->host->peer_get(e->host->ctx, p->tag, &pv) || !pv.known) {
-        e->offerArmed = false;
-        notePlain(e, PLAIN_NOT_PEER, p);
-        return SUPE_V_PLAIN;
-    }
     /* Unreachable, and in a hold: no hail is sent, and the traffic is queued
-     * rather than refused — each packet waits out its own patience (§12). */
+     * rather than refused — each packet waits out its own queue lifetime. */
     if (pv.holdUntilMs && (int32_t)(pv.holdUntilMs - now) > 0) {
-        e->offerArmed = false;
-        e->dropsHold++;
+        if (head) e->dropsHold++;
         return SUPE_V_WAIT;
     }
-    if (pv.intervalUntilMs && (int32_t)(pv.intervalUntilMs - now) > 0) {
-        /* Mid-run: the interval in which the hailed party may hail back. */
-        e->offerArmed = false;
+    /* Mid-run: the interval in which the hailed party may hail back. */
+    if (pv.intervalUntilMs && (int32_t)(pv.intervalUntilMs - now) > 0)
         return SUPE_V_WAIT;
-    }
-    if (e->plainOnce) {
+    if (head && e->plainOnce) {
         e->plainOnce = false;
-        e->offerArmed = false;
+        p->flags |= LORAQ_F_PLAIN;
         notePlain(e, PLAIN_ONCE, p);
         return SUPE_V_PLAIN;
     }
@@ -896,9 +901,41 @@ uint8_t supeEngVerdict(SupeEngine* e) {
     e->host->chan_get(e->host->ctx, &cv);
     uint32_t waitUntil = 0;
     int d = shouldDetour(&pv, e->q, &cv, now, &waitUntil);
-    if (d == DETOUR_NO)  { e->offerArmed = false; return SUPE_V_PLAIN; }
-    if (d == DETOUR_WAIT) { e->offerArmed = false; return SUPE_V_WAIT; }
+    if (d == DETOUR_NO) {
+        if (head) p->flags |= LORAQ_F_PLAIN;
+        return SUPE_V_PLAIN;
+    }
+    if (d == DETOUR_WAIT) return SUPE_V_WAIT;
+    return SUPE_V_OFFER;
+}
 
+uint8_t supeEngVerdict(SupeEngine* e) {
+    LoraPkt* p = loraqAt(e->q, 0);
+    uint32_t now = eNow(e);
+    if (!p) {
+        e->offerArmed = false;
+        if (e->expired) notePlain(e, PLAIN_EXPIRED, p);
+        return SUPE_V_PLAIN;
+    }
+
+    /* A head that must wait does not hold what is behind it: the first packet
+     * that can act — go plain, be dropped, or be offered to its own peer — is
+     * moved to the head and acted on in its place. */
+    if (verdictOf(e, p, now, false) == SUPE_V_WAIT) {
+        for (uint8_t i = 1; i < loraqDepth(e->q); i++) {
+            if (verdictOf(e, loraqAt(e->q, i), now, false) == SUPE_V_WAIT) continue;
+            loraqPromote(e->q, i);
+            e->offerArmed = false;
+            p = loraqAt(e->q, 0);
+            break;
+        }
+    }
+
+    uint8_t v = verdictOf(e, p, now, true);
+    if (v != SUPE_V_OFFER) {
+        e->offerArmed = false;
+        return v;
+    }
     if (!e->offerArmed) {
         e->offerArmed = true;
         e->offerJitterUntilMs = now
@@ -955,12 +992,14 @@ static uint8_t proposalTop(SupeEngine* e, const uint8_t* tag, bool haveTag,
 }
 
 /* Trim a train to the regime's ceiling at a configuration. The frames stay
- * built; only the count travels. */
-static void trimToCeiling(SupeEngine* e, SupeTrainInfo* t, const SupeCfg* cfg) {
+ * built; only the count travels. False when not even its first frame fits:
+ * that train cannot ride a meeting at all, and goes the plain way. */
+static bool trimToCeiling(SupeEngine* e, SupeTrainInfo* t, const SupeCfg* cfg) {
     const SupeRegime* g = supeRegime(e->regime);
     uint32_t ceil = SUPE_LEN_MAX_MS;
     if (g && g->trainCeilMs && g->trainCeilMs < ceil) ceil = g->trainCeilMs;
     while (t->count > 1 && trainLenMs(e, t, t->count, cfg) > ceil) t->count--;
+    return t->count > 0 && trainLenMs(e, t, t->count, cfg) <= ceil;
 }
 
 void supeEngLaunch(SupeEngine* e) {
@@ -1008,7 +1047,11 @@ void supeEngLaunch(SupeEngine* e) {
         built = true;
         SupeCfg ceilCfg;
         h.budgetCeil = proposalTop(e, tag, true, widestBwOf(e), &ceilCfg);
-        trimToCeiling(e, &tx, &ceilCfg);
+        if (!trimToCeiling(e, &tx, &ceilCfg)) {
+            e->host->train_done(e->host->ctx, false);
+            e->plainOnce = true;
+            return;
+        }
         h.count = tx.count;
         h.lenByte = supeEncLen(trainLenMs(e, &tx, tx.count, &ceilCfg));
         owedDischarge(e, tag, peerId);       /* a hail with traffic pays the debt too */
@@ -1115,6 +1158,12 @@ static uint8_t chooseBudget(SupeEngine* e, uint8_t chan, uint8_t proposal,
     int top = ln - 1;
     if (top > proposal)   top = proposal;
     if (top > e->ownTop)  top = e->ownTop;
+    /* Never above either node's capability limit (§8), the peer's as it
+     * announced it, whatever it proposed. */
+    SupePeerView pv = {};
+    if (haveTag && tagUsable(tag) && e->host->peer_get(e->host->ctx, tag, &pv) &&
+        pv.known && top > pv.topBudget)
+        top = pv.topBudget;
     int headroomDeci = snr10 - (int)supeReqSnrDeci(readCfg->sf) + (int)readCfg->marginDeci;
     int affordDeci = headroomDeci - SUPE_RATE_MARGIN_DB * 10;
     uint8_t budget = 0;
@@ -1181,6 +1230,12 @@ static void openAsHailed(SupeEngine* e, SupeSched* s) {
             m->tx = ti;
             m->txBuilt = true;
             haveTrain = true;
+            SupeCfg propCfg;
+            proposalTop(e, m->tag, m->haveTag, chanMaxBwOf(e, m->chan), &propCfg);
+            if (!trimToCeiling(e, &m->tx, &propCfg)) {
+                releaseHeldTrain(e);
+                haveTrain = false;
+            }
         }
     }
 
@@ -1288,7 +1343,15 @@ static void slotSpeakWide(SupeEngine* e, SupeSched* s, uint8_t k) {
     m->txBuilt = true;
     SupeCfg propCfg;
     uint8_t top = proposalTop(e, s->tag, s->haveTag, chanMaxBwOf(e, sl->chan), &propCfg);
-    trimToCeiling(e, &m->tx, &propCfg);
+    if (!trimToCeiling(e, &m->tx, &propCfg)) {
+        releaseHeldTrain(e);
+        if (s->nNoTrain < 255) s->nNoTrain++;
+        e->host->tune_home(e->host->ctx);
+        m->retuned = false;
+        s->nextSlot = (uint8_t)(k + 1);
+        armTimer(e);
+        return;
+    }
 
     m->listener = false;
     m->weHailed = false;
@@ -2130,7 +2193,12 @@ static void answerEnd(SupeEngine* e) {
         }
         if (haveReturn) {
             if (m->tx.count > m->peerCeil) m->tx.count = m->peerCeil;
-            trimToCeiling(e, &m->tx, &m->cfg);
+            if (!trimToCeiling(e, &m->tx, &m->cfg)) {
+                releaseHeldTrain(e);
+                haveReturn = false;
+            }
+        }
+        if (haveReturn) {
             m->leg = 1;
             SupeGot hv = {};
             memcpy(hv.g.hash, m->hash3, SUPE_HASH_LEN);

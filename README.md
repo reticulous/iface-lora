@@ -453,9 +453,10 @@ lora [<n>] a[nnounce]         repeat every announce this node originated, then
 lora [<n>] supe               what SUPE has learned and decided on this radio
                               which channel plan is in force and what its steps
                               resolve to, when this build's protocol version expires
-                              (a calendar date compiled in — past it a node
-                              stops speaking SUPE by itself rather than speaking
-                              a stale protocol version at a network that has moved on),
+                              (three weeks after the build — past it a node
+                              stops speaking SUPE by itself and announces that
+                              it does not, rather than speaking a stale
+                              protocol version at a network that has moved on),
                               the tag set of addresses that mean us, anything
                               currently held for someone else's channel switch, and the
                               counters: offers out, offers answered, probes,

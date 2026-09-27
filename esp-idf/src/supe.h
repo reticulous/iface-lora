@@ -214,24 +214,15 @@ static inline bool supeRegimeHasPlan(uint8_t regime) {
 /* ─────────────── expiry ───────────────
  *
  * Each version of each regime carries an expiry fixed when the software is
- * built. Past that date a node neither sends nor accepts frames naming it and
- * falls back to plain main-channel operation, so an obsolete dialect leaves the
- * air by itself instead of having to be spoken forever.
+ * built. Past it a node neither sends nor accepts frames naming it, announces
+ * regime 0xF, and falls back to plain main-channel operation, so an obsolete
+ * dialect leaves the air by itself instead of having to be spoken forever.
  *
- * At this stage of development the expiry is a CALENDAR DATE, stated here and
- * moved by hand (SUPE.md §3). A date rather than an offset from the build
- * because what matters is that every node on a channel stops speaking the same
- * dialect at the same moment: with an offset, two nodes flashed a week apart
- * expire a week apart, and the older one spends that week talking to nobody
- * while looking like a radio fault. A date they were both built with retires
- * the dialect on both at once.
- *
- * The cost is that it has to be advanced deliberately, and that a build made
- * after it is born expired — which is the right failure: it is loud, it is
- * immediate, and it says the dialect needs a decision rather than a reflash. */
-#define SUPE_EXPIRY_Y  2026
-#define SUPE_EXPIRY_M  10
-#define SUPE_EXPIRY_D  10
+ * At this stage of development the expiry is a fixed span after the build
+ * (SUPE.md §3). Two nodes flashed a week apart expire a week apart; the older
+ * one keeps announcing that it does not speak SUPE, so its neighbours stop
+ * hailing it rather than mistaking it for a radio fault. */
+#define SUPE_EXPIRY_AFTER_BUILD_S  (21u * 86400u)
 
 /** Unix seconds of this build, from the compiler's own __DATE__/__TIME__. */
 uint32_t supeBuildUnix(void);

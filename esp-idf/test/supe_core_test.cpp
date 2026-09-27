@@ -199,6 +199,12 @@ static void testHailCodec(void) {
     ok(supeDecHail(f, n, &d) && d.count == 0, "a hail-back decodes with a count of zero");
     h.count = SUPE_TRAIN_MAX + 1;
     ok(supeEncHail(f, sizeof f, &h) == 0, "a count past the train cap refuses");
+    /* Received, a longer train is the READY's to trim, not the decoder's to
+     * refuse (§8). */
+    h.count = 0;
+    n = supeEncHail(f, sizeof f, &h);
+    f[8] = 40;
+    ok(supeDecHail(f, n, &d) && d.count == 40, "a hail describing more than a train decodes");
 }
 
 static void testReadyCodec(void) {
@@ -442,9 +448,7 @@ static void testExpiry(void) {
     uint32_t built  = supeBuildUnix();
     uint32_t expires = supeExpiryUnix();
     ok(built > 1750000000u, "the build timestamp is plausible");
-    /* 2026-09-10T00:00:00Z. Stated as the number so the test fails when the
-     * date moves without the test being looked at. */
-    eqi((long)expires, 1791590400L, "the expiry is the stated calendar date");
+    eqi((long)(expires - built), 21L * 86400L, "the expiry is three weeks after the build");
     ok(expires > built, "this build was made before its own expiry");
     ok(!supeExpired(built), "a fresh build is not expired");
     ok(!supeExpired(expires - 86400), "the day before, it is still current");
