@@ -247,6 +247,7 @@ struct LoraRadio {
      * the frame waits a random time up to this many of its own airtimes before
      * it contends again, rather than re-contending in slots at the busy frame's
      * end with everyone else it held up. */
+    uint16_t        curAnnounceCapPermille;   /* experiment: s.lora.<i>.announce_cap_permille */
     uint8_t         cadSpread;
     TickType_t      cadHoldUntil;    /* 0 = no hold */
 
