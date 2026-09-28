@@ -1096,6 +1096,25 @@ void drainOneOutbound(LoraRadio* r) {
     bool granted = csmaClear(r);
     csmaWatchSync(r);
     if (!granted) {                 /* listen-before-talk not yet satisfied */
+        /* Experiment (s.lora.<i>.busy_spread): the first free sense after a
+         * busy one starts a random hold before contention resumes. */
+        if (r->busySpread) {
+            if (r->senseBusy) {
+                r->busyEpisode = true;
+            } else if (r->busyEpisode) {
+                r->busyEpisode = false;
+                LoraPkt* head = loraqAt(&r->q, 0);
+                uint32_t span = head ? (uint32_t)r->busySpread * pktAirMs(r, head->len) : 0;
+                if (span) {
+                    TickType_t hold = pdMS_TO_TICKS(esp_random() % span);
+                    if (hold == 0) hold = 1;
+                    r->cadHoldUntil = xTaskGetTickCount() + hold;
+                    if (r->cadHoldUntil == 0) r->cadHoldUntil = 1;
+                    csmaResetAccess(r);
+                    return;
+                }
+            }
+        }
         TickType_t waited = xTaskGetTickCount() - r->csmaStart;
         /* Radio contention is otherwise invisible until the drop valve fires —
          * name it explicitly once per frame so a "nothing went out" hunt can

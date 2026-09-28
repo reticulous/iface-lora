@@ -249,6 +249,14 @@ struct LoraRadio {
      * end with everyone else it held up. */
     uint16_t        curAnnounceCapPermille;   /* experiment: s.lora.<i>.announce_cap_permille */
     uint8_t         cadSpread;
+    /* Experiment (s.lora.<i>.busy_spread, default 0 = off): after the channel
+     * has been busy, the head waits a random time up to this many of its own
+     * airtimes before it contends again. Everything a busy frame held up is
+     * otherwise released at its end into about 280 ms, and relays that cannot
+     * hear each other then collide. */
+    uint8_t         busySpread;
+    bool            senseBusy;       /* the last sense's verdict */
+    bool            busyEpisode;     /* a busy sense since the head last contended */
     TickType_t      cadHoldUntil;    /* 0 = no hold */
 
     /* Analog front-end recalibration (s.lora.<i>.agc_reset, seconds; 0 = off).

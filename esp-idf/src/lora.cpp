@@ -404,6 +404,9 @@ static bool radioStart(LoraRadio* r) {
     r->appc = storageGetInt(sk(kb, sizeof kb, r->idx, "appc"), 1) != 0;
     r->cadGrant = storageGetInt(sk(kb, sizeof kb, r->idx, "cad_grant"), 0) != 0;
     r->cadSpread = (uint8_t)storageGetInt(sk(kb, sizeof kb, r->idx, "cad_spread"), 0);
+    r->busySpread = (uint8_t)storageGetInt(sk(kb, sizeof kb, r->idx, "busy_spread"), 0);
+    r->senseBusy = false;
+    r->busyEpisode = false;
     r->cadHoldUntil = 0;
     r->appcBand    = 1;
     r->appcBinIdx  = (millis() % APPC_HOUR_MS) / APPC_BIN_MS;
