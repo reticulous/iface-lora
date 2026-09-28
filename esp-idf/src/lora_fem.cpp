@@ -2,6 +2,9 @@
 
 #include "lora_fem.h"
 
+#include <climits>
+#include <strings.h>
+
 #include "driver/gpio.h"
 
 #include "compat.h"
@@ -120,6 +123,33 @@ static void femDriveGate(int pin, int level)
 
 static void calBuild(LoraRadio* r);   /* fwd — defined with the conversion */
 
+#if CONFIG_IDF_TARGET_LINUX
+/* On the host the front end is whatever the station was told its board is
+ * (hwLinuxFrontEnd, from SPANGAP_BOARD), in place of the build's Kconfig: one
+ * binary is any board. Weak, so a build assembled without the board straddle
+ * still links and keeps its Kconfig. */
+extern "C" __attribute__((weak)) bool hwLinuxFrontEnd(const char**, const char**,
+                                                      int*, int*, int*) { return false; }
+
+/* The slot as the board describes it, which r->slot points at from femInit on,
+ * the part it names (the TX_CAL entry to take), and the ceiling it states at
+ * the connector (0 = unsaid). */
+static LoraSlot s_hostSlot[LORA_NUM_RADIOS];
+static char     s_hostPart[LORA_NUM_RADIOS][32];
+static int      s_hostMaxDbm[LORA_NUM_RADIOS];
+#endif
+
+/* The rating that caps the ceiling: the board's own statement on the host when
+ * it made one, else the Kconfig rating of a front end. INT_MAX = no cap. */
+static int boardCapDbm(const LoraRadio* r, bool highBand)
+{
+#if CONFIG_IDF_TARGET_LINUX
+    if (s_hostMaxDbm[r->idx] > 0) return s_hostMaxDbm[r->idx];
+#endif
+    if (r->femType == FEM_NONE) return INT_MAX;
+    return highBand ? CONFIG_LORA_TX_POWER_MAX_HF : CONFIG_LORA_TX_POWER_MAX;
+}
+
 void femBandSelect(LoraRadio* r, bool highBand)
 {
     const LoraSlot* s = r->slot;
@@ -144,18 +174,18 @@ void femBandSelect(LoraRadio* r, bool highBand)
      * chip would do on its own. A board that can transmit round its amplifier
      * spans BOTH states — the quiet end is the bypass path's, the loud end the
      * amplifier's — because nothing outside here has to know which one a given
-     * power will use. A front end's board rating caps the ceiling; that is a
-     * rating, not a measurement, and it is allowed to be the tighter. */
+     * power will use. A front end's board rating caps the ceiling (on the host,
+     * the board's stated maximum, front end or not); that is a rating, not a
+     * measurement, and it is allowed to be the tighter. */
     int mx = rfCalMaxDbm(&r->cal), mn = rfCalMinDbm(&r->cal);
     if (femCanBypassPa(r)) {
         const int byMx = rfCalMaxDbm(&r->calBypass), byMn = rfCalMinDbm(&r->calBypass);
         if (byMx > mx) mx = byMx;
         if (byMn < mn) mn = byMn;
     }
-    if (r->femType != FEM_NONE) {
-        const int cap = highBand ? CONFIG_LORA_TX_POWER_MAX_HF : CONFIG_LORA_TX_POWER_MAX;
-        if (mx > cap) mx = cap;
-    }
+    const int cap = boardCapDbm(r, highBand);
+    if (mx > cap) mx = cap;
+    if (mx < mn) mx = mn;   /* a rating under the floor still leaves the floor */
     r->maxTxDbm = (int8_t)mx;
     r->minTxDbm = (int8_t)mn;
 
@@ -188,6 +218,45 @@ void femInit(LoraRadio* r)
     r->femRxLna  = true;   /* every wiring but the KCT8103L's receives through
                             * whatever LNA it has; the flag is only ever cleared
                             * by femRxLna on that part */
+
+#if CONFIG_IDF_TARGET_LINUX
+    /* The host's board, when the station was told one. Nothing to detect or
+     * drive: the chip model applies the same front end on its side of the bus
+     * (SIMesh's STATION.md), so all this does is convert with it. A part this
+     * file knows keeps its own behaviour; any other is a declared one. Its
+     * switch rows are installed with no pins, so femRxLna's swap moves the
+     * receive gain and nothing else. */
+    const char *part = nullptr, *txCal = nullptr;
+    int gainDb = 0, rxGainDb = 0, maxDbm = 0;
+    if (hwLinuxFrontEnd(&part, &txCal, &gainDb, &rxGainDb, &maxDbm)) {
+        LoraSlot& hs = s_hostSlot[r->idx];
+        hs = *s;
+        hs.fem_pwr = hs.fem_en = hs.fem_hf_pwr = -1;
+        hs.fem_gain_db = gainDb;
+        hs.fem_hf_gain_db = 0;
+        hs.tx_cal = txCal;
+        hs.rssi_cal = rxGainDb;
+        hs.lr_rfsw_tx_bypass = 0;
+        r->slot = &hs;
+        snprintf(s_hostPart[r->idx], sizeof s_hostPart[r->idx], "%s", part);
+        s_hostMaxDbm[r->idx] = maxDbm;
+
+        r->femType = !strcasecmp(part, "gc1109")   ? FEM_GC1109
+                   : !strcasecmp(part, "kct8103l") ? FEM_KCT8103L
+                   : (part[0] || gainDb > 0)       ? FEM_DECLARED
+                                                   : FEM_NONE;
+        if (r->femType == FEM_GC1109 || r->femType == FEM_KCT8103L) {
+            uint32_t (&pins)[Module::RFSWITCH_MAX_PINS] = s_femPins[r->idx];
+            for (size_t i = 0; i < Module::RFSWITCH_MAX_PINS; i++) pins[i] = RADIOLIB_NC;
+            r->mod->setRfSwitchTable(pins, kFemModeTable);
+        }
+        femSettle(r);
+        info("lora/%d board: front end %s (%d..%d dBm at antenna, rx +%d dB, cal %s)",
+             r->idx, part[0] ? part : "none", r->minTxDbm, r->maxTxDbm,
+             r->cal.rxGainDb, rfCalName(r->cal.grade));
+        return;
+    }
+#endif
 
     /* How much the front end amplifies on RECEIVE is femType's to say: both
      * detected parts put an LNA in the RX path — 17 dB on the GC1109, 20 dB on
@@ -362,8 +431,10 @@ static void calBuild(LoraRadio* r)
     const LoraSlot* s = r->slot;
     rfCalReset(&r->cal, chipLo(r), chipHi(r));
 
-    if (r->femType == FEM_DECLARED)
-        r->cal.flatGainDb = (int8_t)(r->highBand ? s->fem_hf_gain_db : s->fem_gain_db);
+    /* A stated gain is the flat model's. On a board it is a declared front
+     * end's alone; the host's board may state one for a named part too, and a
+     * curve for that part replaces it below. */
+    r->cal.flatGainDb = (int8_t)(r->highBand ? s->fem_hf_gain_db : s->fem_gain_db);
 
     /* A board that names its own receive gain outranks the part's datasheet
      * figure; that is what the symbol is for. Neither applies while the LNA is
@@ -375,6 +446,9 @@ static void calBuild(LoraRadio* r)
     if (r->highBand) return;   /* the 2.4 GHz port keeps the flat model */
 
     const char* name = femName((LoraFemType)r->femType);
+#if CONFIG_IDF_TARGET_LINUX
+    if (s_hostPart[r->idx][0]) name = s_hostPart[r->idx];
+#endif
     char why[80];
     if (!rfCalParse(&r->cal, s->tx_cal, name, why, sizeof why) && why[0])
         err("lora/%d TX_CAL %s — uncalibrated", r->idx, why);

@@ -12,7 +12,12 @@ On ESP-IDF's Linux host target there is no SPI bus: `src/host/virtual_hal.cpp`
 is RadioLib's HAL over SIMesh's chip library (`SIMesh/radio`, which must sit
 beside this straddle in the workspace), a model of an SX1262 with a UDP link
 to a virtual medium, and the driver above runs unchanged. That is the
-simulated testbed — see [`SIMesh`](../SIMesh/README.md).
+simulated testbed — see [`SIMesh`](../SIMesh/README.md). The front end there
+is the station's board rather than the build's: when the board straddle
+answers `hwLinuxFrontEnd()` (hw-linux, from `SPANGAP_BOARD`), its part, TX
+calibration, gains and ceiling replace the slot's Kconfig figures, and the
+conversions below run with them exactly as on that board, against a chip
+model that applies the same front end on its side of the bus.
 
 ## Origins
 
@@ -207,7 +212,7 @@ once, because the client is holding a 0.25 s validation window open.
 | `s.lora.<n>.mode` | `"access_point"` | RNS interface mode: `full`, `gateway`, `access_point`, `roaming`, `boundary`. It sets how long a route learned over this radio is kept and whether the node discovers paths on behalf of others; it does not decide whether traffic is forwarded, which is `s.rnsd.transport_enabled` alone. |
 | `s.lora.<n>.lbt` | `1` | Listen-before-talk: CSMA/CA carrier-sense before each transmit. `0` = blind transmit (no sensing). Live. On a quiet, single-node band you can turn it off to skip the sensing; on a shared band leave it on. |
 | `s.lora.<n>.appc` | `1` | Adaptive p-persistent CSMA — see below. Sizes the random backoff by how much of the recent past *this radio* spent transmitting, instead of growing it on collisions. Only has an effect while `lbt` is on. `0` reverts to the exponential-backoff channel plan. Live. |
-| `s.lora.<n>.airtime_limit` | `-1` | Transmit seconds per hour on the hailing channel, over a sliding hour; once spent, nothing more is sent until minutes age out. `-1` follows the band: 100 s in 863–870 MHz (EN 300 220's ceiling with listen-before-talk), none elsewhere. `0` = no limit. |
+| `s.lora.<n>.airtime_limit` | `-1` | Transmit seconds per hour on the hailing channel, over a sliding hour; going over it logs a warning once per spell, and transmission carries on. `-1` follows the band: 360 s in 863–870 MHz (the 10 % duty cycle of 869.4–869.65 MHz), none elsewhere. `0` = no limit. |
 | `s.lora.<n>.agc_reset` | `300` | Seconds between recalibrations of the SX126x analog front end (`0` = off; SX126x only). An SX126x that has heard a strong signal can leave its receive gain latched at that setting and stop hearing, and neither standby nor a fresh receive resets it — only powering the front end down does. This tick does that, plus a full block calibration, on an otherwise idle radio; a busy radio defers to the next tick. It is the one periodic wake the radio task holds without a consumer asking for it, which is why the period is minutes rather than the minute other firmwares use: the cost is a wake plus a few ms of chip work, and the bound it buys is how long a latched receiver can stay deaf. |
 | `s.lora.<n>.fem_rx_lna` | `1` | Keep the board's external receive amplifier (the front-end module's LNA) in the RX path. It is the front end's standing cost — about 8 mA for as long as the radio listens, more than the SX1262 itself — bought for about 20 dB of gain ahead of the chip. `0` routes reception round it: a solar or small-battery node may prefer the range loss. Only a **KCT8103L** front end (Heltec V4.3) can switch its LNA out, so the row shows only where that part was detected; on a GC1109 board (V4 ≤ 4.2) the LNA is always in line and the setting is inert. Live. |
 | `s.lora.<n>.ifac_netname` | `""` | IFAC network name. Empty = open (non-IFAC) interface. |

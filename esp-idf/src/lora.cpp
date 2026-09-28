@@ -441,7 +441,7 @@ static bool radioStart(LoraRadio* r) {
          * own ceiling where there is one this code knows, 0 is none. */
         int lim = storageGetInt(sk(kb, sizeof kb, r->idx, "airtime_limit"), -1);
         if (lim < 0)
-            lim = (freq_hz >= 863000000 && freq_hz <= 870000000) ? HAIL_AIR_ETSI_S : 0;
+            lim = (freq_hz >= 863000000 && freq_hz <= 870000000) ? HAIL_AIR_EU_S : 0;
         r->hailAirLimitMs = (uint32_t)lim * 1000u;
     }
     r->airPreamble = preamble; r->airImplicit = false; r->airSf = (uint8_t)sf;
@@ -883,15 +883,20 @@ void loraNudge(void) {
  * DIO1 is a light-sleep wake source) and outbound wakes via ITS, so with nothing
  * pending the task blocks until a real event and the chip light-sleeps. */
 
+static const char* s_dlWhy = "none";
+#define DL_TAKE(d, why) do { if ((d) < soonest) { soonest = (d); s_dlWhy = (why); } } while (0)
+#define DL_ZERO(why)    do { s_dlWhy = (why); return 0; } while (0)
+
 static TickType_t nextDeadline(void) {
     TickType_t now = xTaskGetTickCount();
     /* Idle default: block until an ISR/ITS wake. Shrunk below only for real
      * pending work — a deferred stats flush, a registration retry, or outbound. */
     TickType_t soonest = portMAX_DELAY;
+    s_dlWhy = "none";
     /* A coalesced config apply is owed at its deadline. */
     if (s_cfgPend) {
         TickType_t d = (int32_t)(s_cfgDueTick - now) > 0 ? (TickType_t)(s_cfgDueTick - now) : 0;
-        if (d < soonest) soonest = d;
+        DL_TAKE(d, "cfg");
     }
     /* Stats and LoRaMon maintenance keep their own beat on the interface task,
      * so nothing here has to hold a timer for them. */
@@ -902,7 +907,7 @@ static TickType_t nextDeadline(void) {
          * re-registers). Poll at 1 Hz until it takes. */
         if (r->running && r->enabled && r->rnsdHandle < 0) {
             TickType_t d = pdMS_TO_TICKS(LORA_STATS_MIN_MS);
-            if (d < soonest) soonest = d;
+            DL_TAKE(d, "register");
         }
         /* Outbound queued and radio free. With LBT off, loop immediately.
          * With LBT on and channel access mid-procedure, wake when the machine
@@ -919,17 +924,17 @@ static TickType_t nextDeadline(void) {
          * TxDone, which serviceRadio consumes, and anything else on it belongs
          * to the watchdog — whose deadline is below, and which a zero here would
          * spend at full CPU instead of asleep. */
-        if (r->running && !r->txActive && radioIrqLinePending(r)) return 0;
+        if (r->running && !r->txActive && radioIrqLinePending(r)) DL_ZERO("irq");
         /* A manual tx request just arrived, or its carrier-sense is mid-backoff:
          * service it now / re-sense at slot pace. */
-        if (r->mtxReq) return 0;
+        if (r->mtxReq) DL_ZERO("mtx");
         /* The recalibration beat, while one is configured. */
         if (r->running && r->enabled && r->agcResetMs) {
             int32_t rem = (int32_t)(r->agcNext - now);
             TickType_t d = rem > 0 ? (TickType_t)rem : 0;
-            if (d < soonest) soonest = d;
+            DL_TAKE(d, "agc");
         }
-        if (r->mtxPhase == MTXP_LBT && r->slotTicks < soonest) soonest = r->slotTicks;
+        if (r->mtxPhase == MTXP_LBT) DL_TAKE(r->slotTicks, "mtx-lbt");
         /* Gating and availability are separate conjunctions: an rnode packet is
          * pending without any rnsd handle, so folding the two together would
          * leave it unable to wake the loop. Undecoded client bytes count too —
@@ -941,12 +946,12 @@ static TickType_t nextDeadline(void) {
         {
             uint32_t d = supeNextDeadlineMs(r);
             if (d != UINT32_MAX) {
-                if (d == 0) return 0;
+                if (d == 0) DL_ZERO("supe");
                 /* Sub-tick deadlines round UP: a 3 ms deadline slept as zero
                  * ticks is a busy-wait until it passes, not a sleep. */
                 TickType_t t = pdMS_TO_TICKS(d);
                 if (t == 0) t = 1;
-                if (t < soonest) soonest = t;
+                DL_TAKE(t, "supe");
             }
         }
 #endif
@@ -961,31 +966,30 @@ static TickType_t nextDeadline(void) {
                         (s_rnode.handle >= 0 && s_rnode.radio == r->idx &&
                          (s_rnode.txLen > 0 || itsBytesAvailable(s_rnode.handle) > 0));
         if (outReady && outAvail) {
-            if (!r->lbt) return 0;
+            if (!r->lbt) DL_ZERO("out-nolbt");
             /* Counted in the derived slot in both regimes — APPC's own slot is
              * only the unit its backoff target is counted in. A free stretch is
              * one wait with the demodulator routed to DIO1 to end it; a busy
              * channel only a poll can see is re-sensed every slot. */
-            TickType_t d = hailAirSpent(r) ? hailAirWait(r) : csmaSenseDue(r, now);
-            if (d == 0) return 0;
-            if (d < soonest) soonest = d;
+            TickType_t d = csmaSenseDue(r, now);
+            if (d == 0) DL_ZERO("out-csma");
+            DL_TAKE(d, "out-csma");
         }
         /* TxDone watchdog fallback — the IRQ normally wakes us first. */
         if (r->txActive) {
             int32_t rem = (int32_t)(r->txDeadline - now);
             TickType_t d = rem > 0 ? (TickType_t)rem : 0;
-            if (d < soonest) soonest = d;
+            DL_TAKE(d, "txdone");
         }
         if (r->splitPending) {
             TickType_t at = splitHolding(r) ? r->splitHoldUntil : r->splitDeadline;
             int32_t rem = (int32_t)(at - now);
             TickType_t d = rem > 0 ? (TickType_t)rem : 0;
-            if (d < soonest) soonest = d;
+            DL_TAKE(d, "split");
         }
         /* An announce replay in progress: it takes the channel one frame at a
          * time, so re-sense at slot pace until it drains. */
-        if (r->running && r->enabled && r->annReplay && r->slotTicks < soonest)
-            soonest = r->slotTicks;
+        if (r->running && r->enabled && r->annReplay) DL_TAKE(r->slotTicks, "replay");
         /* The channel-RSSI beat — held only while a LoRaMon viewer draws it.
          * Held even on a silent channel then, because an idle radio is exactly
          * when the reading means something; but with no viewer the beat (and
@@ -995,7 +999,7 @@ static TickType_t nextDeadline(void) {
         if (r->running && r->enabled && loraMonOpen()) {
             int32_t rem = (int32_t)(r->mon.rssiNext - now);
             TickType_t d = rem > 0 ? (TickType_t)rem : 0;
-            if (d < soonest) soonest = d;
+            DL_TAKE(d, "mon");
         }
         /* Outstanding proof expectations: wake at the soonest deadline so a
          * missed proof scores its quality miss without waiting for traffic. */
@@ -1005,7 +1009,8 @@ static TickType_t nextDeadline(void) {
                 if (!r->nei->pend[p].used) continue;
                 int32_t rem = (int32_t)(r->nei->pend[p].deadlineMs - nowMs);
                 TickType_t d = rem > 0 ? pdMS_TO_TICKS((uint32_t)rem) : 0;
-                if (d < soonest) soonest = d;
+                if (rem > 0 && d == 0) d = 1;
+                DL_TAKE(d, "nei");
             }
         }
     }
@@ -1324,11 +1329,12 @@ static void loraTaskMain(void*) {
                                        radioIrqLinePending(r)) ? 1 : 0;
 #if !defined(CONFIG_LORA_NO_SUPE)
                         warn("lora hot loop: 500 zero-deadline passes in %lu ms: "
+                             "zero=%s "
                              "supeD=%lu airD=%lu offer=%d ann=%d annSoon=%d "
                              "csma=%d q=%u "
                              "txA=%d split=%d mtx=%d its=%u "
                              "cfg=%d irq=%d agc=%d mon=%d nei=%d replay=%d",
-                             (unsigned long)(nowMs - winStartMs),
+                             (unsigned long)(nowMs - winStartMs), s_dlWhy,
                              (unsigned long)supeNextDeadlineMs(r),
                              (unsigned long)airtimeNextDeadlineMs(r, nowMs),
                              r->supe ? (int)r->supe->eng.offerArmed : -1,
@@ -1343,9 +1349,10 @@ static void loraTaskMain(void*) {
                              (int)loraMonOpen(), neiPend, (int)r->annReplay);
 #else
                         warn("lora hot loop: 500 zero-deadline passes in %lu ms: "
+                             "zero=%s "
                              "csma=%d q=%u txA=%d split=%d mtx=%d its=%u "
                              "cfg=%d irq=%d agc=%d mon=%d nei=%d replay=%d",
-                             (unsigned long)(nowMs - winStartMs),
+                             (unsigned long)(nowMs - winStartMs), s_dlWhy,
                              (int)r->csmaPhase, (unsigned)loraqDepth(&r->q),
                              (int)r->txActive, (int)r->splitPending,
                              (int)r->mtxReq,

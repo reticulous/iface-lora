@@ -68,9 +68,10 @@
 #define SPLIT_RX_TIMEOUT_MS  5000
 #define SPLIT_FLIP_MS        30     /* sender's gap between halves, with margin */
 #define HAIL_AIR_BINS        60     /* one-minute bins: an hour */
-/* EN 300 220's ceiling for a listen-before-talk transmitter in 863–870 MHz:
- * 100 s of air in any hour, per 200 kHz. The hailing channel's default there. */
-#define HAIL_AIR_ETSI_S      100
+/* The hailing channel's default budget in 863–870 MHz: 360 s of air in any
+ * hour, the 10 % duty cycle of 869.4–869.65 MHz, taken for the whole band.
+ * Going over it is logged, never enforced. */
+#define HAIL_AIR_EU_S        360
 
 
 /* Per-frame protocol class, published as the record's last field and coloured
@@ -338,7 +339,7 @@ struct LoraRadio {
     uint32_t        hailAirMs[HAIL_AIR_BINS];
     uint32_t        hailAirMin;      /* absolute minute the ring is aligned to */
     uint32_t        hailAirLimitMs;  /* per hour; 0 = no limit */
-    bool            hailAirWarned;   /* "budget spent" said once per spell */
+    bool            hailAirWarned;   /* "over budget" said once per spell */
 
     /* Non-blocking TX: startTransmit() fires the chip and returns; the TxDone IRQ
      * (same DIO1 line as RX) wakes the task, which finishes and either sends the

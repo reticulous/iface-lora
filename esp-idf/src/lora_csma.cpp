@@ -175,9 +175,6 @@ static void appcRollBins(LoraRadio* r, uint32_t nowMs) {
     r->appcBinIdx  = bin;
 }
 
-/* Credit one transmitted frame's time-on-air. Called per frame at TxDone, where
- * the duration is already computed for the LoRaMon record. Sole writer of the
- * bins, and it runs on the radio task. */
 /* The hailing channel's hour: one bin a minute, aged by the clock rather than a
  * beat, so an idle radio holds no wake for it. */
 static void hailAirRoll(LoraRadio* r, uint32_t nowMs) {
@@ -188,31 +185,27 @@ static void hailAirRoll(LoraRadio* r, uint32_t nowMs) {
     r->hailAirMin = min;
 }
 
-bool hailAirSpent(LoraRadio* r) {
-    if (!r->hailAirLimitMs) return false;
-    hailAirRoll(r, millis());
+/* The budget is advisory: going over it is warned once per spell, and a
+ * spell ends when the hour's sum is back under the limit. Nothing is held. */
+static void hailAirCheck(LoraRadio* r) {
+    if (!r->hailAirLimitMs) return;
     uint32_t sum = 0;
     for (int i = 0; i < HAIL_AIR_BINS; i++) sum += r->hailAirMs[i];
-    bool spent = sum >= r->hailAirLimitMs;
-    if (spent && !r->hailAirWarned)
-        warn("lora/%d hailing-channel airtime spent (%u of %u s this hour) — "
-             "holding transmissions", r->idx, (unsigned)(sum / 1000),
+    bool over = sum >= r->hailAirLimitMs;
+    if (over && !r->hailAirWarned)
+        warn("lora/%d hailing-channel airtime over budget (%u of %u s this hour) — "
+             "still transmitting", r->idx, (unsigned)(sum / 1000),
              (unsigned)(r->hailAirLimitMs / 1000));
-    r->hailAirWarned = spent;
-    return spent;
+    r->hailAirWarned = over;
 }
 
-/* While the budget is spent, nothing changes until the oldest minute leaves the
- * window: wake then rather than every slot. */
-TickType_t hailAirWait(const LoraRadio* r) {
-    (void)r;
-    uint32_t ms = 60000u - millis() % 60000u;
-    return pdMS_TO_TICKS(ms) + 1;
-}
-
+/* Credit one transmitted frame's time-on-air. Called per frame at TxDone, where
+ * the duration is already computed for the LoRaMon record. Sole writer of the
+ * bins, and it runs on the radio task. */
 void appcAddAirtime(LoraRadio* r, uint32_t durMs) {
     hailAirRoll(r, millis());
     r->hailAirMs[r->hailAirMin % HAIL_AIR_BINS] += durMs;
+    hailAirCheck(r);
     if (!r->appc) return;
     appcRollBins(r, millis());
     r->appcBinCur += durMs;
@@ -415,7 +408,6 @@ void csmaPrime(LoraRadio* r) {
 }
 
 bool csmaClear(LoraRadio* r) {
-    if (hailAirSpent(r)) return false;
     return csmaAdvance(r, /*prime=*/false);
 }
 

@@ -874,8 +874,8 @@ warning and `nextDeadline()` are mode-agnostic.
 Either way the machine is driven from the task loop: when access is deferred the
 frame stays queued and `nextDeadline()` wakes the task when the machine next has
 something to decide (`csmaSenseDue`), never at 0, which would peg the task.
-`lbt=0` reverts to blind transmit. The other TX guards are `splitHolding` (§5)
-and the hailing channel's airtime budget, below.
+`lbt=0` reverts to blind transmit. The other TX guard is `splitHolding` (§5);
+the hailing channel's airtime budget, below, only warns.
 
 **Sensing cadence: one wait per stretch, ended by the demodulator.**
 
@@ -1135,15 +1135,15 @@ names the wait once per frame after a second. The one exception is a packet
 SUPE holds for a peer that meets: its queue lifetime runs (§19.4). A packet
 SUPE sends the plain way is ordinary traffic again, and waits like any other.
 
-**The hailing channel's airtime budget (`hailAirSpent`).** `csmaClear` grants
-nothing once this radio has spent `s.lora.<n>.airtime_limit` seconds on the
-hailing channel within the last hour — by default 100 s in 863–870 MHz, EN
-300 220's ceiling for a listen-before-talk transmitter, and no limit
-elsewhere. The hour is sixty one-minute bins (`hailAirMs`), credited where the
-APPC band is (`appcAddAirtime`) and aged by the clock, so an idle radio holds
-no wake for them. While the budget is spent the queue holds, `nextDeadline`
-wakes at the next minute boundary instead of every slot, and the exhaustion is
-logged once per spell.
+**The hailing channel's airtime budget (`hailAirCheck`).** Once this radio
+has spent `s.lora.<n>.airtime_limit` seconds on the hailing channel within the
+last hour, a warning is logged once per spell; nothing is held, and channel
+access goes on as before. The default is 360 s in 863–870 MHz, the 10 % duty
+cycle of 869.4–869.65 MHz taken for the whole band, and no limit elsewhere.
+The hour is sixty one-minute bins (`hailAirMs`), credited where the APPC band
+is (`appcAddAirtime`), checked there and aged by the clock, so an idle radio
+holds no wake for them. A spell ends at the first frame credited with the
+hour's sum back under the limit.
 
 **One floor per channel, carried across retunes (`csmaFloorSwitch`).** The
 tracker snaps down to the first sample below it and creeps *up* at 2% of the gap
