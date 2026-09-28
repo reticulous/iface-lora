@@ -474,6 +474,32 @@ int16_t radioRxResume(LoraRadio* r) {
  *
  * Chips without a preamble-detect IRQ report nothing rather than guess; there,
  * carrier sense and the post-hoc csmaMediumHeld correction stand alone. */
+/* One channel-activity detection, then receive again. The demodulator's flags
+ * see only the frame it locked on, and only from its preamble's end; the RSSI
+ * sense sees only what stands above the floor by its margin. A CAD correlates
+ * for the chirps themselves: a frame that began while the demodulator followed
+ * another, one below the noise, a preamble a few symbols old. It takes the chip
+ * out of receive for its two symbols, so it is asked once, at the grant, and
+ * only after the flags said nothing is being received. A CAD that does not
+ * finish reads as busy: a node that cannot sense must not talk. */
+bool radioCadBusy(LoraRadio* r) {
+    PhysicalLayer* p = r->radio;
+    if (p->startChannelScan() != RADIOLIB_ERR_NONE) {
+        radioStartRx(r);
+        return false;
+    }
+    uint32_t done   = p->getIrqMapped(1UL << RADIOLIB_IRQ_CAD_DONE);
+    uint32_t detect = p->getIrqMapped(1UL << RADIOLIB_IRQ_CAD_DETECTED);
+    bool busy = true;
+    for (int i = 0; i < 20; i++) {
+        vTaskDelay(1);
+        uint32_t f = p->getIrqFlags();
+        if (f & done) { busy = (f & detect) != 0; break; }
+    }
+    radioStartRx(r);
+    return busy;
+}
+
 bool radioRxInProgress(LoraRadio* r) {
     if (!r->irqPreamble && !r->irqHdrValid) return false;
     if (r->txActive) return false;      /* the flags belong to the transmit in flight */

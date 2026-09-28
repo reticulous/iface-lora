@@ -1115,6 +1115,20 @@ void drainOneOutbound(LoraRadio* r) {
         return;
     }
     r->csmaStalled = false;
+    /* Experiment (s.lora.<i>.cad_grant): the grant is checked by one CAD, which
+     * finds what the flags and the RSSI sense cannot (radioCadBusy). Activity
+     * means the frame contends again from scratch. */
+    if (r->lbt && r->cadGrant) {
+        r->cadGrantRuns++;
+        if (radioCadBusy(r)) {
+            r->cadGrantBusy++;
+            if (r->cadGrantBusy == 1 || r->cadGrantBusy % 100 == 0)
+                info("lora/%d cad_grant: %u of %u grants found the channel busy",
+                     r->idx, (unsigned)r->cadGrantBusy, (unsigned)r->cadGrantRuns);
+            csmaResetAccess(r);
+            return;
+        }
+    }
     {
         /* The total is everything since the frame first could not go out; the
          * contention part is what channel access just spent. What is left is

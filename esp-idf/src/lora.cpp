@@ -402,6 +402,7 @@ static bool radioStart(LoraRadio* r) {
     if (r->appcSlotTicks < 1) r->appcSlotTicks = 1;
     r->appcDifsTicks = pdMS_TO_TICKS(APPC_SIFS_MS) + 2 * r->appcSlotTicks;
     r->appc = storageGetInt(sk(kb, sizeof kb, r->idx, "appc"), 1) != 0;
+    r->cadGrant = storageGetInt(sk(kb, sizeof kb, r->idx, "cad_grant"), 0) != 0;
     r->appcBand    = 1;
     r->appcBinIdx  = (millis() % APPC_HOUR_MS) / APPC_BIN_MS;
     r->appcBinCur  = 0;

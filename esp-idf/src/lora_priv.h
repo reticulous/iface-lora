@@ -239,6 +239,11 @@ struct LoraRadio {
     TickType_t      rxPreambleTicks;  /* preamble → header-valid */
     TickType_t      rxPacketTicks;    /* header-valid → rx-done */
 
+    /* Experiment (s.lora.<i>.cad_grant, default off): one channel-activity
+     * detection at each grant, before the frame goes out. */
+    bool            cadGrant;
+    uint32_t        cadGrantRuns, cadGrantBusy;
+
     /* Analog front-end recalibration (s.lora.<i>.agc_reset, seconds; 0 = off).
      * The only standing wake this task holds by default — see radioAgcReset. */
     uint32_t        agcResetMs;
