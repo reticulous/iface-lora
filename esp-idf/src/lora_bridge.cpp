@@ -1011,6 +1011,9 @@ static void csmaWatchSync(LoraRadio* r) {
  * transmit is already on-air (txActive) the queue and the ITS buffers simply
  * hold what they hold,
  * and we revisit once the radio is idle. */
+/* A packet's time on air, defined below; the spread holds are sized by it. */
+static uint32_t pktAirMs(const LoraRadio* r, uint16_t len);
+
 void drainOneOutbound(LoraRadio* r) {
     /* Run the wait clock before any of the blocking returns below, so it
      * counts time lost to anything owning the radio and not just to channel
@@ -1060,6 +1063,7 @@ void drainOneOutbound(LoraRadio* r) {
     if (loraqDepth(&r->q) == 0) {
         csmaResetAccess(r);         /* nothing queued → reset channel-access state */
         csmaWatchSync(r);
+        r->cadHoldUntil = 0;        /* nothing for a spread hold to hold */
         return;
     }
 
@@ -1080,6 +1084,13 @@ void drainOneOutbound(LoraRadio* r) {
      * packet simply flies. */
     if (sv == SUPE_V_OFFER) return;   /* the glue launches it after the jitter */
 #endif
+
+    /* Experiment (s.lora.<i>.cad_spread): a frame a busy CAD sent back waits
+     * out its random hold before it contends again. */
+    if (r->cadHoldUntil) {
+        if ((int32_t)(xTaskGetTickCount() - r->cadHoldUntil) < 0) return;
+        r->cadHoldUntil = 0;
+    }
 
     bool granted = csmaClear(r);
     csmaWatchSync(r);
@@ -1126,6 +1137,20 @@ void drainOneOutbound(LoraRadio* r) {
                 info("lora/%d cad_grant: %u of %u grants found the channel busy",
                      r->idx, (unsigned)r->cadGrantBusy, (unsigned)r->cadGrantRuns);
             csmaResetAccess(r);
+            if (r->cadSpread) {
+                /* Everyone this frame held up is released at its end; the ones
+                 * that cannot hear each other then collide wherever they land
+                 * inside one airtime of each other. Spread the retry over
+                 * cad_spread airtimes of this frame instead. */
+                LoraPkt* head = loraqAt(&r->q, 0);
+                uint32_t span = head ? (uint32_t)r->cadSpread * pktAirMs(r, head->len) : 0;
+                if (span) {
+                    TickType_t hold = pdMS_TO_TICKS(esp_random() % span);
+                    if (hold == 0) hold = 1;
+                    r->cadHoldUntil = xTaskGetTickCount() + hold;
+                    if (r->cadHoldUntil == 0) r->cadHoldUntil = 1;
+                }
+            }
             return;
         }
     }
