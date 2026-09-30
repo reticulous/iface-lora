@@ -84,6 +84,25 @@ idf_component_register(
         radiolib
 )
 
+# RadioLib ships a HAL for ESP-IDF of its own and compiles it whatever the
+# target, and that one drives a real SPI peripheral: it includes
+# driver/spi_master.h, which no host target has. This straddle never uses it —
+# it hands RadioLib the HAL above, the chip's bus on a board and the chip
+# model's in a station — so on the host the file leaves the build rather than
+# the board pretending to have a bus.
+if(IDF_TARGET STREQUAL "linux" AND TARGET __idf_jgromes__radiolib)
+    get_target_property(_lora_rl_srcs __idf_jgromes__radiolib SOURCES)
+    set(_lora_rl_keep "")
+    foreach(_lora_f IN LISTS _lora_rl_srcs)
+        get_filename_component(_lora_n "${_lora_f}" NAME)
+        if(_lora_n STREQUAL "EspHal.cpp")
+            continue()
+        endif()
+        list(APPEND _lora_rl_keep "${_lora_f}")
+    endforeach()
+    set_target_properties(__idf_jgromes__radiolib PROPERTIES SOURCES "${_lora_rl_keep}")
+endif()
+
 # Pins + per-radio type come from this component's own Kconfig (LORA_* /
 # LORAn_*), resolved from the buildable's sdkconfig — no reach into the
 # board's main/ header, no function-pointer table.
