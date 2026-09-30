@@ -574,6 +574,7 @@ static bool radioStart(LoraRadio* r) {
     }
     r->curIfacSize = (uint8_t)storageGetInt(sk(kb, sizeof kb, r->idx, "ifac_size"), 0);
     r->curAnnounceCap = (uint8_t)storageGetInt(sk(kb, sizeof kb, r->idx, "announce_cap"), RNS_IFACE_ANNOUNCE_CAP_DEFAULT);
+    r->curPathAnswerSpread = (uint8_t)storageGetInt(sk(kb, sizeof kb, r->idx, "path_answer_spread"), 0);
     /* Default 3. This is the expensive edge: this node is custodian of the
      * mesh on the other side of the radio, re-acquiring a neighbour costs
      * ~1.5 s of airtime, and a path response is a signed announce only a node
