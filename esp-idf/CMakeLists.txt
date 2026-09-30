@@ -18,16 +18,16 @@ set(LORA_SRCS
 
 # On the host the bus is a chip model in the same process and the medium is a
 # UDP socket, so the ESP-IDF SPI HAL is replaced rather than configured. The
-# model is SIMesh's chip library (SIMesh/radio), with its ESP-IDF backend,
+# model is sim-mesh's chip library (sim-mesh/radio), with its ESP-IDF backend,
 # found beside this straddle in the workspace.
 set(LORA_HOST_PRIV_INCLUDE_DIRS "")
 if(IDF_TARGET STREQUAL "linux")
     get_filename_component(_lora_real "${CMAKE_CURRENT_LIST_FILE}" REALPATH)
     get_filename_component(_lora_dir "${_lora_real}" DIRECTORY)
-    get_filename_component(SIMRADIO_DIR "${_lora_dir}/../../SIMesh/radio" ABSOLUTE)
+    get_filename_component(SIMRADIO_DIR "${_lora_dir}/../../sim-mesh/radio" ABSOLUTE)
     if(NOT EXISTS "${SIMRADIO_DIR}/include/simradio.h")
-        message(FATAL_ERROR "iface-lora on the linux target links SIMesh's chip library, "
-                            "and there is none at ${SIMRADIO_DIR}: SIMesh belongs beside "
+        message(FATAL_ERROR "iface-lora on the linux target links sim-mesh's chip library, "
+                            "and there is none at ${SIMRADIO_DIR}: sim-mesh belongs beside "
                             "iface-lora in the workspace")
     endif()
     list(REMOVE_ITEM LORA_SRCS "src/esp_idf_hal.cpp")

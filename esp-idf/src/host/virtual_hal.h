@@ -1,5 +1,5 @@
 /**
- * VirtualHal — RadioLib's HAL over the GPIO shim and SIMesh's chip model.
+ * VirtualHal — RadioLib's HAL over the GPIO shim and sim-mesh's chip model.
  *
  * It stands where EspIdfHal stands on a board and answers the same questions:
  * pins through the shim, time through esp_timer, and an SPI transfer handed to

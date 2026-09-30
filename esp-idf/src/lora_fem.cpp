@@ -222,7 +222,7 @@ void femInit(LoraRadio* r)
 #if CONFIG_IDF_TARGET_LINUX
     /* The host's board, when the station was told one. Nothing to detect or
      * drive: the chip model applies the same front end on its side of the bus
-     * (SIMesh's STATION.md), so all this does is convert with it. A part this
+     * (sim-mesh's STATION.md), so all this does is convert with it. A part this
      * file knows keeps its own behaviour; any other is a declared one. Its
      * switch rows are installed with no pins, so femRxLna's swap moves the
      * receive gain and nothing else. */

@@ -9,10 +9,10 @@ shared SPI bus, each registering with `rnsd` as its own interface `lora/0`,
 only the per-chip bring-up dispatches by family.
 
 On ESP-IDF's Linux host target there is no SPI bus: `src/host/virtual_hal.cpp`
-is RadioLib's HAL over SIMesh's chip library (`SIMesh/radio`, which must sit
+is RadioLib's HAL over sim-mesh's chip library (`sim-mesh/radio`, which must sit
 beside this straddle in the workspace), a model of an SX1262 with a UDP link
 to a virtual medium, and the driver above runs unchanged. That is the
-simulated testbed — see [`SIMesh`](../SIMesh/README.md). The front end there
+simulated testbed — see [`sim-mesh`](../sim-mesh/README.md). The front end there
 is the station's board rather than the build's: when the board straddle
 answers `hwLinuxFrontEnd()` (hw-linux, from `SPANGAP_BOARD`), its part, TX
 calibration, gains and ceiling replace the slot's Kconfig figures, and the
