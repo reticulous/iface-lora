@@ -16,29 +16,32 @@ set(LORA_SRCS
     "src/rolling.cpp"
 )
 
-# On the host the bus is a chip model in the same process and the medium is a
-# UDP socket, so the ESP-IDF SPI HAL is replaced rather than configured. The
-# model is sim-mesh's chip library (sim-mesh/radio), with its ESP-IDF backend,
-# found beside this straddle in the workspace.
+# On the host the bus is a chip model and the medium is a UDP socket, so the
+# ESP-IDF SPI HAL is replaced rather than configured. The model is sim-mesh's
+# virtual SX1262, the shared library libsimradio-sx1262.so: linked by its
+# soname and never carried in the image, since sim-mesh provides it when it
+# starts the station. The copy linked against is compiled here, from sim-mesh's
+# own radio directory and with this build's compiler, so a station built for
+# the other architecture links one of its own. That directory is
+# SIM_MESH_RADIO_DIR, else sim-mesh's beside this straddle in the workspace.
 set(LORA_HOST_PRIV_INCLUDE_DIRS "")
 if(IDF_TARGET STREQUAL "linux")
-    get_filename_component(_lora_real "${CMAKE_CURRENT_LIST_FILE}" REALPATH)
-    get_filename_component(_lora_dir "${_lora_real}" DIRECTORY)
-    get_filename_component(SIMRADIO_DIR "${_lora_dir}/../../sim-mesh/radio" ABSOLUTE)
-    if(NOT EXISTS "${SIMRADIO_DIR}/include/simradio.h")
-        message(FATAL_ERROR "iface-lora on the linux target links sim-mesh's chip library, "
-                            "and there is none at ${SIMRADIO_DIR}: sim-mesh belongs beside "
-                            "iface-lora in the workspace")
+    if(DEFINED ENV{SIM_MESH_RADIO_DIR})
+        set(SIMRADIO_DIR "$ENV{SIM_MESH_RADIO_DIR}")
+    else()
+        get_filename_component(_lora_real "${CMAKE_CURRENT_LIST_FILE}" REALPATH)
+        get_filename_component(_lora_dir "${_lora_real}" DIRECTORY)
+        get_filename_component(SIMRADIO_DIR "${_lora_dir}/../../sim-mesh/radio" ABSOLUTE)
+    endif()
+    if(NOT EXISTS "${SIMRADIO_DIR}/include/simradio.h" OR NOT EXISTS "${SIMRADIO_DIR}/CMakeLists.txt")
+        message(FATAL_ERROR "iface-lora on the linux target links sim-mesh's virtual SX1262, "
+                            "and ${SIMRADIO_DIR} is not sim-mesh's radio directory: clone "
+                            "sim-mesh beside this straddle, or name its radio directory in "
+                            "SIM_MESH_RADIO_DIR")
     endif()
     list(REMOVE_ITEM LORA_SRCS "src/esp_idf_hal.cpp")
-    list(APPEND LORA_SRCS
-        "src/host/virtual_hal.cpp"
-        "${SIMRADIO_DIR}/src/model.cpp"
-        "${SIMRADIO_DIR}/src/ether_link.cpp"
-        "${SIMRADIO_DIR}/src/conductor.cpp"
-        "${SIMRADIO_DIR}/src/json.cpp"
-        "${SIMRADIO_DIR}/backend/esp-idf/services.cpp")
-    set(LORA_HOST_PRIV_INCLUDE_DIRS "${SIMRADIO_DIR}/include" "${SIMRADIO_DIR}/src")
+    list(APPEND LORA_SRCS "src/host/virtual_hal.cpp" "src/host/simradio_glue.cpp")
+    set(LORA_HOST_PRIV_INCLUDE_DIRS "${SIMRADIO_DIR}/include")
 endif()
 
 # SUPE, whole. CONFIG_LORA_NO_SUPE leaves it out of the image; every call site
@@ -101,6 +104,27 @@ if(IDF_TARGET STREQUAL "linux" AND TARGET __idf_jgromes__radiolib)
         list(APPEND _lora_rl_keep "${_lora_f}")
     endforeach()
     set_target_properties(__idf_jgromes__radiolib PROPERTIES SOURCES "${_lora_rl_keep}")
+endif()
+
+# The virtual radio, by its soname: the station finds it at run time on the
+# LD_LIBRARY_PATH sim-mesh gives it. And the glue that hands it this port's
+# services, which only weak references reach, named so it is linked.
+if(IDF_TARGET STREQUAL "linux")
+    include(ExternalProject)
+    set(_lora_simradio_bin "${CMAKE_CURRENT_BINARY_DIR}/simradio")
+    set(_lora_simradio_lib "${_lora_simradio_bin}/libsimradio-sx1262.so")
+    ExternalProject_Add(lora_simradio
+        SOURCE_DIR "${SIMRADIO_DIR}"
+        BINARY_DIR "${_lora_simradio_bin}"
+        CMAKE_ARGS "-DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}"
+                   "-DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
+        BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target simradio-sx1262
+        BUILD_ALWAYS ON
+        INSTALL_COMMAND ""
+        BUILD_BYPRODUCTS "${_lora_simradio_lib}")
+    add_dependencies(${COMPONENT_LIB} lora_simradio)
+    target_link_libraries(${COMPONENT_LIB} PUBLIC "${_lora_simradio_lib}")
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u simradio_glue_linked")
 endif()
 
 # Pins + per-radio type come from this component's own Kconfig (LORA_* /
