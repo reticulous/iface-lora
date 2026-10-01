@@ -369,6 +369,7 @@ static bool radioStart(LoraRadio* r) {
     if (r->slotTicks < 1) r->slotTicks = 1;
     r->difsTicks = 2 * r->slotTicks;
     r->lbt = storageGetInt(sk(kb, sizeof kb, r->idx, "lbt"), 1) != 0;
+    r->shortPr = storageGetInt(sk(kb, sizeof kb, r->idx, "short_pr"), 0) != 0;
     r->csmaCw = CSMA_CW_MIN;
     r->csmaStalled = false;
     csmaNoiseFloorReset(r);
