@@ -88,12 +88,15 @@ idf_component_register(
 )
 
 # RadioLib ships a HAL for ESP-IDF of its own and compiles it whatever the
-# target, and that one drives a real SPI peripheral: it includes
-# driver/spi_master.h, which no host target has. This straddle never uses it —
-# it hands RadioLib the HAL above, the chip's bus on a board and the chip
-# model's in a station — so on the host the file leaves the build rather than
-# the board pretending to have a bus.
-if(IDF_TARGET STREQUAL "linux" AND TARGET __idf_jgromes__radiolib)
+# target. This straddle never uses it — it hands RadioLib the HAL above, the
+# chip's bus on a board and the chip model's in a station — so the file leaves
+# the build on every target. It would not build on either: on the host it
+# includes driver/spi_master.h, which no host target has, and on a board it
+# refuses a FreeRTOS tick below 1000 Hz, because its delay() truncates to
+# ticks. The tick here stays at 100 Hz for light sleep's sake, and
+# EspIdfHal::delay rounds up to whole ticks, so no wait RadioLib asks for is
+# lost.
+if(TARGET __idf_jgromes__radiolib)
     get_target_property(_lora_rl_srcs __idf_jgromes__radiolib SOURCES)
     set(_lora_rl_keep "")
     foreach(_lora_f IN LISTS _lora_rl_srcs)
