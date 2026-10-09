@@ -11,7 +11,7 @@
  * floor as the low envelope of RSSI (snap down fast, creep up slowly) so an
  * active channel can't inflate the reference it's compared against. Also busy
  * while the second half of a split is due (splitHolding). */
-static bool channelBusy(LoraRadio* r) {
+static bool channelBusyRaw(LoraRadio* r) {
     r->csmaDemodBusy = false;
     if (splitHolding(r)) return true;
     /* Ask the demodulator before measuring power. It is the only party that can
@@ -50,6 +50,15 @@ static bool channelBusy(LoraRadio* r) {
         if (fresh) return true;
     }
     return rssi > r->noiseFloor + CSMA_RSSI_MARGIN_DB;
+}
+
+/* Experiment (s.lora.<i>.busy_spread): the drain needs to know when a sense
+ * found the channel busy and when it next found it free, so every verdict of
+ * the shared sense is kept. */
+static bool channelBusy(LoraRadio* r) {
+    bool busy = channelBusyRaw(r);
+    r->senseBusy = busy;
+    return busy;
 }
 
 /* The slot-attendance sense: the appointment grants the peer's attention, never

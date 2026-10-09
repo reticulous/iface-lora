@@ -121,6 +121,7 @@ int16_t radioStartRx(LoraRadio* r);
 int16_t radioRxResume(LoraRadio* r);   /* after readData: a no-op where the chip kept receiving */
 void    radioRxDiscard(LoraRadio* r);  /* a packet that will not be read: empty a FIFO part's */
 bool    radioRxInProgress(LoraRadio* r);
+bool    radioCadBusy(LoraRadio* r);    /* one CAD, receive re-armed after; true = activity */
 bool    radioIrqLinePending(const LoraRadio* r);
 bool    radioBusyWakeCapable(const LoraRadio* r);
 bool    radioBusyWake(LoraRadio* r, uint32_t bits);

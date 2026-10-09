@@ -239,6 +239,26 @@ struct LoraRadio {
     TickType_t      rxPreambleTicks;  /* preamble → header-valid */
     TickType_t      rxPacketTicks;    /* header-valid → rx-done */
 
+    /* Experiment (s.lora.<i>.cad_grant, default off): one channel-activity
+     * detection at each grant, before the frame goes out. */
+    bool            cadGrant;
+    uint32_t        cadGrantRuns, cadGrantBusy;
+    /* Experiment (s.lora.<i>.cad_spread, default 0 = off): after a busy CAD
+     * the frame waits a random time up to this many of its own airtimes before
+     * it contends again, rather than re-contending in slots at the busy frame's
+     * end with everyone else it held up. */
+    uint16_t        curAnnounceCapPermille;   /* experiment: s.lora.<i>.announce_cap_permille */
+    uint8_t         cadSpread;
+    /* Experiment (s.lora.<i>.busy_spread, default 0 = off): after the channel
+     * has been busy, the head waits a random time up to this many of its own
+     * airtimes before it contends again. Everything a busy frame held up is
+     * otherwise released at its end into about 280 ms, and relays that cannot
+     * hear each other then collide. */
+    uint8_t         busySpread;
+    bool            senseBusy;       /* the last sense's verdict */
+    bool            busyEpisode;     /* a busy sense since the head last contended */
+    TickType_t      cadHoldUntil;    /* 0 = no hold */
+
     /* Analog front-end recalibration (s.lora.<i>.agc_reset, seconds; 0 = off).
      * The only standing wake this task holds by default — see radioAgcReset. */
     uint32_t        agcResetMs;

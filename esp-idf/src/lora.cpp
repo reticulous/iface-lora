@@ -402,6 +402,12 @@ static bool radioStart(LoraRadio* r) {
     if (r->appcSlotTicks < 1) r->appcSlotTicks = 1;
     r->appcDifsTicks = pdMS_TO_TICKS(APPC_SIFS_MS) + 2 * r->appcSlotTicks;
     r->appc = storageGetInt(sk(kb, sizeof kb, r->idx, "appc"), 1) != 0;
+    r->cadGrant = storageGetInt(sk(kb, sizeof kb, r->idx, "cad_grant"), 0) != 0;
+    r->cadSpread = (uint8_t)storageGetInt(sk(kb, sizeof kb, r->idx, "cad_spread"), 0);
+    r->busySpread = (uint8_t)storageGetInt(sk(kb, sizeof kb, r->idx, "busy_spread"), 0);
+    r->senseBusy = false;
+    r->busyEpisode = false;
+    r->cadHoldUntil = 0;
     r->appcBand    = 1;
     r->appcBinIdx  = (millis() % APPC_HOUR_MS) / APPC_BIN_MS;
     r->appcBinCur  = 0;
@@ -574,6 +580,7 @@ static bool radioStart(LoraRadio* r) {
     }
     r->curIfacSize = (uint8_t)storageGetInt(sk(kb, sizeof kb, r->idx, "ifac_size"), 0);
     r->curAnnounceCap = (uint8_t)storageGetInt(sk(kb, sizeof kb, r->idx, "announce_cap"), RNS_IFACE_ANNOUNCE_CAP_DEFAULT);
+    r->curAnnounceCapPermille = (uint16_t)storageGetInt(sk(kb, sizeof kb, r->idx, "announce_cap_permille"), 0);
     /* Default 3. This is the expensive edge: this node is custodian of the
      * mesh on the other side of the radio, re-acquiring a neighbour costs
      * ~1.5 s of airtime, and a path response is a signed announce only a node
@@ -960,7 +967,12 @@ static TickType_t nextDeadline(void) {
          * spend the whole window at full CPU instead of asleep. The window's own
          * deadline is the s_cfgPend term at the top. */
         bool outReady = r->running && !splitHolding(r) && !r->txActive &&
-                        !loraCfgQuiet();
+                        !loraCfgQuiet() && !r->cadHoldUntil;
+        if (r->running && r->cadHoldUntil) {
+            int32_t rem = (int32_t)(r->cadHoldUntil - now);
+            TickType_t d = rem > 0 ? (TickType_t)rem : 0;
+            if (d < soonest) soonest = d;
+        }
         bool outAvail = (r->rnsdHandle >= 0 && itsBytesAvailable(r->rnsdHandle) > 0) ||
                         loraqDepth(&r->q) > 0 ||
                         (s_rnode.handle >= 0 && s_rnode.radio == r->idx &&

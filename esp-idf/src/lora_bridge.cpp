@@ -55,6 +55,7 @@ bool registerWithRnsd(LoraRadio* r) {
     reg.in = reg.out = 1;
     reg.ifac_size = r->curIfacSize;
     reg.announce_cap = r->curAnnounceCap;
+    reg.announce_cap_permille = r->curAnnounceCapPermille;
     reg.rx_signal = 1;   /* inbound data frames carry the 4-byte RSSI/SNR prefix */
     /* And, ahead of it, the 16-byte key of the node that transmitted — the peer
      * table's own row, so rnsd's shared neighbourhood groups a node's
@@ -1011,6 +1012,9 @@ static void csmaWatchSync(LoraRadio* r) {
  * transmit is already on-air (txActive) the queue and the ITS buffers simply
  * hold what they hold,
  * and we revisit once the radio is idle. */
+/* A packet's time on air, defined below; the spread holds are sized by it. */
+static uint32_t pktAirMs(const LoraRadio* r, uint16_t len);
+
 void drainOneOutbound(LoraRadio* r) {
     /* Run the wait clock before any of the blocking returns below, so it
      * counts time lost to anything owning the radio and not just to channel
@@ -1060,6 +1064,7 @@ void drainOneOutbound(LoraRadio* r) {
     if (loraqDepth(&r->q) == 0) {
         csmaResetAccess(r);         /* nothing queued → reset channel-access state */
         csmaWatchSync(r);
+        r->cadHoldUntil = 0;        /* nothing for a spread hold to hold */
         return;
     }
 
@@ -1081,9 +1086,35 @@ void drainOneOutbound(LoraRadio* r) {
     if (sv == SUPE_V_OFFER) return;   /* the glue launches it after the jitter */
 #endif
 
+    /* Experiment (s.lora.<i>.cad_spread): a frame a busy CAD sent back waits
+     * out its random hold before it contends again. */
+    if (r->cadHoldUntil) {
+        if ((int32_t)(xTaskGetTickCount() - r->cadHoldUntil) < 0) return;
+        r->cadHoldUntil = 0;
+    }
+
     bool granted = csmaClear(r);
     csmaWatchSync(r);
     if (!granted) {                 /* listen-before-talk not yet satisfied */
+        /* Experiment (s.lora.<i>.busy_spread): the first free sense after a
+         * busy one starts a random hold before contention resumes. */
+        if (r->busySpread) {
+            if (r->senseBusy) {
+                r->busyEpisode = true;
+            } else if (r->busyEpisode) {
+                r->busyEpisode = false;
+                LoraPkt* head = loraqAt(&r->q, 0);
+                uint32_t span = head ? (uint32_t)r->busySpread * pktAirMs(r, head->len) : 0;
+                if (span) {
+                    TickType_t hold = pdMS_TO_TICKS(esp_random() % span);
+                    if (hold == 0) hold = 1;
+                    r->cadHoldUntil = xTaskGetTickCount() + hold;
+                    if (r->cadHoldUntil == 0) r->cadHoldUntil = 1;
+                    csmaResetAccess(r);
+                    return;
+                }
+            }
+        }
         TickType_t waited = xTaskGetTickCount() - r->csmaStart;
         /* Radio contention is otherwise invisible until the drop valve fires —
          * name it explicitly once per frame so a "nothing went out" hunt can
@@ -1115,6 +1146,34 @@ void drainOneOutbound(LoraRadio* r) {
         return;
     }
     r->csmaStalled = false;
+    /* Experiment (s.lora.<i>.cad_grant): the grant is checked by one CAD, which
+     * finds what the flags and the RSSI sense cannot (radioCadBusy). Activity
+     * means the frame contends again from scratch. */
+    if (r->lbt && r->cadGrant) {
+        r->cadGrantRuns++;
+        if (radioCadBusy(r)) {
+            r->cadGrantBusy++;
+            if (r->cadGrantBusy == 1 || r->cadGrantBusy % 100 == 0)
+                info("lora/%d cad_grant: %u of %u grants found the channel busy",
+                     r->idx, (unsigned)r->cadGrantBusy, (unsigned)r->cadGrantRuns);
+            csmaResetAccess(r);
+            if (r->cadSpread) {
+                /* Everyone this frame held up is released at its end; the ones
+                 * that cannot hear each other then collide wherever they land
+                 * inside one airtime of each other. Spread the retry over
+                 * cad_spread airtimes of this frame instead. */
+                LoraPkt* head = loraqAt(&r->q, 0);
+                uint32_t span = head ? (uint32_t)r->cadSpread * pktAirMs(r, head->len) : 0;
+                if (span) {
+                    TickType_t hold = pdMS_TO_TICKS(esp_random() % span);
+                    if (hold == 0) hold = 1;
+                    r->cadHoldUntil = xTaskGetTickCount() + hold;
+                    if (r->cadHoldUntil == 0) r->cadHoldUntil = 1;
+                }
+            }
+            return;
+        }
+    }
     {
         /* The total is everything since the frame first could not go out; the
          * contention part is what channel access just spent. What is left is
