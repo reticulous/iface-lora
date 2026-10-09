@@ -243,7 +243,7 @@ config LORA0_LR_IRQ_DIO
         the radio comes up, calls itself healthy, and never reports a frame.
 
 config LORA0_LR_RFSW_IDLE
-    hex "Radio 0 — LR2021 DIOs driven high in standby"
+    hex "Radio 0 — LR11x0/LR2021 DIOs driven high in standby"
     default 0
     depends on LORA_COUNT > 0
     help
@@ -254,28 +254,33 @@ config LORA0_LR_RFSW_IDLE
         no mask names is left alone. All five zero (the default) means the
         board has no radio-driven front end, and nothing is programmed.
 
+        The LR11x0 has five switch DIOs rather than seven — bit 0..3 = DIO5..
+        DIO8, bit 4 = DIO10 (DIO9 is its IRQ) — and one receive row for both
+        bands, so it takes RX and ignores RX_HF. Its TX row covers both of its
+        sub-GHz amplifiers.
+
         This is how a board states a FEM the MCU cannot reach: the chip drives
         the part directly as it changes mode, so the switching costs no GPIO
         and no host round-trip. Pair it with LORA0_FEM_GAIN_DB, which is what
         converts the user's antenna dBm to a drive level the part survives.
 
 config LORA0_LR_RFSW_RX
-    hex "Radio 0 — LR2021 DIOs driven high in sub-GHz receive"
+    hex "Radio 0 — LR11x0/LR2021 DIOs driven high in sub-GHz receive"
     default 0
     depends on LORA_COUNT > 0
 
 config LORA0_LR_RFSW_TX
-    hex "Radio 0 — LR2021 DIOs driven high in sub-GHz transmit"
+    hex "Radio 0 — LR11x0/LR2021 DIOs driven high in sub-GHz transmit"
     default 0
     depends on LORA_COUNT > 0
 
 config LORA0_LR_RFSW_RX_HF
-    hex "Radio 0 — LR2021 DIOs driven high in 2.4 GHz receive"
+    hex "Radio 0 — LR11x0/LR2021 DIOs driven high in 2.4 GHz receive"
     default 0
     depends on LORA_COUNT > 0
 
 config LORA0_LR_RFSW_TX_HF
-    hex "Radio 0 — LR2021 DIOs driven high in 2.4 GHz transmit"
+    hex "Radio 0 — LR11x0/LR2021 DIOs driven high in 2.4 GHz transmit"
     default 0
     depends on LORA_COUNT > 0
 config LORA0_LR_RFSW_TX_BYPASS
@@ -489,7 +494,7 @@ config LORA1_LR_IRQ_DIO
         the radio comes up, calls itself healthy, and never reports a frame.
 
 config LORA1_LR_RFSW_IDLE
-    hex "Radio 1 — LR2021 DIOs driven high in standby"
+    hex "Radio 1 — LR11x0/LR2021 DIOs driven high in standby"
     default 0
     depends on LORA_COUNT > 1
     help
@@ -500,28 +505,33 @@ config LORA1_LR_RFSW_IDLE
         no mask names is left alone. All five zero (the default) means the
         board has no radio-driven front end, and nothing is programmed.
 
+        The LR11x0 has five switch DIOs rather than seven — bit 0..3 = DIO5..
+        DIO8, bit 4 = DIO10 (DIO9 is its IRQ) — and one receive row for both
+        bands, so it takes RX and ignores RX_HF. Its TX row covers both of its
+        sub-GHz amplifiers.
+
         This is how a board states a FEM the MCU cannot reach: the chip drives
         the part directly as it changes mode, so the switching costs no GPIO
         and no host round-trip. Pair it with LORA1_FEM_GAIN_DB, which is what
         converts the user's antenna dBm to a drive level the part survives.
 
 config LORA1_LR_RFSW_RX
-    hex "Radio 1 — LR2021 DIOs driven high in sub-GHz receive"
+    hex "Radio 1 — LR11x0/LR2021 DIOs driven high in sub-GHz receive"
     default 0
     depends on LORA_COUNT > 1
 
 config LORA1_LR_RFSW_TX
-    hex "Radio 1 — LR2021 DIOs driven high in sub-GHz transmit"
+    hex "Radio 1 — LR11x0/LR2021 DIOs driven high in sub-GHz transmit"
     default 0
     depends on LORA_COUNT > 1
 
 config LORA1_LR_RFSW_RX_HF
-    hex "Radio 1 — LR2021 DIOs driven high in 2.4 GHz receive"
+    hex "Radio 1 — LR11x0/LR2021 DIOs driven high in 2.4 GHz receive"
     default 0
     depends on LORA_COUNT > 1
 
 config LORA1_LR_RFSW_TX_HF
-    hex "Radio 1 — LR2021 DIOs driven high in 2.4 GHz transmit"
+    hex "Radio 1 — LR11x0/LR2021 DIOs driven high in 2.4 GHz transmit"
     default 0
     depends on LORA_COUNT > 1
 config LORA1_LR_RFSW_TX_BYPASS
@@ -714,7 +724,7 @@ config LORA2_LR_IRQ_DIO
         the radio comes up, calls itself healthy, and never reports a frame.
 
 config LORA2_LR_RFSW_IDLE
-    hex "Radio 2 — LR2021 DIOs driven high in standby"
+    hex "Radio 2 — LR11x0/LR2021 DIOs driven high in standby"
     default 0
     depends on LORA_COUNT > 2
     help
@@ -725,28 +735,33 @@ config LORA2_LR_RFSW_IDLE
         no mask names is left alone. All five zero (the default) means the
         board has no radio-driven front end, and nothing is programmed.
 
+        The LR11x0 has five switch DIOs rather than seven — bit 0..3 = DIO5..
+        DIO8, bit 4 = DIO10 (DIO9 is its IRQ) — and one receive row for both
+        bands, so it takes RX and ignores RX_HF. Its TX row covers both of its
+        sub-GHz amplifiers.
+
         This is how a board states a FEM the MCU cannot reach: the chip drives
         the part directly as it changes mode, so the switching costs no GPIO
         and no host round-trip. Pair it with LORA2_FEM_GAIN_DB, which is what
         converts the user's antenna dBm to a drive level the part survives.
 
 config LORA2_LR_RFSW_RX
-    hex "Radio 2 — LR2021 DIOs driven high in sub-GHz receive"
+    hex "Radio 2 — LR11x0/LR2021 DIOs driven high in sub-GHz receive"
     default 0
     depends on LORA_COUNT > 2
 
 config LORA2_LR_RFSW_TX
-    hex "Radio 2 — LR2021 DIOs driven high in sub-GHz transmit"
+    hex "Radio 2 — LR11x0/LR2021 DIOs driven high in sub-GHz transmit"
     default 0
     depends on LORA_COUNT > 2
 
 config LORA2_LR_RFSW_RX_HF
-    hex "Radio 2 — LR2021 DIOs driven high in 2.4 GHz receive"
+    hex "Radio 2 — LR11x0/LR2021 DIOs driven high in 2.4 GHz receive"
     default 0
     depends on LORA_COUNT > 2
 
 config LORA2_LR_RFSW_TX_HF
-    hex "Radio 2 — LR2021 DIOs driven high in 2.4 GHz transmit"
+    hex "Radio 2 — LR11x0/LR2021 DIOs driven high in 2.4 GHz transmit"
     default 0
     depends on LORA_COUNT > 2
 config LORA2_LR_RFSW_TX_BYPASS
@@ -939,7 +954,7 @@ config LORA3_LR_IRQ_DIO
         the radio comes up, calls itself healthy, and never reports a frame.
 
 config LORA3_LR_RFSW_IDLE
-    hex "Radio 3 — LR2021 DIOs driven high in standby"
+    hex "Radio 3 — LR11x0/LR2021 DIOs driven high in standby"
     default 0
     depends on LORA_COUNT > 3
     help
@@ -950,28 +965,33 @@ config LORA3_LR_RFSW_IDLE
         no mask names is left alone. All five zero (the default) means the
         board has no radio-driven front end, and nothing is programmed.
 
+        The LR11x0 has five switch DIOs rather than seven — bit 0..3 = DIO5..
+        DIO8, bit 4 = DIO10 (DIO9 is its IRQ) — and one receive row for both
+        bands, so it takes RX and ignores RX_HF. Its TX row covers both of its
+        sub-GHz amplifiers.
+
         This is how a board states a FEM the MCU cannot reach: the chip drives
         the part directly as it changes mode, so the switching costs no GPIO
         and no host round-trip. Pair it with LORA3_FEM_GAIN_DB, which is what
         converts the user's antenna dBm to a drive level the part survives.
 
 config LORA3_LR_RFSW_RX
-    hex "Radio 3 — LR2021 DIOs driven high in sub-GHz receive"
+    hex "Radio 3 — LR11x0/LR2021 DIOs driven high in sub-GHz receive"
     default 0
     depends on LORA_COUNT > 3
 
 config LORA3_LR_RFSW_TX
-    hex "Radio 3 — LR2021 DIOs driven high in sub-GHz transmit"
+    hex "Radio 3 — LR11x0/LR2021 DIOs driven high in sub-GHz transmit"
     default 0
     depends on LORA_COUNT > 3
 
 config LORA3_LR_RFSW_RX_HF
-    hex "Radio 3 — LR2021 DIOs driven high in 2.4 GHz receive"
+    hex "Radio 3 — LR11x0/LR2021 DIOs driven high in 2.4 GHz receive"
     default 0
     depends on LORA_COUNT > 3
 
 config LORA3_LR_RFSW_TX_HF
-    hex "Radio 3 — LR2021 DIOs driven high in 2.4 GHz transmit"
+    hex "Radio 3 — LR11x0/LR2021 DIOs driven high in 2.4 GHz transmit"
     default 0
     depends on LORA_COUNT > 3
 config LORA3_LR_RFSW_TX_BYPASS

@@ -210,6 +210,10 @@ static void cliPrintSlot(int i) {
                   "%02x/%02x/%02x/%02x/%02x (bit 0 = DIO5)\n",
                   s->lr_irq_dio, s->lr_rfsw[0], s->lr_rfsw[1], s->lr_rfsw[2],
                   s->lr_rfsw[3], s->lr_rfsw[4]);
+    else if (chipFamily(s->chip) == FAM_LR11X0)
+        cliPrintf("        lr11x0 rfsw idle/rx/tx/tx_hf=%02x/%02x/%02x/%02x "
+                  "(bit 0 = DIO5)\n",
+                  s->lr_rfsw[0], s->lr_rfsw[1], s->lr_rfsw[2], s->lr_rfsw[4]);
 
     char kb[48];
     int  freq_hz = storageGetInt(sk(kb, sizeof kb, i, "frequency"), 0);

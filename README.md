@@ -134,12 +134,13 @@ switches, or interactively via `spangap menuconfig`.
     bonded a different one and does not say so gets a radio that comes up, calls
     itself healthy and never reports a frame.
   - `CONFIG_LORAn_LR_RFSW_IDLE` / `_RX` / `_TX` / `_RX_HF` / `_TX_HF` —
-    **LR2021 only**: the chip's internal RF-switch table, one bitmask per mode
-    over its own DIOs (bit 0 = DIO5 … bit 6 = DIO11). A DIO named by any of the
-    five is programmed as an RF-switch output and driven high in exactly the
+    **LR11x0 and LR2021**: the chip's internal RF-switch table, one bitmask per
+    mode over its own DIOs (bit 0 = DIO5 … bit 6 = DIO11). A DIO named by any of
+    the five is programmed as an RF-switch output and driven high in exactly the
     modes whose mask holds it; all five zero means no radio-driven front end.
     The chip applies the row itself on every mode change, so nothing on the host
-    follows a transmit.
+    follows a transmit. The LR11x0 has five switch DIOs (bit 0..3 = DIO5..DIO8,
+    bit 4 = DIO10) and one receive row for both bands, so it ignores `_RX_HF`.
   - **chip** — the radio part on the slot (`SX1262` default); the choice covers
     all 15 supported parts.
 

@@ -43,10 +43,11 @@ struct LoraSlot {
     int      fem_hf_pwr;           /* 2.4 GHz front end's supply GPIO (-1 = single band) */
     int      fem_hf_gain_db;       /* declared-FEM TX gain on the 2.4 GHz path, dB */
     int      lr_irq_dio;           /* LR2021: which chip DIO carries the IRQ line (5..11) */
-    uint8_t  lr_rfsw[5];           /* LR2021: DIOs driven high per mode, in the order the
-                                    * chip numbers them — idle, rx, tx, rx_hf, tx_hf; bit 0
-                                    * = DIO5 … bit 6 = DIO11. All zero = no radio-driven
-                                    * front end (see lora_radio.cpp's lr2021ApplyDio) */
+    uint8_t  lr_rfsw[5];           /* LR11x0/LR2021: DIOs driven high per mode, in the order
+                                    * the LR2021 numbers them — idle, rx, tx, rx_hf, tx_hf;
+                                    * bit 0 = DIO5 … bit 6 = DIO11 (LR11x0: bit 4 = DIO10,
+                                    * no RX_HF). All zero = no radio-driven front end (see
+                                    * lora_radio.cpp's lr11x0ApplyRfSwitch / lr2021ApplyDio) */
     uint8_t  lr_rfsw_tx_bypass;    /* LR2021: the sub-GHz TX row again, with the transmit
                                     * amplifier's select line dropped so the chip drives
                                     * the antenna directly. 0 = this board has no bypass

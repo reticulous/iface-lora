@@ -324,8 +324,8 @@ The RF switch is handled at the call site, not in dispatch, in one of four
 forms: `Module::setRfSwitchPins(rx, tx)` for a two-GPIO external switch (set on
 the `Module` before `begin()`, so it covers every family); `setDio2AsRfSwitch(true)`
 inside `radioBegin` when the slot asks for it (SX126x only); a detected
-front-end module's table installed by `femInit` (§4b); or the LR2021's own DIOs
-programmed after `begin()` (§4c).
+front-end module's table installed by `femInit` (§4b); or the LR11x0's or
+LR2021's own DIOs programmed after `begin()` (§4c).
 
 **RX gain.** SX126x/LR `begin()` sets the regulator to **DC-DC** (passing
 `useRegulatorLDO = false`). The LNA gain mode is a per-radio setting
@@ -625,7 +625,7 @@ to the new limit with a warning and re-sizes every power control bound to
 `lora.<n>.tx_power_max` — the web slider reactively, the LCD one when the pane
 is next built.
 
-## 4c. LR2021 DIO wiring (`lr2021ApplyDio`)
+## 4c. LR2021 and LR11x0 DIO wiring (`lr2021ApplyDio`, `lr11x0ApplyRfSwitch`)
 
 The LR2021 bonds out DIO5..DIO11 and lets the board decide what each one is: the
 interrupt line, an RF-switch output, or nothing. Both facts are the board's
@@ -654,7 +654,18 @@ The index fix is on the library's master branch and in no release. One datasheet
 constraint survives either way and is honoured here: **DIO5 accepts only the
 pull-up in sleep**, and any other pull makes the chip refuse the command.
 
-**A frequency change must go through a full `begin()`** on this family.
+The **LR11x0** takes the same `CONFIG_LORAn_LR_RFSW_*` masks
+(`lr11x0ApplyRfSwitch`), in one `SetDioAsRfSwitch` (0x0112) after `begin()`: an
+enable mask, then one mask per mode — standby, rx, tx, tx_hp, tx_hf, gnss, wifi.
+Its IRQ is fixed on DIO9, so `LR_IRQ_DIO` does not apply; its switch DIOs are
+DIO5..DIO8 and DIO10 (bits 0..4). It has one receive row for both bands, so
+`_RX_HF` is not applied (a value that differs from `_RX` is warned about); `_TX`
+fills both the tx and tx_hp rows, since which sub-GHz amplifier RadioLib picks
+depends on the power asked for; the GNSS and Wi-Fi scanner rows stay empty.
+`LR11x0::setRfSwitchTable` is bypassed for the reason above — it, too, builds
+each mode's mask from the caller's array position rather than the DIO number.
+
+**A frequency change must go through a full `begin()`** on the LR2021.
 Crossing the part's LF/HF boundary re-points the whole front end, and the
 incremental setters answer a live cross-band move with an error rather than a
 retune. §9's config lifecycle already stops and restarts the radio on any

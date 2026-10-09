@@ -90,6 +90,42 @@ static int16_t lr11x0Begin(LoraRadio* r, float freq, float bw, uint8_t sf, uint8
     return st;
 }
 
+/* The LR11x0's RF switch: the same LORAn_LR_RFSW_* masks as the LR2021 below,
+ * programmed in one SetDioAsRfSwitch — an enable mask, then one mask per mode
+ * in the chip's order: standby, rx, tx, tx_hp, tx_hf, gnss, wifi. The part has
+ * five switch DIOs (bit 0..3 = DIO5..DIO8, bit 4 = DIO10; DIO9 is its IRQ) and
+ * one receive row for both bands, so RX_HF has nowhere to go; the sub-GHz TX
+ * row serves both its low- and high-power amplifiers, and the GNSS and Wi-Fi
+ * scanner rows stay empty because nothing here uses them. Sent after begin(),
+ * whose reset clears it, through the Module for the same reason as below:
+ * LR11x0::setRfSwitchTable indexes its masks by array position, not DIO. */
+#define LORA_LR11X0_RFSW_DIOS  0x1F
+
+static void lr11x0ApplyRfSwitch(LoraRadio* r)
+{
+    const LoraSlot* s = r->slot;
+    uint8_t en = 0;
+    for (int i = 0; i < 5; i++) en |= s->lr_rfsw[i];
+    if (!en) return;
+    if (en & ~LORA_LR11X0_RFSW_DIOS)
+        warn("lora/%d LR11x0 has no RF-switch DIO for mask bits %02x — check "
+             "CONFIG_LORA%d_LR_RFSW_*", r->idx, en & ~LORA_LR11X0_RFSW_DIOS, r->idx);
+    if (s->lr_rfsw[3] && s->lr_rfsw[3] != s->lr_rfsw[1])
+        warn("lora/%d LR11x0 has one receive row for both bands; "
+             "CONFIG_LORA%d_LR_RFSW_RX_HF is not applied", r->idx, r->idx);
+    uint8_t cmd[8] = {
+        (uint8_t)(en & LORA_LR11X0_RFSW_DIOS),
+        s->lr_rfsw[0], s->lr_rfsw[1], s->lr_rfsw[2], s->lr_rfsw[2], s->lr_rfsw[4],
+        0, 0,
+    };
+    for (int i = 1; i < 6; i++) cmd[i] &= LORA_LR11X0_RFSW_DIOS;
+    int16_t st = r->mod->SPIwriteStream(RADIOLIB_LR11X0_CMD_SET_DIO_AS_RF_SWITCH,
+                                        cmd, sizeof cmd);
+    if (st != RADIOLIB_ERR_NONE)
+        warn("lora/%d LR11x0 RF-switch table refused: %s (%d)",
+             r->idx, rlErrName(st), (int)st);
+}
+
 /* ─────────────── LR2021 DIO wiring ───────────────
  *
  * The LR2021 bonds out DIO5..DIO11 and lets the board decide what each one is:
@@ -266,6 +302,7 @@ static int16_t radioBeginOnce(LoraRadio* r, float freq, float bw, uint8_t sf, ui
  *     more RX current), the PA over-current trip, and the RX-sensitivity
  *     register patch. The frequency is also checked against the part's
  *     image-calibration bands (sx126xImageBandKnown).
+ *   LR11x0 — the board's RF-switch table (lr11x0ApplyRfSwitch).
  *   LR2021 — the board's DIO map (lr2021ApplyDio) and the RX gain level.
  *
  * Which is also why a frequency change goes through a full stop/start rather
@@ -315,6 +352,10 @@ int16_t radioBegin(LoraRadio* r, float freq, float bw, uint8_t sf, uint8_t cr,
         if (g != RADIOLIB_ERR_NONE)
             warn("lora/%d LR2021 RX gain level refused: %s (%d)",
                  r->idx, rlErrName(g), (int)g);
+        return st;
+    }
+    if (chipFamily(r->slot->chip) == FAM_LR11X0) {
+        lr11x0ApplyRfSwitch(r);   /* the board's antenna switch, cleared by begin()'s reset */
         return st;
     }
     if (chipFamily(r->slot->chip) != FAM_SX126X) return st;
