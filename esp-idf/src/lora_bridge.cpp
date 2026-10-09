@@ -56,6 +56,7 @@ bool registerWithRnsd(LoraRadio* r) {
     reg.ifac_size = r->curIfacSize;
     reg.announce_cap = r->curAnnounceCap;
     reg.announce_cap_permille = r->curAnnounceCapPermille;
+    reg.path_answer_spread = r->curPathAnswerSpread;
     reg.rx_signal = 1;   /* inbound data frames carry the 4-byte RSSI/SNR prefix */
     /* And, ahead of it, the 16-byte key of the node that transmitted — the peer
      * table's own row, so rnsd's shared neighbourhood groups a node's

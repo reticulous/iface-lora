@@ -283,6 +283,7 @@ struct LoraRadio {
     char            curIfacNetkey[64];    /* IFAC passphrase (secrets.) */
     uint8_t         curIfacSize;          /* IFAC access-code length */
     uint8_t         curAnnounceCap;       /* % bandwidth cap for announces (s.) */
+    uint8_t         curPathAnswerSpread;  /* experiment: s.lora.<i>.path_answer_spread */
     uint8_t         curCommunityRadius;   /* serve nodes within this many hops on this radio; 0 = none */
 
     /* Split-RX reassembly — one in-flight split at a time per radio. */
