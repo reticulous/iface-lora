@@ -126,6 +126,57 @@ static void rnsdInject(LoraRadio* r, const uint8_t* data, size_t len,
     }
 }
 
+/* ── Short path requests ──
+ *
+ * The reticulum project's short path request (`reticulum_packet::short_pr`):
+ * a path request cut to what a search needs, flown under type byte 0xCA in
+ * place of the split header. The body is the destination's first four bytes
+ * (its label), a two-byte tag, and, from a transport node, the first byte of
+ * its transport id (a hint): six or seven bytes, where a full request is 51 to
+ * 67. Received, it is rebuilt into the ordinary request it stands for, with
+ * the cut bytes zero, and rnsd routes it as any other. rns answers a label
+ * with the whole announce of a destination bearing it, and the asker checks
+ * the full hash. 0xCA's low nibble is neither 0 nor 1, so it is no split
+ * header; it is also outside SUPE's types, and it is taken before SUPE's
+ * dispatch. Off unless `s.lora.<n>.short_pr` is set; this build hears short
+ * requests and answers them, and asks in full itself. */
+#define LORA_SHORT_PR        0xCA
+#define SHORT_PR_LABEL_LEN   4
+#define SHORT_PR_TAG_LEN     2
+#define SHORT_PR_BODY_MIN    (SHORT_PR_LABEL_LEN + SHORT_PR_TAG_LEN)
+#define SHORT_PR_BODY_MAX    (SHORT_PR_BODY_MIN + 1)
+#define SHORT_PR_REBUILT_MAX (19 + 16 + 16 + SHORT_PR_TAG_LEN)
+
+/* rnstransport.path.request's destination hash: canon's
+ * RNS.Destination.hash(None, "rnstransport", "path", "request"). */
+static const uint8_t kPathRequestDest[16] = {
+    0x6b, 0x9f, 0x66, 0x01, 0x4d, 0x98, 0x53, 0xfa,
+    0xab, 0x22, 0x0f, 0xba, 0x47, 0xd0, 0x27, 0x61,
+};
+
+/* The path request a short body stands for, into `out`: its length, or 0 when
+ * `body` is no short body. Flags 0x08 (HEADER_1, BROADCAST, PLAIN, DATA),
+ * hops 0, context 0; then the label zero-filled to 16, the hint zero-filled
+ * to 16 where there is one, and the tag. Every node rebuilds the same bytes,
+ * so rns's dedup key holds. */
+static size_t shortPrRebuild(const uint8_t* body, size_t n, uint8_t* out, size_t cap) {
+    if (n != SHORT_PR_BODY_MIN && n != SHORT_PR_BODY_MAX) return 0;
+    size_t need = 19 + 16 + (n == SHORT_PR_BODY_MAX ? 16 : 0) + SHORT_PR_TAG_LEN;
+    if (cap < need) return 0;
+    memset(out, 0, need);
+    out[0] = 0x08;
+    memcpy(out + 2, kPathRequestDest, sizeof kPathRequestDest);
+    size_t i = 19;
+    memcpy(out + i, body, SHORT_PR_LABEL_LEN);
+    i += 16;
+    if (n == SHORT_PR_BODY_MAX) {
+        out[i] = body[SHORT_PR_BODY_MIN];
+        i += 16;
+    }
+    memcpy(out + i, body + SHORT_PR_LABEL_LEN, SHORT_PR_TAG_LEN);
+    return need;
+}
+
 static void deliverInbound(LoraRadio* r, const uint8_t* data, size_t len,
                            double airMs, int frames) {
     (void)airMs; (void)frames;   /* per-frame recording/logging now happens in handleRxDone */
@@ -293,6 +344,17 @@ static void handleRxDone(LoraRadio* r) {
          * transmits at tx_power and has nothing to park it for. */
         r->apRxSuggest     = (int8_t)frame[1];
         r->apRxSuggestPend = apEnabled(r) && (int8_t)frame[1] != PWRREQ_NO_TXP;
+        ours = true;
+    }
+
+    /* A short path request, where this radio hears them: rebuilt into the
+     * request it stands for and handed to rnsd as one. Ours to classify, so it
+     * never reaches split framing or SUPE's dispatch. */
+    if (!ours && r->shortPr && header == LORA_SHORT_PR &&
+        (pktLen == 1 + SHORT_PR_BODY_MIN || pktLen == 1 + SHORT_PR_BODY_MAX)) {
+        uint8_t req[SHORT_PR_REBUILT_MAX];
+        size_t n = shortPrRebuild(frame + 1, pktLen - 1, req, sizeof req);
+        if (n) deliverInbound(r, req, n, airMs, 1);
         ours = true;
     }
 

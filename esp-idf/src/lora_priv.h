@@ -319,6 +319,7 @@ struct LoraRadio {
     /* CSMA / listen-before-talk. slotTicks/difsTicks derive from the LoRa
      * symbol time at config; the phase machine is driven from the task loop. */
     bool            lbt;             /* carrier-sense enabled (s.lora.<i>.lbt) */
+    bool            shortPr;         /* short path requests heard (s.lora.<i>.short_pr) */
     bool            rxBoostedGain;   /* boosted RX gain (s.lora.<i>.rx_boosted_gain): a
                                       * flag on SX126x, the top gain level on LR2021 */
     TickType_t      slotTicks;       /* CSMA slot time */
