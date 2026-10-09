@@ -220,6 +220,18 @@ void appcAddAirtime(LoraRadio* r, uint32_t durMs) {
     r->appcBinCur += durMs;
 }
 
+/* This radio's on-air ms on the hailing channel over the sliding hour. Read
+ * from another task like appcAirtime, so it ages the bins on the way past
+ * rather than rolling them: a bin hailAirRoll would clear reads as empty. */
+uint32_t hailAirHourMs(const LoraRadio* r) {
+    uint32_t gap = millis() / 60000u - r->hailAirMin;
+    if (gap >= HAIL_AIR_BINS) return 0;
+    uint32_t sum = 0;
+    for (uint32_t k = gap + 1; k <= HAIL_AIR_BINS; k++)
+        sum += r->hailAirMs[(r->hailAirMin + k) % HAIL_AIR_BINS];
+    return sum;
+}
+
 /* Fraction of the last two bins this radio spent transmitting. Ages the stored
  * bins into the present without writing them, so the CLI printer — which reads
  * live radio state from its own task — cannot race the radio task's accounting.

@@ -573,7 +573,8 @@ KCT8103L was sensed. The transmit path is untouched either way: the TX row is
 the same in both tables and the power curve does not move.
 
 **Declared** — `CONFIG_LORAn_FEM_GAIN_DB`, non-zero. The control lines hang off
-the **radio's** DIOs (§4c), so there is no pin to sense and no table to install
+the **radio's** DIOs (§4c, or an SX126x's `DIO2` — the B&Q Station G2, whose PA
+and LNA are always in the path), so there is no pin to sense and no table to install
 here: nothing identifies the part at runtime, the board states its gain and
 `CONFIG_LORA_TX_POWER_MAX` states its limit, and that pair is the whole model.
 The gain applies flat — nobody has measured this one per rung — with the clamp
@@ -585,7 +586,11 @@ The pair is a **guard** as much as a conversion. A front end whose TX input is
 rated for a few dBm sits behind a chip that will deliver +22 to anything that
 asks, and the only thing standing between them is the subtraction. Raising
 `CONFIG_LORA_TX_POWER_MAX` without raising the gain raises the chip drive by the
-same amount.
+same amount. On the Station G2 the PA's input leaves its P1dB region at a chip
+drive of 16 dBm; a gain of 20 under a limit of 35 holds the chip at 15. Since
+nothing here switches the part, `femInit` logs an error when a declared board
+names no switch path at all — no `DIO2_RF_SWITCH`, no RF-switch GPIOs, no
+`LR_RFSW` mask.
 
 ### 4b.1 Two bands, and what follows the carrier
 

@@ -11,6 +11,7 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "service.h"
 
@@ -38,6 +39,26 @@ struct lora_peer_summary {
 /** Fill `out` for radio slot `radio`. False when the slot is invalid, no
  *  radios are configured, or the radio has never been up (no observations). */
 bool loraPeerSummary(int radio, lora_peer_summary* out);
+
+/** Point-in-time traffic snapshot for a small status surface, read off the
+ *  radio's in-memory counters rather than the lora.<n>.stats.* keys, which
+ *  publish only while a UI reads them (uiTelemetryWanted). Same advisory
+ *  contract as lora_peer_summary. A caller charting rates keeps its own
+ *  previous sample and divides by its own clock. */
+struct lora_traffic_summary {
+    bool     up;            /* radio on-air */
+    uint64_t tx_bytes, rx_bytes;
+    uint64_t tx_frames, rx_frames;
+    int      airtime_pct;   /* own TX airtime over the appc window, percent */
+    int      duty_pct10;    /* own TX on the hailing channel over the sliding
+                             * hour, tenths of a percent */
+    int      noise_dbm;     /* tracked channel noise floor, dBm */
+    int      txp_dbm;       /* configured TX power, connector dBm */
+};
+
+/** Fill `out` for radio slot `radio`. False when the slot is invalid or no
+ *  radios are configured; counters read zero before the radio first runs. */
+bool loraTrafficSummary(int radio, lora_traffic_summary* out);
 
 /** What to call the node a three-byte tag resolves to: its announced name(s),
  *  comma-joined, or "#N" — the number `lora n` prints — where it has none. Empty

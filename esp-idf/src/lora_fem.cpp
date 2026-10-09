@@ -274,6 +274,16 @@ void femInit(LoraRadio* r)
      * other, never both. */
     if (s->fem_gain_db > 0 || s->fem_hf_gain_db > 0) {
         r->femType  = FEM_DECLARED;
+        /* Nothing here switches a declared part, so something else has to: the
+         * SX126x's DIO2, the two RF-switch GPIOs, or the LR chips' DIO masks.
+         * A board naming none of them would transmit an always-in-path
+         * amplifier into a switch parked for receive. */
+        bool lrRfsw = false;
+        for (uint8_t m : s->lr_rfsw) lrRfsw |= m != 0;
+        if (!s->dio2_rf_switch && s->rfsw_rx < 0 && s->rfsw_tx < 0 && !lrRfsw)
+            err("lora/%d FEM declared but nothing switches the antenna (no DIO2_RF_SWITCH, "
+                "RFSW pins or LR_RFSW masks) — TX would drive it into a switch set for RX",
+                r->idx);
         /* Both supply gates start up, matching the pull-ups these nets carry on
          * every board seen so far: the band is not known until the first
          * begin(), and a front end powered a moment too long costs current

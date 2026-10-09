@@ -33,7 +33,8 @@
  * call site in the driver is covered without edits.
  *
  * DECLARED — the control lines hang off the RADIO's own DIOs (LORAn_LR_RFSW_*,
- * programmed in lora_radio.cpp), so there is no pin to sense and no table to
+ * programmed in lora_radio.cpp, or an SX126x's DIO2 — the B&Q Station G2's
+ * always-in-path amplifier and LNA), so there is no pin to sense and no table to
  * install here. Nothing identifies the part at runtime; the board states its
  * gain (LORAn_FEM_GAIN_DB) and its antenna ceiling (LORA_TX_POWER_MAX), and
  * that pair is the whole model.

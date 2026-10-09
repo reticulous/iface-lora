@@ -170,14 +170,18 @@ config LORA0_FEM_GAIN_DB
         A front end the board DECLARES instead of one the driver detects. The
         FEM_*_PIN group above describes a part on an MCU-driven enable net,
         which is what makes it sensible; this describes a part whose control
-        lines hang off the RADIO's own DIOs (the LR_RFSW group below), where
-        there is nothing to sense and no GPIO to switch. One number states it:
-        the gain the part adds on TX.
+        lines hang off the RADIO's own DIOs (the LR_RFSW group below, or an
+        SX126x's DIO2_RF_SWITCH), where there is nothing to sense and no GPIO
+        to switch. One number states it: the gain the part adds on TX.
 
         Antenna dBm minus this gain is the chip drive, so the chip is never
         asked for more than LORA_TX_POWER_MAX minus this — which is what keeps
         a front end whose TX input tops out at a few dBm from being handed the
-        chip's full +22.
+        chip's full +22. The B&Q Station G2 is the case: its PA is always in
+        the path behind the SX1262's DIO2 switch, its input leaves the P1dB
+        region at a chip drive of 16 dBm, and declaring 20 here with
+        LORA_TX_POWER_MAX at 35 holds the chip at 15. Its LNA's gain goes in
+        this slot's RSSI_CAL.
 
 config LORA0_TX_CAL
     string "Radio 0 — TX calibration curves (empty = uncalibrated)"
@@ -450,14 +454,18 @@ config LORA1_FEM_GAIN_DB
         A front end the board DECLARES instead of one the driver detects. The
         FEM_*_PIN group above describes a part on an MCU-driven enable net,
         which is what makes it sensible; this describes a part whose control
-        lines hang off the RADIO's own DIOs (the LR_RFSW group below), where
-        there is nothing to sense and no GPIO to switch. One number states it:
-        the gain the part adds on TX.
+        lines hang off the RADIO's own DIOs (the LR_RFSW group below, or an
+        SX126x's DIO2_RF_SWITCH), where there is nothing to sense and no GPIO
+        to switch. One number states it: the gain the part adds on TX.
 
         Antenna dBm minus this gain is the chip drive, so the chip is never
         asked for more than LORA_TX_POWER_MAX minus this — which is what keeps
         a front end whose TX input tops out at a few dBm from being handed the
-        chip's full +22.
+        chip's full +22. The B&Q Station G2 is the case: its PA is always in
+        the path behind the SX1262's DIO2 switch, its input leaves the P1dB
+        region at a chip drive of 16 dBm, and declaring 20 here with
+        LORA_TX_POWER_MAX at 35 holds the chip at 15. Its LNA's gain goes in
+        this slot's RSSI_CAL.
 
 config LORA1_TX_CAL
     string "Radio 1 — TX calibration curves (empty = uncalibrated)"
@@ -680,14 +688,18 @@ config LORA2_FEM_GAIN_DB
         A front end the board DECLARES instead of one the driver detects. The
         FEM_*_PIN group above describes a part on an MCU-driven enable net,
         which is what makes it sensible; this describes a part whose control
-        lines hang off the RADIO's own DIOs (the LR_RFSW group below), where
-        there is nothing to sense and no GPIO to switch. One number states it:
-        the gain the part adds on TX.
+        lines hang off the RADIO's own DIOs (the LR_RFSW group below, or an
+        SX126x's DIO2_RF_SWITCH), where there is nothing to sense and no GPIO
+        to switch. One number states it: the gain the part adds on TX.
 
         Antenna dBm minus this gain is the chip drive, so the chip is never
         asked for more than LORA_TX_POWER_MAX minus this — which is what keeps
         a front end whose TX input tops out at a few dBm from being handed the
-        chip's full +22.
+        chip's full +22. The B&Q Station G2 is the case: its PA is always in
+        the path behind the SX1262's DIO2 switch, its input leaves the P1dB
+        region at a chip drive of 16 dBm, and declaring 20 here with
+        LORA_TX_POWER_MAX at 35 holds the chip at 15. Its LNA's gain goes in
+        this slot's RSSI_CAL.
 
 config LORA2_TX_CAL
     string "Radio 2 — TX calibration curves (empty = uncalibrated)"
@@ -910,14 +922,18 @@ config LORA3_FEM_GAIN_DB
         A front end the board DECLARES instead of one the driver detects. The
         FEM_*_PIN group above describes a part on an MCU-driven enable net,
         which is what makes it sensible; this describes a part whose control
-        lines hang off the RADIO's own DIOs (the LR_RFSW group below), where
-        there is nothing to sense and no GPIO to switch. One number states it:
-        the gain the part adds on TX.
+        lines hang off the RADIO's own DIOs (the LR_RFSW group below, or an
+        SX126x's DIO2_RF_SWITCH), where there is nothing to sense and no GPIO
+        to switch. One number states it: the gain the part adds on TX.
 
         Antenna dBm minus this gain is the chip drive, so the chip is never
         asked for more than LORA_TX_POWER_MAX minus this — which is what keeps
         a front end whose TX input tops out at a few dBm from being handed the
-        chip's full +22.
+        chip's full +22. The B&Q Station G2 is the case: its PA is always in
+        the path behind the SX1262's DIO2 switch, its input leaves the P1dB
+        region at a chip drive of 16 dBm, and declaring 20 here with
+        LORA_TX_POWER_MAX at 35 holds the chip at 15. Its LNA's gain goes in
+        this slot's RSSI_CAL.
 
 config LORA3_TX_CAL
     string "Radio 3 — TX calibration curves (empty = uncalibrated)"

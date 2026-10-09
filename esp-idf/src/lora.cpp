@@ -1605,6 +1605,21 @@ bool loraPeerSummary(int radio, lora_peer_summary* out) {
     return true;
 }
 
+bool loraTrafficSummary(int radio, lora_traffic_summary* out) {
+    if (radio < 0 || radio >= kNumRadios) return false;
+    LoraRadio* r = &s_radios[radio];
+    out->up          = r->running;
+    out->tx_bytes    = r->txBytes;
+    out->rx_bytes    = r->rxBytes;
+    out->tx_frames   = r->txFrames;
+    out->rx_frames   = r->rxFrames;
+    out->airtime_pct = (int)(appcAirtime(r) * 100.0f);
+    out->duty_pct10  = (int)(hailAirHourMs(r) / 3600u);   /* ms per hour → ‰ */
+    out->noise_dbm   = (int)r->noiseFloor;
+    out->txp_dbm     = r->cfgTxp;
+    return true;
+}
+
 static int tagHexVal(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -1669,6 +1684,7 @@ void LoraService::onInit() {
 }
 
 bool loraPeerSummary(int, lora_peer_summary*) { return false; }
+bool loraTrafficSummary(int, lora_traffic_summary*) { return false; }
 void loraNameForTag(int, const char*, char* out, size_t outLen) {
     if (out && outLen) out[0] = '\0';
 }

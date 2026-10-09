@@ -668,7 +668,7 @@ void peersNodeNames(const Neighbor* e, char* out, size_t outLen) {
  * power, not at 22, and the estimate would be off by the difference. */
 static int peersAssumedPeerTxp(void) {
     int v = storageGetInt("s.lora.assumed_peer_txp", 22);
-    if (v < -30 || v > 30) v = 22;
+    if (v < -30 || v > 40) v = 22;   /* garbage filter: an amplified board reaches 36 */
     return v;
 }
 

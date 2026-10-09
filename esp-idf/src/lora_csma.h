@@ -100,4 +100,5 @@ uint32_t csmaWatchBits(const LoraRadio* r);
 TickType_t csmaSenseDue(const LoraRadio* r, TickType_t now);
 void     appcAddAirtime(LoraRadio* r, uint32_t durMs);
 float    appcAirtime(const LoraRadio* r);
+uint32_t hailAirHourMs(const LoraRadio* r);
 uint8_t  appcLiveBand(const LoraRadio* r);
