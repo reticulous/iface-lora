@@ -190,9 +190,9 @@ static void backToRx(LoraRadio* r, bool start) {
      * as close behind as a split's second half — so it keeps the hold. Before
      * the receiver is armed, since arming takes the standby this governs. */
 #if !defined(CONFIG_LORA_NO_SUPE)
-    if (!supeBusy(r)) radioHoldOsc(r, false);
+    if (!supeBusy(r)) radioHoldOsc(r, LORA_HOLD_AWAKE);
 #else
-    radioHoldOsc(r, false);
+    radioHoldOsc(r, LORA_HOLD_AWAKE);
 #endif
     if (start) radioStartRx(r);
     else       radioRxResume(r);
@@ -573,9 +573,9 @@ void startTxFrame(LoraRadio* r, int idx) {
      * the frame flies, because the fallback it sets is what the chip acts on the
      * moment TxDone arrives. */
 #if !defined(CONFIG_LORA_NO_SUPE)
-    radioHoldOsc(r, idx + 1 < (int)r->txFrameCount || supeBusy(r));
+    radioHoldOsc(r, LORA_HOLD_AWAKE || idx + 1 < (int)r->txFrameCount || supeBusy(r));
 #else
-    radioHoldOsc(r, idx + 1 < (int)r->txFrameCount);
+    radioHoldOsc(r, LORA_HOLD_AWAKE || idx + 1 < (int)r->txFrameCount);
 #endif
     int16_t st = r->radio->startTransmit(r->txFrame[idx], r->txFrameLen[idx]);
     if (st != RADIOLIB_ERR_NONE) {

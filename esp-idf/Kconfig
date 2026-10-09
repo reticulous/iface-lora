@@ -27,6 +27,22 @@ config LORA_NO_SUPE
         are unaffected — SUPE is designed to leave non-participants unmodified
         and unaware.
 
+config LORA_HOLD_OSC_AWAKE
+    bool "Hold the reference oscillator whenever the radio is awake"
+    default n
+    help
+        SX126x only. Without it the oscillator is held only through a chain of
+        frames (radioHoldOsc): after any other frame the part falls back to
+        STDBY_RC, the TCXO stops, and the next receiver or carrier waits out its
+        start-up (5 ms with RadioLib) — deaf right after each transmission,
+        and late with each carrier after its channel check. Held, the part
+        falls back to STDBY_XOSC instead and every frame starts as soon as the
+        PLL locks.
+
+        A node that listens continuously runs the TCXO anyway; the price is
+        the standby gaps around frames only (on a RAK4631's SX1262 the TCXO
+        and XOSC cost ~1.45 mA in standby).
+
 # ─── shared SPI bus ───────────────────────────────────────────────────
 # One SPI host carries every radio (and, on boards like the T-Deck, the
 # display and SD card too). spi_helper makes bus bring-up idempotent, so

@@ -129,6 +129,14 @@ void    radioIrqClearAll(LoraRadio* r);
 bool    radioAgcReset(LoraRadio* r);
 void    agcResetPoll(LoraRadio* r);
 void    radioHoldOsc(LoraRadio* r, bool hold);
+
+/* CONFIG_LORA_HOLD_OSC_AWAKE: the oscillator held whenever the radio is awake,
+ * not only through a chain of frames. */
+#if defined(CONFIG_LORA_HOLD_OSC_AWAKE)
+#define LORA_HOLD_AWAKE true
+#else
+#define LORA_HOLD_AWAKE false
+#endif
 float   channelRssi(LoraRadio* r);
 
 /* Re-program the LR2021's DIO RF-switch map from the board's masks and the
