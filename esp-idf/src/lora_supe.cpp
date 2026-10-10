@@ -1233,17 +1233,19 @@ uint32_t supeNextDeadlineMs(LoraRadio* r) {
         uint32_t at = supeEngNextEventMs(&ss->eng, now);
         if (at != UINT32_MAX) soon(at);
     }
-    if (ss->annPending) { if (slotMs < best) best = slotMs; }
-    else if (r->annIntervalMin && ss->eng.m.phase == SUPE_M_IDLE) soon(ss->annNextMs);
-    /* Paced like annPending once it comes due, not `soon(0)`. supePoll returns
-     * ahead of the beat while a transmit is in flight or an announce replay is
-     * running, so a window that has expired can stay unserviced for a while —
+    /* Both announce beats are paced like annPending once they come due, not
+     * `soon(0)`. supePoll returns ahead of the beat while a transmit is in
+     * flight, an announce replay is running or a hail is waiting for the
+     * channel, so a beat that has come due can stay unserviced for a while —
      * and a deadline of zero over that stretch is the main loop spinning on a
      * request nothing is in a position to grant. */
-    if (ss->annSoonPend) {
-        if ((int32_t)(now - ss->annSoonMs) >= 0) { if (slotMs < best) best = slotMs; }
-        else soon(ss->annSoonMs);
-    }
+    auto beat = [&](uint32_t at) {
+        if ((int32_t)(now - at) >= 0) { if (slotMs < best) best = slotMs; }
+        else soon(at);
+    };
+    if (ss->annPending) { if (slotMs < best) best = slotMs; }
+    else if (r->annIntervalMin && ss->eng.m.phase == SUPE_M_IDLE) beat(ss->annNextMs);
+    if (ss->annSoonPend) beat(ss->annSoonMs);
     {
         uint32_t d = airtimeNextDeadlineMs(r, now);
         if (d < best) best = d;
