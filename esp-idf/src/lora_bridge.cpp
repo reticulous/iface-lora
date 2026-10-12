@@ -388,7 +388,7 @@ static void handleRxDone(LoraRadio* r) {
 #if !defined(CONFIG_LORA_NO_SUPE)
     uint8_t meetTag[SUPE_TAG_LEN];
     inMeeting = supeMeetingTag(r, meetTag);
-    if (!ours && !supeIsFramingByte(header)) {
+    if (!ours && !loraIsFramingByte(header)) {
         if (supeIsTypeByte(header)) {
             supeOnFrame(r, frame, pktLen, (int16_t)lround(r->rssiLast),
                         (int16_t)lround(r->snrLast * 10.0));
@@ -400,7 +400,7 @@ static void handleRxDone(LoraRadio* r) {
 #else
     /* Nothing on the air is ours but Reticulum: anything else is somebody
      * else's traffic, counted and left alone. */
-    if (!ours) foreign = true;
+    if (!ours && !loraIsFramingByte(header)) foreign = true;
 #endif
 
     /* Record this on-air frame (RX_DONE marks end-of-air, so start = end − ToA),

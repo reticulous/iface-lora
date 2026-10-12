@@ -1,16 +1,20 @@
 #pragma once
-/* Time-on-air, per Semtech AN1200.13 — the one copy of it.
+/* Small LoRa helpers that both halves of this straddle need, one copy of each:
+ * time-on-air, the calling channel's LDRO rule, and the test for a Reticulum
+ * frame's first byte.
+ *
+ * Time-on-air is per Semtech AN1200.13.
  *
  * Symbol time Tsym = 2^SF / BW; the preamble runs (n+4.25) symbols and the
  * payload rounds up into whole symbols, with low-data-rate optimisation (DE)
  * engaged once a symbol exceeds 16 ms.
  *
- * It lives in a header, alone, because both halves of this straddle need it and
- * neither can reach the other: SUPE's portable core compiles with a plain g++
- * (see test/) so it cannot call into the driver, and the driver has to time a
- * frame in a build with no SUPE in it at all (CONFIG_LORA_NO_SUPE). A second
- * copy is how the radio-check sweep's airtime came to be over-stated by half —
- * once was enough. Header-only and free of ESP-IDF for the same reason.
+ * They live in a header, alone, because both halves of this straddle need them
+ * and neither can reach the other: SUPE's portable core compiles with a plain
+ * g++ (see test/) so it cannot call into the driver, and the driver needs them
+ * in a build with no SUPE in it at all (CONFIG_LORA_NO_SUPE). A second copy of
+ * the formula is how the radio-check sweep's airtime came to be over-stated by
+ * half — once was enough. Header-only and free of ESP-IDF for the same reason.
  *
  * `implicitHeader` is NOT optional bookkeeping: a headerless frame drops the
  * 20-bit header from the payload term. `crc` likewise — a SUPE frame flies
@@ -42,3 +46,10 @@ static inline double loraToaSeconds(int sf, int bw_hz, int cr_denom, int preambl
     double payloadSym = 8.0 + fmax(ceil(num / den) * (cr + 4), 0.0);
     return (preamble + 4.25) * tSym + payloadSym * tSym;
 }
+
+/* The first byte of a Reticulum frame on the air: a random sequence id in the
+ * high nibble and the split flag in bit 0, the three bits between always
+ * clear (INTERNALS.md §5). So a first byte whose low nibble is 0 or 1 is one
+ * the framing can produce, and any other byte does not begin a Reticulum
+ * frame. */
+static inline bool loraIsFramingByte(uint8_t b) { return (b & 0x0F) <= 0x01; }

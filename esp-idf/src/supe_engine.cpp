@@ -8,7 +8,7 @@
  * IDF header, something has leaked in that belongs in lora_supe.cpp.
  */
 #include "supe_engine.h"
-#include "lora_toa.h"
+#include "lora_helpers.h"
 
 #include <string.h>
 #include <stdio.h>

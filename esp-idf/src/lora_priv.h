@@ -18,7 +18,7 @@
 #include "spangap.h"
 #include "mem.h"       /* gp_alloc (PSRAM) for the LoRaMon ring/history buffers */
 #include "rolling.h"   /* one-hour running totals in ten-minute buckets */
-#include "lora_toa.h"  /* time-on-air, and the calling channel's LDRO rule */
+#include "lora_helpers.h"  /* time-on-air, the calling channel's LDRO rule, the framing byte test */
 #if !defined(CONFIG_LORA_NO_SUPE)
 #include "supe.h"      /* SUPE's pure core: regimes, ladder, codec, deadlines */
 #endif

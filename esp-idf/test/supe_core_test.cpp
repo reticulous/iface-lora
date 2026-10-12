@@ -83,8 +83,8 @@ static void testTypeBytes(void) {
     /* The rule the receive path's dispatch rests on: the split framing reaches
      * every byte whose low nibble is 0 or 1, and no assigned type value is one
      * of those. */
-    ok(supeIsFramingByte(0xC0) && supeIsFramingByte(0xC1), "0xC0/0xC1 are framing bytes");
-    ok(supeIsFramingByte(0xD0) && supeIsFramingByte(0xD1), "0xD0/0xD1 are framing bytes");
+    ok(loraIsFramingByte(0xC0) && loraIsFramingByte(0xC1), "0xC0/0xC1 are framing bytes");
+    ok(loraIsFramingByte(0xD0) && loraIsFramingByte(0xD1), "0xD0/0xD1 are framing bytes");
     ok(!supeIsTypeByte(0xC0) && !supeIsTypeByte(0xD1), "framing bytes are not type bytes");
     ok(supeIsTypeByte(SUPE_T_HAIL) && supeIsTypeByte(SUPE_T_ANNOUNCE) &&
        supeIsTypeByte(SUPE_T_GOT) && supeIsTypeByte(SUPE_T_READY) &&

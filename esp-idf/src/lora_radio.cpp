@@ -5,7 +5,7 @@
  */
 #include "lora_priv.h"
 #include "lora_fem.h"
-#include "lora_toa.h"
+#include "lora_helpers.h"
 
 #if defined(CONFIG_LORA0_CS_PIN)
 
@@ -727,7 +727,7 @@ void agcResetPoll(LoraRadio* r) {
 /* ─────────────── helpers ─────────────── */
 
 /* Time-on-air (seconds) for a `payload`-byte LoRa frame. The formula itself is
- * in lora_toa.h — one copy, shared with SUPE's portable core, because two copies
+ * in lora_helpers.h — one copy, shared with SUPE's portable core, because two copies
  * are exactly how the sweep's airtime came to be over-stated by half. CRC on:
  * every frame this overload is asked about carries one.
  *

@@ -42,6 +42,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include "lora_helpers.h"   /* loraIsFramingByte */
 
 /* ─────────────── frame types (SUPE.md §0.3, normative) ───────────────
  *
@@ -65,13 +66,9 @@
 #define SUPE_T_BYE         0xC7   /* everything accounted for */
 #define SUPE_T_RESEND      0xC8   /* one repair round's bitmask */
 
-/** True for a byte the split framing cannot produce — the receive path's whole
- *  basis for telling a SUPE frame from a packet's first byte. */
-static inline bool supeIsFramingByte(uint8_t b) { return (b & 0x0F) <= 0x01; }
-
 /** True iff `b` is a SUPE type byte: in range, and not one the framing reaches. */
 static inline bool supeIsTypeByte(uint8_t b) {
-    return b >= SUPE_TYPE_MIN && b <= SUPE_TYPE_MAX && !supeIsFramingByte(b);
+    return b >= SUPE_TYPE_MIN && b <= SUPE_TYPE_MAX && !loraIsFramingByte(b);
 }
 
 /* ─────────────── level and power encoding ───────────────

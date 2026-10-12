@@ -5,7 +5,7 @@
  * test in test/ compiles this file directly.
  */
 #include "supe.h"
-#include "lora_toa.h"   /* the shared time-on-air formula */
+#include "lora_helpers.h"   /* the shared time-on-air formula */
 
 #include <string.h>
 #include <math.h>

@@ -1295,7 +1295,7 @@ integer rule instead (`loraLdroRnode`, `2^SF / (BW/1000) > 16`), which leaves
 it off at SF11/125k, SF12/250k and SF10/62.5k — the two ends of a link must
 agree or neither decodes. Airtime estimates at those three settings are
 therefore slightly long. The formula itself is `loraToaSeconds`
-in `lora_toa.h` — header-only and free of ESP-IDF, because both halves of the
+in `lora_helpers.h` — header-only and free of ESP-IDF, because both halves of the
 straddle need it and neither can reach the other: SUPE's portable core compiles
 with a plain g++ (test/), and the driver has to time a frame in a build with no
 SUPE in it at all (§19.1.1). One copy on purpose — two are how the radio-check
