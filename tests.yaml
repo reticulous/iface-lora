@@ -1,0 +1,18 @@
+tests:
+  - id: supe-host
+    type: host
+    env: spangap
+    tier: smoke
+    run: make -B -C esp-idf/test all
+    tools: [g++, make]
+    paths: [esp-idf/src/**, esp-idf/test/**]
+
+  - id: rnode-endpoint
+    type: hil
+    tier: extended
+    run: python3 esp-idf/test/rnode_test.py
+    tools: [python3, docker]
+    configs: [reticulous/reticulous:no-supe]
+    hardware: [lora]
+    # TODO ldub: rnode_test.py finds the device via `spangap cli` and the
+    # workspace bridge, so TEST_PORT may not be the right handle.
