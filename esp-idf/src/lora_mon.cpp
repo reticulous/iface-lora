@@ -20,6 +20,7 @@
  */
 #include "lora_priv.h"
 
+#include <atomic>
 #include <cstdarg>
 #include <ctime>
 #include <string>
@@ -282,7 +283,22 @@ static void publishPeers(LoraRadio* r) {
  * tasks and the browser, each after one or two of them, and storage deduplicates
  * an unchanged value, so a beat that measured nothing new costs the storage
  * actor almost nothing. Timestamps rather than ages for the same reason — an
- * age changes on every beat, a timestamp only when something was heard. */
+ * age changes on every beat, a timestamp only when something was heard.
+ *
+ * A firmware reader that wants to hear about new measurements subscribes to
+ * `lora.<n>.meas_gen`, not to the `lora.<n>.meas` prefix. That counter moves
+ * once per publication and once per forgotten slot, so a subscriber gets one
+ * notify per beat instead of one per changed field — on a fresh table that is
+ * every field of every slot at once, more than an LCD-task inbox drains inside
+ * the storage notify bound. A counter rather than a timestamp, because storage
+ * suppresses an unchanged value and two bumps can land in the same second. */
+static void bumpMeasGen(LoraRadio* r) {
+    static std::atomic<uint32_t> gen[kNumRadios];
+    char k[32];
+    snprintf(k, sizeof k, "lora.%d.meas_gen", r->idx);
+    storageSet(k, (int)(gen[r->idx].fetch_add(1) + 1));
+}
+
 static void publishMeas(LoraRadio* r) {
     if (!r->nei) return;
     char k[48];
@@ -348,6 +364,7 @@ static void publishMeas(LoraRadio* r) {
         setOr("heard_ts",  e->lastHeardMs != 0, e->lastHeardMs ? tsOf(e->lastHeardMs) : 0);
         storageEnd();
     }
+    bumpMeasGen(r);
 }
 
 /* One forgotten slot, off both publications at once (lora_mon.h). Neither
@@ -361,6 +378,7 @@ void loraPeerPubForget(LoraRadio* r, int slot) {
     storageDeleteTree(k);
     snprintf(k, sizeof k, "lora.%d.meas.%d", r->idx, slot);
     storageDeleteTree(k);
+    bumpMeasGen(r);
 }
 
 /* True while any radio's table holds a neighbour worth publishing. */

@@ -2059,7 +2059,11 @@ links and `NEI_DESTS_MAX` = 16 destinations a row).
   neighbour and the frame counters have moved since the last publication —
   `measTrafficSig` — deleted when the slot empties), keyed for outside readers
   by the six-hex `tags` a node answers to — that is how lxmf's Ping and contact
-  bars, and the web contact list, find a destination hash's radio link. The
+  bars, and the web contact list, find a destination hash's radio link. Each
+  publication, and each slot forgotten, bumps `lora.<n>.meas_gen`
+  (`bumpMeasGen`); a firmware subscriber watches that counter, never the
+  `lora.<n>.meas` prefix, which notifies once per changed field and floods the
+  subscriber's inbox on a fresh table. The
   tick is independent of any UI being present because those readers are
   firmware tasks, and a quiet neighbourhood arms no wake at all; traffic that
   lands during a long idle block is published at the task's next wake.
