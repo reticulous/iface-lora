@@ -753,8 +753,14 @@ static void cliSupe(int idx, const char* sub, const char* arg) {
 
     if (sub && strcmp(sub, "rx") == 0) {
         if (!arg || !*arg) { cliPrintf("usage: lora %d supe rx <hex>\n", idx); return; }
+        /* A frame pasted in space-separated groups reads as one run. */
+        char hex[2 * SUPE_MAX_FRAME + 4];
+        size_t hl = 0;
+        for (const char* p = arg; *p && hl + 1 < sizeof hex; p++)
+            if (!isspace((unsigned char)*p)) hex[hl++] = *p;
+        hex[hl] = '\0';
         uint8_t f[SUPE_MAX_FRAME];
-        int n = cliParseBytes(arg, f, sizeof f);
+        int n = cliParseBytes(hex, f, sizeof f);
         if (n <= 0) { cliPrintf("bad hex\n"); return; }
         if (!supeMounted(r)) { cliPrintf("SUPE is not running on lora/%d\n", idx); return; }
         /* A plausible level and signal-to-noise, so anything the frame feeds —

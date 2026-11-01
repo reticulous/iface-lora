@@ -478,7 +478,8 @@ lora [<n>] supe d[isable]     s.lora.<n>.SUPE.enable and announces the change
                               still READS SUPE and keeps its picture of the
                               neighbourhood current; it just answers nothing.
 lora [<n>] supe rx 0x<hex>    inject a frame into the receive path as if the
-                              radio had decoded it. Paste a line's second column
+                              radio had decoded it (spaces in the hex are
+                              ignored). Paste a line's second column
                               from esp-idf/test/golden.txt, which the host tests
                               regenerate in exactly this form — never
                               hand-written, or the codec and the test can drift
