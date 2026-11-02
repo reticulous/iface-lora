@@ -1530,7 +1530,7 @@ void LoraService::onInit() {
         storageDefault("s.lora.rnode.serial", 1);
         storageDefault("s.lora.rnode.tcp",    0);
         storageDefault("s.lora.rnode.upnp",   0);
-        storageDefault("s.lora.rnode.ble",    1);
+        storageDefault("s.lora.rnode.ble",    0);
         for (int i = 1; i < kNumRadios; i++) {
             storageDefault(sk(kb, sizeof kb, i, "enable"), 0);
             storageDefault(sk(kb, sizeof kb, i, "mode"), "access_point");

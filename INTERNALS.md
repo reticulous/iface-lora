@@ -2679,16 +2679,18 @@ Protocol reference:
 | `s.lora.rnode.serial` | 1 | the serial entry point (highest existing port, in-band trigger) |
 | `s.lora.rnode.tcp`    | 0 | the TCP entry point on port 7633 — a switch, not a port number |
 | `s.lora.rnode.upnp`   | 0 | that entry point published to the internet — net's `publicFacing` flag |
-| `s.lora.rnode.ble`    | 1 | the Bluetooth entry point, read by `reticulous/rnode-ble` |
+| `s.lora.rnode.ble`    | 0 | the Bluetooth entry point, read by `reticulous/rnode-ble` |
 
 Global, not per radio: there is one endpoint for the device, and **one switch
 per entry point — no master enable**: an open entry point is what "enabled" means, and a
-client can only arrive through an open one. TCP is the one entry point that defaults
-shut, because a LoRa segment reachable from any host on the LAN is a decision,
-not a default. Serial and Bluetooth default open because dormant they cost
-nothing: the serial claim is in-band-triggered — the port is a full console,
-esptool auto-reset included, until a client's first KISS FEND takes it over —
-and both reach nobody a USB cable or a Bluetooth pairing didn't already admit.
+client can only arrive through an open one. TCP defaults shut, because a LoRa
+segment reachable from any host on the LAN is a decision, not a default.
+Bluetooth defaults shut because it is not dormant: opening it brings the
+Bluetooth host up, ~40 KB of internal RAM that a fresh device then lacks when
+Reticulum starts. Serial defaults open because dormant it costs nothing: the
+claim is in-band-triggered — the port is a full console, esptool auto-reset
+included, until a client's first KISS FEND takes it over — and it reaches
+nobody a USB cable didn't already admit.
 A session records which entry point it entered through (`RnodeState.door`), so
 switching one entry point off drops its own session and leaves another entry point's alone.
 

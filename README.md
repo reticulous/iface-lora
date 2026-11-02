@@ -228,7 +228,7 @@ once, because the client is holding a 0.25 s validation window open.
 | `s.lora.rnode.serial` | `1` | The serial entry point: the endpoint rides the highest serial port that exists — the console port normally, the second CDC port after `usb cdc`. On by default because it costs nothing until a client speaks (see below). Live. |
 | `s.lora.rnode.tcp` | `0` | The TCP entry point, on port 7633 — a switch, not a port number: an RNS client dials 7633 and nothing else. Off by default: a listener on the network is a decision, not a side effect. Live. |
 | `s.lora.rnode.upnp` | `0` | **Accessible from internet** — ask the router to forward port 7633 in from the WAN, so a client outside the LAN can attach. The flag rides the endpoint's registration with `spangap-net` as `publicFacing`, and [upnp](../upnp) is what acts on it; the switch appears under the TCP entry point only in a build that stages upnp, and only while that entry point is open. Off by default — the other two entry points reach as far as the desk this device is on, this one reaches the whole internet. Live. |
-| `s.lora.rnode.ble` | `1` | The Bluetooth entry point, when `reticulous/rnode-ble` is in the build (which owns it — see its README). Live. |
+| `s.lora.rnode.ble` | `0` | The Bluetooth entry point, when `reticulous/rnode-ble` is in the build (which owns it — see its README). Off by default: it is what brings the Bluetooth host up, which takes ~40 KB of internal RAM. Live. |
 | `s.lora.version` | — | Internal defaults-seeding gate; not a user setting. |
 
 A radio refuses to come up until `frequency`, `tx_power`, and a valid

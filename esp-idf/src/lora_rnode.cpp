@@ -18,10 +18,11 @@ RnodeState s_rnode;
  * hardcoded client-side, so the setting is a switch, not a number. */
 #define RNODE_TCP_PORT 7633
 
-/* One switch per door. Serial and Bluetooth default ON — a dormant in-band-
- * triggered claim and an unadvertised GATT service cost nothing until a
- * client speaks — TCP defaults OFF: a listener on the network is a decision,
- * not a side effect. There is no master switch: an open door is what
+/* One switch per door. Serial defaults ON — a dormant in-band-triggered claim
+ * costs nothing until a client speaks. Bluetooth defaults OFF: the door is
+ * what brings the Bluetooth host up, and that host takes ~40 KB of internal
+ * RAM the rest of the image needs. TCP defaults OFF: a listener on the network
+ * is a decision, not a side effect. There is no master switch: an open door is what
  * "enabled" means, and a client can only arrive through an open one.
  * (`s.lora.rnode.ble` is read by rnode-ble, which owns that door.) */
 static bool rnodeSerialOn(void) { return storageGetInt("s.lora.rnode.serial", 1) != 0; }
@@ -36,7 +37,7 @@ static bool rnodeDoorOn(uint8_t door) {
     switch (door) {
     case RNODE_VIA_SERIAL: return rnodeSerialOn();
     case RNODE_VIA_TCP:    return rnodeTcpOn();
-    case RNODE_VIA_BLE:    return storageGetInt("s.lora.rnode.ble", 1) != 0;
+    case RNODE_VIA_BLE:    return storageGetInt("s.lora.rnode.ble", 0) != 0;
     }
     return false;
 }
