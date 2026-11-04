@@ -1160,9 +1160,15 @@ last hour, a warning is logged once per spell; nothing is held, and channel
 access goes on as before. The default is 360 s in 863–870 MHz, the 10 % duty
 cycle of 869.4–869.65 MHz taken for the whole band, and no limit elsewhere.
 The hour is sixty one-minute bins (`hailAirMs`), credited where the APPC band
-is (`appcAddAirtime`), checked there and aged by the clock, so an idle radio
-holds no wake for them. A spell ends at the first frame credited with the
-hour's sum back under the limit.
+is (`appcAddAirtime`), checked there and aged by the clock. A spell ends at
+the first frame credited with the hour's sum back under the limit. The sum
+and the budget are published as `lora.<n>.airtime_hour_ms` and
+`airtime_limit_ms`, headless too, for local consumers that stream over the
+radio and keep inside the budget themselves; they decide on the figure, so it
+is kept current (`hailAirRefreshMs`): the interface task beats every
+`LORA_AIR_FRESH_MS` (10 s) while the radio has transmitted in the current or
+previous minute, else once more as each non-empty bin ages out, and not at
+all for an empty hour.
 
 **One floor per channel, carried across retunes (`csmaFloorSwitch`).** The
 tracker snaps down to the first sample below it and creeps *up* at 2% of the gap

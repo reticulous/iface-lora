@@ -403,11 +403,20 @@ static uint64_t measTrafficSig(void) {
 }
 
 void publishStats(LoraRadio* r) {
+    char b[48];
+    /* The hailing channel's transmit time over the sliding hour and its
+     * per-hour budget (0 = none), for a local consumer that streams over
+     * this radio and must stay inside the budget — so published headless
+     * too, and kept current by the beat (hailAirRefreshMs). Advisory
+     * figures only: the radio holds nothing back on them. */
+    storageBegin();
+    storageSet(rk(b, sizeof b, r->idx, "airtime_hour_ms"),  (int)hailAirHourMs(r));
+    storageSet(rk(b, sizeof b, r->idx, "airtime_limit_ms"), (int)r->hailAirLimitMs);
+    storageEnd();
     /* Skip the churn on a headless, WiFi-down node — nothing pulls these keys
      * there. A UI (web over WiFi, or an LCD build) re-populates them when it
      * appears; see uiTelemetryWanted(). */
     if (!uiTelemetryWanted()) return;
-    char b[48];
     /* One bracket → one storage op. Unbracketed this fired ~8 separate sync
      * round-trips to the storage task every second; under an inbound-message
      * burst those pile up on the storage op port and stall the radio task. */
@@ -1426,6 +1435,19 @@ static void loraIfTaskMain(void*) {
             bool active = s_monWatched || uiTelemetryWanted();
             TickType_t due = active ? lastBeat + pdMS_TO_TICKS(LORA_STATS_MIN_MS)
                                     : lastShift + shiftTicks;
+            /* The hour's airtime is read by consumers deciding whether to
+             * transmit, UI or not: a beat comes as soon as it may have moved
+             * (hailAirRefreshMs), and the stats gate publishes it then. */
+            uint32_t air = UINT32_MAX;
+            for (int i = 0; i < kNumRadios; i++) {
+                uint32_t a = hailAirRefreshMs(&s_radios[i]);
+                if (a < air) air = a;
+            }
+            if (air != UINT32_MAX) {
+                TickType_t ad = air == LORA_AIR_FRESH_MS ? lastBeat + pdMS_TO_TICKS(air)
+                                                         : now + pdMS_TO_TICKS(air);
+                if ((int32_t)(ad - due) < 0) due = ad;
+            }
             /* The measurement publication has its own 15 s beat, UI or not —
              * its readers are other firmware tasks (lxmf's Ping) as much as
              * the browser — armed only while there is a neighbour to publish
@@ -1495,14 +1517,16 @@ static void loraIfTaskMain(void*) {
             prevWatch = w;
 #endif
 
-            /* Stats: counters only move on a tx/rx event, so publish only when
-             * the sum of them has changed since the last beat. */
+            /* Stats: counters only move on a tx/rx event and the hour's
+             * airtime on a transmit or as its minute bins age out, so publish
+             * only when the sum of them has changed since the last beat. */
             uint64_t sig = 0;
             for (int i = 0; i < kNumRadios; i++) {
                 LoraRadio* r = &s_radios[i];
                 sig += r->txBytes + r->rxBytes + r->txFrames + r->rxFrames +
                        r->crcErr + r->splitTimeouts + r->txDropped +
-                       (uint32_t)r->rssiLast + (uint32_t)r->snrLast;
+                       (uint32_t)r->rssiLast + (uint32_t)r->snrLast +
+                       hailAirHourMs(r);
             }
             if (sig != statsSig) {
                 statsSig = sig;

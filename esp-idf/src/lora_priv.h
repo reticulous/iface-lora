@@ -157,6 +157,9 @@ enum : uint8_t { MTXP_OFF = 0, MTXP_LBT = 1, MTXP_TX = 2 };
 #define LORA_CFG_ONAIR_RETRY_MS 50
 
 #define LORA_STATS_MIN_MS 1000
+/* While a radio has transmitted in the current or previous minute, its
+ * published hourly airtime (lora.<n>.airtime_hour_ms) is at most this old. */
+#define LORA_AIR_FRESH_MS 10000
 /* Cadence of the per-peer measurement publication (lora.<n>.meas.*). */
 #define LORA_MEAS_MS      15000
 

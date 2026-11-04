@@ -232,6 +232,21 @@ uint32_t hailAirHourMs(const LoraRadio* r) {
     return sum;
 }
 
+/* How soon hailAirHourMs should be read again for its publication to stay
+ * current, in ms: LORA_AIR_FRESH_MS while this radio transmitted in the
+ * current or previous minute (it may again at any moment), else until the
+ * next non-empty minute bin ages out of the hour; UINT32_MAX while the hour
+ * is empty. Bin k (counted from hailAirMin) leaves at minute hailAirMin + k. */
+uint32_t hailAirRefreshMs(const LoraRadio* r) {
+    if (!hailAirHourMs(r)) return UINT32_MAX;
+    uint32_t ms = millis(), gap = ms / 60000u - r->hailAirMin;
+    if (gap <= 1) return LORA_AIR_FRESH_MS;
+    for (uint32_t k = gap + 1; k <= HAIL_AIR_BINS; k++)
+        if (r->hailAirMs[(r->hailAirMin + k) % HAIL_AIR_BINS])
+            return (r->hailAirMin + k) * 60000u - ms + 50;
+    return UINT32_MAX;
+}
+
 /* Fraction of the last two bins this radio spent transmitting. Ages the stored
  * bins into the present without writing them, so the CLI printer — which reads
  * live radio state from its own task — cannot race the radio task's accounting.
